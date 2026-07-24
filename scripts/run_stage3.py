@@ -26,7 +26,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 ZARR_PATH = (
         PROJECT_ROOT
-        / "data-sample"
+        / "data/sample"
         / "biohub_5samples_20timepoints"
         / "train"
         / "44b6_0113de3b"
