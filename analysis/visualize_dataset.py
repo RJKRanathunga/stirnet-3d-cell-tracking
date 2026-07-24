@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DATA_ROOT = (
         PROJECT_ROOT
-        / "data-sample"
+        / "data/sample"
         / "biohub_5samples_20timepoints"
         / "train"
 )
