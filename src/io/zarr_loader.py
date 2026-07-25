@@ -1,67 +1,18 @@
 from pathlib import Path
 
+import numpy as np
 import zarr
 
 
-def load_zarr_array(zarr_path: str | Path):
-    """
-    Open a Zarr array stored at <zarr_path>/0.
+def open_sample(sample_path: str | Path):
+    """Open a Zarr sample."""
 
-    Parameters
-    ----------
-    zarr_path:
-        Path to the .zarr directory.
-
-    Returns
-    -------
-    zarr.Array
-        Zarr array with shape:
-        (time, z, y, x)
-    """
-
-    zarr_path = Path(zarr_path)
-    array_path = zarr_path / "0"
-
-    if not array_path.exists():
-        raise FileNotFoundError(
-            f"Zarr array not found:\n{array_path}"
-        )
-
-    volume = zarr.open_array(
-        str(array_path),
-        mode="r"
-    )
-
-    return volume
+    return zarr.open_array(Path(sample_path) / "0")
 
 
-def load_timepoint(
-        zarr_path: str | Path,
-        timepoint: int
-):
-    """
-    Load one 3D timepoint from a Zarr dataset.
+def load_timepoint(sample_path: str | Path, t: int) -> np.ndarray:
+    """Load a single 3D volume."""
 
-    Parameters
-    ----------
-    zarr_path:
-        Path to the .zarr directory.
+    array = open_sample(sample_path)
 
-    timepoint:
-        Time index.
-
-    Returns
-    -------
-    numpy.ndarray
-        3D volume with shape (z, y, x).
-    """
-
-    volume = load_zarr_array(zarr_path)
-
-    if timepoint < 0 or timepoint >= volume.shape[0]:
-        raise IndexError(
-            f"Timepoint {timepoint} is outside valid range "
-            f"[0, {volume.shape[0] - 1}]"
-        )
-
-    return volume[timepoint]
+    return array[t]

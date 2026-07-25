@@ -1,71 +1,23 @@
 import numpy as np
-
 from scipy.ndimage import gaussian_filter
 
 
-def estimate_background(
+def background_correction(
         volume: np.ndarray,
-        sigma: float = 20.0
+        voxel_size: tuple[float, float, float],
+        sigma_um: float = 4.0,
 ) -> np.ndarray:
-    """
-    Estimate the slowly varying background of a 3D volume.
+    """Subtract a smooth background estimate."""
 
-    Parameters
-    ----------
-    volume:
-        Input 3D volume.
+    sigma = sigma_um / np.asarray(voxel_size)
 
-    sigma:
-        Gaussian scale used for background estimation.
-
-    Returns
-    -------
-    np.ndarray
-        Estimated background volume.
-    """
-
-    background = gaussian_filter(
-        volume,
-        sigma=sigma
-    )
-
-    return background
-
-
-def correct_background(
-        volume: np.ndarray,
-        sigma: float = 20.0
-) -> np.ndarray:
-    """
-    Subtract estimated background from the volume.
-
-    Negative values are clipped to zero.
-
-    Parameters
-    ----------
-    volume:
-        Input 3D volume.
-
-    sigma:
-        Gaussian scale used for background estimation.
-
-    Returns
-    -------
-    np.ndarray
-        Background-corrected volume.
-    """
-
-    background = estimate_background(
-        volume,
-        sigma=sigma
-    )
+    background = gaussian_filter(volume, sigma=sigma)
 
     corrected = volume - background
 
-    corrected = np.clip(
-        corrected,
-        0.0,
-        None
-    )
+    corrected = np.clip(corrected, 0.0, None)
+
+    if corrected.max() > 0:
+        corrected /= corrected.max()
 
     return corrected

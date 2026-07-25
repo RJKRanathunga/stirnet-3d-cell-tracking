@@ -2,3 +2,5 @@
 scikit-image
 numpy
 pandas
+scipy
+tqdm
