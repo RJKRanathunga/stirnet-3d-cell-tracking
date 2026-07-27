@@ -254,7 +254,7 @@ def visualize_dataset(dataset):
 
     viewer = napari.Viewer(
         title=f"BioHub Cell Tracking - {name}",
-        ndisplay=2
+        ndisplay=3
     )
 
     # --------------------------------------------------------
