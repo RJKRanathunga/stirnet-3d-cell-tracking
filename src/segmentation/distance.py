@@ -18,13 +18,19 @@ def compute_distance_transform(
 
 def smooth_distance_transform(
         distance: np.ndarray,
-        sigma: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        sigma_physical: float = 0.8,
 ) -> np.ndarray:
     """
     Smooth the distance transform before marker detection.
     """
 
+    sigma_zyx = (
+        sigma_physical / 1.625,
+        sigma_physical / 0.40625,
+        sigma_physical / 0.40625,
+    )
+
     return ndimage.gaussian_filter(
         distance,
-        sigma=sigma,
+        sigma=sigma_zyx,
     )

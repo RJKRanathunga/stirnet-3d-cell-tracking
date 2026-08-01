@@ -1,19 +1,30 @@
-"""Reusable 3D cell-volume extraction utilities.
+"""Reusable aligned 3D cell-volume extraction utilities.
 
-This module supports both:
+The extractor saves a fixed-size crop around a detected cell centroid.  The
+same spatial bounds are applied to every supplied pipeline representation, so
+raw intensity, preprocessed intensity, the binary mask, and watershed instance
+labels remain voxel-aligned.
 
-1. Standalone batch extraction by editing the configuration at the top and
-   running this file directly.
-2. Interactive extraction from Napari through ``napari_extractor.py``.
+The raw crop keeps the original backward-compatible filename::
 
-Saved outputs are written to ``data/extracted/merged_cells`` by default.
+    <sample>_t####_cell#####.npy
+
+Optional diagnostic crops use explicit suffixes::
+
+    <sample>_t####_cell#####_preprocessed.npy
+    <sample>_t####_cell#####_binary_mask.npy
+    <sample>_t####_cell#####_instance_labels.npy
+    <sample>_t####_cell#####.json
+
+This module supports both standalone batch extraction and interactive use from
+``napari_extractor.py``.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -26,26 +37,34 @@ import pandas as pd
 SAMPLE_ID = "44b6_0113de3b"
 FRAME = 0
 CELL_IDS = [1, 2, 3]
-BOX_SIZE = (17, 65, 65)  # (Z, Y, X), in voxels
+BOX_SIZE = (12, 50, 50)  # (Z, Y, X), in voxels
 VOXEL_SIZE = (1.625, 0.40625, 0.40625)  # (Z, Y, X)
 PAD_VALUE = 0
 OVERWRITE = False
+
+# Optional standalone diagnostic sources.  Set these to a 3D array for FRAME
+# or a 4D (T, Z, Y, X) array.  Leave as None when using the Napari widget.
+PREPROCESSED_ARRAY_PATH: Path | None = None
+BINARY_MASK_ARRAY_PATH: Path | None = None
+INSTANCE_LABELS_ARRAY_PATH: Path | None = None
 
 
 # ============================================================
 # Project paths
 # ============================================================
 
-# Expected location:
-#   <project-root>/diagnostics/cell_volume_extraction/extraction.py
+
 def _detect_project_root() -> Path:
+    """Locate the repository root from this module's nested package path."""
+
     module_path = Path(__file__).resolve()
 
     for parent in module_path.parents:
         if (parent / "data").exists() and (parent / "diagnostics").exists():
             return parent
 
-    # Normal repository layout, even before the data directory exists.
+    # Expected location:
+    # <project-root>/diagnostics/cell_volume_extraction/extraction.py
     if len(module_path.parents) >= 3:
         return module_path.parents[2]
 
@@ -81,8 +100,9 @@ OUTPUT_DIR = DATA_ROOT / "extracted" / "merged_cells"
 # Validation and lookup
 # ============================================================
 
+
 def validate_box_size(box_size: Sequence[int]) -> np.ndarray:
-    """Validate a ``(Z, Y, X)`` box size and return an integer array."""
+    """Validate a ``(Z, Y, X)`` crop size and return an integer array."""
 
     size = np.asarray(box_size, dtype=int)
 
@@ -100,17 +120,57 @@ def validate_box_size(box_size: Sequence[int]) -> np.ndarray:
     return size
 
 
-def validate_image_volume(image_volume: Any) -> None:
-    """Validate that the image volume uses ``(T, Z, Y, X)`` ordering."""
+def validate_image_volume(image_volume: Any, *, name: str = "image_volume") -> None:
+    """Validate a primary image source with ``(T, Z, Y, X)`` ordering."""
 
     if not hasattr(image_volume, "shape"):
-        raise TypeError("image_volume must expose a shape attribute.")
+        raise TypeError(f"{name} must expose a shape attribute.")
 
     if len(image_volume.shape) != 4:
         raise ValueError(
-            "Expected image_volume with shape (T, Z, Y, X), "
+            f"Expected {name} with shape (T, Z, Y, X), "
             f"but found {image_volume.shape}."
         )
+
+
+def validate_aligned_volume(
+    volume: Any,
+    *,
+    reference_volume: Any,
+    name: str,
+) -> None:
+    """Validate an optional aligned 3D or 4D diagnostic representation.
+
+    A 3D source is interpreted as the data for the selected frame.  A 4D
+    source must be aligned with the primary ``(T, Z, Y, X)`` image volume.
+    """
+
+    if not hasattr(volume, "shape"):
+        raise TypeError(f"{name} must expose a shape attribute.")
+
+    shape = tuple(int(value) for value in volume.shape)
+    reference_shape = tuple(int(value) for value in reference_volume.shape)
+
+    if len(shape) == 3:
+        if shape != reference_shape[1:]:
+            raise ValueError(
+                f"{name} has spatial shape {shape}, but the raw volume has "
+                f"spatial shape {reference_shape[1:]}."
+            )
+        return
+
+    if len(shape) == 4:
+        if shape != reference_shape:
+            raise ValueError(
+                f"{name} has shape {shape}, but the raw volume has shape "
+                f"{reference_shape}."
+            )
+        return
+
+    raise ValueError(
+        f"{name} must be either 3D (Z, Y, X) or 4D (T, Z, Y, X); "
+        f"found shape {shape}."
+    )
 
 
 def validate_cell_table(cells: pd.DataFrame) -> None:
@@ -129,11 +189,7 @@ def validate_cell_table(cells: pd.DataFrame) -> None:
 
 
 def find_cell(cells: pd.DataFrame, frame: int, cell_id: int) -> pd.Series:
-    """Return exactly one cell identified by ``frame`` and ``cell_id``.
-
-    If the table contains a ``frame`` column, both fields are used. If it does
-    not, the table is assumed to already contain only the requested frame.
-    """
+    """Return exactly one cell identified by ``frame`` and ``cell_id``."""
 
     validate_cell_table(cells)
 
@@ -147,7 +203,11 @@ def find_cell(cells: pd.DataFrame, frame: int, cell_id: int) -> pd.Series:
 
     if matches.empty:
         available_ids = (
-            frame_cells["cell_id"].astype(int).sort_values().drop_duplicates().tolist()
+            frame_cells["cell_id"]
+            .astype(int)
+            .sort_values()
+            .drop_duplicates()
+            .tolist()
         )
         preview = available_ids[:30]
         suffix = " ..." if len(available_ids) > 30 else ""
@@ -166,8 +226,9 @@ def find_cell(cells: pd.DataFrame, frame: int, cell_id: int) -> pd.Series:
 
 
 # ============================================================
-# Bounds and extraction
+# Bounds and aligned extraction
 # ============================================================
+
 
 def calculate_box_bounds(
     centroid_zyx: Sequence[float],
@@ -213,34 +274,37 @@ def calculate_box_bounds(
     }
 
 
-def extract_fixed_box(
-    image_volume: Any,
+def extract_box_with_bounds(
+    volume: Any,
+    *,
     frame: int,
-    centroid_zyx: Sequence[float],
     box_size: Sequence[int],
-    pad_value: int | float = 0,
-) -> tuple[np.ndarray, dict[str, list[int]]]:
-    """Extract a fixed-size box from a ``(T, Z, Y, X)`` image volume.
+    bounds: Mapping[str, Sequence[int]],
+    pad_value: int | float | bool = 0,
+) -> np.ndarray:
+    """Extract one aligned 3D crop using already-calculated bounds.
 
-    Any part outside the image is padded so the returned array always has the
-    requested shape.
+    ``volume`` may be either a 4D ``(T, Z, Y, X)`` source or a 3D source for
+    the selected frame.
     """
 
-    validate_image_volume(image_volume)
-    frame = int(frame)
-
-    if not 0 <= frame < image_volume.shape[0]:
-        raise IndexError(
-            f"Frame {frame} is outside the valid range "
-            f"0 to {image_volume.shape[0] - 1}."
-        )
+    if not hasattr(volume, "shape"):
+        raise TypeError("volume must expose a shape attribute.")
 
     size = validate_box_size(box_size)
-    bounds = calculate_box_bounds(
-        centroid_zyx=centroid_zyx,
-        box_size=size,
-        spatial_shape_zyx=image_volume.shape[1:],
-    )
+    ndim = len(volume.shape)
+
+    if ndim not in (3, 4):
+        raise ValueError(
+            "volume must have shape (Z, Y, X) or (T, Z, Y, X); "
+            f"found {volume.shape}."
+        )
+
+    frame = int(frame)
+    if ndim == 4 and not 0 <= frame < volume.shape[0]:
+        raise IndexError(
+            f"Frame {frame} is outside the valid range 0 to {volume.shape[0] - 1}."
+        )
 
     requested_start = np.asarray(bounds["requested_start_zyx"], dtype=int)
     clipped_start = np.asarray(bounds["clipped_start_zyx"], dtype=int)
@@ -258,18 +322,61 @@ def extract_fixed_box(
         for start, stop in zip(destination_start, destination_stop)
     )
 
-    crop = np.full(tuple(size), pad_value, dtype=image_volume.dtype)
-    crop[destination_slices] = np.asarray(image_volume[(frame, *source_slices)])
+    dtype = getattr(volume, "dtype", np.asarray(volume).dtype)
+    crop = np.full(tuple(size), pad_value, dtype=dtype)
+
+    if ndim == 4:
+        source_data = np.asarray(volume[(frame, *source_slices)])
+    else:
+        source_data = np.asarray(volume[source_slices])
+
+    crop[destination_slices] = source_data
+    return crop
+
+
+def extract_fixed_box(
+    image_volume: Any,
+    frame: int,
+    centroid_zyx: Sequence[float],
+    box_size: Sequence[int],
+    pad_value: int | float = 0,
+) -> tuple[np.ndarray, dict[str, list[int]]]:
+    """Extract a fixed-size box from a ``(T, Z, Y, X)`` image volume."""
+
+    validate_image_volume(image_volume)
+    frame = int(frame)
+
+    if not 0 <= frame < image_volume.shape[0]:
+        raise IndexError(
+            f"Frame {frame} is outside the valid range "
+            f"0 to {image_volume.shape[0] - 1}."
+        )
+
+    size = validate_box_size(box_size)
+    bounds = calculate_box_bounds(
+        centroid_zyx=centroid_zyx,
+        box_size=size,
+        spatial_shape_zyx=image_volume.shape[1:],
+    )
+
+    crop = extract_box_with_bounds(
+        image_volume,
+        frame=frame,
+        box_size=size,
+        bounds=bounds,
+        pad_value=pad_value,
+    )
 
     return crop, bounds
 
 
 # ============================================================
-# Metadata and saving
+# Metadata and output paths
 # ============================================================
 
+
 def to_json_value(value: Any) -> Any:
-    """Convert pandas/NumPy/path values into JSON-compatible values."""
+    """Convert pandas, NumPy, and path values into JSON-compatible values."""
 
     if value is None:
         return None
@@ -301,17 +408,64 @@ def _display_path(path: Path | str | None) -> str | None:
         return str(resolved)
 
 
+def build_artifact_paths(
+    sample_id: str,
+    frame: int,
+    cell_id: int,
+    output_dir: Path | str = OUTPUT_DIR,
+) -> dict[str, Path]:
+    """Build all possible output paths for one diagnostic case."""
+
+    directory = Path(output_dir)
+    stem = f"{sample_id}_t{int(frame):04d}_cell{int(cell_id):05d}"
+
+    return {
+        # Backward-compatible raw filename used by the existing notebook.
+        "raw": directory / f"{stem}.npy",
+        "preprocessed": directory / f"{stem}_preprocessed.npy",
+        "binary_mask": directory / f"{stem}_binary_mask.npy",
+        "instance_labels": directory / f"{stem}_instance_labels.npy",
+        "metadata": directory / f"{stem}.json",
+    }
+
+
 def build_output_paths(
     sample_id: str,
     frame: int,
     cell_id: int,
     output_dir: Path | str = OUTPUT_DIR,
 ) -> tuple[Path, Path]:
-    """Build the ``.npy`` and ``.json`` paths for one extraction."""
+    """Backward-compatible helper returning raw and metadata paths."""
 
-    directory = Path(output_dir)
-    stem = f"{sample_id}_t{int(frame):04d}_cell{int(cell_id):05d}"
-    return directory / f"{stem}.npy", directory / f"{stem}.json"
+    paths = build_artifact_paths(sample_id, frame, cell_id, output_dir)
+    return paths["raw"], paths["metadata"]
+
+
+def _summarize_crop(name: str, crop: np.ndarray, *, cell_id: int) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "shape": [int(value) for value in crop.shape],
+        "dtype": str(crop.dtype),
+    }
+
+    if crop.size == 0:
+        return summary
+
+    if name == "binary_mask":
+        summary["foreground_voxels"] = int(np.count_nonzero(crop))
+        summary["foreground_fraction"] = float(np.count_nonzero(crop) / crop.size)
+    elif name == "instance_labels":
+        labels = np.unique(crop)
+        nonzero = labels[labels != 0]
+        summary["nonzero_label_count"] = int(len(nonzero))
+        summary["nonzero_labels"] = [int(value) for value in nonzero.tolist()]
+        summary["selected_cell_id_present_as_label"] = bool(np.any(crop == cell_id))
+        summary["selected_cell_id_voxels"] = int(np.count_nonzero(crop == cell_id))
+    else:
+        summary["minimum"] = float(np.min(crop))
+        summary["maximum"] = float(np.max(crop))
+        summary["mean"] = float(np.mean(crop))
+
+    return summary
 
 
 def make_metadata(
@@ -322,47 +476,73 @@ def make_metadata(
     cell_id: int,
     centroid_zyx: np.ndarray,
     box_size: np.ndarray,
-    bounds: dict[str, list[int]],
+    bounds: Mapping[str, Sequence[int]],
     voxel_size_zyx: Sequence[float],
-    output_file: Path,
+    output_files: Mapping[str, Path],
+    artifact_summaries: Mapping[str, Mapping[str, Any]],
     source_cell_file: Path | str | None = None,
     source_zarr_array: Path | str | None = None,
+    source_preprocessed: Path | str | None = None,
+    source_binary_mask: Path | str | None = None,
+    source_instance_labels: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Create metadata for one saved cell volume."""
+    """Create metadata for one aligned diagnostic extraction."""
 
     cell_features = {
         str(column): to_json_value(value)
         for column, value in row.items()
     }
 
+    displayed_outputs = {
+        name: _display_path(path)
+        for name, path in output_files.items()
+    }
+
     metadata: dict[str, Any] = {
         "sample_id": str(sample_id),
         "frame": int(frame),
         "cell_id": int(cell_id),
-        "output_volume": _display_path(output_file),
+        # Retained for backward compatibility.
+        "output_volume": displayed_outputs.get("raw"),
+        "output_files": displayed_outputs,
+        "available_artifacts": sorted(displayed_outputs),
+        "artifact_summaries": dict(artifact_summaries),
         "centroid_zyx": centroid_zyx.tolist(),
-        "centroid_index_zyx": bounds["centroid_index_zyx"],
+        "centroid_index_zyx": list(bounds["centroid_index_zyx"]),
         "box_size_zyx": box_size.tolist(),
-        "voxel_size_zyx": [float(v) for v in voxel_size_zyx],
-        "requested_start_zyx": bounds["requested_start_zyx"],
-        "requested_stop_zyx": bounds["requested_stop_zyx"],
-        "clipped_start_zyx": bounds["clipped_start_zyx"],
-        "clipped_stop_zyx": bounds["clipped_stop_zyx"],
-        "padding_before_zyx": bounds["padding_before_zyx"],
-        "padding_after_zyx": bounds["padding_after_zyx"],
+        "voxel_size_zyx": [float(value) for value in voxel_size_zyx],
+        "requested_start_zyx": list(bounds["requested_start_zyx"]),
+        "requested_stop_zyx": list(bounds["requested_stop_zyx"]),
+        "clipped_start_zyx": list(bounds["clipped_start_zyx"]),
+        "clipped_stop_zyx": list(bounds["clipped_stop_zyx"]),
+        "padding_before_zyx": list(bounds["padding_before_zyx"]),
+        "padding_after_zyx": list(bounds["padding_after_zyx"]),
         "cell_features": cell_features,
     }
 
-    if source_cell_file is not None:
-        metadata["source_cell_file"] = _display_path(source_cell_file)
-    if source_zarr_array is not None:
-        metadata["source_zarr_array"] = _display_path(source_zarr_array)
+    source_paths = {
+        "cell_table": source_cell_file,
+        "raw_zarr_array": source_zarr_array,
+        "preprocessed": source_preprocessed,
+        "binary_mask": source_binary_mask,
+        "instance_labels": source_instance_labels,
+    }
+    metadata["source_files"] = {
+        name: _display_path(path)
+        for name, path in source_paths.items()
+        if path is not None
+    }
 
     return metadata
 
 
+# ============================================================
+# Saving
+# ============================================================
+
+
 def update_manifest(
-    record: dict[str, Any],
+    record: Mapping[str, Any],
     output_dir: Path | str = OUTPUT_DIR,
 ) -> Path:
     """Insert or replace one row in ``manifest.csv``."""
@@ -370,7 +550,7 @@ def update_manifest(
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
     manifest_path = directory / "manifest.csv"
-    new_row = pd.DataFrame([record])
+    new_row = pd.DataFrame([dict(record)])
 
     if manifest_path.exists():
         manifest = pd.concat([pd.read_csv(manifest_path), new_row], ignore_index=True)
@@ -398,44 +578,126 @@ def save_cell_extraction(
     voxel_size_zyx: Sequence[float] = VOXEL_SIZE,
     pad_value: int | float = PAD_VALUE,
     overwrite: bool = False,
+    # Optional aligned pipeline representations.
+    preprocessed_volume: Any | None = None,
+    binary_mask_volume: Any | None = None,
+    instance_labels_volume: Any | None = None,
+    # Optional source-path provenance.
     source_cell_file: Path | str | None = None,
     source_zarr_array: Path | str | None = None,
+    source_preprocessed: Path | str | None = None,
+    source_binary_mask: Path | str | None = None,
+    source_instance_labels: Path | str | None = None,
 ) -> tuple[Path, Path, np.ndarray, dict[str, Any]]:
-    """Extract and save one cell volume plus metadata and manifest entry."""
+    """Extract and save one aligned diagnostic cell case.
+
+    The same requested/clipped bounds are used for every supplied volume.  The
+    returned tuple is intentionally backward compatible:
+
+    ``(raw_path, metadata_path, raw_crop, metadata)``.
+    """
 
     validate_image_volume(image_volume)
     size = validate_box_size(box_size)
     frame = int(frame)
     cell_id = int(cell_id)
-    row = find_cell(cells=cells, frame=frame, cell_id=cell_id)
 
+    optional_sources = {
+        "preprocessed": preprocessed_volume,
+        "binary_mask": binary_mask_volume,
+        "instance_labels": instance_labels_volume,
+    }
+    for name, source in optional_sources.items():
+        if source is not None:
+            validate_aligned_volume(
+                source,
+                reference_volume=image_volume,
+                name=f"{name}_volume",
+            )
+
+    row = find_cell(cells=cells, frame=frame, cell_id=cell_id)
     centroid_zyx = row[
         ["centroid_z", "centroid_y", "centroid_x"]
     ].to_numpy(dtype=float)
 
-    volume_path, metadata_path = build_output_paths(
+    bounds = calculate_box_bounds(
+        centroid_zyx=centroid_zyx,
+        box_size=size,
+        spatial_shape_zyx=image_volume.shape[1:],
+    )
+
+    all_paths = build_artifact_paths(
         sample_id=sample_id,
         frame=frame,
         cell_id=cell_id,
         output_dir=output_dir,
     )
 
-    if (volume_path.exists() or metadata_path.exists()) and not overwrite:
+    requested_artifacts = ["raw"]
+    requested_artifacts.extend(
+        name for name, source in optional_sources.items() if source is not None
+    )
+    requested_paths = [all_paths[name] for name in requested_artifacts]
+    requested_paths.append(all_paths["metadata"])
+
+    existing = [path for path in requested_paths if path.exists()]
+    if existing and not overwrite:
+        names = ", ".join(path.name for path in existing)
         raise FileExistsError(
-            f"Extraction already exists for frame {frame}, cell {cell_id}: "
-            f"{volume_path.name}. Enable overwrite to replace it."
+            f"Extraction already contains existing files for frame {frame}, "
+            f"cell {cell_id}: {names}. Enable overwrite to regenerate the case."
         )
 
-    crop, bounds = extract_fixed_box(
-        image_volume=image_volume,
-        frame=frame,
-        centroid_zyx=centroid_zyx,
-        box_size=size,
-        pad_value=pad_value,
-    )
+    crops: dict[str, np.ndarray] = {
+        "raw": extract_box_with_bounds(
+            image_volume,
+            frame=frame,
+            box_size=size,
+            bounds=bounds,
+            pad_value=pad_value,
+        )
+    }
 
-    volume_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(volume_path, crop, allow_pickle=False)
+    if preprocessed_volume is not None:
+        crops["preprocessed"] = extract_box_with_bounds(
+            preprocessed_volume,
+            frame=frame,
+            box_size=size,
+            bounds=bounds,
+            pad_value=pad_value,
+        )
+
+    if binary_mask_volume is not None:
+        crops["binary_mask"] = extract_box_with_bounds(
+            binary_mask_volume,
+            frame=frame,
+            box_size=size,
+            bounds=bounds,
+            pad_value=False,
+        ).astype(bool, copy=False)
+
+    if instance_labels_volume is not None:
+        crops["instance_labels"] = extract_box_with_bounds(
+            instance_labels_volume,
+            frame=frame,
+            box_size=size,
+            bounds=bounds,
+            pad_value=0,
+        )
+
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+
+    saved_files: dict[str, Path] = {}
+    for name, crop in crops.items():
+        path = all_paths[name]
+        np.save(path, crop, allow_pickle=False)
+        saved_files[name] = path
+
+    artifact_summaries = {
+        name: _summarize_crop(name, crop, cell_id=cell_id)
+        for name, crop in crops.items()
+    }
 
     metadata = make_metadata(
         sample_id=sample_id,
@@ -446,11 +708,16 @@ def save_cell_extraction(
         box_size=size,
         bounds=bounds,
         voxel_size_zyx=voxel_size_zyx,
-        output_file=volume_path,
+        output_files=saved_files,
+        artifact_summaries=artifact_summaries,
         source_cell_file=source_cell_file,
         source_zarr_array=source_zarr_array,
+        source_preprocessed=source_preprocessed,
+        source_binary_mask=source_binary_mask,
+        source_instance_labels=source_instance_labels,
     )
 
+    metadata_path = all_paths["metadata"]
     with metadata_path.open("w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2, allow_nan=False)
 
@@ -465,18 +732,36 @@ def save_cell_extraction(
             "box_depth": int(size[0]),
             "box_height": int(size[1]),
             "box_width": int(size[2]),
-            "volume_file": volume_path.name,
+            # Retained for compatibility with the existing manifest.
+            "volume_file": saved_files["raw"].name,
+            "raw_file": saved_files["raw"].name,
+            "preprocessed_file": (
+                saved_files["preprocessed"].name
+                if "preprocessed" in saved_files
+                else None
+            ),
+            "binary_mask_file": (
+                saved_files["binary_mask"].name
+                if "binary_mask" in saved_files
+                else None
+            ),
+            "instance_labels_file": (
+                saved_files["instance_labels"].name
+                if "instance_labels" in saved_files
+                else None
+            ),
             "metadata_file": metadata_path.name,
         },
         output_dir=output_dir,
     )
 
-    return volume_path, metadata_path, crop, metadata
+    return saved_files["raw"], metadata_path, crops["raw"], metadata
 
 
 # ============================================================
 # Standalone loading and batch execution
 # ============================================================
+
 
 def get_cell_file(frame: int, cells_dir: Path | str = CELLS_DIR) -> Path:
     """Return the per-frame cell CSV using sorted ``t*.csv`` ordering."""
@@ -520,6 +805,14 @@ def load_original_volume(zarr_array_path: Path | str = ZARR_ARRAY_PATH):
     return volume
 
 
+def _load_optional_npy(path: Path | None) -> np.ndarray | None:
+    if path is None:
+        return None
+    if not Path(path).exists():
+        raise FileNotFoundError(f"Optional diagnostic array was not found at {path}")
+    return np.load(path, mmap_mode="r")
+
+
 def extract_selected_cells() -> None:
     """Standalone batch extraction using the configuration above."""
 
@@ -532,17 +825,27 @@ def extract_selected_cells() -> None:
     cells, cell_file = load_frame_cells(frame)
     image_volume = load_original_volume()
 
+    preprocessed_volume = _load_optional_npy(PREPROCESSED_ARRAY_PATH)
+    binary_mask_volume = _load_optional_npy(BINARY_MASK_ARRAY_PATH)
+    instance_labels_volume = _load_optional_npy(INSTANCE_LABELS_ARRAY_PATH)
+
     print(f"Sample:     {SAMPLE_ID}")
     print(f"Frame:      {frame}")
     print(f"Box size:   {tuple(validate_box_size(BOX_SIZE))}")
     print(f"Output:     {OUTPUT_DIR}")
+    print(
+        "Artifacts:  raw"
+        + (", preprocessed" if preprocessed_volume is not None else "")
+        + (", binary mask" if binary_mask_volume is not None else "")
+        + (", instance labels" if instance_labels_volume is not None else "")
+    )
     print()
 
     saved = skipped = failed = 0
 
     for cell_id in CELL_IDS:
         try:
-            volume_path, _, crop, _ = save_cell_extraction(
+            volume_path, _, crop, metadata = save_cell_extraction(
                 image_volume=image_volume,
                 cells=cells,
                 sample_id=SAMPLE_ID,
@@ -553,10 +856,20 @@ def extract_selected_cells() -> None:
                 voxel_size_zyx=VOXEL_SIZE,
                 pad_value=PAD_VALUE,
                 overwrite=OVERWRITE,
+                preprocessed_volume=preprocessed_volume,
+                binary_mask_volume=binary_mask_volume,
+                instance_labels_volume=instance_labels_volume,
                 source_cell_file=cell_file,
                 source_zarr_array=ZARR_ARRAY_PATH,
+                source_preprocessed=PREPROCESSED_ARRAY_PATH,
+                source_binary_mask=BINARY_MASK_ARRAY_PATH,
+                source_instance_labels=INSTANCE_LABELS_ARRAY_PATH,
             )
-            print(f"[SAVED]   Cell {cell_id}: {volume_path.name} | shape={crop.shape}")
+            artifact_names = ", ".join(metadata["available_artifacts"])
+            print(
+                f"[SAVED]   Cell {cell_id}: {volume_path.name} | "
+                f"shape={crop.shape} | {artifact_names}"
+            )
             saved += 1
         except FileExistsError as error:
             print(f"[SKIPPED] Cell {cell_id}: {error}")

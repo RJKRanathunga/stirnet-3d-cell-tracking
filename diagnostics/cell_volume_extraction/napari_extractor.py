@@ -1,9 +1,13 @@
-"""Interactive Napari widget for previewing and saving 3D cell volumes.
+"""Interactive Napari widget for aligned diagnostic cell extraction.
 
 The widget reads the current Napari time frame, looks up a user-entered cell
-ID, draws the exact extraction boundary as a red 3D wireframe, and saves the
-volume when the user clicks the button or presses ``E`` while the canvas has
-focus.
+ID, draws the exact extraction boundary as a red 3D wireframe, and saves all
+supplied aligned representations when the user clicks Extract or presses the
+configured key.
+
+At minimum the raw image is saved.  For merged-cell diagnostics, also pass the
+binary-mask and watershed instance-label volumes.  A preprocessed intensity
+volume may be supplied as well.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ try:
         calculate_box_bounds,
         find_cell,
         save_cell_extraction,
+        validate_aligned_volume,
         validate_box_size,
         validate_cell_table,
         validate_image_volume,
@@ -47,6 +52,7 @@ except ImportError:  # Allows direct execution during development.
         calculate_box_bounds,
         find_cell,
         save_cell_extraction,
+        validate_aligned_volume,
         validate_box_size,
         validate_cell_table,
         validate_image_volume,
@@ -56,6 +62,20 @@ except ImportError:  # Allows direct execution during development.
 BOX_LAYER_NAME = "Cell extraction box"
 
 
+def _resolve_layer_data(source: Any | None) -> Any | None:
+    """Accept either an array-like object or a Napari layer."""
+
+    if source is None:
+        return None
+
+    # Napari layers expose both ``name`` and ``data``.  NumPy arrays also have
+    # ``data``, so checking ``name`` prevents conversion to a memoryview.
+    if hasattr(source, "name") and hasattr(source, "data"):
+        return source.data
+
+    return source
+
+
 def make_box_wireframe(
     frame: int,
     requested_start_zyx: Sequence[int],
@@ -63,8 +83,8 @@ def make_box_wireframe(
 ) -> list[np.ndarray]:
     """Return 12 four-dimensional line segments for a voxel-aligned cuboid.
 
-    The crop contains voxel indices ``start`` through ``stop - 1``. Therefore,
-    the visual boundaries are placed half a voxel outside those voxel centres.
+    The crop contains voxel indices ``start`` through ``stop - 1``.  Visual
+    boundaries are therefore placed half a voxel outside those voxel centres.
     Each line uses ``(T, Z, Y, X)`` coordinates.
     """
 
@@ -124,7 +144,7 @@ def make_box_wireframe(
 
 
 class CellVolumeExtractorWidget(QWidget):
-    """Dock widget for interactive cell-volume collection."""
+    """Dock widget for interactive aligned failure-case collection."""
 
     def __init__(
         self,
@@ -133,34 +153,79 @@ class CellVolumeExtractorWidget(QWidget):
         cells: pd.DataFrame,
         image_volume: Any,
         sample_id: str,
+        # Optional aligned diagnostic volumes or Napari layers.
+        preprocessed_volume: Any | None = None,
+        binary_mask_volume: Any | None = None,
+        instance_labels_volume: Any | None = None,
         output_dir: Path | str = OUTPUT_DIR,
         voxel_size_zyx: Sequence[float] = VOXEL_SIZE,
         default_box_size: Sequence[int] = BOX_SIZE,
         pad_value: int | float = PAD_VALUE,
+        # Optional source-path provenance.
         source_cells_dir: Path | str | None = None,
         source_zarr_array: Path | str | None = None,
+        source_preprocessed: Path | str | None = None,
+        source_binary_mask: Path | str | None = None,
+        source_instance_labels: Path | str | None = None,
         time_axis: int = 0,
         extract_key: str = "E",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
 
+        self.image_volume = _resolve_layer_data(image_volume)
+        self.preprocessed_volume = _resolve_layer_data(preprocessed_volume)
+        self.binary_mask_volume = _resolve_layer_data(binary_mask_volume)
+        self.instance_labels_volume = _resolve_layer_data(instance_labels_volume)
+
         validate_cell_table(cells)
-        validate_image_volume(image_volume)
+        validate_image_volume(self.image_volume)
+
+        optional_sources = {
+            "preprocessed": self.preprocessed_volume,
+            "binary mask": self.binary_mask_volume,
+            "instance labels": self.instance_labels_volume,
+        }
+        for name, source in optional_sources.items():
+            if source is not None:
+                validate_aligned_volume(
+                    source,
+                    reference_volume=self.image_volume,
+                    name=name,
+                )
+                if len(source.shape) != 4:
+                    raise ValueError(
+                        f"The interactive Napari {name} source must have shape "
+                        "(T, Z, Y, X), because the widget follows the time slider. "
+                        f"Found {source.shape}. Use a 3D source only with the "
+                        "standalone extractor for one fixed frame."
+                    )
 
         self.viewer = viewer
         self.cells = cells
-        self.image_volume = image_volume
         self.sample_id = str(sample_id)
         self.output_dir = Path(output_dir)
         self.voxel_size_zyx = tuple(float(value) for value in voxel_size_zyx)
         self.pad_value = pad_value
+
         self.source_cells_dir = (
             Path(source_cells_dir) if source_cells_dir is not None else None
         )
         self.source_zarr_array = (
             Path(source_zarr_array) if source_zarr_array is not None else None
         )
+        self.source_preprocessed = (
+            Path(source_preprocessed) if source_preprocessed is not None else None
+        )
+        self.source_binary_mask = (
+            Path(source_binary_mask) if source_binary_mask is not None else None
+        )
+        self.source_instance_labels = (
+            Path(source_instance_labels)
+            if source_instance_labels is not None
+            else None
+        )
+
         self.time_axis = int(time_axis)
         self.extract_key = str(extract_key)
 
@@ -181,9 +246,25 @@ class CellVolumeExtractorWidget(QWidget):
         self._connect_events()
         self._bind_extract_key()
         self._update_frame_label()
+
+        missing = []
+        if self.binary_mask_volume is None:
+            missing.append("binary mask")
+        if self.instance_labels_volume is None:
+            missing.append("instance labels")
+
+        if missing:
+            warning = (
+                " Diagnostic warning: "
+                + ", ".join(missing)
+                + " not supplied, so those crops will not be saved."
+            )
+        else:
+            warning = ""
+
         self._set_status(
             f"Go to a frame, enter a cell ID, and preview the box. "
-            f"Press {self.extract_key} to extract."
+            f"Press {self.extract_key} to extract.{warning}"
         )
 
     # --------------------------------------------------------
@@ -233,6 +314,13 @@ class CellVolumeExtractorWidget(QWidget):
         button_row.addWidget(self.clear_button)
         layout.addLayout(button_row)
 
+        artifacts_label = QLabel(
+            "Will save: " + ", ".join(self.available_artifacts())
+        )
+        artifacts_label.setWordWrap(True)
+        artifacts_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(artifacts_label)
+
         output_label = QLabel(f"Output: {self.output_dir}")
         output_label.setWordWrap(True)
         output_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -253,6 +341,16 @@ class CellVolumeExtractorWidget(QWidget):
         spin.setValue(value)
         return spin
 
+    def available_artifacts(self) -> list[str]:
+        names = ["raw"]
+        if self.preprocessed_volume is not None:
+            names.append("preprocessed")
+        if self.binary_mask_volume is not None:
+            names.append("binary mask")
+        if self.instance_labels_volume is not None:
+            names.append("instance labels")
+        return names
+
     def _connect_events(self) -> None:
         self.preview_button.clicked.connect(self.preview_box)
         self.extract_button.clicked.connect(self.extract_current_cell)
@@ -265,7 +363,7 @@ class CellVolumeExtractorWidget(QWidget):
         try:
             self.viewer.dims.events.current_step.connect(self._on_frame_changed)
         except AttributeError:
-            # The widget remains fully usable; the frame label is refreshed when
+            # The widget remains usable; the frame label is refreshed when
             # preview or extraction is requested.
             pass
 
@@ -393,7 +491,7 @@ class CellVolumeExtractorWidget(QWidget):
     # --------------------------------------------------------
 
     def extract_current_cell(self, *_args: Any) -> None:
-        """Extract the current frame/cell/box and save it to disk."""
+        """Extract the current frame/cell/box and save aligned artifacts."""
 
         try:
             signature = self._current_signature()
@@ -404,8 +502,11 @@ class CellVolumeExtractorWidget(QWidget):
             frame, cell_id, box_size = signature
             source_cell_file = self._source_cell_file(frame)
 
-            volume_path, metadata_path, crop, _metadata = save_cell_extraction(
+            raw_path, metadata_path, crop, metadata = save_cell_extraction(
                 image_volume=self.image_volume,
+                preprocessed_volume=self.preprocessed_volume,
+                binary_mask_volume=self.binary_mask_volume,
+                instance_labels_volume=self.instance_labels_volume,
                 cells=self.cells,
                 sample_id=self.sample_id,
                 frame=frame,
@@ -417,11 +518,20 @@ class CellVolumeExtractorWidget(QWidget):
                 overwrite=self.overwrite_checkbox.isChecked(),
                 source_cell_file=source_cell_file,
                 source_zarr_array=self.source_zarr_array,
+                source_preprocessed=self.source_preprocessed,
+                source_binary_mask=self.source_binary_mask,
+                source_instance_labels=self.source_instance_labels,
             )
 
+            saved_names = [
+                Path(path).name
+                for path in metadata["output_files"].values()
+                if path is not None
+            ]
             message = (
-                f"Saved frame {frame}, cell {cell_id}: {volume_path.name} "
-                f"with shape {crop.shape}. Metadata: {metadata_path.name}"
+                f"Saved frame {frame}, cell {cell_id}, shape {crop.shape}: "
+                + ", ".join(saved_names)
+                + f". Metadata: {metadata_path.name}"
             )
             self._set_status(message)
             self.viewer.status = message
@@ -462,10 +572,7 @@ class CellVolumeExtractorWidget(QWidget):
             self._set_status("Cell ID changed. Click Preview box.")
 
     def _on_box_size_changed(self, _value: int) -> None:
-        if (
-            self._preview_signature is not None
-            and self.auto_update_checkbox.isChecked()
-        ):
+        if self._preview_signature is not None and self.auto_update_checkbox.isChecked():
             self.preview_box(report_errors=False)
 
     def _set_status(self, message: str) -> None:
@@ -483,22 +590,31 @@ def add_cell_volume_extractor(
     cells: pd.DataFrame,
     image_volume: Any,
     sample_id: str,
+    preprocessed_volume: Any | None = None,
+    binary_mask_volume: Any | None = None,
+    instance_labels_volume: Any | None = None,
     output_dir: Path | str = OUTPUT_DIR,
     voxel_size_zyx: Sequence[float] = VOXEL_SIZE,
     default_box_size: Sequence[int] = BOX_SIZE,
     pad_value: int | float = PAD_VALUE,
     source_cells_dir: Path | str | None = None,
     source_zarr_array: Path | str | None = None,
+    source_preprocessed: Path | str | None = None,
+    source_binary_mask: Path | str | None = None,
+    source_instance_labels: Path | str | None = None,
     time_axis: int = 0,
     extract_key: str = "E",
     dock_area: str = "right",
 ) -> CellVolumeExtractorWidget:
-    """Create and dock the interactive extractor in an existing viewer."""
+    """Create and dock the aligned diagnostic extractor in an existing viewer."""
 
     widget = CellVolumeExtractorWidget(
         viewer=viewer,
         cells=cells,
         image_volume=image_volume,
+        preprocessed_volume=preprocessed_volume,
+        binary_mask_volume=binary_mask_volume,
+        instance_labels_volume=instance_labels_volume,
         sample_id=sample_id,
         output_dir=output_dir,
         voxel_size_zyx=voxel_size_zyx,
@@ -506,6 +622,9 @@ def add_cell_volume_extractor(
         pad_value=pad_value,
         source_cells_dir=source_cells_dir,
         source_zarr_array=source_zarr_array,
+        source_preprocessed=source_preprocessed,
+        source_binary_mask=source_binary_mask,
+        source_instance_labels=source_instance_labels,
         time_axis=time_axis,
         extract_key=extract_key,
     )
