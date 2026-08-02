@@ -5,6 +5,12 @@ from .napari_scene_extractor import (
     TrackingSceneExtractorWidget,
     add_tracking_scene_extractor,
 )
+from .napari_scene_visualizer import (
+    TrackingScene,
+    TrackingSceneVisualizationError,
+    TrackingSceneVisualizerWidget,
+    add_tracking_scene_visualizer,
+)
 
 __all__ = [
     "CropBounds",
@@ -12,4 +18,8 @@ __all__ = [
     "TrackingSceneCaptureModel",
     "TrackingSceneExtractorWidget",
     "add_tracking_scene_extractor",
+    "TrackingScene",
+    "TrackingSceneVisualizationError",
+    "TrackingSceneVisualizerWidget",
+    "add_tracking_scene_visualizer",
 ]

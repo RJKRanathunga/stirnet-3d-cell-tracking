@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
+
+from src.io.scene_io import load_tracking_scene as load_scene_data
 
 try:
     from qtpy.QtWidgets import (
@@ -114,37 +115,17 @@ def discover_scenes(scenes_root: str | Path, category: str) -> list[str]:
     return sorted(names, key=sort_key)
 
 
-def _load_array(scene_path: Path, filename: str, label: str) -> np.ndarray:
-    path = scene_path / filename
-    if not path.is_file():
-        raise TrackingSceneVisualizationError(
-            f"Missing {label} file: {path}"
-        )
-
-    try:
-        return np.load(path, allow_pickle=False)
-    except Exception as error:
-        raise TrackingSceneVisualizationError(
-            f"Could not load {label} file '{path.name}': {error}"
-        ) from error
-
-
 def load_tracking_scene(scene_path: str | Path) -> TrackingScene:
     """Load and validate one scene directory created by the extractor."""
-    path = Path(scene_path)
-    metadata_path = path / "scene.json"
-    if not metadata_path.is_file():
-        raise TrackingSceneVisualizationError(
-            f"Scene metadata file does not exist: {metadata_path}"
-        )
-
     try:
-        with metadata_path.open("r", encoding="utf-8") as file:
-            metadata = json.load(file)
+        loaded = load_scene_data(scene_path)
     except Exception as error:
         raise TrackingSceneVisualizationError(
-            f"Could not read scene metadata: {error}"
+            f"Could not load tracking scene: {error}"
         ) from error
+
+    path = loaded.path
+    metadata = loaded.metadata
 
     schema_version = int(metadata.get("schema_version", -1))
     if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
@@ -153,59 +134,10 @@ def load_tracking_scene(scene_path: str | Path) -> TrackingScene:
             f"Supported versions: {sorted(SUPPORTED_SCHEMA_VERSIONS)}"
         )
 
-    files = metadata.get("files")
-    if not isinstance(files, dict):
-        raise TrackingSceneVisualizationError(
-            "scene.json does not contain a valid 'files' object."
-        )
-
-    frames = _load_array(path, str(files.get("frames", "frames.npy")), "frames")
-    binary_mask = _load_array(
-        path,
-        str(files.get("binary_mask", "binary_mask.npy")),
-        "binary mask",
-    )
-    instance_labels = _load_array(
-        path,
-        str(files.get("instance_labels", "instance_labels.npy")),
-        "instance labels",
-    )
-
-    if frames.ndim != 1:
-        raise TrackingSceneVisualizationError("frames.npy must be one-dimensional.")
-    if binary_mask.ndim != 4 or instance_labels.ndim != 4:
-        raise TrackingSceneVisualizationError(
-            "binary_mask.npy and instance_labels.npy must have shape (T, Z, Y, X)."
-        )
-    if binary_mask.shape != instance_labels.shape:
-        raise TrackingSceneVisualizationError(
-            "Binary-mask and instance-label arrays have different shapes."
-        )
-    if binary_mask.shape[0] != len(frames):
-        raise TrackingSceneVisualizationError(
-            "The number of saved frame values does not match the volume time axis."
-        )
-
-    masked_images: dict[str, np.ndarray] = {}
-    image_files = files.get("masked_images", {})
-    if not isinstance(image_files, dict):
-        raise TrackingSceneVisualizationError(
-            "scene.json field 'files.masked_images' must be an object."
-        )
-
-    for display_name, filename in image_files.items():
-        image = _load_array(path, str(filename), f"masked image '{display_name}'")
-        if image.shape != instance_labels.shape:
-            raise TrackingSceneVisualizationError(
-                f"Masked image '{display_name}' has shape {image.shape}; "
-                f"expected {instance_labels.shape}."
-            )
-        masked_images[str(display_name)] = image
-
     expected_shape = metadata.get("crop_shape_zyx")
     if expected_shape is not None:
         expected_shape = tuple(int(value) for value in expected_shape)
-        if tuple(instance_labels.shape[1:]) != expected_shape:
+        if tuple(loaded.instance_labels.shape[1:]) != expected_shape:
             raise TrackingSceneVisualizationError(
                 "Saved volume shape does not match scene.json field 'crop_shape_zyx'."
             )
@@ -213,10 +145,10 @@ def load_tracking_scene(scene_path: str | Path) -> TrackingScene:
     return TrackingScene(
         path=path,
         metadata=metadata,
-        frames=frames.astype(np.int64, copy=False),
-        binary_mask=binary_mask.astype(bool, copy=False),
-        instance_labels=instance_labels,
-        masked_images=masked_images,
+        frames=loaded.frames.astype(np.int64, copy=False),
+        binary_mask=loaded.binary_mask.astype(bool, copy=False),
+        instance_labels=loaded.instance_labels,
+        masked_images=loaded.images,
     )
 
 

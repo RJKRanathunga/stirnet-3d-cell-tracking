@@ -1,15 +1,5 @@
-from pathlib import Path
+"""Compatibility wrapper for :mod:`src.io.tables`."""
 
-import pandas as pd
+from src.io.tables import load_csv, save_csv
 
-
-def save_csv(df: pd.DataFrame, path: str | Path):
-    path = Path(path)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    df.to_csv(path, index=False)
-
-
-def load_csv(path: str | Path):
-    return pd.read_csv(path)
+__all__ = ["load_csv", "save_csv"]

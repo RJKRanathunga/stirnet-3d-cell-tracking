@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import unittest
+from importlib import import_module
 from dataclasses import replace
 from unittest.mock import patch
 
 import numpy as np
 
-from src.detection.pipeline import detect_cells
-from src.segmentation.config import DEFAULT_SEGMENTATION_CONFIG
-from src.segmentation.pipeline import segment_instances, segment_instances_detailed
+from src.api import detect_cells, segment_instances
+
+DEFAULT_SEGMENTATION_CONFIG = import_module(
+    "src.03_segmentation.config"
+).DEFAULT_SEGMENTATION_CONFIG
+segment_instances_detailed = import_module(
+    "src.03_segmentation.pipeline"
+).segment_instances_detailed
 
 
 class SyntheticComponents:
@@ -128,8 +134,9 @@ class ProbabilisticSegmentationTests(unittest.TestCase):
     def test_failed_component_processing_falls_back_to_one_instance(self) -> None:
         mask = self.synthetic.pair(separation_um=4.4)
 
-        with patch(
-            "src.segmentation.pipeline.analyze_component_crop",
+        with patch.object(
+            import_module("src.03_segmentation.pipeline"),
+            "analyze_component_crop",
             side_effect=RuntimeError("injected failure"),
         ):
             result = segment_instances_detailed(mask)

@@ -43,6 +43,10 @@ class ComponentDiagnostic:
     posterior_h1: float
     posterior_h2: float
     posterior_h3: float
+    h2_conditional_probability: float
+    h2_odds_vs_h1: float
+    h3_conditional_probability: float
+    h3_odds_vs_h2: float
     decision_status: str
     split_accepted: bool
     marker_positions_zyx: tuple[tuple[int, int, int], ...]
@@ -392,6 +396,22 @@ def segment_instances_detailed(
                 posterior_h1=_posterior_by_k(evaluation, 1),
                 posterior_h2=_posterior_by_k(evaluation, 2),
                 posterior_h3=_posterior_by_k(evaluation, 3),
+                h2_conditional_probability=(
+                    analysis.decision.h2_conditional_probability
+                    if error_message is None else 0.0
+                ),
+                h2_odds_vs_h1=(
+                    analysis.decision.h2_odds_vs_h1
+                    if error_message is None else 0.0
+                ),
+                h3_conditional_probability=(
+                    analysis.decision.h3_conditional_probability
+                    if error_message is None else 0.0
+                ),
+                h3_odds_vs_h2=(
+                    analysis.decision.h3_odds_vs_h2
+                    if error_message is None else 0.0
+                ),
                 decision_status=decision_status,
                 split_accepted=len(positive_local_labels) > 1,
                 marker_positions_zyx=global_positions,
@@ -430,11 +450,48 @@ def segment_instances_detailed(
 def segment_instances(
     binary_mask: np.ndarray,
     config: SegmentationConfig = DEFAULT_SEGMENTATION_CONFIG,
-) -> np.ndarray:
+    *,
+    return_diagnostics: bool = False,
+):
     """Convert a 3-D foreground mask into deterministic instance labels.
 
     The return type and shape match the historical production interface. Use
     :func:`segment_instances_detailed` when markers or diagnostics are needed.
     """
 
-    return segment_instances_detailed(binary_mask, config).instance_labels
+    result = segment_instances_detailed(
+        binary_mask,
+        config,
+        include_hypothesis_diagnostics=return_diagnostics,
+    )
+    if not return_diagnostics:
+        return result.instance_labels
+
+    from src.diagnostics import DecisionRecord, StageTrace
+
+    trace = StageTrace(
+        stage_name="03_segmentation",
+        inputs={"binary_mask": binary_mask},
+        outputs={"instance_labels": result.instance_labels},
+        intermediates={"markers": result.markers},
+        metrics={
+            "components": len(result.component_diagnostics),
+            "instances": int(result.instance_labels.max()),
+        },
+        decisions=[
+            DecisionRecord(
+                decision_type="component_split",
+                outcome=record.decision_status,
+                subject_id=record.component_id,
+                reason=record.error,
+                metrics={
+                    "selected_cell_count": record.selected_cell_count,
+                    "posterior_h1": record.posterior_h1,
+                    "posterior_h2": record.posterior_h2,
+                    "posterior_h3": record.posterior_h3,
+                },
+            )
+            for record in result.component_diagnostics
+        ],
+    )
+    return result.instance_labels, trace
