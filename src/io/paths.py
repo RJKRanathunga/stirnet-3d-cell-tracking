@@ -36,11 +36,13 @@ class PipelinePaths:
     def processed_root(self) -> Path:
         return self.data_root / "processed"
 
+    @property
+    def training_root(self) -> Path:
+        return self.data_root / "biohub_5samples_20timepoints" / "train"
+
     def sample_zarr(self, sample_id: str) -> Path:
         return (
-            self.data_root
-            / "biohub_5samples_20timepoints"
-            / "train"
+            self.training_root
             / sample_id
             / f"{sample_id}.zarr"
         )
@@ -67,3 +69,25 @@ class PipelinePaths:
     @property
     def tracking_scenes(self) -> Path:
         return self.project_root / "data" / "tracking_scenes"
+
+
+def get_sample_output_dir(
+    sample_id: str,
+    *,
+    paths: PipelinePaths | None = None,
+) -> Path:
+    """Return the existing Stage 6 output directory for one sample."""
+
+    resolved = paths or PipelinePaths.discover()
+    return resolved.processed_dataset(sample_id)
+
+
+def get_stage_dir(
+    sample_id: str,
+    stage: str,
+    *,
+    paths: PipelinePaths | None = None,
+) -> Path:
+    """Return a named stage directory below one sample's processed output."""
+
+    return get_sample_output_dir(sample_id, paths=paths) / stage

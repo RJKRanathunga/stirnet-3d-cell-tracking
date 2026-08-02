@@ -1,7 +1,12 @@
 """Shared, contract-preserving pipeline I/O."""
 
 from .arrays import load_npy, load_npy_time_series, load_timepoint, open_sample, save_npy
-from .paths import PipelinePaths, find_project_root
+from .paths import (
+    PipelinePaths,
+    find_project_root,
+    get_sample_output_dir,
+    get_stage_dir,
+)
 from .scene_io import TrackingSceneData, load_tracking_scene
 from .stage_io import (
     ProcessedDatasetInputs,
@@ -21,6 +26,8 @@ __all__ = [
     "Stage8Outputs",
     "TrackingSceneData",
     "find_project_root",
+    "get_sample_output_dir",
+    "get_stage_dir",
     "load_csv",
     "load_json",
     "load_npy",
