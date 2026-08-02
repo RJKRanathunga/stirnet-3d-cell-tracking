@@ -2,3 +2,7 @@ data
 .idea
 .venv
 evaluation/segmentation/annotations
+
+# Python-generated cache files
+__pycache__/
+*.py[cod]
