@@ -894,7 +894,16 @@ class TrackingSceneExtractorWidget(QWidget):
         return [corners[[start, stop]] for start, stop in edge_pairs]
 
     def _update_preview(self) -> None:
+        # Preserve the user's current visibility choice before replacing the layer.
+        try:
+            existing_layer = self.viewer.layers[PREVIEW_LAYER_NAME]
+            preview_visible = bool(existing_layer.visible)
+        except Exception:
+            # Show the preview by default when it is first created.
+            preview_visible = True
+
         self._remove_preview_layer()
+
         if not self.model.selections:
             return
 
@@ -908,7 +917,7 @@ class TrackingSceneExtractorWidget(QWidget):
         paths = self._box_paths(corners)
 
         try:
-            self.viewer.add_shapes(
+            preview_layer = self.viewer.add_shapes(
                 paths,
                 shape_type=["path"] * len(paths),
                 name=PREVIEW_LAYER_NAME,
@@ -917,15 +926,17 @@ class TrackingSceneExtractorWidget(QWidget):
                 edge_width=2,
             )
         except Exception:
-            # A point-corner fallback keeps the preview usable on Napari
-            # versions that cannot render 3D path shapes in the current mode.
-            self.viewer.add_points(
+            # Fallback for Napari versions that cannot display the 3D paths.
+            preview_layer = self.viewer.add_points(
                 corners,
                 name=PREVIEW_LAYER_NAME,
                 scale=(1, *self.model.voxel_size_zyx),
                 size=3,
                 face_color="yellow",
             )
+
+        # Restore the visibility state from the previous layer.
+        preview_layer.visible = preview_visible
 
 
 def add_tracking_scene_extractor(
