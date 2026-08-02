@@ -29,6 +29,8 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from src.io import PipelinePaths
+
 
 # ============================================================
 # Standalone configuration
@@ -54,24 +56,7 @@ INSTANCE_LABELS_ARRAY_PATH: Path | None = None
 # ============================================================
 
 
-def _detect_project_root() -> Path:
-    """Locate the repository root from this module's nested package path."""
-
-    module_path = Path(__file__).resolve()
-
-    for parent in module_path.parents:
-        if (parent / "data").exists() and (parent / "diagnostics").exists():
-            return parent
-
-    # Expected location:
-    # <project-root>/diagnostics/cell_volume_extraction/extraction.py
-    if len(module_path.parents) >= 3:
-        return module_path.parents[2]
-
-    return Path.cwd().resolve()
-
-
-PROJECT_ROOT = _detect_project_root()
+PROJECT_ROOT = PipelinePaths.discover().project_root
 DATA_ROOT = PROJECT_ROOT / "data"
 
 CELLS_DIR = (

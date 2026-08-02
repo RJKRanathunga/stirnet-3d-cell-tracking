@@ -2,20 +2,63 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 
-def find_project_root(start: str | Path | None = None) -> Path:
-    """Locate the project without depending on a notebook working directory."""
+PROJECT_ROOT_ENV = "CELL_TRACKING_PROJECT_ROOT"
+PROJECT_ROOT_MARKERS = ("src", "notebooks", "pyproject.toml")
 
-    current = Path(start or Path.cwd()).resolve()
-    if current.is_file():
-        current = current.parent
-    for candidate in (current, *current.parents):
-        if (candidate / "src").is_dir() and (candidate / "notebooks").is_dir():
+
+def _normalize(path: str | Path) -> Path:
+    return Path(path).expanduser().resolve()
+
+
+def _is_project_root(path: Path) -> bool:
+    return (
+        (path / "src").is_dir()
+        and (path / "notebooks").is_dir()
+        and (path / "pyproject.toml").is_file()
+    )
+
+
+def _invalid_root(path: Path | str, source: str) -> RuntimeError:
+    markers = ", ".join(PROJECT_ROOT_MARKERS)
+    return RuntimeError(
+        f"Invalid project root from {source}: {path}. "
+        f"Expected repository markers: {markers}."
+    )
+
+
+def find_project_root(start: str | Path | None = None) -> Path:
+    """Locate and validate the project root without depending on the CWD."""
+
+    if start is not None:
+        current = _normalize(start)
+        if current.is_file():
+            current = current.parent
+        for candidate in (current, *current.parents):
+            if _is_project_root(candidate):
+                return candidate
+        raise _invalid_root(current, "explicit input")
+
+    environment_root = os.environ.get(PROJECT_ROOT_ENV)
+    if environment_root is not None:
+        if not environment_root.strip():
+            raise _invalid_root("<empty>", f"{PROJECT_ROOT_ENV} environment override")
+        candidate = _normalize(environment_root)
+        if _is_project_root(candidate):
             return candidate
-    return Path(__file__).resolve().parents[2]
+        raise _invalid_root(
+            candidate,
+            f"{PROJECT_ROOT_ENV} environment override",
+        )
+
+    module_root = Path(__file__).resolve().parents[2]
+    if _is_project_root(module_root):
+        return module_root
+    raise _invalid_root(module_root, "installed module location")
 
 
 @dataclass(frozen=True)

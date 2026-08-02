@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage
 
-from src.io.zarr_loader import load_timepoint
+from src.io import load_timepoint
 
 
 # ============================================================

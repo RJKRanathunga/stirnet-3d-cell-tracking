@@ -6,3 +6,8 @@ evaluation/segmentation/annotations
 # Python-generated cache files
 __pycache__/
 *.py[cod]
+
+# Editable-build artifacts
+*.egg-info/
+build/
+dist/
