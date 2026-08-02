@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 
 from src.io.scene_io import load_tracking_scene as load_scene_data
+scene_layer_transform = import_module(
+    "src.09_visualization.transforms"
+).scene_layer_transform
 
 try:
     from qtpy.QtWidgets import (
@@ -158,22 +162,10 @@ def _layer_transform(
     use_original_coordinates: bool,
 ) -> tuple[tuple[float, float, float, float], tuple[float, float, float, float]]:
     """Return Napari scale and translate values for (T, Z, Y, X)."""
-    scale = (1.0, *scene.voxel_size_zyx)
-
-    frame_origin = float(scene.frames[0]) if len(scene.frames) else 0.0
-    if use_original_coordinates:
-        spatial_translate = tuple(
-            origin * spacing
-            for origin, spacing in zip(
-                scene.crop_origin_zyx,
-                scene.voxel_size_zyx,
-            )
-        )
-    else:
-        spatial_translate = (0.0, 0.0, 0.0)
-
-    translate = (frame_origin, *spatial_translate)
-    return scale, translate
+    return scene_layer_transform(
+        scene,
+        use_original_coordinates=use_original_coordinates,
+    )
 
 
 def remove_tracking_scene_layers(viewer: Any) -> None:
