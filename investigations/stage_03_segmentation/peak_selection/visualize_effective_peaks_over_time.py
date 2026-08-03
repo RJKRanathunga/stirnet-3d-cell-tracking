@@ -218,7 +218,8 @@ def compute_or_load_peak_cache(
     cache_dir = (
         paths.project_root
         / "data"
-        / "diagnostics"
+        / "investigations"
+        / "stage_03_segmentation"
         / "effective_peaks"
         / sample_id
     )
