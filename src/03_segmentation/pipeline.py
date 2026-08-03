@@ -1,4 +1,4 @@
-"""Production entry points for probabilistic 3-D instance segmentation."""
+"""Production entry points for all-effective-peak 3-D instance segmentation."""
 
 from __future__ import annotations
 
@@ -9,14 +9,6 @@ from scipy import ndimage
 
 from .config import DEFAULT_SEGMENTATION_CONFIG, SegmentationConfig
 from .distance import compute_distance_transform
-from .geometry import describe_cell_mask
-from .hypotheses import (
-    HypothesisDecision,
-    HypothesisEvaluation,
-    SplitHypothesis,
-    choose_hierarchical_hypothesis,
-    evaluate_spatial_split_hypotheses,
-)
 from .peaks import (
     DistancePeakAnalysis,
     LobeCollapseResult,
@@ -26,6 +18,7 @@ from .peaks import (
     collapse_same_lobe_peaks,
     detect_persistent_distance_peaks,
 )
+from .watershed import build_marker_watershed
 
 
 VOXEL_SIZE = DEFAULT_SEGMENTATION_CONFIG.voxel_size_zyx_um
@@ -33,46 +26,18 @@ VOXEL_SIZE = DEFAULT_SEGMENTATION_CONFIG.voxel_size_zyx_um
 
 @dataclass(frozen=True)
 class ComponentDiagnostic:
-    """Compact record of one component-level split decision."""
+    """Compact record of one component-level production result."""
 
     component_id: int
     source_voxels: int
     raw_peak_count: int
-    effective_lobe_count: int
-    selected_cell_count: int
-    posterior_h1: float
-    posterior_h2: float
-    posterior_h3: float
-    h2_conditional_probability: float
-    h2_odds_vs_h1: float
-    h3_conditional_probability: float
-    h3_odds_vs_h2: float
-    decision_status: str
-    split_accepted: bool
+    effective_peak_count: int
+    instance_count: int
+    marker_count: int
     marker_positions_zyx: tuple[tuple[int, int, int], ...]
     bbox_zyx: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+    processing_status: str
     error: str | None
-
-
-@dataclass(frozen=True)
-class HypothesisDiagnostic:
-    """Optional compact evidence record for the best model of one size."""
-
-    component_id: int
-    k: int
-    posterior_probability: float
-    prior_probability: float
-    log_likelihood: float
-    lobe_support: float
-    coverage_support: float
-    marker_quality: float
-    neck_support: float
-    child_shape: float
-    shape_improvement: float
-    child_volume: float
-    fragment_safety: float
-    minimum_child_fraction: float
-    selected_peak_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -83,17 +48,16 @@ class InstanceComponentMapping:
     local_child_label: int
     instance_id: int
     voxel_count: int
-    decision_status: str
+    processing_status: str
 
 
 @dataclass(frozen=True)
 class SegmentationResult:
     """Detailed segmentation output for diagnostic or notebook workflows."""
 
-    instance_labels: np.ndarray
+    final_labels: np.ndarray
     markers: np.ndarray
     component_diagnostics: tuple[ComponentDiagnostic, ...]
-    hypothesis_diagnostics: tuple[HypothesisDiagnostic, ...]
     instance_component_map: tuple[InstanceComponentMapping, ...]
     component_debug_artifacts: tuple["ComponentDebugArtifacts", ...] = ()
 
@@ -109,26 +73,22 @@ class ComponentDebugArtifacts:
     raw_distance: np.ndarray
     watershed_distance: np.ndarray
     merge_tree_distance: np.ndarray
-    peaks: tuple[PeakCandidate, ...]
+    raw_peaks: tuple[PeakCandidate, ...]
     effective_peaks: tuple[PeakCandidate, ...]
     pair_evidence: tuple[PairEvidence, ...]
-    hypotheses: tuple[SplitHypothesis, ...]
-    selected_positions_zyx: tuple[tuple[int, int, int], ...]
-    selected_labels: np.ndarray
-    decision: HypothesisDecision
+    marker_positions_zyx: tuple[tuple[int, int, int], ...]
+    final_labels: np.ndarray
 
 
 @dataclass(frozen=True)
 class ComponentAnalysis:
-    """Internal spatial analysis for one unpadded component crop."""
+    """Internal all-effective-peak analysis for one unpadded component crop."""
 
-    labels: np.ndarray
-    selected_positions_zyx: tuple[tuple[int, int, int], ...]
-    peaks: tuple[PeakCandidate, ...]
+    final_labels: np.ndarray
+    marker_positions_zyx: tuple[tuple[int, int, int], ...]
+    raw_peaks: tuple[PeakCandidate, ...]
     effective_peaks: tuple[PeakCandidate, ...]
     pair_evidence: tuple[PairEvidence, ...]
-    evaluation: HypothesisEvaluation
-    decision: HypothesisDecision
     debug_artifacts: ComponentDebugArtifacts | None = None
 
 
@@ -138,7 +98,7 @@ def analyze_component_crop(
     *,
     retain_debug_artifacts: bool = False,
 ) -> ComponentAnalysis:
-    """Run spatial-only probabilistic inference on one tight component crop."""
+    """Split one tight component crop using every effective peak as a marker."""
 
     component_mask = np.asarray(component_mask, dtype=bool)
     if component_mask.ndim != 3 or not component_mask.any():
@@ -163,56 +123,56 @@ def analyze_component_crop(
     collapsed: LobeCollapseResult = collapse_same_lobe_peaks(
         peak_analysis.peaks, pair_evidence, config
     )
-    merged_description = describe_cell_mask(
-        padded_mask, config.voxel_size_zyx_um
-    )
-    evaluation = evaluate_spatial_split_hypotheses(
-        padded_mask,
-        peak_analysis.raw_distance,
-        peak_analysis.watershed_distance,
-        collapsed.effective_peaks,
-        pair_evidence,
-        merged_description,
-        config,
-    )
-    decision = choose_hierarchical_hypothesis(evaluation.best_by_k, config)
+    effective_peaks = collapsed.effective_peaks
+    if not effective_peaks:
+        raise RuntimeError("peak collapse produced no effective peaks")
+
+    if len(effective_peaks) == 1:
+        padded_labels = padded_mask.astype(np.int32)
+    else:
+        padded_labels = build_marker_watershed(
+            padded_mask,
+            peak_analysis.watershed_distance,
+            effective_peaks,
+        )
 
     inner = tuple(
         slice(padding, -padding) if padding > 0 else slice(None)
         for _ in range(3)
     )
-    chosen_labels = np.asarray(decision.chosen.labels[inner], dtype=np.int32)
-    selected_positions = tuple(
+    final_labels = np.asarray(padded_labels[inner], dtype=np.int32)
+    marker_positions = tuple(
         tuple(coordinate - padding for coordinate in peak.position_zyx)
-        for peak in decision.chosen.selected_peaks
+        for peak in effective_peaks
     )
-    _validate_local_result(component_mask, chosen_labels, selected_positions)
+    _validate_local_result(component_mask, final_labels, marker_positions)
+
     debug_artifacts = None
     if retain_debug_artifacts:
         debug_artifacts = ComponentDebugArtifacts(
             component_id=0,
-            bbox_zyx=((0, component_mask.shape[0]), (0, component_mask.shape[1]), (0, component_mask.shape[2])),
+            bbox_zyx=(
+                (0, component_mask.shape[0]),
+                (0, component_mask.shape[1]),
+                (0, component_mask.shape[2]),
+            ),
             component_mask=component_mask,
             padded_component_mask=padded_mask,
             raw_distance=peak_analysis.raw_distance,
             watershed_distance=peak_analysis.watershed_distance,
             merge_tree_distance=peak_analysis.merge_tree_distance,
-            peaks=peak_analysis.peaks,
-            effective_peaks=collapsed.effective_peaks,
+            raw_peaks=peak_analysis.peaks,
+            effective_peaks=effective_peaks,
             pair_evidence=pair_evidence,
-            hypotheses=evaluation.best_by_k,
-            selected_positions_zyx=selected_positions,
-            selected_labels=chosen_labels,
-            decision=decision,
+            marker_positions_zyx=marker_positions,
+            final_labels=final_labels,
         )
     return ComponentAnalysis(
-        chosen_labels,
-        selected_positions,
+        final_labels,
+        marker_positions,
         peak_analysis.peaks,
-        collapsed.effective_peaks,
+        effective_peaks,
         pair_evidence,
-        evaluation,
-        decision,
         debug_artifacts,
     )
 
@@ -227,9 +187,9 @@ def _validate_local_result(
     if labels.shape != component_mask.shape:
         raise RuntimeError("local labels and component mask have different shapes")
     if np.any(labels[component_mask] <= 0):
-        raise RuntimeError("local hypothesis does not cover the source component")
+        raise RuntimeError("local labels do not cover the source component")
     if np.any(labels[~component_mask] != 0):
-        raise RuntimeError("local hypothesis extends outside the source component")
+        raise RuntimeError("local labels extend outside the source component")
 
     positive_labels = tuple(
         int(value) for value in np.unique(labels) if int(value) > 0
@@ -277,7 +237,7 @@ def _fallback_component_analysis(
 
 def _prepare_component_output(
     local_labels: np.ndarray,
-    selected_positions: tuple[tuple[int, int, int], ...],
+    marker_positions: tuple[tuple[int, int, int], ...],
     component_slice: tuple[slice, slice, slice],
     global_mask: np.ndarray,
 ) -> tuple[tuple[int, ...], tuple[tuple[int, int, int], ...]]:
@@ -286,7 +246,7 @@ def _prepare_component_output(
     positive_labels = tuple(
         int(value) for value in np.unique(local_labels) if int(value) > 0
     )
-    if len(positive_labels) != len(selected_positions):
+    if len(positive_labels) != len(marker_positions):
         raise RuntimeError("marker count does not match local child count")
     starts = np.asarray(
         [axis_slice.start for axis_slice in component_slice], dtype=int
@@ -296,62 +256,24 @@ def _prepare_component_output(
             int(value)
             for value in starts + np.asarray(local_position, dtype=int)
         )
-        for local_position in selected_positions
+        for local_position in marker_positions
     )
     if any(not global_mask[position] for position in global_positions):
         raise RuntimeError("a component marker lies outside the global mask")
     return positive_labels, global_positions
 
 
-def _posterior_by_k(evaluation: HypothesisEvaluation | None, k: int) -> float:
-    if evaluation is None:
-        return 0.0
-    return next(
-        (
-            hypothesis.posterior_probability
-            for hypothesis in evaluation.best_by_k
-            if hypothesis.k == k
-        ),
-        0.0,
-    )
-
-
-def _hypothesis_diagnostic(
-    component_id: int,
-    hypothesis: SplitHypothesis,
-) -> HypothesisDiagnostic:
-    evidence = hypothesis.evidence
-    return HypothesisDiagnostic(
-        component_id=component_id,
-        k=hypothesis.k,
-        posterior_probability=hypothesis.posterior_probability,
-        prior_probability=hypothesis.prior_probability,
-        log_likelihood=hypothesis.log_likelihood,
-        lobe_support=evidence.lobe_support,
-        coverage_support=evidence.coverage_support,
-        marker_quality=evidence.marker_quality,
-        neck_support=evidence.neck_support,
-        child_shape=evidence.child_shape,
-        shape_improvement=evidence.shape_improvement,
-        child_volume=evidence.child_volume,
-        fragment_safety=evidence.fragment_safety,
-        minimum_child_fraction=hypothesis.minimum_child_fraction,
-        selected_peak_ids=tuple(peak.peak_id for peak in hypothesis.selected_peaks),
-    )
-
-
 def segment_instances_detailed(
     binary_mask: np.ndarray,
     config: SegmentationConfig = DEFAULT_SEGMENTATION_CONFIG,
     *,
-    include_hypothesis_diagnostics: bool = False,
     retain_debug_artifacts: bool = False,
 ) -> SegmentationResult:
-    """Segment a 3-D mask and return aligned markers plus compact diagnostics.
+    """Segment a 3-D mask using all effective peaks and return aligned markers.
 
-    Every connected component is processed independently in a padded crop. Any
-    unexpected component-level failure is isolated: the original component is
-    emitted as one instance and the error is recorded.
+    Every 6-connected component is processed independently in a padded crop.
+    Any unexpected component-level failure is isolated: the original component
+    is emitted as one instance and the error is recorded.
     """
 
     mask = np.asarray(binary_mask, dtype=bool)
@@ -362,10 +284,9 @@ def segment_instances_detailed(
         mask, structure=ndimage.generate_binary_structure(3, 1)
     )
     component_slices = ndimage.find_objects(component_labels)
-    instance_labels = np.zeros(mask.shape, dtype=np.int32)
+    final_labels = np.zeros(mask.shape, dtype=np.int32)
     markers = np.zeros(mask.shape, dtype=np.int32)
     component_diagnostics: list[ComponentDiagnostic] = []
-    hypothesis_diagnostics: list[HypothesisDiagnostic] = []
     instance_mapping: list[InstanceComponentMapping] = []
     component_debug_artifacts: list[ComponentDebugArtifacts] = []
     next_instance_id = 1
@@ -383,36 +304,37 @@ def segment_instances_detailed(
                 config,
                 retain_debug_artifacts=retain_debug_artifacts,
             )
-            local_labels = analysis.labels
-            selected_positions = analysis.selected_positions_zyx
-            decision_status = analysis.decision.decision_status
-            raw_peak_count = len(analysis.peaks)
-            effective_lobe_count = len(analysis.effective_peaks)
-            evaluation: HypothesisEvaluation | None = analysis.evaluation
+            local_labels = analysis.final_labels
+            marker_positions = analysis.marker_positions_zyx
+            processing_status = "processed"
+            raw_peak_count = len(analysis.raw_peaks)
+            effective_peak_count = len(analysis.effective_peaks)
             positive_local_labels, global_positions = _prepare_component_output(
                 local_labels,
-                selected_positions,
+                marker_positions,
                 component_slice,
                 mask,
             )
+            if len(positive_local_labels) != effective_peak_count:
+                raise RuntimeError(
+                    "successful component instance count differs from effective peak count"
+                )
         except Exception as error:  # component isolation is a required safety net
-            local_labels, selected_positions = _fallback_component_analysis(
+            local_labels, marker_positions = _fallback_component_analysis(
                 local_component, config
             )
-            decision_status = "fallback_single"
+            processing_status = "fallback_single"
             raw_peak_count = 0
-            effective_lobe_count = 1
-            evaluation = None
+            effective_peak_count = 1
             error_message = f"{type(error).__name__}: {error}"
             positive_local_labels, global_positions = _prepare_component_output(
                 local_labels,
-                selected_positions,
+                marker_positions,
                 component_slice,
                 mask,
             )
 
-        target_view = instance_labels[component_slice]
-
+        target_view = final_labels[component_slice]
         for local_label, global_position in zip(
             positive_local_labels, global_positions
         ):
@@ -427,7 +349,7 @@ def segment_instances_detailed(
                     local_label,
                     instance_id,
                     int(np.count_nonzero(region)),
-                    decision_status,
+                    processing_status,
                 )
             )
 
@@ -446,72 +368,56 @@ def segment_instances_detailed(
                     raw_distance=artifact.raw_distance,
                     watershed_distance=artifact.watershed_distance,
                     merge_tree_distance=artifact.merge_tree_distance,
-                    peaks=artifact.peaks,
+                    raw_peaks=artifact.raw_peaks,
                     effective_peaks=artifact.effective_peaks,
                     pair_evidence=artifact.pair_evidence,
-                    hypotheses=artifact.hypotheses,
-                    selected_positions_zyx=artifact.selected_positions_zyx,
-                    selected_labels=artifact.selected_labels,
-                    decision=artifact.decision,
+                    marker_positions_zyx=artifact.marker_positions_zyx,
+                    final_labels=artifact.final_labels,
                 )
             )
+        instance_count = len(positive_local_labels)
+        marker_count = len(global_positions)
         component_diagnostics.append(
             ComponentDiagnostic(
                 component_id=component_id,
                 source_voxels=source_voxels,
                 raw_peak_count=raw_peak_count,
-                effective_lobe_count=effective_lobe_count,
-                selected_cell_count=len(positive_local_labels),
-                posterior_h1=_posterior_by_k(evaluation, 1),
-                posterior_h2=_posterior_by_k(evaluation, 2),
-                posterior_h3=_posterior_by_k(evaluation, 3),
-                h2_conditional_probability=(
-                    analysis.decision.h2_conditional_probability
-                    if error_message is None else 0.0
-                ),
-                h2_odds_vs_h1=(
-                    analysis.decision.h2_odds_vs_h1
-                    if error_message is None else 0.0
-                ),
-                h3_conditional_probability=(
-                    analysis.decision.h3_conditional_probability
-                    if error_message is None else 0.0
-                ),
-                h3_odds_vs_h2=(
-                    analysis.decision.h3_odds_vs_h2
-                    if error_message is None else 0.0
-                ),
-                decision_status=decision_status,
-                split_accepted=len(positive_local_labels) > 1,
+                effective_peak_count=effective_peak_count,
+                instance_count=instance_count,
+                marker_count=marker_count,
                 marker_positions_zyx=global_positions,
                 bbox_zyx=bbox,  # type: ignore[arg-type]
+                processing_status=processing_status,
                 error=error_message,
             )
         )
-        if include_hypothesis_diagnostics and evaluation is not None:
-            hypothesis_diagnostics.extend(
-                _hypothesis_diagnostic(component_id, hypothesis)
-                for hypothesis in evaluation.best_by_k
-            )
+        if error_message is None:
+            if instance_count != effective_peak_count:
+                raise RuntimeError(
+                    "successful component instance count differs from effective peak count"
+                )
+            if marker_count != effective_peak_count:
+                raise RuntimeError(
+                    "successful component marker count differs from effective peak count"
+                )
 
-    if np.any(instance_labels[mask] <= 0):
+    if np.any(final_labels[mask] <= 0):
         raise RuntimeError("final labels do not cover the complete binary mask")
-    if np.any(instance_labels[~mask] != 0):
+    if np.any(final_labels[~mask] != 0):
         raise RuntimeError("final labels extend outside the binary mask")
     marker_values = markers[markers > 0]
-    expected_ids = np.arange(1, int(instance_labels.max()) + 1, dtype=np.int32)
+    expected_ids = np.arange(1, int(final_labels.max()) + 1, dtype=np.int32)
     if not np.array_equal(np.sort(marker_values), expected_ids):
         raise RuntimeError("final marker IDs and instance IDs are not aligned")
     for marker_position in np.argwhere(markers > 0):
         position = tuple(int(value) for value in marker_position)
-        if int(markers[position]) != int(instance_labels[position]):
+        if int(markers[position]) != int(final_labels[position]):
             raise RuntimeError("a final marker ID differs from its instance ID")
 
     return SegmentationResult(
-        instance_labels,
+        final_labels,
         markers,
         tuple(component_diagnostics),
-        tuple(hypothesis_diagnostics),
         tuple(instance_mapping),
         tuple(component_debug_artifacts),
     )
@@ -523,45 +429,37 @@ def segment_instances(
     *,
     return_diagnostics: bool = False,
 ):
-    """Convert a 3-D foreground mask into deterministic instance labels.
+    """Convert a 3-D foreground mask into deterministic instance labels."""
 
-    The return type and shape match the historical production interface. Use
-    :func:`segment_instances_detailed` when markers or diagnostics are needed.
-    """
-
-    result = segment_instances_detailed(
-        binary_mask,
-        config,
-        include_hypothesis_diagnostics=return_diagnostics,
-    )
+    result = segment_instances_detailed(binary_mask, config)
     if not return_diagnostics:
-        return result.instance_labels
+        return result.final_labels
 
     from src.diagnostics import DecisionRecord, StageTrace
 
     trace = StageTrace(
         stage_name="03_segmentation",
         inputs={"binary_mask": binary_mask},
-        outputs={"instance_labels": result.instance_labels},
+        outputs={"instance_labels": result.final_labels},
         intermediates={"markers": result.markers},
         metrics={
             "components": len(result.component_diagnostics),
-            "instances": int(result.instance_labels.max()),
+            "instances": int(result.final_labels.max()),
         },
         decisions=[
             DecisionRecord(
-                decision_type="component_split",
-                outcome=record.decision_status,
+                decision_type="component_segmentation",
+                outcome=record.processing_status,
                 subject_id=record.component_id,
                 reason=record.error,
                 metrics={
-                    "selected_cell_count": record.selected_cell_count,
-                    "posterior_h1": record.posterior_h1,
-                    "posterior_h2": record.posterior_h2,
-                    "posterior_h3": record.posterior_h3,
+                    "raw_peak_count": record.raw_peak_count,
+                    "effective_peak_count": record.effective_peak_count,
+                    "instance_count": record.instance_count,
+                    "marker_count": record.marker_count,
                 },
             )
             for record in result.component_diagnostics
         ],
     )
-    return result.instance_labels, trace
+    return result.final_labels, trace

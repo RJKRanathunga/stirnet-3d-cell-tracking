@@ -514,10 +514,9 @@ def build_peak_pair_evidence(
 ) -> tuple[PairEvidence, ...]:
     """Evaluate pairwise saddle and branch evidence for candidate peaks."""
 
-    candidates = peaks[: config.max_candidate_peaks]
     total_voxels = max(int(np.count_nonzero(mask)), 1)
     records: list[PairEvidence] = []
-    for first, second in combinations(candidates, 2):
+    for first, second in combinations(peaks, 2):
         first_depth = float(merge_tree_distance[first.position_zyx])
         second_depth = float(merge_tree_distance[second.position_zyx])
         smaller_depth = max(min(first_depth, second_depth), 1e-6)
@@ -601,13 +600,12 @@ def collapse_same_lobe_peaks(
     accidentally collapsing two genuine lobes through an intermediate peak.
     """
 
-    candidates = peaks[: config.max_candidate_peaks]
     same_lookup = {
         frozenset((record.peak_id_a, record.peak_id_b)): record.same_lobe_probability
         for record in pair_evidence
     }
     ordered = sorted(
-        candidates,
+        peaks,
         key=lambda peak: (
             -(peak.persistence_score * peak.raw_depth_um),
             -peak.raw_depth_um,

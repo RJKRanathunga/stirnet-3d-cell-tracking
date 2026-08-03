@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import tempfile
+import inspect
+import json
 import unittest
+from dataclasses import fields
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,13 +24,18 @@ from diagnostics.pipeline_replay import (
     match_instance_by_iou,
 )
 from diagnostics.pipeline_replay.models import ProductionFrame
-from diagnostics.pipeline_replay.napari_layers import remove_pipeline_replay_layers
+from diagnostics.pipeline_replay.component_debug import ComponentDebugResult
+from diagnostics.pipeline_replay.napari_layers import (
+    add_debug_layers,
+    remove_pipeline_replay_layers,
+)
 from src.api import create_binary_mask, preprocess_volume
 from src.io import PipelinePaths, save_csv, save_json, save_npy
 
 preprocessing_config = import_module("src.01_preprocessing.config")
 masking_config = import_module("src.02_masking.config")
 replay_runner_module = import_module("diagnostics.pipeline_replay.runner")
+segmentation_config = import_module("src.03_segmentation.config")
 
 
 class _SyntheticSource:
@@ -138,11 +146,13 @@ class PipelineReplayTests(unittest.TestCase):
         runner._mask_work = mask
         runner._display_slices = (slice(1, 4), slice(2, 7), slice(2, 7))
         captured = {}
-        def fake_segment(value, *_args, **_kwargs):
+        def fake_segment(value, *_args, **kwargs):
             captured["mask"] = value.copy()
+            captured["kwargs"] = kwargs
             return SimpleNamespace(
-                instance_labels=value.astype(np.int32),
+                final_labels=value.astype(np.int32),
                 markers=np.zeros_like(value, dtype=np.int32),
+                component_diagnostics=(),
                 component_debug_artifacts=(),
             )
         with patch.object(replay_runner_module.segmentation_module, "segment_instances_detailed", side_effect=fake_segment):
@@ -150,6 +160,119 @@ class PipelineReplayTests(unittest.TestCase):
         self.assertEqual(int(captured["mask"].sum()), 8)
         self.assertTrue(captured["mask"][2, 0, 4])
         self.assertTrue(captured["mask"][2, 7, 4])
+        self.assertEqual(captured["kwargs"], {"retain_debug_artifacts": True})
+
+    def test_stage3_replay_uses_all_effective_peaks_without_a_count_cap(self) -> None:
+        shape = (11, 81, 61)
+        voxel = np.asarray(
+            segmentation_config.DEFAULT_SEGMENTATION_CONFIG.voxel_size_zyx_um
+        )
+        physical = np.indices(shape).transpose(1, 2, 3, 0) * voxel
+        center = np.asarray((5, 40, 30)) * voxel
+        mask = np.zeros(shape, dtype=bool)
+        for offset in (-7.2, -2.4, 2.4, 7.2):
+            lobe_center = center + np.asarray((0.0, offset, 0.0))
+            mask |= np.linalg.norm(physical - lobe_center, axis=-1) <= 2.8
+
+        source = _SyntheticSource(np.zeros(shape, dtype=np.float32))
+        source.crop_origin_zyx = (0, 0, 0)
+        source.crop_stop_zyx = shape
+        source.crop_shape_zyx = shape
+        runner = PipelineReplayRunner(source)
+        runner.reload_baseline(0)
+        runner._raw_work = source.frame.raw
+        runner._mask_work = mask
+        runner._display_slices = tuple(slice(0, value) for value in shape)
+        runner.state.work_crop_global = runner._display_slices
+
+        runner._run_stage_3()
+        result = runner.result()
+        component = result.component_results[0]
+
+        self.assertGreater(component.effective_peak_count, 3)
+        self.assertEqual(
+            component.marker_count, component.effective_peak_count
+        )
+        self.assertEqual(
+            component.instance_count, component.effective_peak_count
+        )
+        self.assertEqual(
+            len(component.effective_peak_positions_zyx),
+            component.effective_peak_count,
+        )
+        np.testing.assert_array_equal(
+            component.marker_positions_zyx,
+            component.effective_peak_positions_zyx,
+        )
+        self.assertEqual(
+            int(result.display_instance_labels.max()),
+            component.effective_peak_count,
+        )
+        np.testing.assert_array_equal(result.display_instance_labels > 0, mask)
+        self.assertEqual(component.processing_status, "processed")
+        self.assertIsNone(component.error)
+
+        class Viewer:
+            def __init__(self):
+                self.layers = []
+
+            def _add(self, data, name, **kwargs):
+                layer = SimpleNamespace(data=data, name=name, **kwargs)
+                self.layers.append(layer)
+                return layer
+
+            add_image = _add
+            add_labels = _add
+            add_points = _add
+            add_shapes = _add
+
+        viewer = Viewer()
+        add_debug_layers(viewer, source, result)
+        names = {layer.name for layer in viewer.layers}
+        self.assertIn("Debug | Effective peaks (final markers)", names)
+        self.assertIn("Debug | Final labels", names)
+        self.assertIn("Debug | Final boundaries", names)
+        self.assertIn("Debug | Peak pair evidence", names)
+        self.assertTrue(
+            {"Debug | Raw EDT", "Debug | Merge-tree EDT", "Debug | Watershed EDT"}
+            .issubset(names)
+        )
+        self.assertFalse(
+            any(
+                token in name
+                for name in names
+                for token in ("H1", "H2", "H3", "Selected", "Hypothesis")
+            )
+        )
+        final_marker_layer = next(
+            layer
+            for layer in viewer.layers
+            if layer.name == "Debug | Effective peaks (final markers)"
+        )
+        self.assertEqual(len(final_marker_layer.data), component.marker_count)
+
+    def test_stage3_replay_model_and_runner_have_no_removed_contracts(self) -> None:
+        model_fields = {field.name for field in fields(ComponentDebugResult)}
+        runner_source = inspect.getsource(replay_runner_module)
+        debug_source = inspect.getsource(
+            import_module("diagnostics.pipeline_replay.component_debug")
+        )
+        forbidden_fields = {
+            "hypothesis_evidence",
+            "selected_marker_positions_zyx",
+            "selected_cell_count",
+            "decision_status",
+        }
+        self.assertTrue(forbidden_fields.isdisjoint(model_fields))
+        for value in (
+            "include_hypothesis_diagnostics",
+            "hypothesis_diagnostics",
+            "selected_peaks",
+            "posterior",
+            "conditional_probability",
+            "odds_vs",
+        ):
+            self.assertNotIn(value, runner_source + debug_source)
 
     def test_iou_matching_ignores_numeric_label_equality_and_reports_topology(self) -> None:
         production = np.zeros((1, 5, 5), dtype=np.int32)
@@ -186,7 +309,7 @@ class PipelineReplayTests(unittest.TestCase):
 
     def test_layer_cleanup_only_removes_owned_prefixes(self) -> None:
         unrelated = SimpleNamespace(name="User layer")
-        layers = [SimpleNamespace(name="Trial | Binary mask"), unrelated, SimpleNamespace(name="Debug | H2 labels")]
+        layers = [SimpleNamespace(name="Trial | Binary mask"), unrelated, SimpleNamespace(name="Debug | Effective peaks (final markers)")]
         viewer = SimpleNamespace(layers=layers)
         remove_pipeline_replay_layers(viewer)
         self.assertEqual(viewer.layers, [unrelated])
@@ -194,6 +317,23 @@ class PipelineReplayTests(unittest.TestCase):
     def test_gui_module_import_is_optional_without_constructing_qt(self) -> None:
         module = import_module("diagnostics.pipeline_replay.napari_widget")
         self.assertTrue(hasattr(module, "add_pipeline_replay_workbench"))
+
+    def test_replay_workbench_notebook_json_and_code_cells_are_valid(self) -> None:
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "notebooks"
+            / "diagnostics"
+            / "pipeline_replay_workbench.ipynb"
+        )
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(notebook["nbformat"], 4)
+        code_cells = [
+            "".join(cell.get("source", ()))
+            for cell in notebook["cells"]
+            if cell.get("cell_type") == "code"
+        ]
+        for index, source in enumerate(code_cells):
+            compile(source, f"pipeline-replay-cell-{index}", "exec")
 
 
 if __name__ == "__main__":

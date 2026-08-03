@@ -36,12 +36,8 @@ except ImportError:
 
 MAIN_SEGMENTATION_FIELDS = (
     "watershed_sigma_um", "merge_tree_sigma_um", "peak_cluster_radius_um",
-    "max_candidate_peaks", "hard_min_marker_separation_um",
-    "hard_min_child_voxels", "hard_min_child_fraction_k2",
-    "hard_min_child_fraction_k3", "hard_min_equivalent_radius_um",
     "same_lobe_collapse_probability", "pair_prior_distinct",
-    "pair_likelihood_temperature", "h2_min_conditional_probability",
-    "h2_min_odds_vs_h1", "h3_min_conditional_probability", "h3_min_odds_vs_h2",
+    "pair_likelihood_temperature",
 )
 ADVANCED_SEGMENTATION_FIELDS = ("sigma_levels_um", "h_levels_um")
 
@@ -145,8 +141,6 @@ class PipelineReplayWorkbenchWidget(QWidget):
         for name in names:
             if name in ADVANCED_SEGMENTATION_FIELDS:
                 control = QLineEdit()
-            elif name in ("max_candidate_peaks", "hard_min_child_voxels"):
-                control = QSpinBox(); control.setRange(0, 100000)
             else:
                 control = QDoubleSpinBox(); control.setDecimals(6); control.setRange(-1e6, 1e6); control.setSingleStep(0.01)
             self.parameter_controls[(stage, name)] = control
@@ -331,20 +325,20 @@ class PipelineReplayWorkbenchWidget(QWidget):
         match = match_instance_by_iou(production_work, self.runner._labels_work, cell, self.source.voxel_size_zyx_um)
         add_difference_layers(self.viewer, self.source, self.runner.baseline, result, cell, match.trial_instance_id)
         component = result.component_results[0] if result.component_results else None
-        probabilities = ""
-        if component is not None and not component.hypothesis_evidence.empty:
-            probabilities = ", ".join(f"H{int(row.k)}={row.posterior_probability:.3f}" for row in component.hypothesis_evidence.itertuples())
+        component_summary = (
+            f"Stage 3 processing: {component.processing_status}\n"
+            f"Raw/effective peaks: {component.raw_peak_count}/{component.effective_peak_count}\n"
+            f"Final markers/instances: {component.marker_count}/{component.instance_count}\n"
+            f"Pair evidence records: {len(component.pair_evidence)}\n"
+            f"Stage 3 error: {component.error or '-'}\n"
+            if component is not None
+            else "Stage 3 processing: no retained component debug result\n"
+        )
         feature_table = compare_feature_rows(self.runner.baseline.cells, result.features, cell, match.trial_instance_id) if result.features is not None else None
         self.summary_label.setText(
             f"Frame: {result.frame}\nProduction cell: {cell}\nMode: {result.mode.value}\n"
             f"Relevant components: {self.runner.state.relevant_component_ids}\n"
-            f"Hypothesis: {component.decision_status if component else '-'} ({probabilities})\n"
-            f"H2 conditional/odds vs H1: "
-            f"{component.h2_conditional_probability if component else '-'} / "
-            f"{component.h2_odds_vs_h1 if component else '-'}\n"
-            f"H3 conditional/odds vs H2: "
-            f"{component.h3_conditional_probability if component else '-'} / "
-            f"{component.h3_odds_vs_h2 if component else '-'}\n"
+            f"{component_summary}"
             f"Best trial instance: {match.trial_instance_id}\nIoU: {match.iou:.4f} ({match.status})\n"
             f"Centroid displacement: {match.centroid_displacement_voxels if match.centroid_displacement_voxels is not None else '-'} voxels; "
             f"{match.centroid_displacement_um if match.centroid_displacement_um is not None else '-'} µm\n"

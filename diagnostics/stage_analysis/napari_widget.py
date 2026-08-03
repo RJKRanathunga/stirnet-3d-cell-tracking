@@ -7,6 +7,7 @@ from importlib import import_module
 from pathlib import Path
 import traceback
 
+import numpy as np
 from IPython.display import display
 from qtpy.QtWidgets import (
     QCheckBox,
@@ -30,15 +31,11 @@ from .napari_layers import (
     Stage3LayerManager,
     capture_camera,
     render_analysis_layers,
-    render_hypothesis,
     render_input_layers,
     render_peak_setting,
     restore_camera,
 )
 from .runner import (
-    all_hypotheses_dataframe,
-    final_decision_dataframe,
-    hypothesis_summary_text,
     pair_evidence_dataframe,
     peak_detections_dataframe,
     raw_peaks_dataframe,
@@ -55,21 +52,11 @@ PARAMETER_SPECS = (
     ("watershed_sigma_um", float),
     ("merge_tree_sigma_um", float),
     ("peak_cluster_radius_um", float),
-    ("max_candidate_peaks", int),
     ("sigma_levels_um", tuple),
     ("h_levels_um", tuple),
     ("same_lobe_collapse_probability", float),
     ("pair_prior_distinct", float),
     ("pair_likelihood_temperature", float),
-    ("hard_min_marker_separation_um", float),
-    ("hard_min_child_voxels", int),
-    ("hard_min_child_fraction_k2", float),
-    ("hard_min_child_fraction_k3", float),
-    ("hard_min_equivalent_radius_um", float),
-    ("h2_min_conditional_probability", float),
-    ("h2_min_odds_vs_h1", float),
-    ("h3_min_conditional_probability", float),
-    ("h3_min_odds_vs_h2", float),
 )
 
 
@@ -116,7 +103,6 @@ class Stage3AnalysisWidget(QWidget):
         self.selected_only = QCheckBox("Show selected cells only")
         self.selected_only.setChecked(True)
         self.component_combo = QComboBox()
-        self.hypothesis_combo = QComboBox()
         self.sigma_combo = QComboBox()
         self.h_combo = QComboBox()
         form.addRow("Scene category", self.category_combo)
@@ -125,7 +111,6 @@ class Stage3AnalysisWidget(QWidget):
         form.addRow("Selected production IDs", self.selected_ids_label)
         form.addRow("", self.selected_only)
         form.addRow("Target binary component", self.component_combo)
-        form.addRow("Hypothesis", self.hypothesis_combo)
         form.addRow("Peak sigma", self.sigma_combo)
         form.addRow("Peak H-level", self.h_combo)
         root.addLayout(form)
@@ -160,11 +145,9 @@ class Stage3AnalysisWidget(QWidget):
         buttons.addWidget(self.restore_button)
         root.addLayout(buttons)
         self.result_summary = QLabel("Not run")
-        self.hypothesis_summary = QLabel("")
         self.error_summary = QLabel("")
         for label in (
             self.result_summary,
-            self.hypothesis_summary,
             self.error_summary,
         ):
             label.setWordWrap(True)
@@ -172,7 +155,6 @@ class Stage3AnalysisWidget(QWidget):
             "color: #ff6666; font-weight: bold;"
         )
         root.addWidget(self.result_summary)
-        root.addWidget(self.hypothesis_summary)
         root.addWidget(self.error_summary)
 
         self.category_combo.currentTextChanged.connect(self.refresh_scenes)
@@ -181,9 +163,6 @@ class Stage3AnalysisWidget(QWidget):
             self.component_changed
         )
         self.selected_only.toggled.connect(self.refresh_input_layers)
-        self.hypothesis_combo.currentIndexChanged.connect(
-            self.hypothesis_changed
-        )
         self.sigma_combo.currentIndexChanged.connect(
             self.peak_setting_changed
         )
@@ -236,7 +215,6 @@ class Stage3AnalysisWidget(QWidget):
             self.run_result = None
             self._current_time_index = None
             self.component_combo.clear()
-            self.hypothesis_combo.clear()
             self.sigma_combo.clear()
             self.h_combo.clear()
             category = self.category_combo.currentText().strip()
@@ -289,8 +267,6 @@ class Stage3AnalysisWidget(QWidget):
             self._current_time_index = int(scene_time_index)
             self.run_result = None
             self.result_summary.setText("Not run for current frame")
-            self.hypothesis_summary.setText("")
-            self.hypothesis_combo.clear()
             self.sigma_combo.clear()
             self.h_combo.clear()
             self.original_frame_label.setText(
@@ -384,8 +360,6 @@ class Stage3AnalysisWidget(QWidget):
     def component_changed(self, *_args) -> None:
         self.run_result = None
         self.layers.clear_analysis()
-        self.hypothesis_combo.clear()
-        self.hypothesis_summary.setText("")
         self.result_summary.setText("Not run for selected component")
         self.refresh_input_layers()
         self._enforce_3d()
@@ -458,25 +432,21 @@ class Stage3AnalysisWidget(QWidget):
             )
             self._populate_analysis_pickers(config)
             self.peak_setting_changed()
-            self.hypothesis_changed()
-            decision = self.run_result.decision
+            effective_count = len(
+                self.run_result.collapse_result.effective_peaks
+            )
+            instance_count = int(np.max(self.run_result.final_labels))
             self.result_summary.setText(
-                f"{decision.decision_status}; selected cells={decision.chosen.k}; "
-                "canonical wrapper verified; "
-                f"H2 conditional={decision.h2_conditional_probability:.3f}, "
-                f"odds={decision.h2_odds_vs_h1:.3f}; "
-                f"H3 conditional={decision.h3_conditional_probability:.3f}, "
-                f"odds={decision.h3_odds_vs_h2:.3f}"
+                f"processed; effective peaks={effective_count}; "
+                f"final instances={instance_count}; canonical wrapper verified"
             )
             self.display_analysis_tables()
         except Exception as error:
             self.run_result = None
             self.layers.clear_analysis()
             message = f"{type(error).__name__}: {error}"
-            if "every spatial hypothesis failed" in str(error):
-                message = "Every hypothesis failed hard gates. " + message
             self.result_summary.setText(
-                "Stage 3 fallback/error; probability analysis is not trustworthy."
+                "Stage 3 analysis failed; see the error details."
             )
             self.set_error(message + "\n" + traceback.format_exc())
         self._enforce_3d()
@@ -491,18 +461,6 @@ class Stage3AnalysisWidget(QWidget):
             for value in values:
                 combo.addItem(str(value), float(value))
             combo.blockSignals(False)
-        self.hypothesis_combo.blockSignals(True)
-        self.hypothesis_combo.clear()
-        for index, hypothesis in enumerate(
-            self.run_result.evaluation.all_hypotheses
-        ):
-            peak_ids = tuple(
-                peak.peak_id for peak in hypothesis.selected_peaks
-            )
-            self.hypothesis_combo.addItem(
-                f"H{hypothesis.k} #{index} — peaks {peak_ids}", index
-            )
-        self.hypothesis_combo.blockSignals(False)
 
     def peak_setting_changed(self, *_args) -> None:
         if (
@@ -526,30 +484,6 @@ class Stage3AnalysisWidget(QWidget):
         )
         self._enforce_3d()
 
-    def hypothesis_changed(self, *_args) -> None:
-        if (
-            self.run_result is None
-            or self.frame_selection is None
-            or self.source is None
-            or self.hypothesis_combo.currentIndex() < 0
-        ):
-            return
-        index = int(self.hypothesis_combo.currentData())
-        self._with_preserved_view(
-            lambda: render_hypothesis(
-                self.layers,
-                self.run_result,
-                self.frame_selection,
-                self.source.time_count,
-                index,
-                self.run_result.config.voxel_size_zyx_um,
-            )
-        )
-        summary = hypothesis_summary_text(self.run_result, index)
-        self.hypothesis_summary.setText(summary)
-        self.result_summary.setToolTip(summary)
-        self._enforce_3d()
-
     def display_analysis_tables(self) -> None:
         print("Raw peaks")
         display(raw_peaks_dataframe(self.run_result))
@@ -557,10 +491,6 @@ class Stage3AnalysisWidget(QWidget):
         display(peak_detections_dataframe(self.run_result))
         print("Pair evidence")
         display(pair_evidence_dataframe(self.run_result))
-        print("All H1/H2/H3 hypotheses (including weighted log contributions)")
-        display(all_hypotheses_dataframe(self.run_result))
-        print("Final hierarchical decision")
-        display(final_decision_dataframe(self.run_result))
 
 
 def add_stage3_analysis_widget(

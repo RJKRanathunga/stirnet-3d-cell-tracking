@@ -255,26 +255,49 @@ class PeakDiagnosticApiTests(unittest.TestCase):
 
         run = run_stage3_component(resolution, 1, config)
 
-        padding = config.component_padding_voxels
-        inner = tuple(
-            slice(padding, -padding) if padding else slice(None)
-            for _ in range(3)
-        )
-        np.testing.assert_array_equal(
-            run.decision.chosen.labels[inner], run.canonical.labels
+        np.testing.assert_array_equal(run.final_labels, run.canonical.final_labels)
+        self.assertEqual(
+            run.collapse_result.effective_peaks, run.canonical.effective_peaks
         )
         self.assertEqual(
-            run.decision.decision_status,
-            run.canonical.decision.decision_status,
+            run.marker_positions_zyx, run.canonical.marker_positions_zyx
         )
         self.assertEqual(
-            run.decision.chosen.k, len(run.canonical.selected_positions_zyx)
+            int(run.final_labels.max()), len(run.collapse_result.effective_peaks)
+        )
+
+    def test_arbitrary_effective_peak_count_uses_every_peak_as_final_marker(self) -> None:
+        shape = (11, 81, 61)
+        voxel = np.asarray(DEFAULT_CONFIG.voxel_size_zyx_um)
+        physical = np.indices(shape).transpose(1, 2, 3, 0) * voxel
+        center = np.asarray((5, 40, 30)) * voxel
+        component_mask = np.zeros(shape, dtype=bool)
+        for offset in (-7.2, -2.4, 2.4, 7.2):
+            lobe_center = center + np.asarray((0.0, offset, 0.0))
+            component_mask |= (
+                np.linalg.norm(physical - lobe_center, axis=-1) <= 2.8
+            )
+        resolution = resolve_target_components(
+            component_mask.astype(np.int32),
+            component_mask,
+            (1,),
+            display_padding=0,
+        )
+
+        run = run_stage3_component(resolution, 1, DEFAULT_CONFIG)
+
+        self.assertGreater(len(run.collapse_result.effective_peaks), 3)
+        self.assertEqual(
+            int(run.final_labels.max()), len(run.collapse_result.effective_peaks)
         )
         self.assertEqual(
-            tuple(peak.peak_id for peak in run.decision.chosen.selected_peaks),
+            run.marker_positions_zyx,
             tuple(
-                peak.peak_id
-                for peak in run.canonical.decision.chosen.selected_peaks
+                tuple(
+                    coordinate - DEFAULT_CONFIG.component_padding_voxels
+                    for coordinate in peak.position_zyx
+                )
+                for peak in run.collapse_result.effective_peaks
             ),
         )
 
@@ -305,6 +328,15 @@ class NotebookContractTests(unittest.TestCase):
         cls.layers_code = (package / "napari_layers.py").read_text(
             encoding="utf-8"
         )
+        cls.runner_code = (package / "runner.py").read_text(encoding="utf-8")
+        cls.models_code = (package / "models.py").read_text(encoding="utf-8")
+        cls.visualizer_code = (
+            cls.root
+            / "investigations"
+            / "stage_03_segmentation"
+            / "peak_selection"
+            / "visualize_effective_peaks_over_time.py"
+        ).read_text(encoding="utf-8")
 
     def test_notebook_json_and_each_python_cell_compile(self) -> None:
         self.assertEqual(self.notebook["nbformat"], 4)
@@ -368,14 +400,46 @@ class NotebookContractTests(unittest.TestCase):
             "Input | Raw", "Input | Preprocessed", "Mask | Saved", "Mask | Target",
             "Boundary | Target", "Prod | Labels", "Prod | Boundary", "Prod | Selected",
             "EDT | Raw", "EDT | Merge tree", "EDT | Watershed", "Peaks | Raw",
-            "Peaks | Effective", "Peaks | Selected", "Pairs | Evidence",
+            "Peaks | Effective", "Pairs | Evidence",
             "Peak scan | Smoothed EDT", "Peak scan | H-maxima", "Peak scan | Peaks",
-            "Hyp | Labels", "Hyp | Boundary", "Hyp | Markers", "Final | Labels",
-            "Final | Boundary", "Compare | Prod boundary",
+            "Final | Labels", "Final | Boundary", "Compare | Prod boundary",
+            "Compare | Trial boundary",
         }
         self.assertEqual(
             {name for name in required if name not in self.layers_code}, set()
         )
+
+    def test_no_hypothesis_controls_models_tables_or_layers_remain(self) -> None:
+        combined = "\n".join(
+            (self.widget_code, self.layers_code, self.runner_code, self.models_code)
+        )
+        forbidden = (
+            "Hypothesis",
+            "hypothesis",
+            "H1",
+            "H2",
+            "H3",
+            "posterior",
+            "conditional_probability",
+            "odds_vs",
+            "selected_peaks",
+            "decision_status",
+            "combination_prescore",
+            "Peaks | Selected",
+            "Hyp | Labels",
+            "Hyp | Boundary",
+            "Hyp | Markers",
+        )
+        for value in forbidden:
+            self.assertNotIn(value, combined)
+
+    def test_all_frame_visualizer_uses_effective_peaks_as_final_markers(self) -> None:
+        self.assertIn("CACHE_SCHEMA_VERSION = 3", self.visualizer_code)
+        self.assertIn('name="Effective peaks"', self.visualizer_code)
+        self.assertIn("out_of_slice_display=False", self.visualizer_code)
+        self.assertIn("Saved Stage 4 centroids", self.visualizer_code)
+        self.assertNotIn("selected_peak", self.visualizer_code)
+        self.assertNotIn("Current Stage 3 markers", self.visualizer_code)
 
 
 if __name__ == "__main__":

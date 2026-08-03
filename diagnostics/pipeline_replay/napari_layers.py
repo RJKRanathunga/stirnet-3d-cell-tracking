@@ -128,9 +128,9 @@ def add_debug_layers(viewer: Any, source, result, component_index: int = 0):
     debug_translate = tuple(float(value) * spacing for value, spacing in zip(component_origin, scale))
     layers = []
     for data, name in (
-        (component.raw_distance, "Debug | Raw distance"),
-        (component.watershed_distance, "Debug | Watershed distance"),
-        (component.merge_tree_distance, "Debug | Merge-tree distance"),
+        (component.raw_distance, "Debug | Raw EDT"),
+        (component.merge_tree_distance, "Debug | Merge-tree EDT"),
+        (component.watershed_distance, "Debug | Watershed EDT"),
     ):
         layers.append(_replace(viewer, "image", data, name=name, scale=scale, translate=debug_translate, visible=False))
     bbox_start_global = np.asarray([bounds[0] for bounds in component.bbox_zyx]) + np.asarray(result.work_origin_zyx)
@@ -145,7 +145,7 @@ def add_debug_layers(viewer: Any, source, result, component_index: int = 0):
         column: component.effective_peak_properties[column].to_numpy()
         for column in component.effective_peak_properties.columns
     }
-    layers.append(_replace(viewer, "points", local_points(component.effective_peak_positions_zyx), name="Debug | Effective peaks", scale=scale, translate=scene_translate, size=2.5, face_color="red", properties=effective_properties))
+    layers.append(_replace(viewer, "points", local_points(component.effective_peak_positions_zyx), name="Debug | Effective peaks (final markers)", scale=scale, translate=scene_translate, size=2.5, face_color="red", properties=effective_properties))
     peak_by_id = {
         int(peak_id): point
         for peak_id, point in zip(
@@ -163,14 +163,34 @@ def add_debug_layers(viewer: Any, source, result, component_index: int = 0):
         properties = {column: np.asarray([row[column] for row in valid_rows]) for column in component.pair_evidence.columns}
     if lines:
         layers.append(_replace(viewer, "shapes", lines, shape_type="line", name="Debug | Peak pair evidence", scale=scale, translate=scene_translate, edge_width=1, properties=properties))
-    for labels, name in (
-        (component.hypothesis_h1_labels, "Debug | H1 labels"),
-        (component.hypothesis_h2_labels, "Debug | H2 labels"),
-        (component.hypothesis_h3_labels, "Debug | H3 labels"),
-    ):
-        if labels is not None:
-            origin = tuple((bounds[0] + work) * spacing for bounds, work, spacing in zip(component.bbox_zyx, result.work_origin_zyx, scale))
-            layers.append(_replace(viewer, "labels", labels, name=name, scale=scale, translate=origin, visible=False))
+    final_origin = tuple(
+        (bounds[0] + work) * spacing
+        for bounds, work, spacing in zip(
+            component.bbox_zyx, result.work_origin_zyx, scale
+        )
+    )
+    layers.append(
+        _replace(
+            viewer,
+            "labels",
+            component.final_labels,
+            name="Debug | Final labels",
+            scale=scale,
+            translate=final_origin,
+            visible=False,
+        )
+    )
+    layers.append(
+        _replace(
+            viewer,
+            "labels",
+            find_boundaries(component.final_labels, mode="inner").astype(np.uint8),
+            name="Debug | Final boundaries",
+            scale=scale,
+            translate=final_origin,
+            visible=False,
+        )
+    )
     return layers
 
 

@@ -7,16 +7,15 @@ Run from the repository environment:
 The script:
 - reads the complete saved Stage 2 binary mask for each frame;
 - runs the canonical full-frame Stage 3 entry point with debug artifacts;
-- extracts raw peaks, effective peaks, and final selected markers from that
-  exact production execution;
+- extracts raw peaks and final effective-peak markers from that exact
+  production execution;
 - displays all effective peaks in one TZYX Napari points layer;
 - optionally overlays raw data, saved masks, saved labels, and production
   centroids;
 - caches the computed peak table so later launches are fast.
 
-It does not modify production artifacts or defaults. H1/H2/H3 is executed
-only because it is part of the canonical Stage 3 call; its selected markers
-are shown in a separate optional layer.
+It does not modify production artifacts or defaults. Effective peaks are the
+final Stage 3 watershed markers.
 """
 
 from __future__ import annotations
@@ -44,7 +43,7 @@ config_module = import_module("src.03_segmentation.config")
 
 DEFAULT_SEGMENTATION_CONFIG = config_module.DEFAULT_SEGMENTATION_CONFIG
 CONNECTIVITY_3D_6 = ndimage.generate_binary_structure(3, 1)
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -82,10 +81,9 @@ def compute_effective_peaks_for_frame(
     list[dict[str, object]],
     list[dict[str, object]],
     list[dict[str, object]],
-    list[dict[str, object]],
     FrameCounts,
 ]:
-    """Run canonical Stage 3 and extract its raw/effective/selected peak records.
+    """Run canonical Stage 3 and extract raw and effective marker records.
 
     This calls ``segment_instances_detailed`` on the complete saved Stage 2
     frame. Effective peaks are read from the exact component debug artifacts
@@ -99,13 +97,11 @@ def compute_effective_peaks_for_frame(
     result = pipeline_module.segment_instances_detailed(
         mask,
         config,
-        include_hypothesis_diagnostics=False,
         retain_debug_artifacts=True,
     )
 
     raw_rows: list[dict[str, object]] = []
     effective_rows: list[dict[str, object]] = []
-    selected_rows: list[dict[str, object]] = []
     failure_rows: list[dict[str, object]] = []
     padding = int(config.component_padding_voxels)
 
@@ -136,10 +132,6 @@ def compute_effective_peaks_for_frame(
         effective_ids = {
             int(peak.peak_id) for peak in artifact.effective_peaks
         }
-        selected_ids = {
-            int(peak.peak_id)
-            for peak in artifact.decision.chosen.selected_peaks
-        }
 
         def row_for_peak(peak, *, category: str) -> dict[str, object]:
             local_position = (
@@ -156,13 +148,9 @@ def compute_effective_peaks_for_frame(
                 "category": category,
                 "component_voxels": int(diagnostic.source_voxels),
                 "raw_peak_count": int(diagnostic.raw_peak_count),
-                "effective_peak_count": int(
-                    diagnostic.effective_lobe_count
-                ),
-                "selected_cell_count": int(
-                    diagnostic.selected_cell_count
-                ),
-                "decision_status": str(diagnostic.decision_status),
+                "effective_peak_count": int(diagnostic.effective_peak_count),
+                "instance_count": int(diagnostic.instance_count),
+                "processing_status": str(diagnostic.processing_status),
                 "raw_depth_um": float(peak.raw_depth_um),
                 "smoothed_depth_um": float(peak.smoothed_depth_um),
                 "scale_support": float(peak.scale_support),
@@ -171,20 +159,15 @@ def compute_effective_peaks_for_frame(
                 "detection_count": int(peak.detection_count),
                 "persistence_score": float(peak.persistence_score),
                 "is_effective": int(peak.peak_id) in effective_ids,
-                "is_selected": int(peak.peak_id) in selected_ids,
             }
 
         raw_rows.extend(
             row_for_peak(peak, category="raw")
-            for peak in artifact.peaks
+            for peak in artifact.raw_peaks
         )
         effective_rows.extend(
             row_for_peak(peak, category="effective")
             for peak in artifact.effective_peaks
-        )
-        selected_rows.extend(
-            row_for_peak(peak, category="selected")
-            for peak in artifact.decision.chosen.selected_peaks
         )
 
     counts = FrameCounts(
@@ -194,12 +177,12 @@ def compute_effective_peaks_for_frame(
             int(item.raw_peak_count) for item in result.component_diagnostics
         ),
         effective_peak_count=sum(
-            int(item.effective_lobe_count)
+            int(item.effective_peak_count)
             for item in result.component_diagnostics
         ),
         failed_component_count=len(failure_rows),
     )
-    return raw_rows, effective_rows, selected_rows, failure_rows, counts
+    return raw_rows, effective_rows, failure_rows, counts
 
 
 def compute_or_load_peak_cache(
@@ -209,7 +192,7 @@ def compute_or_load_peak_cache(
     frame_count: int,
     config=DEFAULT_SEGMENTATION_CONFIG,
     recompute: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load a valid cache or compute canonical peak tables frame by frame."""
 
     masking_dir = paths.processed_series(sample_id, "masking")
@@ -228,7 +211,6 @@ def compute_or_load_peak_cache(
     fingerprint = _config_fingerprint(config)
     raw_path = cache_dir / f"raw_peaks_{frame_count}f_{fingerprint}.csv"
     peak_path = cache_dir / f"effective_peaks_{frame_count}f_{fingerprint}.csv"
-    selected_path = cache_dir / f"selected_peaks_{frame_count}f_{fingerprint}.csv"
     failure_path = cache_dir / f"failures_{frame_count}f_{fingerprint}.csv"
     count_path = cache_dir / f"frame_counts_{frame_count}f_{fingerprint}.csv"
     metadata_path = cache_dir / f"metadata_{frame_count}f_{fingerprint}.json"
@@ -246,7 +228,6 @@ def compute_or_load_peak_cache(
         not recompute
         and raw_path.is_file()
         and peak_path.is_file()
-        and selected_path.is_file()
         and failure_path.is_file()
         and count_path.is_file()
         and metadata_path.is_file()
@@ -257,34 +238,30 @@ def compute_or_load_peak_cache(
             return (
                 pd.read_csv(raw_path),
                 pd.read_csv(peak_path),
-                pd.read_csv(selected_path),
                 pd.read_csv(failure_path),
                 pd.read_csv(count_path),
             )
 
     all_raw: list[dict[str, object]] = []
     all_peaks: list[dict[str, object]] = []
-    all_selected: list[dict[str, object]] = []
     all_failures: list[dict[str, object]] = []
     all_counts: list[dict[str, object]] = []
 
     for frame, mask_path in enumerate(mask_files):
         print(f"[effective peaks] frame {frame + 1}/{frame_count}: {mask_path.name}")
         binary_mask = load_npy(mask_path, expected_ndim=3)
-        raw, peaks, selected, failures, counts = compute_effective_peaks_for_frame(
+        raw, peaks, failures, counts = compute_effective_peaks_for_frame(
             binary_mask,
             frame=frame,
             config=config,
         )
         all_raw.extend(raw)
         all_peaks.extend(peaks)
-        all_selected.extend(selected)
         all_failures.extend(failures)
         all_counts.append(counts.__dict__)
 
     raw_table = pd.DataFrame(all_raw)
     peak_table = pd.DataFrame(all_peaks)
-    selected_table = pd.DataFrame(all_selected)
     failure_table = pd.DataFrame(
         all_failures,
         columns=(
@@ -299,7 +276,6 @@ def compute_or_load_peak_cache(
 
     raw_table.to_csv(raw_path, index=False)
     peak_table.to_csv(peak_path, index=False)
-    selected_table.to_csv(selected_path, index=False)
     failure_table.to_csv(failure_path, index=False)
     count_table.to_csv(count_path, index=False)
     with metadata_path.open("w", encoding="utf-8") as file:
@@ -307,7 +283,7 @@ def compute_or_load_peak_cache(
         file.write("\n")
 
     print(f"[effective peaks] cache written to {cache_dir}")
-    return raw_table, peak_table, selected_table, failure_table, count_table
+    return raw_table, peak_table, failure_table, count_table
 
 
 def load_production_centroids(
@@ -363,7 +339,6 @@ def launch_viewer(
     frame_count: int,
     raw_peak_table: pd.DataFrame,
     peak_table: pd.DataFrame,
-    selected_peak_table: pd.DataFrame,
     failure_table: pd.DataFrame,
     count_table: pd.DataFrame,
     show_binary: bool,
@@ -451,23 +426,6 @@ def launch_viewer(
             peak_table,
             excluded=("frame", "z", "y", "x"),
         ),
-    )
-
-    viewer.add_points(
-        table_points(selected_peak_table),
-        name="Current Stage 3 markers",
-        scale=scale_tzyx,
-        size=max(1.0, float(point_size) * 1.35),
-        symbol="ring",
-        face_color="transparent",
-        border_color="magenta",
-        border_width=0.18,
-        out_of_slice_display=False,
-        properties=_properties(
-            selected_peak_table,
-            excluded=("frame", "z", "y", "x"),
-        ),
-        visible=False,
     )
 
     production_centroids = pd.DataFrame()
@@ -598,7 +556,7 @@ def main() -> None:
         raise ValueError("--frames must be positive")
 
     paths = PipelinePaths.discover()
-    raw_peak_table, peak_table, selected_peak_table, failure_table, count_table = compute_or_load_peak_cache(
+    raw_peak_table, peak_table, failure_table, count_table = compute_or_load_peak_cache(
         paths=paths,
         sample_id=args.sample_id,
         frame_count=args.frames,
@@ -617,7 +575,6 @@ def main() -> None:
         frame_count=args.frames,
         raw_peak_table=raw_peak_table,
         peak_table=peak_table,
-        selected_peak_table=selected_peak_table,
         failure_table=failure_table,
         count_table=count_table,
         show_binary=not args.no_binary,

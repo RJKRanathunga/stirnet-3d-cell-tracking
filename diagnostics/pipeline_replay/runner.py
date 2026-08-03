@@ -196,18 +196,24 @@ class PipelineReplayRunner:
         detailed = segmentation_module.segment_instances_detailed(
             complete_relevant_mask,
             self.state.segmentation_config,
-            include_hypothesis_diagnostics=True,
             retain_debug_artifacts=True,
         )
-        self._labels_work = detailed.instance_labels
+        self._labels_work = detailed.final_labels
         self._markers_work = detailed.markers
         self.state.trial_labels = self._labels_work
         self.state.trial_markers = self._markers_work
         self.state.connected_components = components
         self.state.relevant_component_ids = relevant
         padding = self.state.segmentation_config.component_padding_voxels
+        diagnostics_by_component = {
+            item.component_id: item for item in detailed.component_diagnostics
+        }
         self.state.component_results = tuple(
-            component_debug_result(artifact, padding)
+            component_debug_result(
+                artifact,
+                diagnostics_by_component[artifact.component_id],
+                padding,
+            )
             for artifact in detailed.component_debug_artifacts
         )
 

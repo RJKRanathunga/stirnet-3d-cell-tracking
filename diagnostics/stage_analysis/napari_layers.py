@@ -20,14 +20,10 @@ ANALYSIS_LAYER_NAMES = {
     "EDT | Watershed",
     "Peaks | Raw",
     "Peaks | Effective",
-    "Peaks | Selected",
     "Pairs | Evidence",
     "Peak scan | Smoothed EDT",
     "Peak scan | H-maxima",
     "Peak scan | Peaks",
-    "Hyp | Labels",
-    "Hyp | Boundary",
-    "Hyp | Markers",
     "Final | Labels",
     "Final | Boundary",
     "Compare | Prod boundary",
@@ -204,7 +200,6 @@ def peak_properties(peaks, run: Stage3ComponentRun) -> dict[str, list]:
     effective = {
         peak.peak_id for peak in run.collapse_result.effective_peaks
     }
-    selected = {peak.peak_id for peak in run.decision.chosen.selected_peaks}
     return {
         "peak_id": [peak.peak_id for peak in peaks],
         "raw_depth": [peak.raw_depth_um for peak in peaks],
@@ -216,7 +211,6 @@ def peak_properties(peaks, run: Stage3ComponentRun) -> dict[str, list]:
         "persistence_score": [peak.persistence_score for peak in peaks],
         "retained": [peak.peak_id in effective for peak in peaks],
         "collapsed": [peak.peak_id not in effective for peak in peaks],
-        "selected": [peak.peak_id in selected for peak in peaks],
     }
 
 
@@ -366,7 +360,6 @@ def render_analysis_layers(
 
     add_peak_layer("Peaks | Raw", run.peak_analysis.peaks, 5)
     add_peak_layer("Peaks | Effective", run.collapse_result.effective_peaks, 7)
-    add_peak_layer("Peaks | Selected", run.decision.chosen.selected_peaks, 9)
 
     by_id = {peak.peak_id: peak for peak in run.peak_analysis.peaks}
     property_names = (
@@ -426,7 +419,7 @@ def render_analysis_layers(
         **common,
     )
 
-    final_labels = embed_component(run.canonical.labels, bbox, crop)
+    final_labels = embed_component(run.final_labels, bbox, crop)
     trial_boundary = find_boundaries(final_labels, mode="inner")
     production_boundary = find_boundaries(
         frame.production_frame.instance_labels[crop], mode="inner"
@@ -523,59 +516,6 @@ def render_peak_setting(
     )
 
 
-def render_hypothesis(
-    manager: Stage3LayerManager,
-    run: Stage3ComponentRun,
-    frame: Stage3FrameSelection,
-    time_count: int,
-    hypothesis_index: int,
-    voxel_size,
-) -> None:
-    crop, bbox = frame.display_crop, run.component_bbox
-    time_index = frame.scene_time_index
-    padding = run.config.component_padding_voxels
-    inner = tuple(
-        slice(padding, -padding) if padding else slice(None) for _ in range(3)
-    )
-    hypothesis = run.evaluation.all_hypotheses[int(hypothesis_index)]
-    labels = embed_component(
-        hypothesis.labels[inner].astype(np.int32), bbox, crop
-    )
-    common = _common_layer_kwargs(frame, voxel_size)
-    manager.add(
-        "add_labels",
-        current_tzyx(labels, time_count, time_index),
-        "Hyp | Labels",
-        opacity=0.50,
-        **common,
-    )
-    manager.add(
-        "add_labels",
-        current_tzyx(
-            find_boundaries(labels, mode="inner").astype(np.uint8),
-            time_count,
-            time_index,
-        ),
-        "Hyp | Boundary",
-        **common,
-    )
-    points = [
-        padded_peak_to_crop(peak.position_zyx, bbox, crop, padding)
-        for peak in hypothesis.selected_peaks
-    ]
-    manager.add(
-        "add_points",
-        _time_points(points, time_index),
-        "Hyp | Markers",
-        size=9,
-        properties={
-            "peak_id": [peak.peak_id for peak in hypothesis.selected_peaks]
-        },
-        text={"string": "{peak_id}", "color": "white"},
-        **common,
-    )
-
-
 __all__ = [
     "ANALYSIS_LAYER_NAMES",
     "OWNER",
@@ -584,7 +524,6 @@ __all__ = [
     "current_tzyx",
     "remove_owned_layers",
     "render_analysis_layers",
-    "render_hypothesis",
     "render_input_layers",
     "render_peak_setting",
     "restore_camera",
