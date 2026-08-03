@@ -95,6 +95,27 @@ class SegmentationResult:
     component_diagnostics: tuple[ComponentDiagnostic, ...]
     hypothesis_diagnostics: tuple[HypothesisDiagnostic, ...]
     instance_component_map: tuple[InstanceComponentMapping, ...]
+    component_debug_artifacts: tuple["ComponentDebugArtifacts", ...] = ()
+
+
+@dataclass(frozen=True)
+class ComponentDebugArtifacts:
+    """Large arrays retained only for an explicitly diagnostic invocation."""
+
+    component_id: int
+    bbox_zyx: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+    component_mask: np.ndarray
+    padded_component_mask: np.ndarray
+    raw_distance: np.ndarray
+    watershed_distance: np.ndarray
+    merge_tree_distance: np.ndarray
+    peaks: tuple[PeakCandidate, ...]
+    effective_peaks: tuple[PeakCandidate, ...]
+    pair_evidence: tuple[PairEvidence, ...]
+    hypotheses: tuple[SplitHypothesis, ...]
+    selected_positions_zyx: tuple[tuple[int, int, int], ...]
+    selected_labels: np.ndarray
+    decision: HypothesisDecision
 
 
 @dataclass(frozen=True)
@@ -108,11 +129,14 @@ class ComponentAnalysis:
     pair_evidence: tuple[PairEvidence, ...]
     evaluation: HypothesisEvaluation
     decision: HypothesisDecision
+    debug_artifacts: ComponentDebugArtifacts | None = None
 
 
 def analyze_component_crop(
     component_mask: np.ndarray,
     config: SegmentationConfig = DEFAULT_SEGMENTATION_CONFIG,
+    *,
+    retain_debug_artifacts: bool = False,
 ) -> ComponentAnalysis:
     """Run spatial-only probabilistic inference on one tight component crop."""
 
@@ -163,6 +187,24 @@ def analyze_component_crop(
         for peak in decision.chosen.selected_peaks
     )
     _validate_local_result(component_mask, chosen_labels, selected_positions)
+    debug_artifacts = None
+    if retain_debug_artifacts:
+        debug_artifacts = ComponentDebugArtifacts(
+            component_id=0,
+            bbox_zyx=((0, component_mask.shape[0]), (0, component_mask.shape[1]), (0, component_mask.shape[2])),
+            component_mask=component_mask,
+            padded_component_mask=padded_mask,
+            raw_distance=peak_analysis.raw_distance,
+            watershed_distance=peak_analysis.watershed_distance,
+            merge_tree_distance=peak_analysis.merge_tree_distance,
+            peaks=peak_analysis.peaks,
+            effective_peaks=collapsed.effective_peaks,
+            pair_evidence=pair_evidence,
+            hypotheses=evaluation.best_by_k,
+            selected_positions_zyx=selected_positions,
+            selected_labels=chosen_labels,
+            decision=decision,
+        )
     return ComponentAnalysis(
         chosen_labels,
         selected_positions,
@@ -171,6 +213,7 @@ def analyze_component_crop(
         pair_evidence,
         evaluation,
         decision,
+        debug_artifacts,
     )
 
 
@@ -302,6 +345,7 @@ def segment_instances_detailed(
     config: SegmentationConfig = DEFAULT_SEGMENTATION_CONFIG,
     *,
     include_hypothesis_diagnostics: bool = False,
+    retain_debug_artifacts: bool = False,
 ) -> SegmentationResult:
     """Segment a 3-D mask and return aligned markers plus compact diagnostics.
 
@@ -323,6 +367,7 @@ def segment_instances_detailed(
     component_diagnostics: list[ComponentDiagnostic] = []
     hypothesis_diagnostics: list[HypothesisDiagnostic] = []
     instance_mapping: list[InstanceComponentMapping] = []
+    component_debug_artifacts: list[ComponentDebugArtifacts] = []
     next_instance_id = 1
 
     for component_id, component_slice in enumerate(component_slices, start=1):
@@ -333,7 +378,11 @@ def segment_instances_detailed(
         error_message: str | None = None
 
         try:
-            analysis = analyze_component_crop(local_component, config)
+            analysis = analyze_component_crop(
+                local_component,
+                config,
+                retain_debug_artifacts=retain_debug_artifacts,
+            )
             local_labels = analysis.labels
             selected_positions = analysis.selected_positions_zyx
             decision_status = analysis.decision.decision_status
@@ -386,6 +435,26 @@ def segment_instances_detailed(
             (int(axis_slice.start), int(axis_slice.stop))
             for axis_slice in component_slice
         )
+        if error_message is None and analysis.debug_artifacts is not None:
+            artifact = analysis.debug_artifacts
+            component_debug_artifacts.append(
+                ComponentDebugArtifacts(
+                    component_id=component_id,
+                    bbox_zyx=bbox,  # type: ignore[arg-type]
+                    component_mask=artifact.component_mask,
+                    padded_component_mask=artifact.padded_component_mask,
+                    raw_distance=artifact.raw_distance,
+                    watershed_distance=artifact.watershed_distance,
+                    merge_tree_distance=artifact.merge_tree_distance,
+                    peaks=artifact.peaks,
+                    effective_peaks=artifact.effective_peaks,
+                    pair_evidence=artifact.pair_evidence,
+                    hypotheses=artifact.hypotheses,
+                    selected_positions_zyx=artifact.selected_positions_zyx,
+                    selected_labels=artifact.selected_labels,
+                    decision=artifact.decision,
+                )
+            )
         component_diagnostics.append(
             ComponentDiagnostic(
                 component_id=component_id,
@@ -444,6 +513,7 @@ def segment_instances_detailed(
         tuple(component_diagnostics),
         tuple(hypothesis_diagnostics),
         tuple(instance_mapping),
+        tuple(component_debug_artifacts),
     )
 
 

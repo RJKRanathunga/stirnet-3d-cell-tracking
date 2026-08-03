@@ -8,15 +8,20 @@ from .connected_components import (
 import numpy as np
 
 from src.diagnostics import StageTrace
+from .config import DEFAULT_MASKING_CONFIG, MaskingConfig
 
 
 def create_binary_mask(
-        volume: np.ndarray,
-        *,
-        return_diagnostics: bool = False,
+    volume: np.ndarray,
+    *,
+    config: MaskingConfig = DEFAULT_MASKING_CONFIG,
+    return_diagnostics: bool = False,
 ):
 
-    threshold = compute_otsu_threshold(volume)
+    base_threshold = compute_otsu_threshold(volume)
+    threshold = (
+        base_threshold * config.threshold_multiplier + config.threshold_offset
+    )
 
     binary_mask = apply_threshold(
         volume,
@@ -27,9 +32,17 @@ def create_binary_mask(
         return binary_mask
     trace = StageTrace(
         stage_name="02_masking",
-        inputs={"volume": volume},
+        inputs={"volume": volume, "config": config},
         outputs={"binary_mask": binary_mask},
-        intermediates={"threshold": threshold},
-        metrics={"foreground_voxels": int(np.count_nonzero(binary_mask))},
+        intermediates={
+            "base_otsu_threshold": float(base_threshold),
+            "effective_threshold": float(threshold),
+            "binary_mask": binary_mask,
+        },
+        metrics={
+            "base_otsu_threshold": float(base_threshold),
+            "effective_threshold": float(threshold),
+            "foreground_voxels": int(np.count_nonzero(binary_mask)),
+        },
     )
     return binary_mask, trace
