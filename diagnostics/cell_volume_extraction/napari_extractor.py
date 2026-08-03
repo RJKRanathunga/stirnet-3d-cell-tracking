@@ -21,9 +21,12 @@ from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
     QCheckBox,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -272,13 +275,33 @@ class CellVolumeExtractorWidget(QWidget):
     # --------------------------------------------------------
 
     def _build_ui(self, default_box_size: np.ndarray) -> None:
-        layout = QVBoxLayout(self)
+        # The dock receives this outer layout. It contains only the scroll area,
+        # allowing the complete control panel to become smaller than its contents.
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.scroll_area = QScrollArea(self)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_area.setMinimumHeight(0)
+
+        self.scroll_content = QWidget()
+        self.scroll_content.setMinimumWidth(0)
+        self.scroll_content.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Preferred,
+        )
+
+        layout = QVBoxLayout(self.scroll_content)
+        layout.setContentsMargins(8, 8, 8, 8)
 
         self.frame_label = QLabel()
         self.frame_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.frame_label)
 
         form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
 
         self.cell_id_spin = QSpinBox()
         self.cell_id_spin.setRange(0, 2_147_483_647)
@@ -296,41 +319,63 @@ class CellVolumeExtractorWidget(QWidget):
 
         layout.addLayout(form)
 
-        self.auto_update_checkbox = QCheckBox("Update preview when box size changes")
+        self.auto_update_checkbox = QCheckBox(
+            "Update preview when box size changes"
+        )
         self.auto_update_checkbox.setChecked(True)
         layout.addWidget(self.auto_update_checkbox)
 
-        self.overwrite_checkbox = QCheckBox("Overwrite an existing extraction")
+        self.overwrite_checkbox = QCheckBox(
+            "Overwrite an existing extraction"
+        )
         self.overwrite_checkbox.setChecked(False)
         layout.addWidget(self.overwrite_checkbox)
 
-        button_row = QHBoxLayout()
+        # A grid is more responsive than three buttons in one horizontal row.
+        button_grid = QGridLayout()
+
         self.preview_button = QPushButton("Preview box")
         self.extract_button = QPushButton(f"Extract ({self.extract_key})")
         self.clear_button = QPushButton("Clear")
 
-        button_row.addWidget(self.preview_button)
-        button_row.addWidget(self.extract_button)
-        button_row.addWidget(self.clear_button)
-        layout.addLayout(button_row)
+        button_grid.addWidget(self.preview_button, 0, 0)
+        button_grid.addWidget(self.extract_button, 0, 1)
+        button_grid.addWidget(self.clear_button, 1, 0, 1, 2)
 
-        artifacts_label = QLabel(
+        layout.addLayout(button_grid)
+
+        artifacts_label = self._make_wrapping_label(
             "Will save: " + ", ".join(self.available_artifacts())
         )
-        artifacts_label.setWordWrap(True)
-        artifacts_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(artifacts_label)
 
-        output_label = QLabel(f"Output: {self.output_dir}")
-        output_label.setWordWrap(True)
-        output_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        output_label = self._make_wrapping_label(
+            f"Output: {self.output_dir}"
+        )
         layout.addWidget(output_label)
 
-        self.status_label = QLabel()
-        self.status_label.setWordWrap(True)
-        self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.status_label = self._make_wrapping_label("")
         layout.addWidget(self.status_label)
+
         layout.addStretch(1)
+
+        self.scroll_area.setWidget(self.scroll_content)
+        outer_layout.addWidget(self.scroll_area)
+
+    @staticmethod
+    def _make_wrapping_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setMinimumWidth(0)
+
+        # Ignoring the label's horizontal size hint allows Qt to narrow it and
+        # recalculate the required wrapped height instead of forcing dock width.
+        label.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Preferred,
+        )
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        return label
 
     @staticmethod
     def _make_size_spin(value: int) -> QSpinBox:
@@ -339,6 +384,11 @@ class CellVolumeExtractorWidget(QWidget):
         spin.setSingleStep(2)
         spin.setKeyboardTracking(False)
         spin.setValue(value)
+        spin.setMinimumWidth(0)
+        spin.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Fixed,
+        )
         return spin
 
     def available_artifacts(self) -> list[str]:

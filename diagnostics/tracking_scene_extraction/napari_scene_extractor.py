@@ -16,14 +16,14 @@ try:
     from qtpy.QtCore import Qt
     from qtpy.QtWidgets import (
         QComboBox,
-        QFormLayout,
         QGridLayout,
         QGroupBox,
-        QHBoxLayout,
         QLabel,
         QLineEdit,
-        QPushButton,
         QPlainTextEdit,
+        QPushButton,
+        QScrollArea,
+        QSizePolicy,
         QSpinBox,
         QVBoxLayout,
         QWidget,
@@ -590,74 +590,136 @@ class TrackingSceneExtractorWidget(QWidget):
         self._update_summary()
 
     def _build_ui(self) -> None:
-        root = QVBoxLayout()
-        self.setLayout(root)
+        """Build a responsive, vertically scrollable dock-widget interface."""
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.current_frame_label = QLabel("Current frame: -")
-        root.addWidget(self.current_frame_label)
+        self.scroll_area = QScrollArea(self)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_area.setMinimumHeight(0)
 
-        selection_group = QGroupBox("Frame selection")
-        selection_layout = QVBoxLayout()
-        selection_group.setLayout(selection_layout)
+        self.scroll_content = QWidget()
+        self.scroll_content.setMinimumWidth(0)
+        self.scroll_content.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Preferred,
+        )
+
+        layout = QVBoxLayout(self.scroll_content)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self.current_frame_label = self._make_wrapping_label("")
+        layout.addWidget(self.current_frame_label)
+
+        frame_group = QGroupBox("Frame selection")
+        frame_layout = QVBoxLayout(frame_group)
 
         self.cell_ids_input = QLineEdit()
-        self.cell_ids_input.setPlaceholderText("Cell IDs, for example: 42, 47")
-        selection_layout.addWidget(self.cell_ids_input)
+        self.cell_ids_input.setPlaceholderText(
+            "Cell IDs, for example: 42, 47"
+        )
+        self.cell_ids_input.setMinimumWidth(0)
+        self.cell_ids_input.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Fixed,
+        )
+        frame_layout.addWidget(self.cell_ids_input)
 
-        selection_buttons = QHBoxLayout()
+        frame_button_grid = QGridLayout()
         self.save_frame_button = QPushButton("Save frame selection")
         self.remove_frame_button = QPushButton("Remove current frame")
-        selection_buttons.addWidget(self.save_frame_button)
-        selection_buttons.addWidget(self.remove_frame_button)
-        selection_layout.addLayout(selection_buttons)
-
         self.clear_button = QPushButton("Clear scene selection")
-        selection_layout.addWidget(self.clear_button)
-        root.addWidget(selection_group)
 
-        crop_group = QGroupBox("Scene crop padding (voxels)")
-        crop_layout = QGridLayout()
-        crop_group.setLayout(crop_layout)
+        frame_button_grid.addWidget(self.save_frame_button, 0, 0)
+        frame_button_grid.addWidget(self.remove_frame_button, 0, 1)
+        frame_button_grid.addWidget(self.clear_button, 1, 0, 1, 2)
+        frame_button_grid.setColumnStretch(0, 1)
+        frame_button_grid.setColumnStretch(1, 1)
+        frame_layout.addLayout(frame_button_grid)
+
+        layout.addWidget(frame_group)
+
+        padding_group = QGroupBox("Scene crop padding (voxels)")
+        padding_layout = QGridLayout(padding_group)
 
         self.padding_spins: list[QSpinBox] = []
-        for column, (axis, default) in enumerate(
+        for column, (axis, value) in enumerate(
             zip(("Z", "Y", "X"), self.default_padding_zyx)
         ):
-            crop_layout.addWidget(QLabel(axis), 0, column)
+            axis_label = QLabel(axis)
             spin = QSpinBox()
-            spin.setRange(0, 4096)
-            spin.setValue(int(default))
-            crop_layout.addWidget(spin, 1, column)
+            spin.setRange(0, 100_000)
+            spin.setKeyboardTracking(False)
+            spin.setValue(int(value))
+            spin.setMinimumWidth(0)
+            spin.setSizePolicy(
+                QSizePolicy.Expanding,
+                QSizePolicy.Fixed,
+            )
+
+            padding_layout.addWidget(axis_label, 0, column)
+            padding_layout.addWidget(spin, 1, column)
+            padding_layout.setColumnStretch(column, 1)
             self.padding_spins.append(spin)
-        root.addWidget(crop_group)
+
+        layout.addWidget(padding_group)
 
         save_group = QGroupBox("Save scene")
-        save_layout = QFormLayout()
-        save_group.setLayout(save_layout)
+        save_layout = QGridLayout(save_group)
 
-        category_row = QWidget()
-        category_layout = QHBoxLayout()
-        category_layout.setContentsMargins(0, 0, 0, 0)
-        category_row.setLayout(category_layout)
+        category_label = QLabel("Category")
         self.category_combo = QComboBox()
-        self.refresh_categories_button = QPushButton("Refresh")
-        category_layout.addWidget(self.category_combo, 1)
-        category_layout.addWidget(self.refresh_categories_button)
-        save_layout.addRow("Category", category_row)
+        self.category_combo.setMinimumWidth(0)
+        self.category_combo.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Fixed,
+        )
 
+        self.refresh_categories_button = QPushButton("Refresh")
         self.save_scene_button = QPushButton("Save scene")
-        save_layout.addRow(self.save_scene_button)
-        root.addWidget(save_group)
+
+        save_layout.addWidget(category_label, 0, 0)
+        save_layout.addWidget(self.category_combo, 0, 1)
+        save_layout.addWidget(self.refresh_categories_button, 0, 2)
+        save_layout.addWidget(self.save_scene_button, 1, 0, 1, 3)
+        save_layout.setColumnStretch(1, 1)
+
+        layout.addWidget(save_group)
 
         self.summary = QPlainTextEdit()
         self.summary.setReadOnly(True)
-        self.summary.setMinimumHeight(160)
-        root.addWidget(self.summary)
+        self.summary.setMinimumWidth(0)
+        self.summary.setMinimumHeight(130)
+        self.summary.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Preferred,
+        )
+        layout.addWidget(self.summary)
 
-        self.root_path_label = QLabel(f"Save root:\n{self.model.save_root}")
-        self.root_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.root_path_label.setWordWrap(True)
-        root.addWidget(self.root_path_label)
+        save_root_label = self._make_wrapping_label(
+            f"Save root:\n{self.model.save_root}"
+        )
+        layout.addWidget(save_root_label)
+
+        layout.addStretch(1)
+
+        self.scroll_area.setWidget(self.scroll_content)
+        outer_layout.addWidget(self.scroll_area)
+
+    @staticmethod
+    def _make_wrapping_label(text: str) -> QLabel:
+        """Create a label that can shrink and wrap inside a narrow dock."""
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setMinimumWidth(0)
+        label.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Preferred,
+        )
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        return label
 
     def _connect_events(self) -> None:
         self.save_frame_button.clicked.connect(self._save_current_frame)
@@ -682,21 +744,33 @@ class TrackingSceneExtractorWidget(QWidget):
         return tuple(spin.value() for spin in self.padding_spins)
 
     def _notify(self, level: str, message: str) -> None:
+        """Display a Napari GUI notification.
+        Fall back to stdout only when Napari's notification API is unavailable.
+        """
         try:
             from napari.utils.notifications import (
                 show_error,
                 show_info,
                 show_warning,
             )
-
-            functions = {
-                "error": show_error,
-                "warning": show_warning,
-                "info": show_info,
-            }
-            functions[level](message)
-        except Exception:
+        except ImportError:
             print(f"[{level.upper()}] {message}")
+            return
+
+        notification_functions = {
+            "error": show_error,
+            "warning": show_warning,
+            "info": show_info,
+        }
+
+        try:
+            notification_function = notification_functions[level]
+        except KeyError as error:
+            raise ValueError(
+                f"Unsupported notification level: {level!r}"
+            ) from error
+
+        notification_function(message)
 
     def _on_dims_changed(self, event: Any = None) -> None:
         self._update_frame_label()
