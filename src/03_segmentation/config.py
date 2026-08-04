@@ -26,6 +26,90 @@ def _default_pair_feature_models() -> tuple[PairFeatureModel, ...]:
 
 
 @dataclass(frozen=True)
+class CenterCandidateConfig:
+    """Provisional thresholds for cheap center-proposal detection.
+
+    These values control transform agreement and proposal representation. They
+    are candidate-detection thresholds, not biological cell measurements.
+    Distances and LoG scales are expressed in micrometres.
+    """
+
+    shape_sigma_levels_um: tuple[float, ...] = (0.8, 1.2, 1.25, 1.6, 2.2)
+    shape_padding_sigma_multiplier: float = 4.0
+    shape_peak_h_fraction: float = 0.08
+    shape_peak_min_relative_response: float = 0.18
+    shape_peak_cluster_radius_um: float = 1.8
+    shape_peak_min_scale_support: float = 0.2
+    shape_center_neighborhood_radius_um: float = 1.8
+
+    cross_transform_match_radius_um: float = 1.4
+
+    proposal_min_absolute_separation_um: float = 2.8
+    proposal_min_normalized_separation: float = 0.62
+    proposal_radius_from_sigma_factor: float = 3.0**0.5
+
+    cross_min_raw_persistence: float = 0.32
+    cross_min_shape_relative_response: float = 0.45
+    cross_min_shape_scale_support: float = 0.2
+
+    shape_only_min_relative_response: float = 0.82
+    shape_only_min_scale_support: float = 0.4
+    shape_only_min_local_depth_ratio: float = 0.78
+
+    raw_only_min_persistence: float = 0.55
+    raw_only_min_setting_support: float = 0.2
+    raw_only_min_depth_ratio: float = 0.55
+    raw_only_min_branch_persistence: float = 0.24
+    raw_only_min_separation_support: float = 0.45
+
+    def __post_init__(self) -> None:
+        if not self.shape_sigma_levels_um or any(
+            not isfinite(float(value)) or float(value) <= 0
+            for value in self.shape_sigma_levels_um
+        ):
+            raise ValueError("shape_sigma_levels_um must be nonempty and positive")
+        positive = (
+            "shape_padding_sigma_multiplier",
+            "shape_peak_cluster_radius_um",
+            "shape_center_neighborhood_radius_um",
+            "cross_transform_match_radius_um",
+            "proposal_min_absolute_separation_um",
+            "proposal_radius_from_sigma_factor",
+        )
+        for name in positive:
+            value = float(getattr(self, name))
+            if not isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive")
+        normalized = (
+            "shape_peak_h_fraction",
+            "shape_peak_min_relative_response",
+            "shape_peak_min_scale_support",
+            "proposal_min_normalized_separation",
+            "cross_min_raw_persistence",
+            "cross_min_shape_relative_response",
+            "cross_min_shape_scale_support",
+            "shape_only_min_relative_response",
+            "shape_only_min_scale_support",
+            "shape_only_min_local_depth_ratio",
+            "raw_only_min_persistence",
+            "raw_only_min_setting_support",
+            "raw_only_min_depth_ratio",
+            "raw_only_min_branch_persistence",
+            "raw_only_min_separation_support",
+        )
+        for name in normalized:
+            value = float(getattr(self, name))
+            if not isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if self.shape_peak_h_fraction <= 0:
+            raise ValueError("shape_peak_h_fraction must be positive")
+        if self.shape_only_min_relative_response < self.cross_min_shape_relative_response:
+            raise ValueError("shape-only response threshold must be at least cross-transform threshold")
+        if self.shape_only_min_scale_support < self.cross_min_shape_scale_support:
+            raise ValueError("shape-only scale support must be at least cross-transform support")
+
+
+@dataclass(frozen=True)
 class GeometricCompletionConfig:
     """Conservative physical thresholds for supplemental body markers.
 
@@ -72,9 +156,9 @@ class GeometricCompletionConfig:
     marker_search_radius_um: float = 2.4
     min_body_score: float = 0.58
 
-    eligibility_min_volume_per_marker_um3: float = 130.0
-    eligibility_min_extent_per_marker_um: float = 7.5
-    eligibility_max_unrepresented_distance_um: float = 4.0
+    candidate_detection: CenterCandidateConfig = field(
+        default_factory=CenterCandidateConfig
+    )
 
     def __post_init__(self) -> None:
         positive = (
@@ -92,9 +176,6 @@ class GeometricCompletionConfig:
             "representation_ellipsoid_radius",
             "marker_min_separation_um",
             "marker_search_radius_um",
-            "eligibility_min_volume_per_marker_um3",
-            "eligibility_min_extent_per_marker_um",
-            "eligibility_max_unrepresented_distance_um",
         )
         for name in positive:
             value = float(getattr(self, name))

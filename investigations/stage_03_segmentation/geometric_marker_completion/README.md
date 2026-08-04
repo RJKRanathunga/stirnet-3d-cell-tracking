@@ -11,9 +11,15 @@ Run one saved 3-D binary component mask:
 .\.venv\Scripts\python.exe investigations\stage_03_segmentation\geometric_marker_completion\run_component_analysis.py path\to\mask.npy
 ```
 
-Use `--force-geometric-analysis` to bypass only the cheap size eligibility
-gate in a focused validation. This does not change the production default: all
-eligible components run geometry normally.
+Use `--force-geometric-analysis` to run geometry regardless of the peak-based
+candidate result in a focused validation. This diagnostic override does not
+disable or change production candidate selection.
+
+Benchmark one or more frames from a ZYX or TZYX NumPy mask:
+
+```powershell
+.\.venv\Scripts\python.exe investigations\stage_03_segmentation\geometric_marker_completion\benchmark_candidate_detection.py path\to\mask.npy --frames 0,1 --csv outputs\candidate_benchmark.csv
+```
 
 Summarize any generated case directories:
 
@@ -21,7 +27,8 @@ Summarize any generated case directories:
 .\.venv\Scripts\python.exe investigations\stage_03_segmentation\geometric_marker_completion\summarize_results.py
 ```
 
-Outputs include effective EDT peaks, caps, candidate and selected bodies,
-cross-sections, supplemental/final markers, rejection reasons, and before/after
-instance counts. Generated outputs are ignored by Git. No real-data improvement
-is claimed until curated merge scenes have been evaluated.
+Outputs include effective EDT peaks, binary-LoG shape peaks, center proposals,
+candidate routes, caps, candidate and selected bodies, cross-sections,
+supplemental/final markers, rejection reasons, and before/after instance counts.
+Generated outputs are ignored by Git. No real-data improvement is claimed until
+curated merge scenes have been evaluated.

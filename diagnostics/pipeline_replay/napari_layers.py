@@ -139,6 +139,8 @@ def add_debug_layers(viewer: Any, source, result, component_index: int = 0):
         (component.watershed_distance, "Debug | Watershed EDT"),
     ):
         layers.append(_replace(viewer, "image", data, name=name, scale=scale, translate=debug_translate, visible=False))
+    if component.binary_log_response is not None:
+        layers.append(_replace(viewer, "image", component.binary_log_response, name="Geometry | Binary LoG response", scale=scale, translate=debug_translate, visible=False))
     bbox_start_global = np.asarray([bounds[0] for bounds in component.bbox_zyx]) + np.asarray(result.work_origin_zyx)
     def local_points(values):
         return np.asarray(values, dtype=float) + bbox_start_global - np.asarray(source.crop_origin_zyx)
@@ -153,6 +155,29 @@ def add_debug_layers(viewer: Any, source, result, component_index: int = 0):
     }
     layers.append(_replace(viewer, "points", local_points(component.effective_peak_positions_zyx), name="Debug | Effective peaks (final markers)", scale=scale, translate=scene_translate, size=2.5, face_color="red", properties=effective_properties))
     layers.append(_replace(viewer, "points", local_points(component.effective_peak_positions_zyx), name="Geometry | Effective EDT markers", scale=scale, translate=scene_translate, size=2.5, face_color="red", properties=effective_properties))
+    shape_properties = {
+        column: component.shape_peaks[column].to_numpy()
+        for column in component.shape_peaks.columns
+    }
+    if len(component.shape_peak_positions_zyx):
+        layers.append(_replace(viewer, "points", local_points(component.shape_peak_positions_zyx), name="Geometry | Shape center peaks", scale=scale, translate=scene_translate, size=2.2, face_color="orange", properties=shape_properties, visible=False))
+    if len(component.binary_log_maxima_zyx):
+        layers.append(_replace(viewer, "points", local_points(component.binary_log_maxima_zyx), name="Geometry | Binary LoG maxima", scale=scale, translate=scene_translate, size=1.8, face_color="orange", properties={"sigma_um": np.full(len(component.binary_log_maxima_zyx), component.binary_log_sigma_um)}, visible=False))
+
+    proposal_table = component.center_proposals
+    proposal_properties = {
+        column: proposal_table[column].to_numpy()
+        for column in proposal_table.columns
+    }
+    if len(component.center_proposal_positions_zyx):
+        layers.append(_replace(viewer, "points", local_points(component.center_proposal_positions_zyx), name="Geometry | Center proposals", scale=scale, translate=scene_translate, size=2.4, face_color="gray", properties=proposal_properties, visible=False))
+    if not proposal_table.empty:
+        unrepresented_table = proposal_table[~proposal_table["represented"].astype(bool)]
+        candidate_table = proposal_table[proposal_table["candidate"].astype(bool)]
+        if len(component.unrepresented_proposal_positions_zyx):
+            layers.append(_replace(viewer, "points", local_points(component.unrepresented_proposal_positions_zyx), name="Geometry | Unrepresented proposals", scale=scale, translate=scene_translate, size=2.6, face_color="yellow", properties={column: unrepresented_table[column].to_numpy() for column in unrepresented_table.columns}, visible=False))
+        if len(component.candidate_proposal_positions_zyx):
+            layers.append(_replace(viewer, "points", local_points(component.candidate_proposal_positions_zyx), name="Geometry | Candidate proposals", scale=scale, translate=scene_translate, size=2.8, face_color="magenta", properties={column: candidate_table[column].to_numpy() for column in candidate_table.columns}))
     if len(component.supplemental_marker_positions_zyx):
         layers.append(_replace(viewer, "points", local_points(component.supplemental_marker_positions_zyx), name="Geometry | Supplemental markers", scale=scale, translate=scene_translate, size=2.8, face_color="magenta"))
     layers.append(_replace(viewer, "points", local_points(component.final_marker_positions_zyx), name="Geometry | Final markers", scale=scale, translate=scene_translate, size=3.0, face_color="white"))

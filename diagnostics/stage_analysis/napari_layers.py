@@ -21,6 +21,12 @@ ANALYSIS_LAYER_NAMES = {
     "Peaks | Raw",
     "Peaks | Effective",
     "Pairs | Evidence",
+    "Geometry | Shape center peaks",
+    "Geometry | Center proposals",
+    "Geometry | Unrepresented proposals",
+    "Geometry | Candidate proposals",
+    "Geometry | Binary LoG response",
+    "Geometry | Binary LoG maxima",
     "Geometry | Boundary samples",
     "Geometry | Surface caps",
     "Geometry | Cap normals",
@@ -212,6 +218,18 @@ def peak_properties(peaks, run: Stage3ComponentRun) -> dict[str, list]:
     effective = {
         peak.peak_id for peak in run.collapse_result.effective_peaks
     }
+    return {
+        "peak_id": [peak.peak_id for peak in peaks],
+        "raw_depth": [peak.raw_depth_um for peak in peaks],
+        "smoothed_depth": [peak.smoothed_depth_um for peak in peaks],
+        "scale_support": [peak.scale_support for peak in peaks],
+        "h_support": [peak.h_support for peak in peaks],
+        "setting_support": [peak.setting_support for peak in peaks],
+        "detection_count": [peak.detection_count for peak in peaks],
+        "persistence_score": [peak.persistence_score for peak in peaks],
+        "retained": [peak.peak_id in effective for peak in peaks],
+        "collapsed": [peak.peak_id not in effective for peak in peaks],
+    }
 
 
 def _geometry_to_crop(position, run, frame):
@@ -237,6 +255,131 @@ def render_geometry_layers(
     time_index = frame.scene_time_index
     common = _common_layer_kwargs(frame, voxel_size)
     spacing = np.asarray(voxel_size, dtype=float)
+
+    shape_peaks = run.candidate_result.shape_peaks
+    if shape_peaks:
+        manager.add(
+            "add_points",
+            _time_points(
+                [_geometry_to_crop(peak.position_zyx, run, frame) for peak in shape_peaks],
+                time_index,
+            ),
+            "Geometry | Shape center peaks",
+            size=5,
+            face_color="orange",
+            properties={
+                "shape_peak_id": [peak.peak_id for peak in shape_peaks],
+                "best_scale_um": [peak.best_scale_um for peak in shape_peaks],
+                "response": [peak.response for peak in shape_peaks],
+                "relative_response": [peak.relative_response for peak in shape_peaks],
+                "scale_support": [peak.scale_support for peak in shape_peaks],
+                "detection_count": [peak.detection_count for peak in shape_peaks],
+                "interior_depth_um": [peak.interior_depth_um for peak in shape_peaks],
+                "local_depth_ratio": [peak.local_depth_ratio for peak in shape_peaks],
+            },
+            visible=False,
+            **common,
+        )
+
+    def proposal_properties(proposals):
+        return {
+            "proposal_id": [proposal.proposal_id for proposal in proposals],
+            "source_types": [
+                ";".join(
+                    source
+                    for source, present in (
+                        ("suppressed_edt", bool(proposal.raw_peak_ids)),
+                        ("binary_log", bool(proposal.shape_peak_ids)),
+                    )
+                    if present
+                )
+                for proposal in proposals
+            ],
+            "route": [proposal.route or "" for proposal in proposals],
+            "represented": [proposal.represented for proposal in proposals],
+            "physical_separation_um": [
+                proposal.nearest_effective_distance_um for proposal in proposals
+            ],
+            "normalized_separation": [
+                proposal.normalized_effective_separation for proposal in proposals
+            ],
+            "raw_persistence": [proposal.raw_persistence for proposal in proposals],
+            "shape_response": [proposal.shape_relative_response for proposal in proposals],
+            "shape_scale_support": [proposal.shape_scale_support for proposal in proposals],
+            "shape_local_depth_ratio": [proposal.shape_local_depth_ratio for proposal in proposals],
+            "reasons": [";".join(proposal.reasons) for proposal in proposals],
+        }
+
+    proposals = list(run.candidate_result.proposals)
+    unrepresented = [proposal for proposal in proposals if not proposal.represented]
+    candidates = [proposal for proposal in proposals if proposal.candidate]
+    for name, values, color, visible in (
+        ("Geometry | Center proposals", proposals, "gray", False),
+        ("Geometry | Unrepresented proposals", unrepresented, "yellow", False),
+        ("Geometry | Candidate proposals", candidates, "magenta", True),
+    ):
+        if values:
+            manager.add(
+                "add_points",
+                _time_points(
+                    [_geometry_to_crop(value.position_zyx, run, frame) for value in values],
+                    time_index,
+                ),
+                name,
+                size=6,
+                face_color=color,
+                properties=proposal_properties(values),
+                **common,
+                visible=visible,
+            )
+
+    candidate_debug = run.candidate_result.debug_artifacts
+    if candidate_debug is not None and candidate_debug.response_volumes:
+        selected_scale = max(
+            range(len(candidate_debug.sigma_levels_um)),
+            key=lambda index: (
+                float(np.max(candidate_debug.response_volumes[index])),
+                -index,
+            ),
+        )
+        padding = run.config.component_padding_voxels
+        inner = tuple(
+            slice(padding, -padding) if padding else slice(None) for _ in range(3)
+        )
+        manager.add(
+            "add_image",
+            current_tzyx(
+                embed_component(
+                    candidate_debug.response_volumes[selected_scale][inner],
+                    run.component_bbox,
+                    frame.display_crop,
+                ),
+                time_count,
+                time_index,
+            ),
+            "Geometry | Binary LoG response",
+            visible=False,
+            **common,
+        )
+        maxima = candidate_debug.raw_maxima_zyx[selected_scale]
+        if len(maxima):
+            manager.add(
+                "add_points",
+                _time_points(
+                    [_geometry_to_crop(value, run, frame) for value in maxima],
+                    time_index,
+                ),
+                "Geometry | Binary LoG maxima",
+                size=4,
+                face_color="orange",
+                visible=False,
+                properties={
+                    "sigma_um": [
+                        candidate_debug.sigma_levels_um[selected_scale]
+                    ] * len(maxima)
+                },
+                **common,
+            )
 
     if debug is not None and len(debug.boundary_positions_zyx):
         boundary = [
@@ -442,20 +585,6 @@ def render_geometry_layers(
                 visible=False,
                 **common,
             )
-    return {
-        "peak_id": [peak.peak_id for peak in peaks],
-        "raw_depth": [peak.raw_depth_um for peak in peaks],
-        "smoothed_depth": [peak.smoothed_depth_um for peak in peaks],
-        "scale_support": [peak.scale_support for peak in peaks],
-        "h_support": [peak.h_support for peak in peaks],
-        "setting_support": [peak.setting_support for peak in peaks],
-        "detection_count": [peak.detection_count for peak in peaks],
-        "persistence_score": [peak.persistence_score for peak in peaks],
-        "retained": [peak.peak_id in effective for peak in peaks],
-        "collapsed": [peak.peak_id not in effective for peak in peaks],
-    }
-
-
 def render_input_layers(
     manager: Stage3LayerManager,
     frame: Stage3FrameSelection,

@@ -14,6 +14,7 @@ peaks_module = import_module("src.03_segmentation.peaks")
 watershed_module = import_module("src.03_segmentation.watershed")
 pipeline_module = import_module("src.03_segmentation.pipeline")
 marker_completion_module = import_module("src.03_segmentation.marker_completion")
+candidate_detection_module = import_module("src.03_segmentation.candidate_detection")
 
 
 def run_stage3_component(resolution, component_id: int, config) -> Stage3ComponentRun:
@@ -47,14 +48,30 @@ def run_stage3_component(resolution, component_id: int, config) -> Stage3Compone
     effective_markers = marker_completion_module.convert_effective_peaks_to_markers(
         effective_peaks
     )
-    geometric_completion = marker_completion_module.safely_complete_geometric_markers(
+    candidate_result = candidate_detection_module.safely_detect_geometric_candidate(
         padded_mask,
         peak_analysis,
+        pair_evidence,
+        collapse_result,
         effective_peaks,
-        config.geometric_completion,
+        config.geometric_completion.candidate_detection,
         config.voxel_size_zyx_um,
         retain_debug_artifacts=True,
     )
+    if candidate_result.candidate:
+        geometric_completion = marker_completion_module.safely_complete_geometric_markers(
+            padded_mask,
+            peak_analysis,
+            effective_peaks,
+            config.geometric_completion,
+            config.voxel_size_zyx_um,
+            candidate_result=candidate_result,
+            retain_debug_artifacts=True,
+        )
+    else:
+        geometric_completion = import_module(
+            "src.03_segmentation.models"
+        ).GeometricCompletionResult.not_candidate(candidate_result)
     final_markers = marker_completion_module.combine_markers(
         effective_markers, geometric_completion.supplemental_markers
     )
@@ -84,6 +101,8 @@ def run_stage3_component(resolution, component_id: int, config) -> Stage3Compone
         "raw peaks": peak_analysis.peaks == canonical.raw_peaks,
         "effective peaks": effective_peaks == canonical.effective_peaks,
         "pair evidence": pair_evidence == canonical.pair_evidence,
+        "candidate proposals": candidate_result.proposals == canonical.candidate_result.proposals,
+        "candidate status": candidate_result.candidate == canonical.candidate_result.candidate,
         "final markers": final_markers == canonical.final_markers,
         "geometry status": (
             geometric_completion.processing_status
@@ -111,6 +130,7 @@ def run_stage3_component(resolution, component_id: int, config) -> Stage3Compone
         peak_detail,
         pair_evidence,
         collapse_result,
+        candidate_result,
         geometric_completion,
         final_markers,
         final_labels,
@@ -175,6 +195,27 @@ def surface_caps_dataframe(run: Stage3ComponentRun) -> pd.DataFrame:
     )
 
 
+def shape_peaks_dataframe(run: Stage3ComponentRun) -> pd.DataFrame:
+    return candidate_detection_module.shape_peaks_dataframe(
+        run.candidate_result, run.component_id
+    )
+
+
+def center_proposals_dataframe(run: Stage3ComponentRun) -> pd.DataFrame:
+    return candidate_detection_module.center_proposals_dataframe(
+        run.candidate_result, run.component_id
+    )
+
+
+def candidate_summary_dataframe(run: Stage3ComponentRun) -> pd.DataFrame:
+    return candidate_detection_module.candidate_summary_dataframe(
+        run.candidate_result,
+        run.component_id,
+        len(run.peak_analysis.peaks),
+        len(run.collapse_result.effective_peaks),
+    )
+
+
 def body_candidates_dataframe(run: Stage3ComponentRun) -> pd.DataFrame:
     return marker_completion_module.body_candidates_dataframe(
         run.geometric_completion, run.component_id
@@ -195,11 +236,14 @@ def marker_completion_dataframe(run: Stage3ComponentRun) -> pd.DataFrame:
 
 __all__ = [
     "body_candidates_dataframe",
+    "candidate_summary_dataframe",
+    "center_proposals_dataframe",
     "cross_sections_dataframe",
     "marker_completion_dataframe",
     "pair_evidence_dataframe",
     "peak_detections_dataframe",
     "raw_peaks_dataframe",
     "run_stage3_component",
+    "shape_peaks_dataframe",
     "surface_caps_dataframe",
 ]

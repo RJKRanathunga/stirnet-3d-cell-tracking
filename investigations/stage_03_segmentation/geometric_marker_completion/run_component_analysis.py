@@ -14,6 +14,7 @@ from src.io.tables import save_csv
 
 pipeline_module = import_module("src.03_segmentation.pipeline")
 completion_module = import_module("src.03_segmentation.marker_completion")
+candidate_module = import_module("src.03_segmentation.candidate_detection")
 
 
 def _peak_table(artifact) -> pd.DataFrame:
@@ -51,6 +52,27 @@ def run(mask_path: Path, output: Path, force: bool) -> None:
         completion = artifact.geometric_completion
         prefix = output / f"component_{artifact.component_id:04d}"
         save_csv(_peak_table(artifact), prefix / "effective_edt_peaks.csv")
+        save_csv(
+            candidate_module.shape_peaks_dataframe(
+                artifact.candidate_result, artifact.component_id
+            ),
+            prefix / "shape_peaks.csv",
+        )
+        save_csv(
+            candidate_module.center_proposals_dataframe(
+                artifact.candidate_result, artifact.component_id
+            ),
+            prefix / "center_proposals.csv",
+        )
+        save_csv(
+            candidate_module.candidate_summary_dataframe(
+                artifact.candidate_result,
+                artifact.component_id,
+                len(artifact.raw_peaks),
+                len(artifact.effective_peaks),
+            ),
+            prefix / "candidate_summary.csv",
+        )
         caps = completion_module.surface_caps_dataframe(
             completion, artifact.component_id
         )

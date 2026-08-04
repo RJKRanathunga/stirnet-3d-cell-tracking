@@ -77,6 +77,7 @@ class Stage3ComponentRun:
     peak_detail: object
     pair_evidence: tuple
     collapse_result: object
+    candidate_result: object
     geometric_completion: object
     final_markers: tuple
     final_labels: np.ndarray

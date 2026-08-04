@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import ndimage
 
+from .candidate_detection import safely_detect_geometric_candidate
 from .config import DEFAULT_SEGMENTATION_CONFIG, SegmentationConfig
 from .distance import compute_distance_transform
 from .marker_completion import (
@@ -14,7 +15,11 @@ from .marker_completion import (
     convert_effective_peaks_to_markers,
     safely_complete_geometric_markers,
 )
-from .models import GeometricCompletionResult, InstanceMarker
+from .models import (
+    GeometricCandidateResult,
+    GeometricCompletionResult,
+    InstanceMarker,
+)
 from .peaks import (
     DistancePeakAnalysis,
     LobeCollapseResult,
@@ -38,6 +43,16 @@ class ComponentDiagnostic:
     source_voxels: int
     raw_peak_count: int
     effective_peak_count: int
+    shape_peak_count: int
+    center_proposal_count: int
+    unrepresented_proposal_count: int
+    candidate_proposal_count: int
+    merge_candidate: bool
+    candidate_routes: tuple[str, ...]
+    candidate_processing_status: str
+    candidate_error: str | None
+    geometry_forced: bool
+    geometry_executed: bool
     surface_cap_count: int
     body_candidate_count: int
     valid_body_count: int
@@ -92,6 +107,7 @@ class ComponentDebugArtifacts:
     raw_peaks: tuple[PeakCandidate, ...]
     effective_peaks: tuple[PeakCandidate, ...]
     pair_evidence: tuple[PairEvidence, ...]
+    candidate_result: GeometricCandidateResult
     final_markers: tuple[InstanceMarker, ...]
     geometric_completion: GeometricCompletionResult
     marker_positions_zyx: tuple[tuple[int, int, int], ...]
@@ -107,6 +123,7 @@ class ComponentAnalysis:
     raw_peaks: tuple[PeakCandidate, ...]
     effective_peaks: tuple[PeakCandidate, ...]
     pair_evidence: tuple[PairEvidence, ...]
+    candidate_result: GeometricCandidateResult
     final_markers: tuple[InstanceMarker, ...]
     geometric_completion: GeometricCompletionResult
     debug_artifacts: ComponentDebugArtifacts | None = None
@@ -149,15 +166,32 @@ def analyze_component_crop(
         raise RuntimeError("peak collapse produced no effective peaks")
 
     effective_markers = convert_effective_peaks_to_markers(effective_peaks)
-    geometric_completion = safely_complete_geometric_markers(
+    candidate_result = safely_detect_geometric_candidate(
         padded_mask,
         peak_analysis,
+        pair_evidence,
+        collapsed,
         effective_peaks,
-        config.geometric_completion,
+        config.geometric_completion.candidate_detection,
         config.voxel_size_zyx_um,
         retain_debug_artifacts=retain_debug_artifacts,
-        force_analysis=force_geometric_analysis,
     )
+    should_run_geometry = force_geometric_analysis or candidate_result.candidate
+    if should_run_geometry:
+        geometric_completion = safely_complete_geometric_markers(
+            padded_mask,
+            peak_analysis,
+            effective_peaks,
+            config.geometric_completion,
+            config.voxel_size_zyx_um,
+            candidate_result=candidate_result,
+            retain_debug_artifacts=retain_debug_artifacts,
+            force_analysis=force_geometric_analysis,
+        )
+    else:
+        geometric_completion = GeometricCompletionResult.not_candidate(
+            candidate_result
+        )
 
     def labels_for(markers: tuple[InstanceMarker, ...]) -> np.ndarray:
         if len(markers) == 1:
@@ -179,7 +213,8 @@ def analyze_component_crop(
         if not geometric_completion.supplemental_markers:
             raise
         geometric_completion = GeometricCompletionResult.failed(
-            RuntimeError(f"geometric marker application failed: {error}")
+            RuntimeError(f"geometric marker application failed: {error}"),
+            candidate_result,
         )
         final_markers = effective_markers
         padded_labels = labels_for(final_markers)
@@ -212,6 +247,7 @@ def analyze_component_crop(
             raw_peaks=peak_analysis.peaks,
             effective_peaks=effective_peaks,
             pair_evidence=pair_evidence,
+            candidate_result=candidate_result,
             final_markers=final_markers,
             geometric_completion=geometric_completion,
             marker_positions_zyx=marker_positions,
@@ -223,6 +259,7 @@ def analyze_component_crop(
         raw_peaks=peak_analysis.peaks,
         effective_peaks=effective_peaks,
         pair_evidence=pair_evidence,
+        candidate_result=candidate_result,
         final_markers=final_markers,
         geometric_completion=geometric_completion,
         debug_artifacts=debug_artifacts,
@@ -363,7 +400,30 @@ def segment_instances_detailed(
             processing_status = "processed"
             raw_peak_count = len(analysis.raw_peaks)
             effective_peak_count = len(analysis.effective_peaks)
+            candidate_result = analysis.candidate_result
+            shape_peak_count = len(candidate_result.shape_peaks)
+            center_proposal_count = len(candidate_result.proposals)
+            unrepresented_proposal_count = sum(
+                not proposal.represented for proposal in candidate_result.proposals
+            )
+            candidate_proposal_count = len(candidate_result.candidate_proposal_ids)
+            merge_candidate = candidate_result.candidate
+            candidate_routes = tuple(
+                dict.fromkeys(
+                    proposal.route
+                    for proposal in candidate_result.proposals
+                    if proposal.candidate and proposal.route is not None
+                )
+            )
+            candidate_processing_status = candidate_result.processing_status
+            candidate_error = candidate_result.error
+            geometry_forced = bool(force_geometric_analysis)
             completion = analysis.geometric_completion
+            geometry_executed = completion.processing_status in {
+                "processed",
+                "forced",
+                "failed",
+            }
             surface_cap_count = len(completion.surface_caps)
             body_candidate_count = len(completion.body_candidates)
             valid_body_count = sum(
@@ -399,6 +459,16 @@ def segment_instances_detailed(
             processing_status = "fallback_single"
             raw_peak_count = 0
             effective_peak_count = 1
+            shape_peak_count = 0
+            center_proposal_count = 0
+            unrepresented_proposal_count = 0
+            candidate_proposal_count = 0
+            merge_candidate = False
+            candidate_routes = ()
+            candidate_processing_status = "not_run_due_to_edt_failure"
+            candidate_error = None
+            geometry_forced = bool(force_geometric_analysis)
+            geometry_executed = False
             surface_cap_count = 0
             body_candidate_count = 0
             valid_body_count = 0
@@ -454,6 +524,7 @@ def segment_instances_detailed(
                     raw_peaks=artifact.raw_peaks,
                     effective_peaks=artifact.effective_peaks,
                     pair_evidence=artifact.pair_evidence,
+                    candidate_result=artifact.candidate_result,
                     final_markers=artifact.final_markers,
                     geometric_completion=artifact.geometric_completion,
                     marker_positions_zyx=artifact.marker_positions_zyx,
@@ -468,6 +539,16 @@ def segment_instances_detailed(
                 source_voxels=source_voxels,
                 raw_peak_count=raw_peak_count,
                 effective_peak_count=effective_peak_count,
+                shape_peak_count=shape_peak_count,
+                center_proposal_count=center_proposal_count,
+                unrepresented_proposal_count=unrepresented_proposal_count,
+                candidate_proposal_count=candidate_proposal_count,
+                merge_candidate=merge_candidate,
+                candidate_routes=candidate_routes,
+                candidate_processing_status=candidate_processing_status,
+                candidate_error=candidate_error,
+                geometry_forced=geometry_forced,
+                geometry_executed=geometry_executed,
                 surface_cap_count=surface_cap_count,
                 body_candidate_count=body_candidate_count,
                 valid_body_count=valid_body_count,
@@ -554,6 +635,11 @@ def segment_instances(
                 metrics={
                     "raw_peak_count": record.raw_peak_count,
                     "effective_peak_count": record.effective_peak_count,
+                    "shape_peak_count": record.shape_peak_count,
+                    "center_proposal_count": record.center_proposal_count,
+                    "candidate_proposal_count": record.candidate_proposal_count,
+                    "merge_candidate": record.merge_candidate,
+                    "geometry_executed": record.geometry_executed,
                     "surface_cap_count": record.surface_cap_count,
                     "body_candidate_count": record.body_candidate_count,
                     "selected_body_count": record.selected_body_count,

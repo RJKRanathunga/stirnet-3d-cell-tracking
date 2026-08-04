@@ -37,12 +37,15 @@ from .napari_layers import (
 )
 from .runner import (
     body_candidates_dataframe,
+    candidate_summary_dataframe,
+    center_proposals_dataframe,
     cross_sections_dataframe,
     marker_completion_dataframe,
     pair_evidence_dataframe,
     peak_detections_dataframe,
     raw_peaks_dataframe,
     run_stage3_component,
+    shape_peaks_dataframe,
     surface_caps_dataframe,
 )
 from .source import Stage3AnalysisSource, discover_categories, discover_scenes
@@ -440,8 +443,13 @@ class Stage3AnalysisWidget(QWidget):
                 self.run_result.collapse_result.effective_peaks
             )
             instance_count = int(np.max(self.run_result.final_labels))
+            candidate = self.run_result.candidate_result
+            geometry = self.run_result.geometric_completion
             self.result_summary.setText(
                 f"processed; effective peaks={effective_count}; "
+                f"shape peaks={len(candidate.shape_peaks)}; "
+                f"candidate proposals={len(candidate.candidate_proposal_ids)}; "
+                f"geometry={geometry.processing_status}; "
                 f"final instances={instance_count}; canonical wrapper verified"
             )
             self.display_analysis_tables()
@@ -495,6 +503,12 @@ class Stage3AnalysisWidget(QWidget):
         display(peak_detections_dataframe(self.run_result))
         print("Pair evidence")
         display(pair_evidence_dataframe(self.run_result))
+        print("Binary-LoG shape peaks")
+        display(shape_peaks_dataframe(self.run_result))
+        print("Center proposals")
+        display(center_proposals_dataframe(self.run_result))
+        print("Candidate summary")
+        display(candidate_summary_dataframe(self.run_result))
         print("Surface caps")
         display(surface_caps_dataframe(self.run_result))
         print("Geometric body candidates")

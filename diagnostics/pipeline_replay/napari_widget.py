@@ -328,6 +328,11 @@ class PipelineReplayWorkbenchWidget(QWidget):
         component_summary = (
             f"Stage 3 processing: {component.processing_status}\n"
             f"Raw/effective peaks: {component.raw_peak_count}/{component.effective_peak_count}\n"
+            f"Shape peaks/proposals: {component.shape_peak_count}/{component.center_proposal_count}\n"
+            f"Unrepresented/candidate proposals: {component.unrepresented_proposal_count}/{component.candidate_proposal_count}\n"
+            f"Merge candidate/routes: {component.merge_candidate}/{component.candidate_routes or '-'}\n"
+            f"Candidate processing: {component.candidate_processing_status}; error: {component.candidate_error or '-'}\n"
+            f"Geometry forced/executed: {component.geometry_forced}/{component.geometry_executed}\n"
             f"Final markers/instances: {component.marker_count}/{component.instance_count}\n"
             f"Pair evidence records: {len(component.pair_evidence)}\n"
             f"Stage 3 error: {component.error or '-'}\n"

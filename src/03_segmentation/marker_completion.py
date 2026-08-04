@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
-from scipy.spatial import cKDTree
 
 from .config import GeometricCompletionConfig
 from .distance import physical_distance, validate_voxel_size
@@ -15,6 +14,7 @@ from .geometric_bodies import (
 )
 from .models import (
     GeometricBody,
+    GeometricCandidateResult,
     GeometricCompletionResult,
     GeometricDebugArtifacts,
     InstanceMarker,
@@ -67,53 +67,6 @@ def combine_markers(
     if len(set(positions)) != len(positions):
         raise ValueError("combined markers contain duplicate positions")
     return effective_markers + ordered_supplemental
-
-
-def geometric_completion_eligible(
-    component_mask: np.ndarray,
-    voxel_size_zyx_um: tuple[float, float, float] | np.ndarray,
-    config: GeometricCompletionConfig,
-    *,
-    raw_peak_count: int | None = None,
-    effective_marker_positions_zyx: tuple[tuple[int, int, int], ...] = (),
-) -> bool:
-    """Cheap runtime gate for shapes large enough to support two physical caps.
-
-    This gate does not infer cell count and imposes no candidate/body-count cap.
-    Suspicious multi-body components remain eligible regardless of EDT count.
-    """
-
-    coordinates = np.argwhere(component_mask)
-    if len(coordinates) < 8:
-        return False
-    spacing = validate_voxel_size(voxel_size_zyx_um)
-    extent = (coordinates.max(axis=0) - coordinates.min(axis=0) + 1) * spacing
-    if float(np.max(extent)) < config.min_cap_separation_um:
-        return False
-    marker_count = max(len(effective_marker_positions_zyx), 1)
-    if raw_peak_count is not None and int(raw_peak_count) > marker_count:
-        return True
-    physical_volume_um3 = len(coordinates) * float(np.prod(spacing))
-    if (
-        physical_volume_um3 / marker_count
-        >= config.eligibility_min_volume_per_marker_um3
-    ):
-        return True
-    if (
-        float(np.max(extent)) / marker_count
-        >= config.eligibility_min_extent_per_marker_um
-    ):
-        return True
-    if effective_marker_positions_zyx:
-        marker_um = np.asarray(effective_marker_positions_zyx, dtype=float) * spacing
-        coordinates_um = coordinates.astype(float) * spacing
-        nearest, _ = cKDTree(marker_um).query(coordinates_um, k=1)
-        if (
-            float(np.max(nearest))
-            >= config.eligibility_max_unrepresented_distance_um
-        ):
-            return True
-    return False
 
 
 def _represented_peak_ids(
@@ -214,6 +167,7 @@ def analyze_geometric_completion(
     config: GeometricCompletionConfig,
     voxel_size_zyx_um: tuple[float, float, float] | np.ndarray,
     *,
+    candidate_result: GeometricCandidateResult | None = None,
     retain_debug_artifacts: bool = False,
     force_analysis: bool = False,
 ) -> GeometricCompletionResult:
@@ -227,17 +181,6 @@ def analyze_geometric_completion(
         raise ValueError("peak-analysis arrays must align with component_mask")
     if not effective_peaks:
         raise ValueError("geometric completion requires effective EDT peaks")
-    if not force_analysis and not geometric_completion_eligible(
-        mask,
-        spacing,
-        config,
-        raw_peak_count=len(peak_analysis.peaks),
-        effective_marker_positions_zyx=tuple(
-            peak.position_zyx for peak in effective_peaks
-        ),
-    ):
-        return GeometricCompletionResult((), (), (), (), "ineligible", None)
-
     surface = analyze_surface_geometry(mask, spacing, config)
     body_analysis = analyze_geometric_bodies(mask, surface, spacing, config)
     represented_candidates = tuple(
@@ -320,9 +263,10 @@ def analyze_geometric_completion(
         final_candidates,
         tuple(updated_selected),
         supplemental_tuple,
-        "processed",
+        "forced" if force_analysis else "processed",
         None,
         debug,
+        candidate_result,
     )
 
 
@@ -333,6 +277,7 @@ def safely_complete_geometric_markers(
     config: GeometricCompletionConfig,
     voxel_size_zyx_um: tuple[float, float, float] | np.ndarray,
     *,
+    candidate_result: GeometricCandidateResult | None = None,
     retain_debug_artifacts: bool = False,
     force_analysis: bool = False,
 ) -> GeometricCompletionResult:
@@ -345,11 +290,12 @@ def safely_complete_geometric_markers(
             effective_peaks,
             config,
             voxel_size_zyx_um,
+            candidate_result=candidate_result,
             retain_debug_artifacts=retain_debug_artifacts,
             force_analysis=force_analysis,
         )
     except Exception as error:  # the safety boundary is an explicit contract
-        return GeometricCompletionResult.failed(error)
+        return GeometricCompletionResult.failed(error, candidate_result)
 
 
 def surface_caps_dataframe(result: GeometricCompletionResult, component_id: int):
@@ -475,7 +421,6 @@ __all__ = [
     "combine_markers",
     "convert_effective_peaks_to_markers",
     "cross_sections_dataframe",
-    "geometric_completion_eligible",
     "marker_completion_dataframe",
     "safely_complete_geometric_markers",
     "surface_caps_dataframe",

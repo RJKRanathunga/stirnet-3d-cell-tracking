@@ -184,6 +184,141 @@ class GeometricDebugArtifacts:
 
 
 @dataclass(frozen=True)
+class ShapePeakCandidate:
+    """One binary-LoG center maximum consolidated across physical scales."""
+
+    peak_id: int
+    position_zyx: Position3D
+    position_um: Float3
+    best_scale_um: float
+    response: float
+    relative_response: float
+    scale_support: float
+    detection_count: int
+    interior_depth_um: float = 0.0
+    local_depth_ratio: float = 0.0
+
+
+@dataclass(frozen=True)
+class CenterProposal:
+    """One inspectable raw-EDT and/or binary-LoG center proposal."""
+
+    proposal_id: int
+    position_zyx: Float3
+    position_um: Float3
+    raw_peak_ids: tuple[int, ...]
+    shape_peak_ids: tuple[int, ...]
+    raw_depth_um: float
+    raw_smoothed_depth_um: float
+    raw_depth_ratio: float
+    raw_persistence: float
+    raw_scale_support: float
+    raw_h_support: float
+    raw_setting_support: float
+    raw_detection_count: int
+    branch_persistence: float
+    branch_balance: float
+    separation_support: float
+    peak_support: float
+    distinct_lobe_probability: float
+    shape_response: float
+    shape_relative_response: float
+    shape_best_scale_um: float
+    shape_scale_support: float
+    shape_detection_count: int
+    shape_interior_depth_um: float
+    shape_local_depth_ratio: float
+    nearest_effective_peak_id: int
+    nearest_effective_distance_um: float
+    normalized_effective_separation: float
+    represented: bool
+    route: str | None
+    candidate: bool
+    score: float
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CandidateDebugArtifacts:
+    """Large binary-LoG arrays retained only for an explicit debug request."""
+
+    sigma_levels_um: tuple[float, ...]
+    response_volumes: tuple[np.ndarray, ...] = field(compare=False, repr=False)
+    raw_maxima_zyx: tuple[np.ndarray, ...] = field(compare=False, repr=False)
+    shape_peaks: tuple[ShapePeakCandidate, ...]
+    center_proposals: tuple[CenterProposal, ...]
+    candidate_proposal_ids: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not (
+            len(self.sigma_levels_um)
+            == len(self.response_volumes)
+            == len(self.raw_maxima_zyx)
+        ):
+            raise ValueError("candidate debug scale collections must align")
+        responses: list[np.ndarray] = []
+        maxima: list[np.ndarray] = []
+        for response, positions in zip(self.response_volumes, self.raw_maxima_zyx):
+            response_array = np.asarray(response, dtype=float)
+            if response_array.ndim != 3:
+                raise ValueError("candidate response volumes must be 3-D")
+            response_array.setflags(write=False)
+            positions_array = np.asarray(positions, dtype=int).reshape((-1, 3))
+            positions_array.setflags(write=False)
+            responses.append(response_array)
+            maxima.append(positions_array)
+        object.__setattr__(self, "response_volumes", tuple(responses))
+        object.__setattr__(self, "raw_maxima_zyx", tuple(maxima))
+
+
+@dataclass(frozen=True)
+class GeometricCandidateResult:
+    """Cheap component-level decision controlling geometric completion."""
+
+    shape_peaks: tuple[ShapePeakCandidate, ...]
+    proposals: tuple[CenterProposal, ...]
+    candidate_proposal_ids: tuple[int, ...]
+    candidate: bool
+    processing_status: str
+    error: str | None
+    reasons: tuple[str, ...] = ()
+    debug_artifacts: CandidateDebugArtifacts | None = field(
+        default=None, compare=False, repr=False
+    )
+
+    @classmethod
+    def no_candidate(
+        cls,
+        shape_peaks: tuple[ShapePeakCandidate, ...] = (),
+        proposals: tuple[CenterProposal, ...] = (),
+        reasons: tuple[str, ...] = ("no_center_proposals",),
+        debug_artifacts: CandidateDebugArtifacts | None = None,
+    ) -> "GeometricCandidateResult":
+        return cls(
+            shape_peaks,
+            proposals,
+            (),
+            False,
+            "processed",
+            None,
+            reasons,
+            debug_artifacts,
+        )
+
+    @classmethod
+    def failed(cls, error: BaseException) -> "GeometricCandidateResult":
+        return cls(
+            (),
+            (),
+            (),
+            False,
+            "failed",
+            f"{type(error).__name__}: {error}",
+            ("candidate_detection_failed",),
+        )
+
+
+@dataclass(frozen=True)
 class GeometricCompletionResult:
     """Compact production result plus optional retained diagnostic geometry."""
 
@@ -196,9 +331,16 @@ class GeometricCompletionResult:
     debug_artifacts: GeometricDebugArtifacts | None = field(
         default=None, compare=False, repr=False
     )
+    candidate_result: GeometricCandidateResult | None = field(
+        default=None, compare=False, repr=False
+    )
 
     @classmethod
-    def failed(cls, error: BaseException) -> "GeometricCompletionResult":
+    def failed(
+        cls,
+        error: BaseException,
+        candidate_result: GeometricCandidateResult | None = None,
+    ) -> "GeometricCompletionResult":
         return cls(
             (),
             (),
@@ -206,17 +348,29 @@ class GeometricCompletionResult:
             (),
             "failed",
             f"{type(error).__name__}: {error}",
+            None,
+            candidate_result,
         )
+
+    @classmethod
+    def not_candidate(
+        cls, candidate_result: GeometricCandidateResult
+    ) -> "GeometricCompletionResult":
+        return cls((), (), (), (), "not_candidate", None, None, candidate_result)
 
 
 __all__ = [
     "BodyEvidence",
+    "CandidateDebugArtifacts",
     "CapPairEvidence",
+    "CenterProposal",
     "CrossSectionEvidence",
     "GeometricBody",
+    "GeometricCandidateResult",
     "GeometricCompletionResult",
     "GeometricDebugArtifacts",
     "InstanceMarker",
+    "ShapePeakCandidate",
     "SurfaceCap",
     "SurfaceSample",
 ]
