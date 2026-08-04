@@ -38,12 +38,44 @@ class Stage8Outputs:
 
 
 @dataclass(frozen=True)
+class Stage7Outputs:
+    tracks: pd.DataFrame
+    boundary_events: pd.DataFrame
+    boundary_predictions: pd.DataFrame
+    missing_predictions: pd.DataFrame
+    boundary_counts: pd.DataFrame
+    global_motion: pd.DataFrame
+    tracking_diagnostics: pd.DataFrame
+    association_events: pd.DataFrame
+    association_candidates: pd.DataFrame
+    track_states: pd.DataFrame
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class Stage10Outputs:
     division_candidates: pd.DataFrame
     division_events: pd.DataFrame
     lineage_edges: pd.DataFrame
     track_lineage: pd.DataFrame
     protected_tracks: pd.DataFrame
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Stage11Outputs:
+    tracks: pd.DataFrame
+    segmentation_events: pd.DataFrame
+    division_events: pd.DataFrame
+    lineage_edges: pd.DataFrame
+    track_lineage: pd.DataFrame
+    protected_tracks: pd.DataFrame
+    endpoint_classifications: pd.DataFrame
+    continuation_candidates: pd.DataFrame
+    continuation_decisions: pd.DataFrame
+    track_id_remap: pd.DataFrame
+    unresolved_endings: pd.DataFrame
+    validation_results: pd.DataFrame
     metadata: dict[str, Any]
 
 
@@ -71,6 +103,26 @@ def load_stage7_detections(
     paths: PipelinePaths | None = None,
 ) -> list[pd.DataFrame]:
     return list(load_processed_dataset_inputs(sample_id, paths=paths).time_frames)
+
+
+def load_stage7_outputs(*, paths: PipelinePaths | None = None) -> Stage7Outputs:
+    """Load Stage 7 tracks plus optional diagnostic evidence tables."""
+
+    resolved = paths or PipelinePaths.discover()
+    root = resolved.stage7_tracking
+    return Stage7Outputs(
+        tracks=load_csv(root / "tracks.csv", required_columns=TRACK_COLUMNS),
+        boundary_events=load_optional_csv(root / "boundary_events.csv"),
+        boundary_predictions=load_optional_csv(root / "boundary_predictions.csv"),
+        missing_predictions=load_optional_csv(root / "missing_predictions.csv"),
+        boundary_counts=load_optional_csv(root / "boundary_detection_counts.csv"),
+        global_motion=load_optional_csv(root / "global_motion.csv"),
+        tracking_diagnostics=load_optional_csv(root / "tracking_diagnostics.csv"),
+        association_events=load_optional_csv(root / "association_events.csv"),
+        association_candidates=load_optional_csv(root / "association_candidates.csv"),
+        track_states=load_optional_csv(root / "track_states.csv"),
+        metadata=load_json(root / "metadata.json"),
+    )
 
 
 def load_stage8_outputs(*, paths: PipelinePaths | None = None) -> Stage8Outputs:
@@ -180,6 +232,83 @@ def load_stage10_outputs(*, paths: PipelinePaths | None = None) -> Stage10Output
         protected_tracks=load_csv(
             root / "protected_tracks.csv",
             required_columns=schemas.PROTECTED_TRACK_COLUMNS,
+        ),
+        metadata=load_json(root / "metadata.json"),
+    )
+
+
+def save_track_reconciliation_result(result, directory: str | Path) -> None:
+    """Save stable Stage 11 tables without modifying Stage 8 or Stage 10."""
+
+    root = Path(directory)
+    mapping = {
+        "tracks": "tracks.csv",
+        "segmentation_events": "segmentation_events.csv",
+        "division_events": "division_events.csv",
+        "lineage_edges": "lineage_edges.csv",
+        "track_lineage": "track_lineage.csv",
+        "protected_tracks": "protected_tracks.csv",
+        "endpoint_classifications": "endpoint_classifications.csv",
+        "continuation_candidates": "continuation_candidates.csv",
+        "continuation_decisions": "continuation_decisions.csv",
+        "track_id_remap": "track_id_remap.csv",
+        "unresolved_endings": "unresolved_endings.csv",
+        "validation_results": "validation_results.csv",
+    }
+    for attribute, filename in mapping.items():
+        save_csv(getattr(result, attribute), root / filename)
+    save_json(result.metadata, root / "metadata.json")
+
+
+def load_stage11_outputs(*, paths: PipelinePaths | None = None) -> Stage11Outputs:
+    """Load and validate all stable Stage 11 artifact schemas."""
+
+    resolved = paths or PipelinePaths.discover()
+    root = resolved.stage11_reconciliation
+    schemas = import_module("src.11_track_reconciliation.step01_config")
+    lineage_schemas = import_module("src.10_cell_lineage.step01_config")
+    return Stage11Outputs(
+        tracks=load_csv(root / "tracks.csv", required_columns=TRACK_COLUMNS),
+        segmentation_events=load_optional_csv(root / "segmentation_events.csv"),
+        division_events=load_csv(
+            root / "division_events.csv",
+            required_columns=lineage_schemas.DIVISION_EVENT_COLUMNS,
+        ),
+        lineage_edges=load_csv(
+            root / "lineage_edges.csv",
+            required_columns=lineage_schemas.LINEAGE_EDGE_COLUMNS,
+        ),
+        track_lineage=load_csv(
+            root / "track_lineage.csv",
+            required_columns=lineage_schemas.TRACK_LINEAGE_COLUMNS,
+        ),
+        protected_tracks=load_csv(
+            root / "protected_tracks.csv",
+            required_columns=lineage_schemas.PROTECTED_TRACK_COLUMNS,
+        ),
+        endpoint_classifications=load_csv(
+            root / "endpoint_classifications.csv",
+            required_columns=schemas.ENDPOINT_CLASSIFICATION_COLUMNS,
+        ),
+        continuation_candidates=load_csv(
+            root / "continuation_candidates.csv",
+            required_columns=schemas.CONTINUATION_CANDIDATE_COLUMNS,
+        ),
+        continuation_decisions=load_csv(
+            root / "continuation_decisions.csv",
+            required_columns=schemas.CONTINUATION_DECISION_COLUMNS,
+        ),
+        track_id_remap=load_csv(
+            root / "track_id_remap.csv",
+            required_columns=schemas.TRACK_ID_REMAP_COLUMNS,
+        ),
+        unresolved_endings=load_csv(
+            root / "unresolved_endings.csv",
+            required_columns=schemas.UNRESOLVED_ENDING_COLUMNS,
+        ),
+        validation_results=load_csv(
+            root / "validation_results.csv",
+            required_columns=schemas.VALIDATION_RESULT_COLUMNS,
         ),
         metadata=load_json(root / "metadata.json"),
     )

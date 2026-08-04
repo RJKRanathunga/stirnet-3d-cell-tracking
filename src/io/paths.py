@@ -114,6 +114,10 @@ class PipelinePaths:
         return self.processed_root / "stage_10_cell_lineage"
 
     @property
+    def stage11_reconciliation(self) -> Path:
+        return self.processed_root / "stage_11_track_reconciliation"
+
+    @property
     def tracking_scenes(self) -> Path:
         return self.project_root / "data" / "tracking_scenes"
 

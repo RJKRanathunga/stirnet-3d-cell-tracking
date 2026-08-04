@@ -10,20 +10,26 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.api import create_binary_mask, preprocess_volume, run_cell_lineage
+from src.api import (
+    create_binary_mask, preprocess_volume, run_cell_lineage,
+    run_track_reconciliation,
+)
 from src.diagnostics import DiagnosticTrace, StageTrace
 from src.diagnostics.invariants import validate_tracks
 from src.io import (
     PipelinePaths,
     Stage10Outputs,
+    Stage11Outputs,
     load_csv,
     load_npy,
     load_optional_csv,
     load_stage10_outputs,
+    load_stage11_outputs,
     load_tracking_scene,
     save_csv,
     save_json,
     save_lineage_result,
+    save_track_reconciliation_result,
     save_npy,
 )
 
@@ -38,6 +44,17 @@ class StageInterfaceTests(unittest.TestCase):
         self.assertEqual(
             paths.stage10_lineage,
             Path("C:/synthetic-project/data/sample/processed/stage_10_cell_lineage"),
+        )
+
+    def test_stage11_public_paths_and_io_symbols(self) -> None:
+        self.assertTrue(callable(run_track_reconciliation))
+        self.assertTrue(callable(load_stage11_outputs))
+        self.assertTrue(callable(save_track_reconciliation_result))
+        self.assertTrue(hasattr(Stage11Outputs, "__dataclass_fields__"))
+        paths = PipelinePaths(Path("C:/synthetic-project"))
+        self.assertEqual(
+            paths.stage11_reconciliation,
+            Path("C:/synthetic-project/data/sample/processed/stage_11_track_reconciliation"),
         )
 
     def test_stage10_empty_headers_and_required_column_validation(self) -> None:

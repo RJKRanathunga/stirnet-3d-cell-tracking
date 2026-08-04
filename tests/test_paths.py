@@ -119,6 +119,10 @@ class ProjectRootTests(unittest.TestCase):
                 paths.stage8_stitching,
                 paths.processed_root / "stage_8_track_stitching",
             )
+            self.assertEqual(
+                paths.stage11_reconciliation,
+                paths.processed_root / "stage_11_track_reconciliation",
+            )
             self.assertEqual(paths.tracking_scenes, root / "data" / "tracking_scenes")
 
     def test_environment_patch_restores_original_value(self) -> None:
