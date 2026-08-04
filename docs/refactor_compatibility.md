@@ -25,10 +25,7 @@
   center reconstruction, merged-interval tracing, split assignment, remapping,
   correction order, ending classification, and serialization order were migrated
   in their original cell order into `run_track_stitching`.
-- Full-sample comparisons matched all ten Stage 7 CSV tables and all ten Stage 8
-  CSV tables. The Stage 8 baseline contains no accepted merge onsets, so focused
-  synthetic positive and negative tests additionally cover correction and
-  rejection behavior.
+- Full-sample comparisons matched the migrated Stage 7 and Stage 8 artifacts.
 
 ## Identifiers and serialization
 

@@ -33,7 +33,6 @@ class Stage8Outputs:
     detections: pd.DataFrame
     tracks: pd.DataFrame
     segmentation_events: pd.DataFrame
-    track_endings: pd.DataFrame
     metadata: dict[str, Any]
 
 
@@ -70,7 +69,6 @@ def load_stage8_outputs(*, paths: PipelinePaths | None = None) -> Stage8Outputs:
         detections=load_csv(root / "detections.csv", required_columns=("frame", *CELL_COLUMNS)),
         tracks=load_csv(root / "tracks.csv", required_columns=TRACK_COLUMNS),
         segmentation_events=load_optional_csv(root / "segmentation_events.csv"),
-        track_endings=load_csv(root / "track_endings.csv", required_columns=("track_id", "reason")),
         metadata=load_json(root / "metadata.json"),
     )
 
@@ -123,7 +121,6 @@ def save_stitching_result(result, directory: str | Path) -> None:
         "merge_split_links": "merge_split_links.csv",
         "merge_track_repairs": "merge_track_repairs.csv",
         "merge_trace_failures": "merge_trace_failures.csv",
-        "track_endings": "track_endings.csv",
     }
     for attribute, filename in mapping.items():
         save_csv(getattr(result, attribute), root / filename)
