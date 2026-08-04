@@ -4,26 +4,67 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from importlib import import_module
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from src.api import create_binary_mask, preprocess_volume
+from src.api import create_binary_mask, preprocess_volume, run_cell_lineage
 from src.diagnostics import DiagnosticTrace, StageTrace
 from src.diagnostics.invariants import validate_tracks
 from src.io import (
+    PipelinePaths,
+    Stage10Outputs,
     load_csv,
     load_npy,
     load_optional_csv,
+    load_stage10_outputs,
     load_tracking_scene,
     save_csv,
     save_json,
+    save_lineage_result,
     save_npy,
 )
 
 
 class StageInterfaceTests(unittest.TestCase):
+    def test_stage10_public_paths_and_io_symbols(self) -> None:
+        self.assertTrue(callable(run_cell_lineage))
+        self.assertTrue(callable(load_stage10_outputs))
+        self.assertTrue(callable(save_lineage_result))
+        self.assertTrue(hasattr(Stage10Outputs, "__dataclass_fields__"))
+        paths = PipelinePaths(Path("C:/synthetic-project"))
+        self.assertEqual(
+            paths.stage10_lineage,
+            Path("C:/synthetic-project/data/sample/processed/stage_10_cell_lineage"),
+        )
+
+    def test_stage10_empty_headers_and_required_column_validation(self) -> None:
+        module = import_module("src.10_cell_lineage.step06_pipeline")
+        schemas = import_module("src.10_cell_lineage.step01_config")
+        with tempfile.TemporaryDirectory() as directory:
+            paths = PipelinePaths(Path(directory))
+            result = module.CellLineageResult(
+                division_candidates=pd.DataFrame(columns=schemas.DIVISION_CANDIDATE_COLUMNS),
+                division_events=pd.DataFrame(columns=schemas.DIVISION_EVENT_COLUMNS),
+                lineage_edges=pd.DataFrame(columns=schemas.LINEAGE_EDGE_COLUMNS),
+                track_lineage=pd.DataFrame(columns=schemas.TRACK_LINEAGE_COLUMNS),
+                protected_tracks=pd.DataFrame(columns=schemas.PROTECTED_TRACK_COLUMNS),
+                metadata={"schema_version": 1},
+            )
+            save_lineage_result(result, paths.stage10_lineage)
+            loaded = load_stage10_outputs(paths=paths)
+            self.assertEqual(
+                loaded.division_candidates.columns.tolist(),
+                list(schemas.DIVISION_CANDIDATE_COLUMNS),
+            )
+            (paths.stage10_lineage / "division_events.csv").write_text(
+                "wrong\n", encoding="utf-8"
+            )
+            with self.assertRaises(ValueError):
+                load_stage10_outputs(paths=paths)
+
     def test_optional_diagnostics_do_not_change_normal_output(self) -> None:
         volume = np.linspace(0, 1, 5 * 9 * 9, dtype=np.float32).reshape(5, 9, 9)
         normal = preprocess_volume(volume)

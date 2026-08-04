@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,16 @@ class Stage8Outputs:
     detections: pd.DataFrame
     tracks: pd.DataFrame
     segmentation_events: pd.DataFrame
+    metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Stage10Outputs:
+    division_candidates: pd.DataFrame
+    division_events: pd.DataFrame
+    lineage_edges: pd.DataFrame
+    track_lineage: pd.DataFrame
+    protected_tracks: pd.DataFrame
     metadata: dict[str, Any]
 
 
@@ -125,3 +136,50 @@ def save_stitching_result(result, directory: str | Path) -> None:
     for attribute, filename in mapping.items():
         save_csv(getattr(result, attribute), root / filename)
     save_json(result.metadata, root / "metadata.json")
+
+
+def save_lineage_result(result, directory: str | Path) -> None:
+    """Save the five stable Stage 10 tables and metadata object."""
+
+    root = Path(directory)
+    mapping = {
+        "division_candidates": "division_candidates.csv",
+        "division_events": "division_events.csv",
+        "lineage_edges": "lineage_edges.csv",
+        "track_lineage": "track_lineage.csv",
+        "protected_tracks": "protected_tracks.csv",
+    }
+    for attribute, filename in mapping.items():
+        save_csv(getattr(result, attribute), root / filename)
+    save_json(result.metadata, root / "metadata.json")
+
+
+def load_stage10_outputs(*, paths: PipelinePaths | None = None) -> Stage10Outputs:
+    """Load Stage 10 artifacts while validating every public table schema."""
+
+    resolved = paths or PipelinePaths.discover()
+    root = resolved.stage10_lineage
+    schemas = import_module("src.10_cell_lineage.step01_config")
+    return Stage10Outputs(
+        division_candidates=load_csv(
+            root / "division_candidates.csv",
+            required_columns=schemas.DIVISION_CANDIDATE_COLUMNS,
+        ),
+        division_events=load_csv(
+            root / "division_events.csv",
+            required_columns=schemas.DIVISION_EVENT_COLUMNS,
+        ),
+        lineage_edges=load_csv(
+            root / "lineage_edges.csv",
+            required_columns=schemas.LINEAGE_EDGE_COLUMNS,
+        ),
+        track_lineage=load_csv(
+            root / "track_lineage.csv",
+            required_columns=schemas.TRACK_LINEAGE_COLUMNS,
+        ),
+        protected_tracks=load_csv(
+            root / "protected_tracks.csv",
+            required_columns=schemas.PROTECTED_TRACK_COLUMNS,
+        ),
+        metadata=load_json(root / "metadata.json"),
+    )

@@ -49,6 +49,13 @@ try:
 except ModuleNotFoundError:
     prepare_visualization_data = _not_available("prepare_visualization_data")
 
+try:
+    run_cell_lineage = import_module(
+        "src.10_cell_lineage.step06_pipeline"
+    ).run_cell_lineage
+except ModuleNotFoundError:
+    run_cell_lineage = _not_available("run_cell_lineage")
+
 
 __all__ = [
     "create_binary_mask",
@@ -57,6 +64,7 @@ __all__ = [
     "prepare_visualization_data",
     "preprocess_volume",
     "run_cell_tracking",
+    "run_cell_lineage",
     "run_track_stitching",
     "segment_instances",
 ]

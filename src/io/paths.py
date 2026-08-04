@@ -110,6 +110,10 @@ class PipelinePaths:
         return self.processed_root / "stage_8_track_stitching"
 
     @property
+    def stage10_lineage(self) -> Path:
+        return self.processed_root / "stage_10_cell_lineage"
+
+    @property
     def tracking_scenes(self) -> Path:
         return self.project_root / "data" / "tracking_scenes"
 
