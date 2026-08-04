@@ -1,8 +1,9 @@
-"""Configuration for all-effective-peak instance segmentation."""
+"""Configuration for effective-EDT plus geometric marker segmentation."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,114 @@ def _default_pair_feature_models() -> tuple[PairFeatureModel, ...]:
         PairFeatureModel("separation_support", (4.0, 2.2), (2.0, 4.2), 0.75),
         PairFeatureModel("peak_support", (3.5, 1.9), (2.0, 2.8), 0.45),
     )
+
+
+@dataclass(frozen=True)
+class GeometricCompletionConfig:
+    """Conservative physical thresholds for supplemental body markers.
+
+    These initial thresholds are intentionally strict and provisional. They
+    must be calibrated against curated real merge scenes before being treated
+    as biological measurements.
+    """
+
+    surface_padding_um: float = 2.0
+    surface_sigma_levels_um: tuple[float, ...] = (0.35, 0.65, 1.0)
+
+    boundary_neighborhood_radius_um: float = 2.0
+    cap_patch_radius_um: float = 1.8
+    cap_cluster_radius_um: float = 1.2
+    cap_min_area_um2: float = 0.8
+    cap_min_prominence_um: float = 0.08
+    cap_min_normal_coherence: float = 0.55
+    cap_min_scale_support: float = 1.0 / 3.0
+
+    min_normal_opposition: float = 0.58
+    min_axis_alignment: float = 0.52
+    min_cap_separation_um: float = 2.0
+    max_cap_separation_um: float = 16.0
+
+    axis_sample_spacing_um: float = 0.35
+    min_axis_occupancy: float = 0.82
+    min_consecutive_axis_occupancy: float = 0.72
+
+    cross_section_spacing_um: float = 0.65
+    cross_section_thickness_um: float = 0.65
+    min_valid_cross_sections: int = 4
+    min_valid_cross_section_fraction: float = 0.55
+    min_median_ellipse_iou: float = 0.48
+    max_centerline_deviation_um: float = 1.25
+    max_area_profile_error: float = 0.48
+
+    min_ellipsoid_occupancy: float = 0.58
+    min_ellipsoid_surface_support: float = 0.24
+    min_unique_volume_fraction: float = 0.10
+    min_unique_surface_fraction: float = 0.08
+
+    representation_ellipsoid_radius: float = 0.85
+    marker_min_separation_um: float = 1.2
+    marker_search_radius_um: float = 2.4
+    min_body_score: float = 0.58
+
+    eligibility_min_volume_per_marker_um3: float = 130.0
+    eligibility_min_extent_per_marker_um: float = 7.5
+    eligibility_max_unrepresented_distance_um: float = 4.0
+
+    def __post_init__(self) -> None:
+        positive = (
+            "surface_padding_um",
+            "boundary_neighborhood_radius_um",
+            "cap_patch_radius_um",
+            "cap_cluster_radius_um",
+            "cap_min_area_um2",
+            "min_cap_separation_um",
+            "max_cap_separation_um",
+            "axis_sample_spacing_um",
+            "cross_section_spacing_um",
+            "cross_section_thickness_um",
+            "max_centerline_deviation_um",
+            "representation_ellipsoid_radius",
+            "marker_min_separation_um",
+            "marker_search_radius_um",
+            "eligibility_min_volume_per_marker_um3",
+            "eligibility_min_extent_per_marker_um",
+            "eligibility_max_unrepresented_distance_um",
+        )
+        for name in positive:
+            value = float(getattr(self, name))
+            if not isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if not self.surface_sigma_levels_um or any(
+            not isfinite(float(value)) or float(value) <= 0
+            for value in self.surface_sigma_levels_um
+        ):
+            raise ValueError("surface_sigma_levels_um must be nonempty and positive")
+        if self.min_cap_separation_um > self.max_cap_separation_um:
+            raise ValueError("minimum cap separation cannot exceed maximum")
+        if self.min_valid_cross_sections < 3:
+            raise ValueError("min_valid_cross_sections must be at least three")
+        normalized = (
+            "cap_min_normal_coherence",
+            "cap_min_scale_support",
+            "min_normal_opposition",
+            "min_axis_alignment",
+            "min_axis_occupancy",
+            "min_consecutive_axis_occupancy",
+            "min_valid_cross_section_fraction",
+            "min_median_ellipse_iou",
+            "max_area_profile_error",
+            "min_ellipsoid_occupancy",
+            "min_ellipsoid_surface_support",
+            "min_unique_volume_fraction",
+            "min_unique_surface_fraction",
+            "min_body_score",
+        )
+        for name in normalized:
+            value = float(getattr(self, name))
+            if not isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if not isfinite(self.cap_min_prominence_um) or self.cap_min_prominence_um < 0:
+            raise ValueError("cap_min_prominence_um cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -46,6 +155,10 @@ class SegmentationConfig:
     pair_likelihood_temperature: float = 1.60
     pair_feature_models: tuple[PairFeatureModel, ...] = field(
         default_factory=_default_pair_feature_models
+    )
+
+    geometric_completion: GeometricCompletionConfig = field(
+        default_factory=GeometricCompletionConfig
     )
 
     probability_epsilon: float = 1e-6

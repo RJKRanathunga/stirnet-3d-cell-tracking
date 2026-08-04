@@ -2,6 +2,8 @@ data
 .idea
 .venv
 evaluation/segmentation/annotations
+investigations/stage_03_segmentation/geometric_marker_completion/outputs/*
+!investigations/stage_03_segmentation/geometric_marker_completion/outputs/.gitignore
 
 # Python-generated cache files
 __pycache__/

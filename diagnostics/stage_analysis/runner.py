@@ -13,6 +13,7 @@ from .models import CanonicalMismatchError, Stage3ComponentRun
 peaks_module = import_module("src.03_segmentation.peaks")
 watershed_module = import_module("src.03_segmentation.watershed")
 pipeline_module = import_module("src.03_segmentation.pipeline")
+marker_completion_module = import_module("src.03_segmentation.marker_completion")
 
 
 def run_stage3_component(resolution, component_id: int, config) -> Stage3ComponentRun:
@@ -43,13 +44,27 @@ def run_stage3_component(resolution, component_id: int, config) -> Stage3Compone
     effective_peaks = collapse_result.effective_peaks
     if not effective_peaks:
         raise RuntimeError("peak collapse produced no effective peaks")
-    if len(effective_peaks) == 1:
+    effective_markers = marker_completion_module.convert_effective_peaks_to_markers(
+        effective_peaks
+    )
+    geometric_completion = marker_completion_module.safely_complete_geometric_markers(
+        padded_mask,
+        peak_analysis,
+        effective_peaks,
+        config.geometric_completion,
+        config.voxel_size_zyx_um,
+        retain_debug_artifacts=True,
+    )
+    final_markers = marker_completion_module.combine_markers(
+        effective_markers, geometric_completion.supplemental_markers
+    )
+    if len(final_markers) == 1:
         padded_labels = padded_mask.astype(np.int32)
     else:
         padded_labels = watershed_module.build_marker_watershed(
             padded_mask,
             peak_analysis.watershed_distance,
-            effective_peaks,
+            final_markers,
         )
 
     inner = tuple(
@@ -57,8 +72,8 @@ def run_stage3_component(resolution, component_id: int, config) -> Stage3Compone
     )
     final_labels = np.asarray(padded_labels[inner], dtype=np.int32)
     marker_positions = tuple(
-        tuple(int(value - padding) for value in peak.position_zyx)
-        for peak in effective_peaks
+        tuple(int(value - padding) for value in marker.position_zyx)
+        for marker in final_markers
     )
     canonical = pipeline_module.analyze_component_crop(
         component_mask, config, retain_debug_artifacts=True
@@ -69,11 +84,16 @@ def run_stage3_component(resolution, component_id: int, config) -> Stage3Compone
         "raw peaks": peak_analysis.peaks == canonical.raw_peaks,
         "effective peaks": effective_peaks == canonical.effective_peaks,
         "pair evidence": pair_evidence == canonical.pair_evidence,
+        "final markers": final_markers == canonical.final_markers,
+        "geometry status": (
+            geometric_completion.processing_status
+            == canonical.geometric_completion.processing_status
+        ),
         "final marker positions": (
             marker_positions == canonical.marker_positions_zyx
         ),
         "final instance count": (
-            len(effective_peaks)
+            len(final_markers)
             == len(tuple(value for value in np.unique(final_labels) if value > 0))
         ),
     }
@@ -91,6 +111,8 @@ def run_stage3_component(resolution, component_id: int, config) -> Stage3Compone
         peak_detail,
         pair_evidence,
         collapse_result,
+        geometric_completion,
+        final_markers,
         final_labels,
         marker_positions,
         canonical,
@@ -147,9 +169,37 @@ def pair_evidence_dataframe(run: Stage3ComponentRun) -> pd.DataFrame:
     )
 
 
+def surface_caps_dataframe(run: Stage3ComponentRun) -> pd.DataFrame:
+    return marker_completion_module.surface_caps_dataframe(
+        run.geometric_completion, run.component_id
+    )
+
+
+def body_candidates_dataframe(run: Stage3ComponentRun) -> pd.DataFrame:
+    return marker_completion_module.body_candidates_dataframe(
+        run.geometric_completion, run.component_id
+    )
+
+
+def cross_sections_dataframe(run: Stage3ComponentRun) -> pd.DataFrame:
+    return marker_completion_module.cross_sections_dataframe(
+        run.geometric_completion, run.component_id
+    )
+
+
+def marker_completion_dataframe(run: Stage3ComponentRun) -> pd.DataFrame:
+    return marker_completion_module.marker_completion_dataframe(
+        run.geometric_completion, run.component_id
+    )
+
+
 __all__ = [
+    "body_candidates_dataframe",
+    "cross_sections_dataframe",
+    "marker_completion_dataframe",
     "pair_evidence_dataframe",
     "peak_detections_dataframe",
     "raw_peaks_dataframe",
     "run_stage3_component",
+    "surface_caps_dataframe",
 ]

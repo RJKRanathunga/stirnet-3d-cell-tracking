@@ -21,6 +21,18 @@ ANALYSIS_LAYER_NAMES = {
     "Peaks | Raw",
     "Peaks | Effective",
     "Pairs | Evidence",
+    "Geometry | Boundary samples",
+    "Geometry | Surface caps",
+    "Geometry | Cap normals",
+    "Geometry | Candidate body axes",
+    "Geometry | Rejected body axes",
+    "Geometry | Selected body axes",
+    "Geometry | Effective EDT markers",
+    "Geometry | Supplemental markers",
+    "Geometry | Final markers",
+    "Geometry | Cross-section planes",
+    "Geometry | Ellipsoid support",
+    "Geometry | Unique support",
     "Peak scan | Smoothed EDT",
     "Peak scan | H-maxima",
     "Peak scan | Peaks",
@@ -200,6 +212,236 @@ def peak_properties(peaks, run: Stage3ComponentRun) -> dict[str, list]:
     effective = {
         peak.peak_id for peak in run.collapse_result.effective_peaks
     }
+
+
+def _geometry_to_crop(position, run, frame):
+    return padded_peak_to_crop(
+        position,
+        run.component_bbox,
+        frame.display_crop,
+        run.config.component_padding_voxels,
+    )
+
+
+def render_geometry_layers(
+    manager: Stage3LayerManager,
+    run: Stage3ComponentRun,
+    frame: Stage3FrameSelection,
+    time_count: int,
+    voxel_size,
+) -> None:
+    """Render retained production geometry without recalculating it."""
+
+    completion = run.geometric_completion
+    debug = completion.debug_artifacts
+    time_index = frame.scene_time_index
+    common = _common_layer_kwargs(frame, voxel_size)
+    spacing = np.asarray(voxel_size, dtype=float)
+
+    if debug is not None and len(debug.boundary_positions_zyx):
+        boundary = [
+            _geometry_to_crop(position, run, frame)
+            for position in debug.boundary_positions_zyx
+        ]
+        manager.add(
+            "add_points",
+            _time_points(boundary, time_index),
+            "Geometry | Boundary samples",
+            size=1.2,
+            face_color="gray",
+            visible=False,
+            **common,
+        )
+
+    cap_positions = [
+        _geometry_to_crop(cap.center_zyx, run, frame)
+        for cap in completion.surface_caps
+    ]
+    if cap_positions:
+        cap_properties = {
+            "cap_id": [cap.cap_id for cap in completion.surface_caps],
+            "area_proxy_um2": [cap.area_proxy_um2 for cap in completion.surface_caps],
+            "prominence_um": [cap.prominence_um for cap in completion.surface_caps],
+            "normal_coherence": [cap.normal_coherence for cap in completion.surface_caps],
+            "curvature_score": [cap.curvature_score for cap in completion.surface_caps],
+            "scale_support": [cap.scale_support for cap in completion.surface_caps],
+        }
+        manager.add(
+            "add_points",
+            _time_points(cap_positions, time_index),
+            "Geometry | Surface caps",
+            size=5,
+            face_color="gold",
+            properties=cap_properties,
+            text={"string": "{cap_id}", "color": "white"},
+            **common,
+        )
+        vectors = []
+        for position, cap in zip(cap_positions, completion.surface_caps):
+            origin = np.asarray((float(time_index), *position), dtype=float)
+            direction = np.asarray(
+                (0.0, *(2.0 * np.asarray(cap.mean_normal) / spacing)),
+                dtype=float,
+            )
+            vectors.append(np.stack((origin, direction)))
+        manager.add(
+            "add_vectors",
+            np.asarray(vectors),
+            "Geometry | Cap normals",
+            edge_color="gold",
+            properties=cap_properties,
+            **common,
+        )
+
+    selected_ids = {body.body_id for body in completion.selected_bodies}
+    candidates = [body for body in completion.body_candidates if body.valid]
+    rejected = [body for body in completion.body_candidates if not body.valid]
+
+    def body_lines(bodies):
+        return _time_lines(
+            [
+                np.asarray(
+                    [
+                        _geometry_to_crop(body.axis_endpoints_zyx[0], run, frame),
+                        _geometry_to_crop(body.axis_endpoints_zyx[1], run, frame),
+                    ]
+                )
+                for body in bodies
+            ],
+            time_index,
+        )
+
+    def body_properties(bodies):
+        return {
+            "body_id": [body.body_id for body in bodies],
+            "body_score": [body.score for body in bodies],
+            "valid": [body.valid for body in bodies],
+            "selected": [body.body_id in selected_ids for body in bodies],
+            "rejection_reasons": [";".join(body.rejection_reasons) for body in bodies],
+            "represented_effective_peak_ids": [
+                ";".join(str(value) for value in body.represented_by_effective_peak_ids)
+                for body in bodies
+            ],
+        }
+
+    for name, bodies, color, visible in (
+        ("Geometry | Candidate body axes", candidates, "cyan", False),
+        ("Geometry | Rejected body axes", rejected, "red", False),
+        ("Geometry | Selected body axes", list(completion.selected_bodies), "lime", True),
+    ):
+        if bodies:
+            manager.add(
+                "add_shapes",
+                body_lines(bodies),
+                name,
+                shape_type="line",
+                edge_color=color,
+                edge_width=2,
+                properties=body_properties(bodies),
+                visible=visible,
+                **common,
+            )
+
+    marker_groups = (
+        (
+            "Geometry | Effective EDT markers",
+            [marker for marker in run.final_markers if marker.source == "effective_edt"],
+            "red",
+        ),
+        (
+            "Geometry | Supplemental markers",
+            list(completion.supplemental_markers),
+            "magenta",
+        ),
+        ("Geometry | Final markers", list(run.final_markers), "white"),
+    )
+    for name, markers, color in marker_groups:
+        if not markers:
+            continue
+        manager.add(
+            "add_points",
+            _time_points(
+                [
+                    _geometry_to_crop(marker.position_zyx, run, frame)
+                    for marker in markers
+                ],
+                time_index,
+            ),
+            name,
+            size=7,
+            face_color=color,
+            properties={
+                "source": [marker.source for marker in markers],
+                "source_reference_id": [marker.source_reference_id for marker in markers],
+                "confidence": [marker.confidence for marker in markers],
+            },
+            **common,
+        )
+
+    # Display cross-sections only for the first selected body to avoid an
+    # unreadable all-candidate plane cloud. The body's properties identify it.
+    if completion.selected_bodies:
+        body = completion.selected_bodies[0]
+        axis = body.rotation_matrix[:, 0]
+        radial_a = body.rotation_matrix[:, 1]
+        radial_b = body.rotation_matrix[:, 2]
+        center_um = np.asarray(body.center_um)
+        polygons = []
+        for section in body.cross_sections:
+            section_center_um = center_um + section.t_um * axis
+            extent_a = max(section.radius_major_um, 0.2)
+            extent_b = max(section.radius_minor_um, 0.2)
+            corners_um = [
+                section_center_um + sign_a * extent_a * radial_a + sign_b * extent_b * radial_b
+                for sign_a, sign_b in ((-1, -1), (-1, 1), (1, 1), (1, -1))
+            ]
+            corners_zyx = np.asarray(corners_um) / spacing
+            polygons.append(
+                np.asarray(
+                    [
+                        (float(time_index), *_geometry_to_crop(point, run, frame))
+                        for point in corners_zyx
+                    ]
+                )
+            )
+        if polygons:
+            manager.add(
+                "add_shapes",
+                polygons,
+                "Geometry | Cross-section planes",
+                shape_type="polygon",
+                edge_color="yellow",
+                face_color="transparent",
+                properties={"body_id": [body.body_id] * len(polygons)},
+                visible=False,
+                **common,
+            )
+
+    for name, values, color in (
+        (
+            "Geometry | Ellipsoid support",
+            None if debug is None else debug.ellipsoid_support_zyx,
+            "blue",
+        ),
+        (
+            "Geometry | Unique support",
+            None if debug is None else debug.unique_support_zyx,
+            "green",
+        ),
+    ):
+        if values is not None and len(values):
+            manager.add(
+                "add_points",
+                _time_points(
+                    [_geometry_to_crop(point, run, frame) for point in values],
+                    time_index,
+                ),
+                name,
+                size=1,
+                face_color=color,
+                visible=False,
+                **common,
+            )
     return {
         "peak_id": [peak.peak_id for peak in peaks],
         "raw_depth": [peak.raw_depth_um for peak in peaks],
@@ -459,6 +701,9 @@ def render_analysis_layers(
         visible=False,
         **common,
     )
+    render_geometry_layers(
+        manager, run, frame, time_count, voxel_size
+    )
 
 
 def render_peak_setting(
@@ -524,6 +769,7 @@ __all__ = [
     "current_tzyx",
     "remove_owned_layers",
     "render_analysis_layers",
+    "render_geometry_layers",
     "render_input_layers",
     "render_peak_setting",
     "restore_camera",

@@ -77,6 +77,8 @@ class Stage3ComponentRun:
     peak_detail: object
     pair_evidence: tuple
     collapse_result: object
+    geometric_completion: object
+    final_markers: tuple
     final_labels: np.ndarray
     marker_positions_zyx: tuple[tuple[int, int, int], ...]
     canonical: object

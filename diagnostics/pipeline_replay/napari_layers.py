@@ -10,7 +10,13 @@ from skimage.segmentation import find_boundaries
 from .comparison import diagnose_instance_centers
 
 
-OWNED_PREFIXES = ("Production | ", "Trial | ", "Debug | ", "Difference | ")
+OWNED_PREFIXES = (
+    "Production | ",
+    "Trial | ",
+    "Debug | ",
+    "Geometry | ",
+    "Difference | ",
+)
 
 
 def remove_pipeline_replay_layers(viewer: Any) -> None:
@@ -146,6 +152,59 @@ def add_debug_layers(viewer: Any, source, result, component_index: int = 0):
         for column in component.effective_peak_properties.columns
     }
     layers.append(_replace(viewer, "points", local_points(component.effective_peak_positions_zyx), name="Debug | Effective peaks (final markers)", scale=scale, translate=scene_translate, size=2.5, face_color="red", properties=effective_properties))
+    layers.append(_replace(viewer, "points", local_points(component.effective_peak_positions_zyx), name="Geometry | Effective EDT markers", scale=scale, translate=scene_translate, size=2.5, face_color="red", properties=effective_properties))
+    if len(component.supplemental_marker_positions_zyx):
+        layers.append(_replace(viewer, "points", local_points(component.supplemental_marker_positions_zyx), name="Geometry | Supplemental markers", scale=scale, translate=scene_translate, size=2.8, face_color="magenta"))
+    layers.append(_replace(viewer, "points", local_points(component.final_marker_positions_zyx), name="Geometry | Final markers", scale=scale, translate=scene_translate, size=3.0, face_color="white"))
+
+    if len(component.boundary_positions_zyx):
+        layers.append(_replace(viewer, "points", local_points(component.boundary_positions_zyx), name="Geometry | Boundary samples", scale=scale, translate=scene_translate, size=1.0, face_color="gray", visible=False))
+    if not component.surface_caps.empty:
+        cap_points = component.surface_caps[["z", "y", "x"]].to_numpy(dtype=float)
+        cap_properties = {
+            column: component.surface_caps[column].to_numpy()
+            for column in component.surface_caps.columns
+        }
+        layers.append(_replace(viewer, "points", local_points(cap_points), name="Geometry | Surface caps", scale=scale, translate=scene_translate, size=2.5, face_color="gold", properties=cap_properties))
+        normal_lines = []
+        for row in component.surface_caps.to_dict("records"):
+            start = np.asarray((row["z"], row["y"], row["x"]), dtype=float)
+            normal = np.asarray((row["normal_z"], row["normal_y"], row["normal_x"]), dtype=float)
+            normal_lines.append(local_points(np.asarray((start, start + 2.0 * normal / np.asarray(scale)))))
+        layers.append(_replace(viewer, "shapes", normal_lines, shape_type="line", name="Geometry | Cap normals", scale=scale, translate=scene_translate, edge_color="gold", edge_width=1, properties=cap_properties))
+
+    if not component.body_candidates.empty:
+        def body_axis_layers(name, table, color, visible):
+            if table.empty:
+                return
+            lines = [
+                local_points(np.asarray((
+                    (row.axis_start_z, row.axis_start_y, row.axis_start_x),
+                    (row.axis_end_z, row.axis_end_y, row.axis_end_x),
+                )))
+                for row in table.itertuples()
+            ]
+            properties = {
+                column: table[column].to_numpy()
+                for column in table.columns
+            }
+            layers.append(_replace(viewer, "shapes", lines, shape_type="line", name=name, scale=scale, translate=scene_translate, edge_color=color, edge_width=1.5, properties=properties, visible=visible))
+
+        valid = component.body_candidates[component.body_candidates["valid"].astype(bool)]
+        rejected = component.body_candidates[~component.body_candidates["valid"].astype(bool)]
+        selected_bodies = component.body_candidates[component.body_candidates["selected"].astype(bool)]
+        body_axis_layers("Geometry | Candidate body axes", valid, "cyan", False)
+        body_axis_layers("Geometry | Rejected body axes", rejected, "red", False)
+        if component.supplemental_marker_count:
+            body_axis_layers("Geometry | Selected body axes", selected_bodies, "lime", True)
+        # Cross-section evidence is attached to the selected-body axis layer;
+        # render selected axes again as the optional plane-selection proxy.
+        if component.supplemental_marker_count:
+            body_axis_layers("Geometry | Cross-section planes", selected_bodies.head(1), "yellow", False)
+    if len(component.ellipsoid_support_zyx):
+        layers.append(_replace(viewer, "points", local_points(component.ellipsoid_support_zyx), name="Geometry | Ellipsoid support", scale=scale, translate=scene_translate, size=1, face_color="blue", visible=False))
+    if len(component.unique_support_zyx):
+        layers.append(_replace(viewer, "points", local_points(component.unique_support_zyx), name="Geometry | Unique support", scale=scale, translate=scene_translate, size=1, face_color="green", visible=False))
     peak_by_id = {
         int(peak_id): point
         for peak_id, point in zip(

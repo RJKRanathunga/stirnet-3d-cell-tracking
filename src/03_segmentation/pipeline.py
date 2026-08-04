@@ -1,4 +1,4 @@
-"""Production entry points for all-effective-peak 3-D instance segmentation."""
+"""Production effective-EDT plus geometric-marker 3-D segmentation."""
 
 from __future__ import annotations
 
@@ -9,6 +9,12 @@ from scipy import ndimage
 
 from .config import DEFAULT_SEGMENTATION_CONFIG, SegmentationConfig
 from .distance import compute_distance_transform
+from .marker_completion import (
+    combine_markers,
+    convert_effective_peaks_to_markers,
+    safely_complete_geometric_markers,
+)
+from .models import GeometricCompletionResult, InstanceMarker
 from .peaks import (
     DistancePeakAnalysis,
     LobeCollapseResult,
@@ -32,11 +38,21 @@ class ComponentDiagnostic:
     source_voxels: int
     raw_peak_count: int
     effective_peak_count: int
+    surface_cap_count: int
+    body_candidate_count: int
+    valid_body_count: int
+    selected_body_count: int
+    represented_body_count: int
+    unrepresented_body_count: int
+    supplemental_marker_count: int
+    final_marker_count: int
     instance_count: int
     marker_count: int
     marker_positions_zyx: tuple[tuple[int, int, int], ...]
     bbox_zyx: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
     processing_status: str
+    geometry_processing_status: str
+    geometry_error: str | None
     error: str | None
 
 
@@ -76,6 +92,8 @@ class ComponentDebugArtifacts:
     raw_peaks: tuple[PeakCandidate, ...]
     effective_peaks: tuple[PeakCandidate, ...]
     pair_evidence: tuple[PairEvidence, ...]
+    final_markers: tuple[InstanceMarker, ...]
+    geometric_completion: GeometricCompletionResult
     marker_positions_zyx: tuple[tuple[int, int, int], ...]
     final_labels: np.ndarray
 
@@ -89,6 +107,8 @@ class ComponentAnalysis:
     raw_peaks: tuple[PeakCandidate, ...]
     effective_peaks: tuple[PeakCandidate, ...]
     pair_evidence: tuple[PairEvidence, ...]
+    final_markers: tuple[InstanceMarker, ...]
+    geometric_completion: GeometricCompletionResult
     debug_artifacts: ComponentDebugArtifacts | None = None
 
 
@@ -97,6 +117,7 @@ def analyze_component_crop(
     config: SegmentationConfig = DEFAULT_SEGMENTATION_CONFIG,
     *,
     retain_debug_artifacts: bool = False,
+    force_geometric_analysis: bool = False,
 ) -> ComponentAnalysis:
     """Split one tight component crop using every effective peak as a marker."""
 
@@ -127,14 +148,41 @@ def analyze_component_crop(
     if not effective_peaks:
         raise RuntimeError("peak collapse produced no effective peaks")
 
-    if len(effective_peaks) == 1:
-        padded_labels = padded_mask.astype(np.int32)
-    else:
-        padded_labels = build_marker_watershed(
+    effective_markers = convert_effective_peaks_to_markers(effective_peaks)
+    geometric_completion = safely_complete_geometric_markers(
+        padded_mask,
+        peak_analysis,
+        effective_peaks,
+        config.geometric_completion,
+        config.voxel_size_zyx_um,
+        retain_debug_artifacts=retain_debug_artifacts,
+        force_analysis=force_geometric_analysis,
+    )
+
+    def labels_for(markers: tuple[InstanceMarker, ...]) -> np.ndarray:
+        if len(markers) == 1:
+            return padded_mask.astype(np.int32)
+        return build_marker_watershed(
             padded_mask,
             peak_analysis.watershed_distance,
-            effective_peaks,
+            markers,
         )
+
+    try:
+        final_markers = combine_markers(
+            effective_markers, geometric_completion.supplemental_markers
+        )
+        padded_labels = labels_for(final_markers)
+    except Exception as error:
+        # A geometric marker application failure is isolated just like a
+        # geometric-analysis failure; the successful EDT result remains valid.
+        if not geometric_completion.supplemental_markers:
+            raise
+        geometric_completion = GeometricCompletionResult.failed(
+            RuntimeError(f"geometric marker application failed: {error}")
+        )
+        final_markers = effective_markers
+        padded_labels = labels_for(final_markers)
 
     inner = tuple(
         slice(padding, -padding) if padding > 0 else slice(None)
@@ -142,8 +190,8 @@ def analyze_component_crop(
     )
     final_labels = np.asarray(padded_labels[inner], dtype=np.int32)
     marker_positions = tuple(
-        tuple(coordinate - padding for coordinate in peak.position_zyx)
-        for peak in effective_peaks
+        tuple(coordinate - padding for coordinate in marker.position_zyx)
+        for marker in final_markers
     )
     _validate_local_result(component_mask, final_labels, marker_positions)
 
@@ -164,16 +212,20 @@ def analyze_component_crop(
             raw_peaks=peak_analysis.peaks,
             effective_peaks=effective_peaks,
             pair_evidence=pair_evidence,
+            final_markers=final_markers,
+            geometric_completion=geometric_completion,
             marker_positions_zyx=marker_positions,
             final_labels=final_labels,
         )
     return ComponentAnalysis(
-        final_labels,
-        marker_positions,
-        peak_analysis.peaks,
-        effective_peaks,
-        pair_evidence,
-        debug_artifacts,
+        final_labels=final_labels,
+        marker_positions_zyx=marker_positions,
+        raw_peaks=peak_analysis.peaks,
+        effective_peaks=effective_peaks,
+        pair_evidence=pair_evidence,
+        final_markers=final_markers,
+        geometric_completion=geometric_completion,
+        debug_artifacts=debug_artifacts,
     )
 
 
@@ -268,6 +320,7 @@ def segment_instances_detailed(
     config: SegmentationConfig = DEFAULT_SEGMENTATION_CONFIG,
     *,
     retain_debug_artifacts: bool = False,
+    force_geometric_analysis: bool = False,
 ) -> SegmentationResult:
     """Segment a 3-D mask using all effective peaks and return aligned markers.
 
@@ -303,21 +356,41 @@ def segment_instances_detailed(
                 local_component,
                 config,
                 retain_debug_artifacts=retain_debug_artifacts,
+                force_geometric_analysis=force_geometric_analysis,
             )
             local_labels = analysis.final_labels
             marker_positions = analysis.marker_positions_zyx
             processing_status = "processed"
             raw_peak_count = len(analysis.raw_peaks)
             effective_peak_count = len(analysis.effective_peaks)
+            completion = analysis.geometric_completion
+            surface_cap_count = len(completion.surface_caps)
+            body_candidate_count = len(completion.body_candidates)
+            valid_body_count = sum(
+                body.valid for body in completion.body_candidates
+            )
+            selected_body_count = len(completion.selected_bodies)
+            represented_body_count = sum(
+                bool(body.represented_by_effective_peak_ids)
+                for body in completion.selected_bodies
+            )
+            unrepresented_body_count = sum(
+                not body.represented_by_effective_peak_ids
+                for body in completion.selected_bodies
+            )
+            supplemental_marker_count = len(completion.supplemental_markers)
+            final_marker_count = len(analysis.final_markers)
+            geometry_processing_status = completion.processing_status
+            geometry_error = completion.error
             positive_local_labels, global_positions = _prepare_component_output(
                 local_labels,
                 marker_positions,
                 component_slice,
                 mask,
             )
-            if len(positive_local_labels) != effective_peak_count:
+            if len(positive_local_labels) != final_marker_count:
                 raise RuntimeError(
-                    "successful component instance count differs from effective peak count"
+                    "successful component instance count differs from final marker count"
                 )
         except Exception as error:  # component isolation is a required safety net
             local_labels, marker_positions = _fallback_component_analysis(
@@ -326,6 +399,16 @@ def segment_instances_detailed(
             processing_status = "fallback_single"
             raw_peak_count = 0
             effective_peak_count = 1
+            surface_cap_count = 0
+            body_candidate_count = 0
+            valid_body_count = 0
+            selected_body_count = 0
+            represented_body_count = 0
+            unrepresented_body_count = 0
+            supplemental_marker_count = 0
+            final_marker_count = 1
+            geometry_processing_status = "not_run_due_to_edt_failure"
+            geometry_error = None
             error_message = f"{type(error).__name__}: {error}"
             positive_local_labels, global_positions = _prepare_component_output(
                 local_labels,
@@ -371,6 +454,8 @@ def segment_instances_detailed(
                     raw_peaks=artifact.raw_peaks,
                     effective_peaks=artifact.effective_peaks,
                     pair_evidence=artifact.pair_evidence,
+                    final_markers=artifact.final_markers,
+                    geometric_completion=artifact.geometric_completion,
                     marker_positions_zyx=artifact.marker_positions_zyx,
                     final_labels=artifact.final_labels,
                 )
@@ -383,22 +468,36 @@ def segment_instances_detailed(
                 source_voxels=source_voxels,
                 raw_peak_count=raw_peak_count,
                 effective_peak_count=effective_peak_count,
+                surface_cap_count=surface_cap_count,
+                body_candidate_count=body_candidate_count,
+                valid_body_count=valid_body_count,
+                selected_body_count=selected_body_count,
+                represented_body_count=represented_body_count,
+                unrepresented_body_count=unrepresented_body_count,
+                supplemental_marker_count=supplemental_marker_count,
+                final_marker_count=final_marker_count,
                 instance_count=instance_count,
                 marker_count=marker_count,
                 marker_positions_zyx=global_positions,
                 bbox_zyx=bbox,  # type: ignore[arg-type]
                 processing_status=processing_status,
+                geometry_processing_status=geometry_processing_status,
+                geometry_error=geometry_error,
                 error=error_message,
             )
         )
         if error_message is None:
-            if instance_count != effective_peak_count:
+            if final_marker_count != effective_peak_count + supplemental_marker_count:
                 raise RuntimeError(
-                    "successful component instance count differs from effective peak count"
+                    "final marker count differs from effective plus supplemental markers"
                 )
-            if marker_count != effective_peak_count:
+            if instance_count != final_marker_count:
                 raise RuntimeError(
-                    "successful component marker count differs from effective peak count"
+                    "successful component instance count differs from final marker count"
+                )
+            if marker_count != final_marker_count:
+                raise RuntimeError(
+                    "successful component marker count differs from final marker count"
                 )
 
     if np.any(final_labels[mask] <= 0):
@@ -455,6 +554,11 @@ def segment_instances(
                 metrics={
                     "raw_peak_count": record.raw_peak_count,
                     "effective_peak_count": record.effective_peak_count,
+                    "surface_cap_count": record.surface_cap_count,
+                    "body_candidate_count": record.body_candidate_count,
+                    "selected_body_count": record.selected_body_count,
+                    "supplemental_marker_count": record.supplemental_marker_count,
+                    "final_marker_count": record.final_marker_count,
                     "instance_count": record.instance_count,
                     "marker_count": record.marker_count,
                 },

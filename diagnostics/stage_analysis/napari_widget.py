@@ -36,10 +36,14 @@ from .napari_layers import (
     restore_camera,
 )
 from .runner import (
+    body_candidates_dataframe,
+    cross_sections_dataframe,
+    marker_completion_dataframe,
     pair_evidence_dataframe,
     peak_detections_dataframe,
     raw_peaks_dataframe,
     run_stage3_component,
+    surface_caps_dataframe,
 )
 from .source import Stage3AnalysisSource, discover_categories, discover_scenes
 
@@ -491,6 +495,14 @@ class Stage3AnalysisWidget(QWidget):
         display(peak_detections_dataframe(self.run_result))
         print("Pair evidence")
         display(pair_evidence_dataframe(self.run_result))
+        print("Surface caps")
+        display(surface_caps_dataframe(self.run_result))
+        print("Geometric body candidates")
+        display(body_candidates_dataframe(self.run_result))
+        print("Cross-sections")
+        display(cross_sections_dataframe(self.run_result))
+        print("Marker completion")
+        display(marker_completion_dataframe(self.run_result))
 
 
 def add_stage3_analysis_widget(
