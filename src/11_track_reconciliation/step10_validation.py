@@ -69,6 +69,18 @@ def validate_reconciliation(
     )
     record("accepted_target_has_one_predecessor", accepted_targets_unique, "one-to-one targets")
     record("accepted_source_has_one_successor", accepted_sources_unique, "one-to-one sources")
+    small_cell_decisions = applied_decisions.loc[
+        applied_decisions["decision"] == "accepted_small_cell_supported"
+    ] if not applied_decisions.empty else applied_decisions
+    small_cell_not_forced = (
+        not small_cell_decisions["forced"].astype(bool).any()
+        if not small_cell_decisions.empty else True
+    )
+    record(
+        "small_cell_supported_assignments_are_not_forced",
+        small_cell_not_forced,
+        f"small_cell_supported={len(small_cell_decisions)}",
+    )
     increasing = True
     for _, group in final_tracks.sort_values(["track_id", "frame"], kind="mergesort").groupby(
         "track_id", sort=True
@@ -173,12 +185,26 @@ def validate_reconciliation(
     record("lineage_roots_and_generations_consistent", root_generation_valid, "acyclic generations")
 
     protected_endpoints = False
+    unaudited_history_exception = False
     endpoint_index = endpoints.set_index("track_id", drop=False) if not endpoints.empty else None
     for decision in applied_decisions.itertuples(index=False):
         source = endpoint_index.loc[int(decision.source_track_id)]
         target = endpoint_index.loc[int(decision.target_track_id)]
+        match = candidates.loc[
+            (candidates["source_track_id"].astype(int) == int(decision.source_track_id))
+            & (candidates["target_track_id"].astype(int) == int(decision.target_track_id))
+            & candidates["admissible"].astype(bool)
+        ]
+        history_exception = (
+            not match.empty
+            and bool(match.iloc[0]["small_cell_history_exception"])
+            and str(decision.decision) == "accepted_small_cell_supported"
+            and not bool(decision.forced)
+        )
+        if not bool(source["source_eligible"]) and not history_exception:
+            unaudited_history_exception = True
         if (
-            not bool(source["source_eligible"])
+            (not bool(source["source_eligible"]) and not history_exception)
             or not bool(target["target_eligible"])
             or bool(source["last_is_boundary"])
             or bool(target["first_is_boundary"])
@@ -188,6 +214,11 @@ def validate_reconciliation(
             protected_endpoints = True
             break
     record("no_boundary_or_virtual_endpoint_reconciled", not protected_endpoints, "endpoint protections honored")
+    record(
+        "source_history_exceptions_are_small_cell_supported",
+        not unaudited_history_exception,
+        "insufficient-history sources cannot enter conservative or forced assignment",
+    )
 
     outside_gate = False
     for decision in applied_decisions.itertuples(index=False):
@@ -209,6 +240,21 @@ def validate_reconciliation(
             outside_gate = True
             break
     record("accepted_edges_respect_hard_gates", not outside_gate, "candidate edge provenance verified")
+    unsupported_small_cell = False
+    for decision in small_cell_decisions.itertuples(index=False):
+        matches = candidates.loc[
+            (candidates["source_track_id"].astype(int) == int(decision.source_track_id))
+            & (candidates["target_track_id"].astype(int) == int(decision.target_track_id))
+            & candidates["admissible"].astype(bool)
+        ]
+        if matches.empty or not bool(matches.iloc[0]["small_cell_special_acceptance"]):
+            unsupported_small_cell = True
+            break
+    record(
+        "small_cell_supported_assignments_have_audited_support",
+        not unsupported_small_cell,
+        "special path requires its scored support predicate",
+    )
     eliminated_targets = set(track_id_remap["original_segment_track_id"].astype(int))
     idempotent = eliminated_targets.isdisjoint(final_ids)
     record(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import math
 
 
@@ -34,8 +34,13 @@ CONTINUATION_CANDIDATE_COLUMNS = (
     "anchor_predicted_y_um", "anchor_predicted_x_um",
     "anchor_prediction_error_um", "neighborhood_distance_error_um",
     "local_survival_ratio", "source_reference_volume",
-    "target_reference_volume", "volume_log_error", "shape_error",
-    "intensity_error", "target_real_observation_count",
+    "target_reference_volume", "effective_pair_volume", "small_cell_regime",
+    "small_cell_mode_applied", "small_cell_history_exception",
+    "volume_log_error", "shape_error",
+    "intensity_error", "normal_intensity_error", "intensity_mean_error",
+    "intensity_median_error", "intensity_std_error", "intensity_iqr_error",
+    "intensity_cv_error", "intensity_sum_error",
+    "target_real_observation_count",
     "candidate_quality_score", "stage7_candidate_available",
     "stage7_candidate_distance_um", "stage7_candidate_pair_cost",
     "stage7_candidate_probability", "stage7_candidate_rank",
@@ -43,6 +48,18 @@ CONTINUATION_CANDIDATE_COLUMNS = (
     "bidirectional_score", "anchor_position_score", "neighborhood_score",
     "temporal_gap_score", "volume_score", "shape_score", "intensity_score",
     "stage7_alternative_score", "uniqueness_score", "continuation_score",
+    "volume_log_score_scale_used", "forward_weight_multiplier",
+    "backward_weight_multiplier", "bidirectional_weight_multiplier",
+    "anchor_weight_multiplier", "neighborhood_weight_multiplier",
+    "temporal_gap_weight_multiplier", "uniqueness_weight_multiplier",
+    "volume_weight_multiplier", "shape_weight_multiplier",
+    "intensity_weight_multiplier", "candidate_quality_weight_multiplier",
+    "stage7_alternative_weight_multiplier",
+    "small_cell_strong_forward", "small_cell_strong_backward",
+    "small_cell_strong_anchor", "small_cell_strong_neighborhood",
+    "small_cell_support_count", "small_cell_unique_enough",
+    "small_cell_special_acceptance", "normal_weighted_score",
+    "size_aware_weighted_score", "size_aware_score_delta",
     "assignment_cost", "source_candidate_count", "target_predecessor_count",
     "source_rank", "target_rank", "source_runner_up_score",
     "target_runner_up_score", "source_score_margin", "target_score_margin",
@@ -54,7 +71,9 @@ CONTINUATION_DECISION_COLUMNS = (
     "source_end_frame", "target_start_frame", "gap_frames", "decision",
     "policy_phase", "forced", "continuation_score", "assignment_cost",
     "source_rank", "target_rank", "source_score_margin",
-    "target_score_margin", "candidate_count", "reason",
+    "target_score_margin", "candidate_count", "reason", "small_cell_regime",
+    "effective_pair_volume", "small_cell_support_count",
+    "small_cell_special_acceptance",
 )
 
 TRACK_ID_REMAP_COLUMNS = (
@@ -73,6 +92,31 @@ UNRESOLVED_ENDING_COLUMNS = (
 VALIDATION_RESULT_COLUMNS = (
     "check_name", "passed", "severity", "details",
 )
+
+
+@dataclass(frozen=True)
+class SmallCellWeightMultipliers:
+    """Candidate-local evidence multipliers for one small-cell calibration knot."""
+
+    forward_position: float
+    backward_position: float
+    bidirectional: float
+    anchor_position: float
+    neighborhood: float
+    temporal_gap: float
+    uniqueness: float
+    volume: float
+    shape: float
+    intensity: float
+    candidate_quality: float
+    stage7_alternative: float
+
+    def __post_init__(self) -> None:
+        for name, value in vars(self).items():
+            if not math.isfinite(float(value)) or float(value) < 0:
+                raise ValueError(
+                    f"small-cell weight multiplier {name!r} must be nonnegative and finite"
+                )
 
 
 @dataclass(frozen=True)
@@ -129,10 +173,75 @@ class TrackReconciliationConfig:
     candidate_quality_weight: float = 0.03
     intensity_weight: float = 0.02
     stage7_alternative_weight: float = 0.03
+    small_cell_mode_enabled: bool = True
+    extremely_small_volume_threshold: float = 100.0
+    small_cell_volume_threshold: float = 200.0
+    small_cell_transition_volume_threshold: float = 350.0
+    small_cell_normal_volume_threshold: float = 600.0
+    small_cell_volume_log_scale_at_75: float = math.log(8.0)
+    small_cell_volume_log_scale_at_150: float = math.log(5.0)
+    small_cell_volume_log_scale_at_250: float = math.log(3.0)
+    small_cell_volume_log_scale_at_400: float = math.log(2.0)
+    small_cell_forward_error_um: float = 4.0
+    small_cell_backward_error_um: float = 5.0
+    small_cell_anchor_error_um: float = 5.0
+    small_cell_neighborhood_error_um: float = 5.0
+    small_cell_minimum_anchor_count: int = 2
+    small_cell_minimum_support_count: int = 2
+    small_cell_minimum_source_margin: float = 0.04
+    small_cell_minimum_target_margin: float = 0.03
+    small_cell_intensity_mean_weight: float = 0.45
+    small_cell_intensity_median_weight: float = 0.45
+    small_cell_intensity_std_weight: float = 0.04
+    small_cell_intensity_iqr_weight: float = 0.03
+    small_cell_intensity_cv_weight: float = 0.03
+    small_cell_intensity_sum_weight: float = 0.0
+    extremely_small_weight_multipliers: SmallCellWeightMultipliers = field(
+        default_factory=lambda: SmallCellWeightMultipliers(
+            forward_position=1.30,
+            backward_position=1.30,
+            bidirectional=1.20,
+            anchor_position=1.40,
+            neighborhood=1.40,
+            temporal_gap=1.00,
+            uniqueness=1.20,
+            volume=0.10,
+            shape=0.10,
+            intensity=0.50,
+            candidate_quality=1.00,
+            stage7_alternative=1.00,
+        )
+    )
+    small_cell_weight_multipliers: SmallCellWeightMultipliers = field(
+        default_factory=lambda: SmallCellWeightMultipliers(
+            forward_position=1.15,
+            backward_position=1.15,
+            bidirectional=1.10,
+            anchor_position=1.20,
+            neighborhood=1.20,
+            temporal_gap=1.00,
+            uniqueness=1.10,
+            volume=0.35,
+            shape=0.30,
+            intensity=0.70,
+            candidate_quality=1.00,
+            stage7_alternative=1.00,
+        )
+    )
 
     def __post_init__(self) -> None:
         if self.policy not in POLICIES:
             raise ValueError(f"policy must be one of {POLICIES}, got {self.policy!r}")
+        if not isinstance(self.small_cell_mode_enabled, bool):
+            raise ValueError("small_cell_mode_enabled must be a boolean")
+        if not isinstance(
+            self.extremely_small_weight_multipliers, SmallCellWeightMultipliers
+        ) or not isinstance(
+            self.small_cell_weight_multipliers, SmallCellWeightMultipliers
+        ):
+            raise ValueError(
+                "small-cell weight multipliers must be SmallCellWeightMultipliers"
+            )
         spacing = tuple(float(value) for value in self.voxel_size_zyx_um)
         if len(spacing) != 3 or not all(math.isfinite(v) and v > 0 for v in spacing):
             raise ValueError("voxel_size_zyx_um must contain three positive finite values")
@@ -146,6 +255,8 @@ class TrackReconciliationConfig:
             "minimum_anchor_count_for_strong_support": (
                 self.minimum_anchor_count_for_strong_support
             ),
+            "small_cell_minimum_anchor_count": self.small_cell_minimum_anchor_count,
+            "small_cell_minimum_support_count": self.small_cell_minimum_support_count,
         }
         for name, value in positive_counts.items():
             if int(value) < 1:
@@ -174,6 +285,32 @@ class TrackReconciliationConfig:
             "invalid_assignment_cost": self.invalid_assignment_cost,
             "conservative_unmatched_cost": self.conservative_unmatched_cost,
             "forced_unmatched_cost": self.forced_unmatched_cost,
+            "extremely_small_volume_threshold": self.extremely_small_volume_threshold,
+            "small_cell_volume_threshold": self.small_cell_volume_threshold,
+            "small_cell_transition_volume_threshold": (
+                self.small_cell_transition_volume_threshold
+            ),
+            "small_cell_normal_volume_threshold": (
+                self.small_cell_normal_volume_threshold
+            ),
+            "small_cell_volume_log_scale_at_75": (
+                self.small_cell_volume_log_scale_at_75
+            ),
+            "small_cell_volume_log_scale_at_150": (
+                self.small_cell_volume_log_scale_at_150
+            ),
+            "small_cell_volume_log_scale_at_250": (
+                self.small_cell_volume_log_scale_at_250
+            ),
+            "small_cell_volume_log_scale_at_400": (
+                self.small_cell_volume_log_scale_at_400
+            ),
+            "small_cell_forward_error_um": self.small_cell_forward_error_um,
+            "small_cell_backward_error_um": self.small_cell_backward_error_um,
+            "small_cell_anchor_error_um": self.small_cell_anchor_error_um,
+            "small_cell_neighborhood_error_um": (
+                self.small_cell_neighborhood_error_um
+            ),
         }
         for name, value in positive_scales.items():
             if not math.isfinite(float(value)) or float(value) <= 0:
@@ -183,6 +320,14 @@ class TrackReconciliationConfig:
                 self.candidate_radius_per_additional_gap_um
             ),
             "boundary_margin_um": self.boundary_margin_um,
+            "small_cell_intensity_mean_weight": self.small_cell_intensity_mean_weight,
+            "small_cell_intensity_median_weight": (
+                self.small_cell_intensity_median_weight
+            ),
+            "small_cell_intensity_std_weight": self.small_cell_intensity_std_weight,
+            "small_cell_intensity_iqr_weight": self.small_cell_intensity_iqr_weight,
+            "small_cell_intensity_cv_weight": self.small_cell_intensity_cv_weight,
+            "small_cell_intensity_sum_weight": self.small_cell_intensity_sum_weight,
         }
         for name, value in nonnegative.items():
             if not math.isfinite(float(value)) or float(value) < 0:
@@ -198,12 +343,20 @@ class TrackReconciliationConfig:
                 self.conservative_minimum_target_margin
             ),
             "gap_decay": self.gap_decay,
+            "small_cell_minimum_source_margin": (
+                self.small_cell_minimum_source_margin
+            ),
+            "small_cell_minimum_target_margin": (
+                self.small_cell_minimum_target_margin
+            ),
         }
         for name, value in thresholds.items():
             if not math.isfinite(float(value)) or not 0 <= float(value) <= 1:
                 raise ValueError(f"{name} must be between zero and one")
         weights = {
-            name: value for name, value in vars(self).items() if name.endswith("_weight")
+            name: value for name, value in vars(self).items()
+            if name.endswith("_weight")
+            and not name.startswith("small_cell_intensity_")
         }
         if any(not math.isfinite(float(v)) or float(v) < 0 for v in weights.values()):
             raise ValueError("score weights must be nonnegative and finite")
@@ -211,6 +364,23 @@ class TrackReconciliationConfig:
             raise ValueError("at least one score weight must be positive")
         if self.minimum_anchor_count_for_strong_support > self.maximum_anchor_count:
             raise ValueError("minimum strong anchor count cannot exceed maximum_anchor_count")
+        if self.small_cell_minimum_anchor_count > self.maximum_anchor_count:
+            raise ValueError("small-cell minimum anchor count cannot exceed maximum_anchor_count")
+        if self.small_cell_minimum_support_count > 4:
+            raise ValueError("small_cell_minimum_support_count cannot exceed four supports")
+        ordered_volume_thresholds = (
+            self.extremely_small_volume_threshold,
+            self.small_cell_volume_threshold,
+            self.small_cell_transition_volume_threshold,
+            self.small_cell_normal_volume_threshold,
+        )
+        if any(
+            first >= second
+            for first, second in zip(ordered_volume_thresholds, ordered_volume_thresholds[1:])
+        ):
+            raise ValueError("small-cell volume thresholds must be strictly increasing")
+        if self.small_cell_normal_volume_threshold <= 400.0:
+            raise ValueError("small_cell_normal_volume_threshold must be above 400 voxels")
 
     def as_dict(self) -> dict[str, object]:
         """Return JSON-stable configuration metadata."""

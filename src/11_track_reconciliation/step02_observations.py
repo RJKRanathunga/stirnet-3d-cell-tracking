@@ -17,7 +17,8 @@ REQUIRED_TRACK_COLUMNS = (
 
 OPTIONAL_DETECTION_FEATURES = (
     "volume_voxels", "intensity_sum", "intensity_mean", "intensity_std",
-    "intensity_median", "equivalent_radius", "axis_major", "axis_middle",
+    "intensity_median", "intensity_iqr", "intensity_cv", "equivalent_radius",
+    "axis_major", "axis_middle",
     "axis_minor", "elongation", "flatness", "anisotropy", "solidity",
     "compactness", "bbox_depth", "bbox_height", "bbox_width", "z_min",
     "y_min", "x_min", "z_max", "y_max", "x_max", "touches_boundary",

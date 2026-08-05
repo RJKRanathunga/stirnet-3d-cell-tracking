@@ -23,8 +23,10 @@ class AssignmentResult:
     unresolved_endings: pd.DataFrame
     component_count: int
     conservative_count: int
+    small_cell_supported_count: int
     forced_count: int
     conservative_assignment: pd.DataFrame
+    small_cell_supported_assignment: pd.DataFrame
     forced_assignment: pd.DataFrame
 
 
@@ -160,6 +162,10 @@ def _strong_support(row: pd.Series, config: TrackReconciliationConfig) -> tuple[
 
 
 def _conservative_qualifies(row: pd.Series, config: TrackReconciliationConfig) -> tuple[bool, str]:
+    if bool(row.get("small_cell_special_acceptance", False)):
+        return False, "deferred_to_small_cell_supported_phase"
+    if bool(row.get("small_cell_history_exception", False)):
+        return False, "small_cell_history_exception_requires_special_support"
     if float(row["continuation_score"]) < config.conservative_minimum_score:
         return False, "below_conservative_score"
     truly_unique = (
@@ -206,6 +212,12 @@ def _decision_record(
         "target_score_margin": float(row["target_score_margin"]),
         "candidate_count": int(row["source_candidate_count"]),
         "reason": reason,
+        "small_cell_regime": str(row.get("small_cell_regime", "unknown")),
+        "effective_pair_volume": float(row.get("effective_pair_volume", math.nan)),
+        "small_cell_support_count": int(row.get("small_cell_support_count", 0)),
+        "small_cell_special_acceptance": bool(
+            row.get("small_cell_special_acceptance", False)
+        ),
     }
 
 
@@ -233,7 +245,12 @@ def resolve_assignments(
     selected_records: list[dict[str, object]] = []
     applied_indices: set[int] = set()
     if config.policy == "diagnostic":
-        proposed = _solve(candidates, admissible_indices, config.forced_unmatched_cost)
+        diagnostic_indices = {
+            index for index in admissible_indices
+            if not bool(candidates.loc[index, "small_cell_history_exception"])
+            or bool(candidates.loc[index, "small_cell_special_acceptance"])
+        }
+        proposed = _solve(candidates, diagnostic_indices, config.forced_unmatched_cost)
         for index in sorted(proposed):
             row = candidates.loc[index]
             selected_records.append(_decision_record(
@@ -245,6 +262,7 @@ def resolve_assignments(
                 reason="globally_best_admissible_diagnostic_edge",
             ))
         conservative_selected = set()
+        small_cell_selected: set[int] = set()
         forced_selected: set[int] = set()
     else:
         for index in sorted(conservative_selected):
@@ -258,20 +276,53 @@ def resolve_assignments(
                 reason="evidence_and_global_assignment_passed",
             ))
         applied_indices.update(conservative_selected)
+        used_sources = {
+            int(candidates.loc[index, "source_track_id"])
+            for index in conservative_selected
+        }
+        used_targets = {
+            int(candidates.loc[index, "target_track_id"])
+            for index in conservative_selected
+        }
+        small_cell_allowed = {
+            index for index in admissible_indices
+            if bool(candidates.loc[index, "small_cell_special_acceptance"])
+            and int(candidates.loc[index, "source_track_id"]) not in used_sources
+            and int(candidates.loc[index, "target_track_id"]) not in used_targets
+        }
+        small_cell_selected = _solve(
+            candidates, small_cell_allowed, config.forced_unmatched_cost
+        )
+        for index in sorted(small_cell_selected):
+            row = candidates.loc[index]
+            selected_records.append(_decision_record(
+                row,
+                component_id=component_by_index[index],
+                decision="accepted_small_cell_supported",
+                phase="small_cell_supported",
+                forced=False,
+                reason=(
+                    "small_cell_reliability_applied_with_strong_forward_"
+                    f"and_{int(row['small_cell_support_count'])}_independent_supports_"
+                    "and_mutual_margin"
+                ),
+            ))
+        applied_indices.update(small_cell_selected)
         forced_selected = set()
         if config.policy == "submission":
             used_sources = {
                 int(candidates.loc[index, "source_track_id"])
-                for index in conservative_selected
+                for index in applied_indices
             }
             used_targets = {
                 int(candidates.loc[index, "target_track_id"])
-                for index in conservative_selected
+                for index in applied_indices
             }
             fallback_allowed = {
                 index for index in admissible_indices
                 if int(candidates.loc[index, "source_track_id"]) not in used_sources
                 and int(candidates.loc[index, "target_track_id"]) not in used_targets
+                and not bool(candidates.loc[index, "small_cell_history_exception"])
             }
             forced_selected = _solve(
                 candidates, fallback_allowed, config.forced_unmatched_cost
@@ -375,6 +426,19 @@ def resolve_assignments(
             ),
             "candidate_count": int(len(admissible)),
             "reason": reason,
+            "small_cell_regime": (
+                str(best["small_cell_regime"]) if best is not None else "unknown"
+            ),
+            "effective_pair_volume": (
+                float(best["effective_pair_volume"]) if best is not None else math.nan
+            ),
+            "small_cell_support_count": (
+                int(best["small_cell_support_count"]) if best is not None else 0
+            ),
+            "small_cell_special_acceptance": (
+                bool(best["small_cell_special_acceptance"])
+                if best is not None else False
+            ),
         })
     decisions = pd.DataFrame(decision_records, columns=CONTINUATION_DECISION_COLUMNS)
     if not decisions.empty:
@@ -394,9 +458,13 @@ def resolve_assignments(
         unresolved_endings=unresolved,
         component_count=component_count,
         conservative_count=len(conservative_selected),
+        small_cell_supported_count=len(small_cell_selected),
         forced_count=len(forced_selected),
         conservative_assignment=decisions.loc[
             decisions["policy_phase"] == "conservative"
+        ].reset_index(drop=True),
+        small_cell_supported_assignment=decisions.loc[
+            decisions["policy_phase"] == "small_cell_supported"
         ].reset_index(drop=True),
         forced_assignment=decisions.loc[
             decisions["policy_phase"] == "forced_submission"

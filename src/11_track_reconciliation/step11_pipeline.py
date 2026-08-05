@@ -139,7 +139,7 @@ def run_track_reconciliation(
     source_reasons = endpoints["source_exclusion_reason"] if not endpoints.empty else pd.Series(dtype=str)
     target_reasons = endpoints["target_exclusion_reason"] if not endpoints.empty else pd.Series(dtype=str)
     metadata: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "stage_name": "11_track_reconciliation",
         "sample_id": str(sample_id),
         "policy": resolved_config.policy,
@@ -153,6 +153,9 @@ def run_track_reconciliation(
         "candidate_edge_count": int(candidates["admissible"].astype(bool).sum()) if not candidates.empty else 0,
         "candidate_component_count": assignments.component_count,
         "conservative_assignment_count": assignments.conservative_count,
+        "small_cell_supported_assignment_count": (
+            assignments.small_cell_supported_count
+        ),
         "forced_assignment_count": assignments.forced_count,
         "total_assignment_count": int(len(assignments.applied_decisions)),
         "unresolved_ending_count": int(len(eligible_unresolved)),
@@ -172,6 +175,7 @@ def run_track_reconciliation(
         "final_tracks": metadata["final_track_count"],
         "candidate_edges": metadata["candidate_edge_count"],
         "conservative_assignments": assignments.conservative_count,
+        "small_cell_supported_assignments": assignments.small_cell_supported_count,
         "forced_assignments": assignments.forced_count,
         "unresolved_eligible_endings": len(eligible_unresolved),
     }
@@ -207,6 +211,35 @@ def run_track_reconciliation(
                 "assignment_cost": float(row.assignment_cost),
                 "direct_endpoint_distance_um": float(row.direct_endpoint_distance_um),
                 "gap_frames": int(row.gap_frames),
+                "effective_pair_volume": float(row.effective_pair_volume),
+                "small_cell_regime": str(row.small_cell_regime),
+                "small_cell_mode_applied": bool(row.small_cell_mode_applied),
+                "small_cell_history_exception": bool(
+                    row.small_cell_history_exception
+                ),
+                "small_cell_support_count": int(row.small_cell_support_count),
+                "small_cell_strong_forward": bool(row.small_cell_strong_forward),
+                "small_cell_strong_backward": bool(row.small_cell_strong_backward),
+                "small_cell_strong_anchor": bool(row.small_cell_strong_anchor),
+                "small_cell_strong_neighborhood": bool(
+                    row.small_cell_strong_neighborhood
+                ),
+                "small_cell_unique_enough": bool(row.small_cell_unique_enough),
+                "small_cell_special_acceptance": bool(
+                    row.small_cell_special_acceptance
+                ),
+                "normal_weighted_score": float(row.normal_weighted_score),
+                "size_aware_weighted_score": float(row.size_aware_weighted_score),
+                "reduced_volume_weight_multiplier": float(
+                    row.volume_weight_multiplier
+                ),
+                "reduced_shape_weight_multiplier": float(row.shape_weight_multiplier),
+                "reduced_intensity_weight_multiplier": float(
+                    row.intensity_weight_multiplier
+                ),
+                "volume_log_score_scale_used": float(
+                    row.volume_log_score_scale_used
+                ),
             },
             provenance=Provenance(
                 source_type="continuation_candidate",
@@ -216,7 +249,29 @@ def run_track_reconciliation(
                 source_candidate_id=str(row.candidate_id),
             ),
         ))
+    candidate_by_pair = {
+        (int(row.source_track_id), int(row.target_track_id)): row
+        for row in candidates.itertuples(index=False)
+        if bool(row.admissible)
+    }
     for row in assignments.decisions.itertuples(index=False):
+        candidate = (
+            candidate_by_pair.get((int(row.source_track_id), int(row.target_track_id)))
+            if pd.notna(row.source_track_id) and pd.notna(row.target_track_id)
+            else None
+        )
+        support_metrics = ({
+            "small_cell_strong_forward": bool(candidate.small_cell_strong_forward),
+            "small_cell_strong_backward": bool(candidate.small_cell_strong_backward),
+            "small_cell_strong_anchor": bool(candidate.small_cell_strong_anchor),
+            "small_cell_strong_neighborhood": bool(
+                candidate.small_cell_strong_neighborhood
+            ),
+            "small_cell_unique_enough": bool(candidate.small_cell_unique_enough),
+            "volume_weight_multiplier": float(candidate.volume_weight_multiplier),
+            "shape_weight_multiplier": float(candidate.shape_weight_multiplier),
+            "intensity_weight_multiplier": float(candidate.intensity_weight_multiplier),
+        } if candidate is not None else {})
         decisions.append(DecisionRecord(
             decision_type="reconciliation_decision",
             outcome=str(row.decision),
@@ -230,6 +285,16 @@ def run_track_reconciliation(
                 ),
                 "forced": bool(row.forced),
                 "candidate_count": int(row.candidate_count),
+                "effective_pair_volume": (
+                    float(row.effective_pair_volume)
+                    if pd.notna(row.effective_pair_volume) else math.nan
+                ),
+                "small_cell_regime": str(row.small_cell_regime),
+                "small_cell_support_count": int(row.small_cell_support_count),
+                "small_cell_special_acceptance": bool(
+                    row.small_cell_special_acceptance
+                ),
+                **support_metrics,
             },
             provenance=Provenance(
                 source_type="track_endpoint",
@@ -266,6 +331,9 @@ def run_track_reconciliation(
             "endpoint_classifications": endpoints,
             "continuation_candidates": candidates,
             "conservative_assignment": assignments.conservative_assignment,
+            "small_cell_supported_assignment": (
+                assignments.small_cell_supported_assignment
+            ),
             "forced_assignment": assignments.forced_assignment,
             "track_id_remap": remapped.track_id_remap,
             "unresolved_endings": assignments.unresolved_endings,

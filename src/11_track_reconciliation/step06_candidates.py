@@ -20,6 +20,12 @@ from .step04_motion import (
     forward_prediction,
 )
 from .step05_neighborhood import anchor_evidence
+from .small_cell_reliability import (
+    classify_small_cell_regime,
+    effective_pair_volume,
+    size_aware_intensity_error,
+    small_cell_mode_applied,
+)
 
 
 SHAPE_FEATURES = (
@@ -29,6 +35,10 @@ SHAPE_FEATURES = (
 )
 INTENSITY_FEATURES = (
     "intensity_mean", "intensity_median", "intensity_std", "intensity_sum",
+)
+INTENSITY_COMPONENT_FEATURES = (
+    "intensity_mean", "intensity_median", "intensity_std", "intensity_iqr",
+    "intensity_cv", "intensity_sum",
 )
 
 
@@ -168,13 +178,23 @@ def generate_candidates(
         for frame, group in endpoints.groupby("first_real_frame", dropna=True, sort=True)
     }
     records: list[dict[str, object]] = []
-    sources = endpoints.loc[endpoints["source_eligible"].astype(bool)].sort_values(
+    source_mask = endpoints["source_eligible"].astype(bool)
+    if config.small_cell_mode_enabled:
+        source_mask |= (
+            endpoints["source_exclusion_reason"].astype(str)
+            == "excluded_insufficient_history"
+        )
+    sources = endpoints.loc[source_mask].sort_values(
         ["last_real_frame", "track_id"], kind="mergesort"
     )
     spacing = np.asarray(config.voxel_size_zyx_um, dtype=float)
     for source in sources.itertuples(index=False):
         source_track_id = int(source.track_id)
         source_end_frame = int(source.last_real_frame)
+        history_exception = (
+            not bool(source.source_eligible)
+            and str(source.source_exclusion_reason) == "excluded_insufficient_history"
+        )
         source_real = real_track_observations(observations, source_track_id)
         source_end = observations.loc[int(source.last_real_observation_index)]
         source_position = source_end[["z", "y", "x"]].to_numpy(dtype=float) * spacing
@@ -257,6 +277,37 @@ def generate_candidates(
                     abs(math.log(target_volume / source_volume))
                     if source_volume > 0 and target_volume > 0 else math.nan
                 )
+                pair_volume = effective_pair_volume(source_volume, target_volume)
+                if (
+                    reason == "admissible"
+                    and history_exception
+                    and (
+                        not math.isfinite(pair_volume)
+                        or pair_volume > config.small_cell_volume_threshold
+                    )
+                ):
+                    reason = "excluded_insufficient_history"
+                intensity_components = {
+                    f"{feature}_error": _feature_error(
+                        source_reference,
+                        target_reference,
+                        (feature,),
+                        logarithmic=True,
+                    )
+                    for feature in INTENSITY_COMPONENT_FEATURES
+                }
+                normal_intensity_error = _feature_error(
+                    source_reference,
+                    target_reference,
+                    INTENSITY_FEATURES,
+                    logarithmic=True,
+                )
+                intensity_error = size_aware_intensity_error(
+                    intensity_components,
+                    normal_intensity_error,
+                    pair_volume,
+                    config,
+                )
                 stage7 = _stage7_alternative(
                     source_real, target_start, association_candidates
                 )
@@ -283,14 +334,19 @@ def generate_candidates(
                     **anchors,
                     "source_reference_volume": source_volume,
                     "target_reference_volume": target_volume,
+                    "effective_pair_volume": pair_volume,
+                    "small_cell_regime": classify_small_cell_regime(pair_volume, config),
+                    "small_cell_mode_applied": small_cell_mode_applied(
+                        pair_volume, config
+                    ),
+                    "small_cell_history_exception": bool(history_exception),
                     "volume_log_error": volume_error,
                     "shape_error": _feature_error(
                         source_reference, target_reference, SHAPE_FEATURES
                     ),
-                    "intensity_error": _feature_error(
-                        source_reference, target_reference, INTENSITY_FEATURES,
-                        logarithmic=True,
-                    ),
+                    "intensity_error": intensity_error,
+                    "normal_intensity_error": normal_intensity_error,
+                    **intensity_components,
                     "target_real_observation_count": int(len(target_real)),
                     "candidate_quality_score": _target_quality(
                         target_real, sequence_last_frame, config

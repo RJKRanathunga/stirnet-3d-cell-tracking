@@ -173,8 +173,6 @@ def classify_endpoints(
             source_reason = "excluded_virtual_endpoint"
         elif bool(row["last_is_virtual"]) or int(row["last_frame"]) != last_real:
             source_reason = "excluded_virtual_endpoint"
-        elif real_count < config.minimum_source_observations:
-            source_reason = "excluded_insufficient_history"
         elif last_real >= sequence_last_frame:
             source_reason = "excluded_last_frame"
         elif bool(row["last_is_boundary"]):
@@ -185,6 +183,8 @@ def classify_endpoints(
             source_reason = "excluded_probable_division"
         elif (track_id, last_real) in merge_sources:
             source_reason = "excluded_merge_event"
+        elif real_count < config.minimum_source_observations:
+            source_reason = "excluded_insufficient_history"
         else:
             source_reason = "eligible"
 
