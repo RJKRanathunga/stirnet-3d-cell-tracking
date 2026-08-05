@@ -26,15 +26,14 @@ def _add_track_group(
         tail_length=tail_length,
     )
     point_layer = viewer.add_points(
-        to_napari_points(frame), name=point_name, scale=scale, size=5,
+        to_napari_points(frame),
+        name=point_name,
+        scale=scale,
+        size=5,
         face_color=color,
         properties={
             "track_id": frame["track_id"].to_numpy(),
             "cell_id": frame["cell_id"].to_numpy(),
-        },
-        text={
-            "string": "T{track_id}", "size": 8, "color": "white",
-            "anchor": "center",
         },
     )
     track_layer.visible = visible
@@ -101,6 +100,26 @@ def create_final_visualization_viewer(
         },
     )
     all_points.visible = False
+
+    track_id_labels = viewer.add_points(
+        visualization.points_array,
+        name="Track IDs",
+        scale=scale,
+        size=1,
+        face_color="transparent",
+        border_color="transparent",
+        properties={
+            "track_id": visualization.track_ids,
+            "cell_id": visualization.cell_ids,
+        },
+        text={
+            "string": "T{track_id}",
+            "size": 8,
+            "color": "white",
+            "anchor": "center",
+        },
+        visible=False,
+    )
 
     groups = visualization.groups
     _add_track_group(viewer, groups.suspicious_termination_tracks,
