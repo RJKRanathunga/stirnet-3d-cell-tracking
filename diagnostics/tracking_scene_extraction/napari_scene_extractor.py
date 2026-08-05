@@ -13,8 +13,11 @@ import numpy as np
 import pandas as pd
 
 try:
-    from qtpy.QtCore import Qt
+    from qtpy.QtCore import QEvent, QTimer, Qt
     from qtpy.QtWidgets import (
+        QAbstractSpinBox,
+        QApplication,
+        QCheckBox,
         QComboBox,
         QGridLayout,
         QGroupBox,
@@ -23,6 +26,7 @@ try:
         QPlainTextEdit,
         QPushButton,
         QScrollArea,
+        QTextEdit,
         QSizePolicy,
         QSpinBox,
         QVBoxLayout,
@@ -578,6 +582,7 @@ class TrackingSceneExtractorWidget(QWidget):
         self.viewer = viewer
         self.model = model
         self.default_padding_zyx = tuple(int(value) for value in default_padding_zyx)
+        self._application = QApplication.instance()
         if len(self.default_padding_zyx) != 3:
             raise SceneCaptureError(
                 "default_padding_zyx must contain exactly three integers."
@@ -585,6 +590,9 @@ class TrackingSceneExtractorWidget(QWidget):
 
         self._build_ui()
         self._connect_events()
+        if self._application is not None:
+            self._application.installEventFilter(self)
+
         self.refresh_categories()
         self._update_frame_label()
         self._update_summary()
@@ -626,6 +634,17 @@ class TrackingSceneExtractorWidget(QWidget):
             QSizePolicy.Fixed,
         )
         frame_layout.addWidget(self.cell_ids_input)
+
+        self.capture_cell_ids_checkbox = QCheckBox(
+            "Keep Cell IDs active and capture number keys"
+        )
+        self.capture_cell_ids_checkbox.setToolTip(
+            "When enabled, changing the frame returns keyboard focus to the "
+            "Cell IDs box. Number keys typed while the Napari canvas is active "
+            "are redirected to this box."
+        )
+        self.capture_cell_ids_checkbox.setChecked(False)
+        frame_layout.addWidget(self.capture_cell_ids_checkbox)
 
         frame_button_grid = QGridLayout()
         self.save_frame_button = QPushButton("Save frame selection")
@@ -728,10 +747,96 @@ class TrackingSceneExtractorWidget(QWidget):
         self.refresh_categories_button.clicked.connect(self.refresh_categories)
         self.save_scene_button.clicked.connect(self._save_scene)
 
+        self.cell_ids_input.returnPressed.connect(self._save_current_frame)
+        self.capture_cell_ids_checkbox.toggled.connect(
+            self._on_capture_cell_ids_toggled
+        )
+
         for spin in self.padding_spins:
             spin.valueChanged.connect(self._selection_changed)
 
         self.viewer.dims.events.current_step.connect(self._on_dims_changed)
+
+    def eventFilter(self, watched: Any, event: Any) -> bool:
+        """Redirect numeric typing from Napari to the Cell IDs editor.
+
+        The filter is deliberately narrow. It only acts when capture mode is
+        enabled, ignores modified shortcuts, and never steals input from another
+        editable Qt control such as a padding spin box or text editor.
+        """
+        if (
+            event.type() != QEvent.KeyPress
+            or not self.capture_cell_ids_checkbox.isChecked()
+            or not self.isVisible()
+        ):
+            return super().eventFilter(watched, event)
+
+        focus_widget = QApplication.focusWidget()
+        if focus_widget is self.cell_ids_input:
+            return super().eventFilter(watched, event)
+
+        # Do not hijack typing intended for any other editable control.
+        if isinstance(
+            focus_widget,
+            (
+                QLineEdit,
+                QAbstractSpinBox,
+                QPlainTextEdit,
+                QTextEdit,
+                QComboBox,
+            ),
+        ):
+            return super().eventFilter(watched, event)
+
+        if event.modifiers() & (
+            Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier
+        ):
+            return super().eventFilter(watched, event)
+
+        text = event.text()
+        if text.isdigit() or text in {",", " "}:
+            # The first captured key starts a new selection instead of being
+            # appended to an ID left over from the previous frame.
+            self._focus_cell_ids_input(select_all=True)
+            self.cell_ids_input.insert(text)
+            return True
+
+        if event.key() == Qt.Key_Backspace:
+            self._focus_cell_ids_input(select_all=False)
+            self.cell_ids_input.backspace()
+            return True
+
+        return super().eventFilter(watched, event)
+
+    def _on_capture_cell_ids_toggled(self, enabled: bool) -> None:
+        if enabled:
+            self._schedule_cell_ids_focus(select_all=True)
+
+    def _schedule_cell_ids_focus(self, *, select_all: bool) -> None:
+        """Restore focus after Napari finishes processing the current event."""
+        if not self.capture_cell_ids_checkbox.isChecked():
+            return
+
+        QTimer.singleShot(
+            0,
+            lambda: self._focus_cell_ids_input(select_all=select_all),
+        )
+
+    def _focus_cell_ids_input(self, *, select_all: bool) -> None:
+        if (
+            not self.capture_cell_ids_checkbox.isChecked()
+            or not self.cell_ids_input.isVisible()
+            or not self.cell_ids_input.isEnabled()
+        ):
+            return
+
+        self.cell_ids_input.setFocus(Qt.ShortcutFocusReason)
+        if select_all and self.cell_ids_input.text():
+            self.cell_ids_input.selectAll()
+        else:
+            self.cell_ids_input.setCursorPosition(
+                len(self.cell_ids_input.text())
+            )
 
     def _current_frame(self) -> int:
         if self.viewer.dims.ndim < 4:
@@ -776,6 +881,9 @@ class TrackingSceneExtractorWidget(QWidget):
         self._update_frame_label()
         self._load_current_selection_into_input()
         self._update_preview()
+        # The time slider and preview layer can claim focus. Restore it only
+        # when the user explicitly enabled Cell ID capture mode.
+        self._schedule_cell_ids_focus(select_all=True)
 
     def _update_frame_label(self) -> None:
         try:
@@ -968,17 +1076,18 @@ class TrackingSceneExtractorWidget(QWidget):
         return [corners[[start, stop]] for start, stop in edge_pairs]
 
     def _update_preview(self) -> None:
-        # Preserve the user's current visibility choice before replacing the layer.
+        # Update the existing preview layer in place whenever possible. Removing
+        # and re-adding it changes Napari's active layer and can steal keyboard
+        # focus from this dock widget.
         try:
             existing_layer = self.viewer.layers[PREVIEW_LAYER_NAME]
             preview_visible = bool(existing_layer.visible)
         except Exception:
-            # Show the preview by default when it is first created.
+            existing_layer = None
             preview_visible = True
 
-        self._remove_preview_layer()
-
         if not self.model.selections:
+            self._remove_preview_layer()
             return
 
         try:
@@ -989,6 +1098,25 @@ class TrackingSceneExtractorWidget(QWidget):
 
         corners = self._box_corners(frame, crop)
         paths = self._box_paths(corners)
+
+        if existing_layer is not None:
+            try:
+                layer_type = getattr(existing_layer, "_type_string", "")
+                if layer_type == "shapes":
+                    existing_layer.data = paths
+                elif layer_type == "points":
+                    existing_layer.data = corners
+                else:
+                    raise TypeError(
+                        f"Unexpected preview layer type: {layer_type!r}"
+                    )
+
+                existing_layer.visible = preview_visible
+                return
+            except Exception:
+                # Recreate only when the installed Napari version cannot update
+                # the current layer safely.
+                self._remove_preview_layer()
 
         try:
             preview_layer = self.viewer.add_shapes(
