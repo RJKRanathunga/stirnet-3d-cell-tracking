@@ -566,6 +566,12 @@ def make_track_state(
         "template": make_feature_template(detection),
         "template_reliable": not is_boundary,
         "template_count": 1 if not is_boundary else 0,
+        "graph_last_confidence": 0.0,
+        "graph_anchor_support_count": 0,
+        "graph_boundary_hypothesis": "",
+        "graph_boundary_face": "",
+        "graph_boundary_confidence": 0.0,
+        "graph_boundary_since_frame": None,
     }
 
 def state_reference_value(
@@ -1303,6 +1309,20 @@ def augmented_assignment(
             )
         ),
     }
+
+
+def stage7_assignment_solver(
+    pair_cost_matrix: np.ndarray,
+    miss_costs: np.ndarray,
+    birth_costs: np.ndarray,
+) -> dict:
+    """Adapt the production augmented solver to the graph callback contract."""
+
+    return augmented_assignment(
+        pair_cost_matrix=pair_cost_matrix,
+        miss_costs=miss_costs,
+        birth_costs=birth_costs,
+    )
 
 def assign_track_states(
     *,

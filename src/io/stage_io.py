@@ -49,6 +49,11 @@ class Stage7Outputs:
     association_events: pd.DataFrame
     association_candidates: pd.DataFrame
     track_states: pd.DataFrame
+    graph_transition_summary: pd.DataFrame
+    graph_candidate_evidence: pd.DataFrame
+    graph_anchor_votes: pd.DataFrame
+    graph_boundary_hypotheses: pd.DataFrame
+    graph_refinement_events: pd.DataFrame
     metadata: dict[str, Any]
 
 
@@ -121,6 +126,21 @@ def load_stage7_outputs(*, paths: PipelinePaths | None = None) -> Stage7Outputs:
         association_events=load_optional_csv(root / "association_events.csv"),
         association_candidates=load_optional_csv(root / "association_candidates.csv"),
         track_states=load_optional_csv(root / "track_states.csv"),
+        graph_transition_summary=load_optional_csv(
+            root / "graph_transition_summary.csv"
+        ),
+        graph_candidate_evidence=load_optional_csv(
+            root / "graph_candidate_evidence.csv"
+        ),
+        graph_anchor_votes=load_optional_csv(
+            root / "graph_anchor_votes.csv"
+        ),
+        graph_boundary_hypotheses=load_optional_csv(
+            root / "graph_boundary_hypotheses.csv"
+        ),
+        graph_refinement_events=load_optional_csv(
+            root / "graph_refinement_events.csv"
+        ),
         metadata=load_json(root / "metadata.json"),
     )
 
@@ -166,6 +186,11 @@ def save_tracking_result(result, directory: str | Path) -> None:
         "association_events": "association_events.csv",
         "association_candidates": "association_candidates.csv",
         "track_states": "track_states.csv",
+        "graph_transition_summary": "graph_transition_summary.csv",
+        "graph_candidate_evidence": "graph_candidate_evidence.csv",
+        "graph_anchor_votes": "graph_anchor_votes.csv",
+        "graph_boundary_hypotheses": "graph_boundary_hypotheses.csv",
+        "graph_refinement_events": "graph_refinement_events.csv",
     }
     for attribute, filename in mapping.items():
         save_csv(getattr(result, attribute), root / filename)

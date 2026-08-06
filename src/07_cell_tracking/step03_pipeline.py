@@ -2,13 +2,26 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 
 from src.diagnostics import DecisionRecord, Provenance, StageTrace
 
+from .graph_tracking import (
+    GraphRefinementResult,
+    GraphTrackingConfig,
+    refine_transition_with_graph,
+)
+from .graph_tracking.diagnostics import (
+    empty_anchor_votes,
+    empty_boundary_hypotheses,
+    empty_candidate_evidence,
+    empty_refinement_events,
+    empty_transition_summary,
+)
 from .step01_config import *
 from .step02_association import *
 
@@ -25,6 +38,11 @@ class TrackingResult:
     association_events: pd.DataFrame
     association_candidates: pd.DataFrame
     track_states: pd.DataFrame
+    graph_transition_summary: pd.DataFrame
+    graph_candidate_evidence: pd.DataFrame
+    graph_anchor_votes: pd.DataFrame
+    graph_boundary_hypotheses: pd.DataFrame
+    graph_refinement_events: pd.DataFrame
     metadata: dict
     summary: dict
 
@@ -33,9 +51,12 @@ def run_cell_tracking(
     time_frames: list[pd.DataFrame],
     *,
     sample_id: str = "44b6_0113de3b",
+    graph_config: GraphTrackingConfig | None = None,
     return_diagnostics: bool = False,
-):
+) -> TrackingResult | tuple[TrackingResult, StageTrace]:
     """Run the notebook's tracking algorithm without changing its ordering."""
+
+    graph_config = graph_config or GraphTrackingConfig(mode="disabled")
 
     time_frames = [
         annotate_boundary_metadata(frame)
@@ -65,6 +86,11 @@ def run_cell_tracking(
     tracking_diagnostic_records: list[dict] = []
     association_event_records: list[dict] = []
     association_candidate_records: list[dict] = []
+    graph_transition_summary_tables: list[pd.DataFrame] = []
+    graph_candidate_evidence_tables: list[pd.DataFrame] = []
+    graph_anchor_vote_tables: list[pd.DataFrame] = []
+    graph_boundary_hypothesis_tables: list[pd.DataFrame] = []
+    graph_refinement_event_tables: list[pd.DataFrame] = []
     
     # Maps target frame t to the global shift from t-1 -> t.
     global_shift_history: dict[int, np.ndarray] = {}
@@ -223,6 +249,211 @@ def run_cell_tracking(
         return float(
             np.median(np.min(distance_matrix, axis=1))
         )
+
+
+    def build_graph_diagnostic_context(
+        graph_result: GraphRefinementResult | None,
+        eligible_states: list[dict],
+        assignment: dict,
+    ) -> dict[str, Any]:
+        """Index one transition's graph evidence for stable Stage 7 records."""
+
+        base_assignment = (
+            graph_result.base_assignment
+            if graph_result is not None
+            else assignment
+        )
+        graph_assignment = (
+            graph_result.graph_assignment
+            if graph_result is not None
+            else assignment
+        )
+
+        def decision_sets(value: dict) -> tuple[dict[int, int], set[int], set[int]]:
+            matches = {
+                int(row): int(col)
+                for row, col in zip(value["rows"], value["cols"])
+            }
+            misses = {
+                int(index)
+                for index in value["missed_state_indices"]
+            }
+            births = {
+                int(index)
+                for index in value["birth_detection_indices"]
+            }
+            return matches, misses, births
+
+        candidate_by_pair: dict[tuple[int, int], dict[str, Any]] = {}
+        boundary_by_state: dict[int, dict[str, Any]] = {}
+        boundary_by_detection: dict[int, dict[str, Any]] = {}
+        changed_states: set[int] = set()
+        changed_detections: set[int] = set()
+
+        if graph_result is not None:
+            for row in graph_result.candidate_evidence.to_dict("records"):
+                candidate_by_pair[
+                    (
+                        int(row["source_state_index"]),
+                        int(row["candidate_detection_index"]),
+                    )
+                ] = row
+
+            state_index_by_track_id = {
+                int(state["track_id"]): state_index
+                for state_index, state in enumerate(eligible_states)
+            }
+            for row in graph_result.boundary_hypotheses.to_dict("records"):
+                track_id = row.get("track_id")
+                detection_index = row.get("detection_index")
+                if pd.notna(track_id):
+                    state_index = state_index_by_track_id.get(int(track_id))
+                    if state_index is not None:
+                        boundary_by_state[state_index] = row
+                if pd.notna(detection_index):
+                    boundary_by_detection[int(detection_index)] = row
+
+            for row in graph_result.refinement_events.to_dict("records"):
+                if not bool(row["changed"]):
+                    continue
+                if row["entity_type"] == "track":
+                    changed_states.add(int(row["entity_index"]))
+                elif row["entity_type"] == "detection":
+                    changed_detections.add(int(row["entity_index"]))
+
+        base_matches, base_misses, base_births = decision_sets(base_assignment)
+        graph_matches, graph_misses, graph_births = decision_sets(graph_assignment)
+        return {
+            "enabled": graph_result is not None,
+            "candidate_by_pair": candidate_by_pair,
+            "boundary_by_state": boundary_by_state,
+            "boundary_by_detection": boundary_by_detection,
+            "changed_states": changed_states,
+            "changed_detections": changed_detections,
+            "base_matches": base_matches,
+            "base_misses": base_misses,
+            "base_births": base_births,
+            "graph_matches": graph_matches,
+            "graph_misses": graph_misses,
+            "graph_births": graph_births,
+        }
+
+
+    def graph_decision_diagnostics(
+        *,
+        context: dict[str, Any],
+        decision_type: str,
+        state_index: int | None = None,
+        detection_index: int | None = None,
+    ) -> dict[str, Any]:
+        """Return graph fields shared by candidate and decision diagnostics."""
+
+        pair = None
+        if state_index is not None and detection_index is not None:
+            pair = context["candidate_by_pair"].get(
+                (int(state_index), int(detection_index))
+            )
+
+        boundary = None
+        if decision_type == "miss" and state_index is not None:
+            boundary = context["boundary_by_state"].get(int(state_index))
+        elif decision_type == "birth" and detection_index is not None:
+            boundary = context["boundary_by_detection"].get(
+                int(detection_index)
+            )
+        elif decision_type in {"match", "candidate"}:
+            if detection_index is not None:
+                boundary = context["boundary_by_detection"].get(
+                    int(detection_index)
+                )
+            if boundary is None and state_index is not None:
+                boundary = context["boundary_by_state"].get(int(state_index))
+
+        if decision_type in {"match", "candidate"}:
+            base_selected = (
+                state_index is not None
+                and detection_index is not None
+                and context["base_matches"].get(int(state_index))
+                == int(detection_index)
+            )
+            graph_selected = (
+                state_index is not None
+                and detection_index is not None
+                and context["graph_matches"].get(int(state_index))
+                == int(detection_index)
+            )
+        elif decision_type == "miss":
+            base_selected = (
+                state_index is not None
+                and int(state_index) in context["base_misses"]
+            )
+            graph_selected = (
+                state_index is not None
+                and int(state_index) in context["graph_misses"]
+            )
+        else:
+            base_selected = (
+                detection_index is not None
+                and int(detection_index) in context["base_births"]
+            )
+            graph_selected = (
+                detection_index is not None
+                and int(detection_index) in context["graph_births"]
+            )
+
+        changed = (
+            state_index is not None
+            and int(state_index) in context["changed_states"]
+        ) or (
+            detection_index is not None
+            and int(detection_index) in context["changed_detections"]
+        )
+        boundary_confidence = (
+            float(boundary["confidence"])
+            if boundary is not None
+            else np.nan
+        )
+        return {
+            "graph_available": bool(pair is not None or boundary is not None),
+            "graph_anchor_count": (
+                int(pair["anchor_count"])
+                if pair is not None
+                else int(boundary["anchor_count"])
+                if boundary is not None
+                else 0
+            ),
+            "graph_inlier_count": (
+                int(pair["inlier_count"])
+                if pair is not None
+                else int(boundary["inlier_count"])
+                if boundary is not None
+                else 0
+            ),
+            "graph_vote_score": (
+                float(pair["vote_score"])
+                if pair is not None
+                else np.nan
+            ),
+            "graph_confidence": (
+                float(pair["graph_confidence"])
+                if pair is not None
+                else boundary_confidence
+            ),
+            "graph_cost_delta": (
+                float(pair["graph_cost_delta"])
+                if pair is not None
+                else np.nan
+            ),
+            "base_selected": bool(base_selected),
+            "graph_selected": bool(graph_selected),
+            "assignment_changed_by_graph": bool(changed),
+            "graph_boundary_event_type": (
+                str(boundary["decision"])
+                if boundary is not None
+                else ""
+            ),
+            "graph_boundary_confidence": boundary_confidence,
+        }
     
     
     def record_top_candidates(
@@ -231,6 +462,7 @@ def run_cell_tracking(
         eligible_states: list[dict],
         detections: pd.DataFrame,
         current_frame: int,
+        graph_context: dict[str, Any],
     ) -> None:
         """Save the most relevant candidate pairs for later failure diagnosis."""
     
@@ -426,6 +658,12 @@ def run_cell_tracking(
                         "candidate_touches_boundary": bool(
                             detection["touches_boundary"]
                         ),
+                        **graph_decision_diagnostics(
+                            context=graph_context,
+                            decision_type="candidate",
+                            state_index=state_index,
+                            detection_index=int(detection_index),
+                        ),
                     }
                 )
     
@@ -605,7 +843,43 @@ def run_cell_tracking(
                 global_shift_history[current_frame] = (
                     initial_global_shift.copy()
                 )
-    
+
+        # Graph refinement is deliberately inserted after the final base
+        # global-shift assignment is selected and before any diagnostics or
+        # track-state mutation consume the assignment.
+        graph_result: GraphRefinementResult | None = None
+        if graph_config.mode != "disabled":
+            graph_result = refine_transition_with_graph(
+                eligible_states=eligible_states,
+                detections=detections,
+                current_frame=current_frame,
+                base_assignment=assignment,
+                volume_shape_zyx=VOLUME_SHAPE_ZYX,
+                voxel_size_zyx_um=VOXEL_SIZE_ZYX,
+                config=graph_config,
+                assignment_solver=stage7_assignment_solver,
+            )
+            graph_transition_summary_tables.append(
+                graph_result.transition_summary
+            )
+            graph_candidate_evidence_tables.append(
+                graph_result.candidate_evidence
+            )
+            graph_anchor_vote_tables.append(graph_result.anchor_votes)
+            graph_boundary_hypothesis_tables.append(
+                graph_result.boundary_hypotheses
+            )
+            graph_refinement_event_tables.append(
+                graph_result.refinement_events
+            )
+            assignment = graph_result.assignment
+
+        graph_context = build_graph_diagnostic_context(
+            graph_result,
+            eligible_states,
+            assignment,
+        )
+
         previous_global_shift = global_shift_history.get(
             current_frame - 1,
             np.zeros(3, dtype=float),
@@ -705,6 +979,7 @@ def run_cell_tracking(
             eligible_states=eligible_states,
             detections=detections,
             current_frame=current_frame,
+            graph_context=graph_context,
         )
     
         distance_matrix = assignment["distance_matrix"]
@@ -751,6 +1026,13 @@ def run_cell_tracking(
         for state_index, detection_index in zip(rows, cols):
             state = eligible_states[int(state_index)]
             detection = detections.iloc[int(detection_index)]
+            graph_exit_was_pending = (
+                state["graph_boundary_hypothesis"] == "exit"
+            )
+            pending_graph_exit_face = state["graph_boundary_face"]
+            pending_graph_exit_confidence = float(
+                state["graph_boundary_confidence"]
+            )
     
             previous_faces = "|".join(
                 sorted(state["last_boundary_faces"])
@@ -914,6 +1196,12 @@ def run_cell_tracking(
                         ]
                     ),
                     "boundary_related": is_boundary_related,
+                    **graph_decision_diagnostics(
+                        context=graph_context,
+                        decision_type="match",
+                        state_index=int(state_index),
+                        detection_index=int(detection_index),
+                    ),
                 }
             )
     
@@ -961,6 +1249,25 @@ def run_cell_tracking(
                         "confidence": association_probability,
                     }
                 )
+
+            if graph_exit_was_pending and update_result["was_reacquired"]:
+                boundary_events.append(
+                    {
+                        "track_id": state["track_id"],
+                        "frame": current_frame,
+                        "event_type": "graph_exit_rejected_reacquired",
+                        "boundary_faces": pending_graph_exit_face,
+                        "missing_frames": 0,
+                        "reacquired_frame": current_frame,
+                        "confidence": pending_graph_exit_confidence,
+                    }
+                )
+            if graph_exit_was_pending:
+                state["graph_boundary_hypothesis"] = ""
+                state["graph_boundary_face"] = ""
+                state["graph_boundary_confidence"] = 0.0
+                state["graph_boundary_since_frame"] = None
+                state["graph_anchor_support_count"] = 0
     
         # --------------------------------------------------------
         # Apply explicit miss decisions and preserve short memory
@@ -968,6 +1275,19 @@ def run_cell_tracking(
     
         for state_index in missed_state_indices:
             state = eligible_states[int(state_index)]
+            graph_exit_row = graph_context["boundary_by_state"].get(
+                int(state_index)
+            )
+            graph_exit_supported = bool(
+                graph_config.mode == "apply"
+                and graph_exit_row is not None
+                and graph_exit_row["event_type"] == "exit"
+                and bool(graph_exit_row["supported"])
+            )
+            graph_exit_pending = bool(
+                graph_exit_supported
+                or state["graph_boundary_hypothesis"] == "exit"
+            )
     
             last_was_boundary = bool(
                 state["last_detection"].get(
@@ -978,7 +1298,25 @@ def run_cell_tracking(
             boundary_context = (
                 state["boundary_pending"]
                 or last_was_boundary
+                or graph_exit_pending
             )
+
+            if graph_exit_supported:
+                state["graph_last_confidence"] = float(
+                    graph_exit_row["confidence"]
+                )
+                state["graph_anchor_support_count"] = int(
+                    graph_exit_row["anchor_count"]
+                )
+                state["graph_boundary_hypothesis"] = "exit"
+                state["graph_boundary_face"] = str(
+                    graph_exit_row["boundary_face"]
+                )
+                state["graph_boundary_confidence"] = float(
+                    graph_exit_row["confidence"]
+                )
+                if state["graph_boundary_since_frame"] is None:
+                    state["graph_boundary_since_frame"] = int(current_frame)
     
             state["missed_frames"] += 1
     
@@ -1044,6 +1382,13 @@ def run_cell_tracking(
                     "boundary_faces": "|".join(
                         sorted(state["last_boundary_faces"])
                     ),
+                    "graph_boundary_hypothesis": state[
+                        "graph_boundary_hypothesis"
+                    ],
+                    "graph_boundary_face": state["graph_boundary_face"],
+                    "graph_boundary_confidence": float(
+                        state["graph_boundary_confidence"]
+                    ),
                 }
             )
     
@@ -1078,6 +1423,11 @@ def run_cell_tracking(
                     "volume_cost": np.nan,
                     "shape_cost": np.nan,
                     "boundary_related": boundary_context,
+                    **graph_decision_diagnostics(
+                        context=graph_context,
+                        decision_type="miss",
+                        state_index=int(state_index),
+                    ),
                 }
             )
     
@@ -1099,6 +1449,31 @@ def run_cell_tracking(
                         ),
                     }
                 )
+
+            if graph_exit_supported:
+                boundary_events.append(
+                    {
+                        "track_id": state["track_id"],
+                        "frame": current_frame,
+                        "event_type": "graph_exit_predicted",
+                        "boundary_faces": state["graph_boundary_face"],
+                        "missing_frames": state["missed_frames"],
+                        "reacquired_frame": np.nan,
+                        "confidence": state["graph_boundary_confidence"],
+                    }
+                )
+            if state["graph_boundary_hypothesis"] == "exit":
+                boundary_events.append(
+                    {
+                        "track_id": state["track_id"],
+                        "frame": current_frame,
+                        "event_type": "graph_exit_pending",
+                        "boundary_faces": state["graph_boundary_face"],
+                        "missing_frames": state["missed_frames"],
+                        "reacquired_frame": np.nan,
+                        "confidence": state["graph_boundary_confidence"],
+                    }
+                )
     
             if state["missed_frames"] > maximum_missing_frames:
                 state["active"] = False
@@ -1117,6 +1492,21 @@ def run_cell_tracking(
                             "confidence": np.nan,
                         }
                     )
+                if state["graph_boundary_hypothesis"] == "exit":
+                    boundary_events.append(
+                        {
+                            "track_id": state["track_id"],
+                            "frame": current_frame,
+                            "event_type": "graph_exit_confirmed",
+                            "boundary_faces": state["graph_boundary_face"],
+                            "missing_frames": state["missed_frames"],
+                            "reacquired_frame": np.nan,
+                            "confidence": state[
+                                "graph_boundary_confidence"
+                            ],
+                        }
+                    )
+                    state["graph_boundary_hypothesis"] = "exit_confirmed"
     
         # --------------------------------------------------------
         # Create tracks from explicit birth decisions
@@ -1126,6 +1516,15 @@ def run_cell_tracking(
     
         for detection_index in birth_detection_indices:
             detection = detections.iloc[int(detection_index)]
+            graph_entry_row = graph_context[
+                "boundary_by_detection"
+            ].get(int(detection_index))
+            graph_entry_supported = bool(
+                graph_config.mode == "apply"
+                and graph_entry_row is not None
+                and graph_entry_row["event_type"] == "entry"
+                and bool(graph_entry_row["supported"])
+            )
     
             track_id = next_track_id
             next_track_id += 1
@@ -1136,6 +1535,21 @@ def run_cell_tracking(
                 frame=current_frame,
                 detection=detection,
             )
+            if graph_entry_supported:
+                state["graph_last_confidence"] = float(
+                    graph_entry_row["confidence"]
+                )
+                state["graph_anchor_support_count"] = int(
+                    graph_entry_row["anchor_count"]
+                )
+                state["graph_boundary_hypothesis"] = "entry_supported"
+                state["graph_boundary_face"] = str(
+                    graph_entry_row["boundary_face"]
+                )
+                state["graph_boundary_confidence"] = float(
+                    graph_entry_row["confidence"]
+                )
+                state["graph_boundary_since_frame"] = int(current_frame)
             track_states[track_id] = state
     
             is_boundary = bool(detection["touches_boundary"])
@@ -1196,6 +1610,11 @@ def run_cell_tracking(
                     "volume_cost": np.nan,
                     "shape_cost": np.nan,
                     "boundary_related": is_boundary,
+                    **graph_decision_diagnostics(
+                        context=graph_context,
+                        decision_type="birth",
+                        detection_index=int(detection_index),
+                    ),
                 }
             )
     
@@ -1213,6 +1632,18 @@ def run_cell_tracking(
                                 "detection_birth_choice_probabilities"
                             ][detection_index]
                         ),
+                    }
+                )
+            if graph_entry_supported:
+                boundary_events.append(
+                    {
+                        "track_id": track_id,
+                        "frame": current_frame,
+                        "event_type": "graph_entry_supported",
+                        "boundary_faces": state["graph_boundary_face"],
+                        "missing_frames": 0,
+                        "reacquired_frame": np.nan,
+                        "confidence": state["graph_boundary_confidence"],
                     }
                 )
     
@@ -1262,6 +1693,25 @@ def run_cell_tracking(
                 ),
                 "global_shift_change_um": float(shift_change_um),
                 "refinement_used": bool(refinement_used),
+                "graph_mode": graph_config.mode,
+                "graph_candidate_evidence": (
+                    int(len(graph_result.candidate_evidence))
+                    if graph_result is not None else 0
+                ),
+                "graph_anchor_votes": (
+                    int(len(graph_result.anchor_votes))
+                    if graph_result is not None else 0
+                ),
+                "graph_boundary_hypotheses": (
+                    int(len(graph_result.boundary_hypotheses))
+                    if graph_result is not None else 0
+                ),
+                "graph_assignment_changes": (
+                    int(graph_result.refinement_events["changed"].sum())
+                    if graph_result is not None
+                    and not graph_result.refinement_events.empty
+                    else 0
+                ),
             }
         )
     
@@ -1353,6 +1803,52 @@ def run_cell_tracking(
     association_candidates = pd.DataFrame(
         association_candidate_records
     )
+
+    def concatenate_graph_tables(
+        tables: list[pd.DataFrame],
+        empty_factory: Callable[[], pd.DataFrame],
+    ) -> pd.DataFrame:
+        populated = [table for table in tables if not table.empty]
+        if not populated:
+            return empty_factory()
+        return pd.concat(populated, ignore_index=True)
+
+    graph_transition_summary = concatenate_graph_tables(
+        graph_transition_summary_tables,
+        empty_transition_summary,
+    )
+    graph_candidate_evidence = concatenate_graph_tables(
+        graph_candidate_evidence_tables,
+        empty_candidate_evidence,
+    )
+    graph_anchor_votes = concatenate_graph_tables(
+        graph_anchor_vote_tables,
+        empty_anchor_votes,
+    )
+    graph_boundary_hypotheses = concatenate_graph_tables(
+        graph_boundary_hypothesis_tables,
+        empty_boundary_hypotheses,
+    )
+    graph_refinement_events = concatenate_graph_tables(
+        graph_refinement_event_tables,
+        empty_refinement_events,
+    )
+
+    graph_refinement_change_count = int(
+        graph_refinement_events["changed"].sum()
+    ) if not graph_refinement_events.empty else 0
+    graph_supported_entry_count = int(
+        (
+            (graph_boundary_hypotheses["event_type"] == "entry")
+            & graph_boundary_hypotheses["supported"].astype(bool)
+        ).sum()
+    ) if not graph_boundary_hypotheses.empty else 0
+    graph_supported_exit_count = int(
+        (
+            (graph_boundary_hypotheses["event_type"] == "exit")
+            & graph_boundary_hypotheses["supported"].astype(bool)
+        ).sum()
+    ) if not graph_boundary_hypotheses.empty else 0
     
     # ============================================================
     # Tracking summary
@@ -1406,6 +1902,12 @@ def run_cell_tracking(
         "global_refinements_used": int(
             global_motion["refinement_used"].sum()
         ) if not global_motion.empty else 0,
+        "graph_mode": graph_config.mode,
+        "graph_transitions": int(len(graph_transition_summary)),
+        "graph_candidate_evidence": int(len(graph_candidate_evidence)),
+        "graph_assignment_changes": graph_refinement_change_count,
+        "graph_supported_entries": graph_supported_entry_count,
+        "graph_supported_exits": graph_supported_exit_count,
     }
     
     pd.Series(summary)
@@ -1463,6 +1965,22 @@ def run_cell_tracking(
                 "position_residual_samples": int(
                     state["position_residual_samples"]
                 ),
+                "graph_last_confidence": float(
+                    state["graph_last_confidence"]
+                ),
+                "graph_anchor_support_count": int(
+                    state["graph_anchor_support_count"]
+                ),
+                "graph_boundary_hypothesis": state[
+                    "graph_boundary_hypothesis"
+                ],
+                "graph_boundary_face": state["graph_boundary_face"],
+                "graph_boundary_confidence": float(
+                    state["graph_boundary_confidence"]
+                ),
+                "graph_boundary_since_frame": state[
+                    "graph_boundary_since_frame"
+                ],
             }
             for state in track_states.values()
         ]
@@ -1472,11 +1990,28 @@ def run_cell_tracking(
     metadata = {
         "architecture": (
             "boundary_aware_probabilistic_global_relative_motion_tracking"
+            "_with_optional_graph_transition_refinement"
         ),
         "association_probabilities_are_calibrated": False,
         "sample_id": sample_id,
         "volume_shape_zyx": VOLUME_SHAPE_ZYX.tolist(),
         "voxel_size_zyx": VOXEL_SIZE_ZYX.tolist(),
+        "graph_tracking": {
+            "mode": graph_config.mode,
+            "enabled": graph_config.mode != "disabled",
+            "configuration": asdict(graph_config),
+            "transition_count": int(len(graph_transition_summary)),
+            "candidate_evidence_count": int(
+                len(graph_candidate_evidence)
+            ),
+            "anchor_vote_count": int(len(graph_anchor_votes)),
+            "boundary_hypothesis_count": int(
+                len(graph_boundary_hypotheses)
+            ),
+            "refinement_change_count": graph_refinement_change_count,
+            "graph_supported_entry_count": graph_supported_entry_count,
+            "graph_supported_exit_count": graph_supported_exit_count,
+        },
         "global_shift": {
             "max_pair_distance_um": GLOBAL_SHIFT_MAX_PAIR_DISTANCE_UM,
             "mad_scale": GLOBAL_SHIFT_MAD_SCALE,
@@ -1613,6 +2148,11 @@ def run_cell_tracking(
         association_events=association_events,
         association_candidates=association_candidates,
         track_states=final_track_states,
+        graph_transition_summary=graph_transition_summary,
+        graph_candidate_evidence=graph_candidate_evidence,
+        graph_anchor_votes=graph_anchor_votes,
+        graph_boundary_hypotheses=graph_boundary_hypotheses,
+        graph_refinement_events=graph_refinement_events,
         metadata=metadata,
         summary=summary,
     )
@@ -1628,6 +2168,20 @@ def run_cell_tracking(
             metrics={
                 "association_probability": row.association_probability,
                 "decision_cost": row.decision_cost,
+                "graph_available": bool(row.graph_available),
+                "graph_confidence": row.graph_confidence,
+                "graph_cost_delta": row.graph_cost_delta,
+                "base_selected": bool(row.base_selected),
+                "graph_selected": bool(row.graph_selected),
+                "assignment_changed_by_graph": bool(
+                    row.assignment_changed_by_graph
+                ),
+                "graph_boundary_event_type": (
+                    row.graph_boundary_event_type
+                ),
+                "graph_boundary_confidence": (
+                    row.graph_boundary_confidence
+                ),
             },
             provenance=Provenance(
                 source_type="tracking_decision",
@@ -1648,6 +2202,11 @@ def run_cell_tracking(
             "association_candidates": association_candidates,
             "missing_predictions": missing_predictions,
             "boundary_events": boundary_events,
+            "graph_transition_summary": graph_transition_summary,
+            "graph_candidate_evidence": graph_candidate_evidence,
+            "graph_anchor_votes": graph_anchor_votes,
+            "graph_boundary_hypotheses": graph_boundary_hypotheses,
+            "graph_refinement_events": graph_refinement_events,
         },
         metrics=summary,
         decisions=decisions,
