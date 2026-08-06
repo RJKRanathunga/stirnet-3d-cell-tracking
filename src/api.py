@@ -29,11 +29,13 @@ def _not_available(name: str):
 
 
 try:
-    run_cell_tracking = import_module(
-        "src.07_cell_tracking.step03_pipeline"
-    ).run_cell_tracking
+    tracking_module = import_module("src.07_cell_tracking")
+
+    run_cell_tracking = tracking_module.run_cell_tracking
+    GraphTrackingConfig = tracking_module.GraphTrackingConfig
 except ModuleNotFoundError:
     run_cell_tracking = _not_available("run_cell_tracking")
+    GraphTrackingConfig = _not_available("GraphTrackingConfig")
 
 try:
     run_track_stitching = import_module(
@@ -65,6 +67,7 @@ except ModuleNotFoundError:
 
 
 __all__ = [
+    "GraphTrackingConfig",
     "create_binary_mask",
     "detect_cells",
     "extract_cell_features",
