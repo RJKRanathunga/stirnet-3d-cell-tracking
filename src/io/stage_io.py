@@ -7,6 +7,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from .arrays import list_timepoint_files, load_npy, save_npy
@@ -54,6 +55,13 @@ class Stage7Outputs:
     graph_anchor_votes: pd.DataFrame
     graph_boundary_hypotheses: pd.DataFrame
     graph_refinement_events: pd.DataFrame
+    graph4d_window_summary: pd.DataFrame
+    graph4d_component_summary: pd.DataFrame
+    graph4d_temporal_edges: pd.DataFrame
+    graph4d_assignment_changes: pd.DataFrame
+    graph4d_boundary_events: pd.DataFrame
+    graph4d_solver_diagnostics: pd.DataFrame
+    graph4d_track_id_map: pd.DataFrame
     metadata: dict[str, Any]
 
 
@@ -141,6 +149,27 @@ def load_stage7_outputs(*, paths: PipelinePaths | None = None) -> Stage7Outputs:
         graph_refinement_events=load_optional_csv(
             root / "graph_refinement_events.csv"
         ),
+        graph4d_window_summary=load_optional_csv(
+            root / "graph4d_window_summary.csv"
+        ),
+        graph4d_component_summary=load_optional_csv(
+            root / "graph4d_component_summary.csv"
+        ),
+        graph4d_temporal_edges=load_optional_csv(
+            root / "graph4d_temporal_edges.csv"
+        ),
+        graph4d_assignment_changes=load_optional_csv(
+            root / "graph4d_assignment_changes.csv"
+        ),
+        graph4d_boundary_events=load_optional_csv(
+            root / "graph4d_boundary_events.csv"
+        ),
+        graph4d_solver_diagnostics=load_optional_csv(
+            root / "graph4d_solver_diagnostics.csv"
+        ),
+        graph4d_track_id_map=load_optional_csv(
+            root / "graph4d_track_id_map.csv"
+        ),
         metadata=load_json(root / "metadata.json"),
     )
 
@@ -191,9 +220,19 @@ def save_tracking_result(result, directory: str | Path) -> None:
         "graph_anchor_votes": "graph_anchor_votes.csv",
         "graph_boundary_hypotheses": "graph_boundary_hypotheses.csv",
         "graph_refinement_events": "graph_refinement_events.csv",
+        "graph4d_window_summary": "graph4d_window_summary.csv",
+        "graph4d_component_summary": "graph4d_component_summary.csv",
+        "graph4d_temporal_edges": "graph4d_temporal_edges.csv",
+        "graph4d_assignment_changes": "graph4d_assignment_changes.csv",
+        "graph4d_boundary_events": "graph4d_boundary_events.csv",
+        "graph4d_solver_diagnostics": "graph4d_solver_diagnostics.csv",
+        "graph4d_track_id_map": "graph4d_track_id_map.csv",
     }
     for attribute, filename in mapping.items():
         save_csv(getattr(result, attribute), root / filename)
+    for filename, arrays in getattr(result, "graph4d_debug_artifacts", {}).items():
+        root.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(root / filename, **arrays)
     save_json(result.metadata, root / "metadata.json")
 
 

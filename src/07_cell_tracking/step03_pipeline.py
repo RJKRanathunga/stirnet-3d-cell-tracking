@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable
 
 import numpy as np
@@ -21,6 +21,20 @@ from .graph_tracking.diagnostics import (
     empty_candidate_evidence,
     empty_refinement_events,
     empty_transition_summary,
+)
+from .graph_tracking.four_d import (
+    FourDGraphResult,
+    TransitionEvidence,
+    run_four_d_graph_tracking,
+)
+from .graph_tracking.four_d.diagnostics import (
+    empty_assignment_changes as empty_graph4d_assignment_changes,
+    empty_boundary_events as empty_graph4d_boundary_events,
+    empty_component_summary as empty_graph4d_component_summary,
+    empty_solver_diagnostics as empty_graph4d_solver_diagnostics,
+    empty_temporal_edges as empty_graph4d_temporal_edges,
+    empty_track_id_map as empty_graph4d_track_id_map,
+    empty_window_summary as empty_graph4d_window_summary,
 )
 from .step01_config import *
 from .step02_association import *
@@ -43,11 +57,28 @@ class TrackingResult:
     graph_anchor_votes: pd.DataFrame
     graph_boundary_hypotheses: pd.DataFrame
     graph_refinement_events: pd.DataFrame
+    graph4d_window_summary: pd.DataFrame
+    graph4d_component_summary: pd.DataFrame
+    graph4d_temporal_edges: pd.DataFrame
+    graph4d_assignment_changes: pd.DataFrame
+    graph4d_boundary_events: pd.DataFrame
+    graph4d_solver_diagnostics: pd.DataFrame
+    graph4d_track_id_map: pd.DataFrame
     metadata: dict
     summary: dict
+    transition_evidence: tuple[TransitionEvidence, ...] = field(
+        default_factory=tuple,
+        repr=False,
+        compare=False,
+    )
+    graph4d_debug_artifacts: dict[str, dict[str, np.ndarray]] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
 
 
-def run_cell_tracking(
+def _run_provisional_or_pairwise_tracking(
     time_frames: list[pd.DataFrame],
     *,
     sample_id: str = "44b6_0113de3b",
@@ -91,6 +122,7 @@ def run_cell_tracking(
     graph_anchor_vote_tables: list[pd.DataFrame] = []
     graph_boundary_hypothesis_tables: list[pd.DataFrame] = []
     graph_refinement_event_tables: list[pd.DataFrame] = []
+    transition_evidence_records: list[TransitionEvidence] = []
     
     # Maps target frame t to the global shift from t-1 -> t.
     global_shift_history: dict[int, np.ndarray] = {}
@@ -848,7 +880,10 @@ def run_cell_tracking(
         # global-shift assignment is selected and before any diagnostics or
         # track-state mutation consume the assignment.
         graph_result: GraphRefinementResult | None = None
-        if graph_config.mode != "disabled":
+        if (
+            graph_config.mode != "disabled"
+            and graph_config.algorithm == "pairwise"
+        ):
             graph_result = refine_transition_with_graph(
                 eligible_states=eligible_states,
                 detections=detections,
@@ -878,6 +913,119 @@ def run_cell_tracking(
             graph_result,
             eligible_states,
             assignment,
+        )
+
+        # Keep a compact immutable snapshot for the post-sequence 4D solver.
+        # Dense evidence is deliberately retained only in memory and is never
+        # written to the default Stage 7 CSV artifact set.
+        detection_probability_margins = np.zeros(len(detections), dtype=float)
+        for detection_index in range(len(detections)):
+            choices = assignment["detection_candidate_probabilities"][
+                :, detection_index
+            ]
+            birth_choice = float(
+                assignment["detection_birth_choice_probabilities"][
+                    detection_index
+                ]
+            )
+            selected_state = next(
+                (
+                    int(state_index)
+                    for state_index, selected_detection in zip(
+                        assignment["rows"], assignment["cols"]
+                    )
+                    if int(selected_detection) == detection_index
+                ),
+                None,
+            )
+            if selected_state is None:
+                selected_probability = birth_choice
+                alternatives = choices
+            else:
+                selected_probability = float(choices[selected_state])
+                alternatives = np.concatenate(
+                    [np.delete(choices, selected_state), [birth_choice]]
+                )
+            detection_probability_margins[detection_index] = (
+                selected_probability
+                - (float(np.max(alternatives)) if alternatives.size else 0.0)
+            )
+
+        transition_evidence_records.append(
+            TransitionEvidence(
+                from_frame=int(current_frame - 1),
+                to_frame=int(current_frame),
+                source_track_ids=np.asarray(
+                    [state["track_id"] for state in eligible_states],
+                    dtype=np.int64,
+                ),
+                source_frames=np.asarray(
+                    [state["last_frame"] for state in eligible_states],
+                    dtype=np.int32,
+                ),
+                target_detection_indices=np.arange(
+                    len(detections), dtype=np.int32
+                ),
+                target_cell_ids=np.asarray(
+                    [
+                        detections.iloc[index].get("cell_id", index + 1)
+                        for index in range(len(detections))
+                    ],
+                    dtype=np.int64,
+                ),
+                pair_cost_matrix=np.asarray(
+                    assignment["pair_cost_matrix"], dtype=float
+                ).copy(),
+                safety_invalid=np.asarray(
+                    assignment["safety_invalid"], dtype=bool
+                ).copy(),
+                distance_matrix=np.asarray(
+                    assignment["distance_matrix"], dtype=float
+                ).copy(),
+                association_probabilities=np.asarray(
+                    assignment["association_probabilities"], dtype=float
+                ).copy(),
+                track_candidate_probabilities=np.asarray(
+                    assignment["track_candidate_probabilities"], dtype=float
+                ).copy(),
+                detection_candidate_probabilities=np.asarray(
+                    assignment["detection_candidate_probabilities"], dtype=float
+                ).copy(),
+                track_probability_margins=np.asarray(
+                    assignment["track_probability_margins"], dtype=float
+                ).copy(),
+                detection_probability_margins=(
+                    detection_probability_margins.copy()
+                ),
+                miss_costs=np.asarray(
+                    assignment["miss_costs"], dtype=float
+                ).copy(),
+                birth_costs=np.asarray(
+                    assignment["birth_costs"], dtype=float
+                ).copy(),
+                global_only_positions_zyx_um=np.asarray(
+                    assignment["global_only_positions"], dtype=float
+                ).copy(),
+                relative_motion_predicted_positions_zyx_um=np.asarray(
+                    assignment["predicted_positions"], dtype=float
+                ).copy(),
+                selected_rows=np.asarray(
+                    assignment["rows"], dtype=np.int32
+                ).copy(),
+                selected_columns=np.asarray(
+                    assignment["cols"], dtype=np.int32
+                ).copy(),
+                missed_rows=np.asarray(
+                    assignment["missed_state_indices"], dtype=np.int32
+                ).copy(),
+                birth_columns=np.asarray(
+                    assignment["birth_detection_indices"], dtype=np.int32
+                ).copy(),
+                global_shift_zyx_um=np.asarray(
+                    final_global_shift, dtype=float
+                ).copy(),
+                global_shift_confidence=float(final_global_confidence),
+            )
         )
 
         previous_global_shift = global_shift_history.get(
@@ -1882,8 +2030,8 @@ def run_cell_tracking(
             (association_events["decision_type"] == "birth").sum()
         ) if not association_events.empty else 0,
         "median_association_probability": float(
-            tracks["association_probability"].median()
-        ),
+            tracks["association_probability"].dropna().median()
+        ) if tracks["association_probability"].notna().any() else np.nan,
         "relative_velocity_updates": int(
             tracks["relative_velocity_updated"].sum()
         ),
@@ -1903,6 +2051,7 @@ def run_cell_tracking(
             global_motion["refinement_used"].sum()
         ) if not global_motion.empty else 0,
         "graph_mode": graph_config.mode,
+        "graph_algorithm": graph_config.algorithm,
         "graph_transitions": int(len(graph_transition_summary)),
         "graph_candidate_evidence": int(len(graph_candidate_evidence)),
         "graph_assignment_changes": graph_refinement_change_count,
@@ -1998,6 +2147,7 @@ def run_cell_tracking(
         "voxel_size_zyx": VOXEL_SIZE_ZYX.tolist(),
         "graph_tracking": {
             "mode": graph_config.mode,
+            "algorithm": graph_config.algorithm,
             "enabled": graph_config.mode != "disabled",
             "configuration": asdict(graph_config),
             "transition_count": int(len(graph_transition_summary)),
@@ -2153,8 +2303,17 @@ def run_cell_tracking(
         graph_anchor_votes=graph_anchor_votes,
         graph_boundary_hypotheses=graph_boundary_hypotheses,
         graph_refinement_events=graph_refinement_events,
+        graph4d_window_summary=empty_graph4d_window_summary(),
+        graph4d_component_summary=empty_graph4d_component_summary(),
+        graph4d_temporal_edges=empty_graph4d_temporal_edges(),
+        graph4d_assignment_changes=empty_graph4d_assignment_changes(),
+        graph4d_boundary_events=empty_graph4d_boundary_events(),
+        graph4d_solver_diagnostics=empty_graph4d_solver_diagnostics(),
+        graph4d_track_id_map=empty_graph4d_track_id_map(),
         metadata=metadata,
         summary=summary,
+        transition_evidence=tuple(transition_evidence_records),
+        graph4d_debug_artifacts={},
     )
     if not return_diagnostics:
         return result
@@ -2212,3 +2371,546 @@ def run_cell_tracking(
         decisions=decisions,
     )
     return result, trace
+
+
+def _graph4d_node_descriptors(
+    time_frames: list[pd.DataFrame],
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for frame, detections in enumerate(time_frames):
+        for detection_index in range(len(detections)):
+            rows.append({
+                "node_index": len(rows),
+                "frame": frame,
+                "detection_position_index": detection_index,
+                "detection_cell_index": detections.index[detection_index],
+            })
+    return pd.DataFrame(rows)
+
+
+def _blank_record(columns: list[str]) -> dict[str, object]:
+    return {column: np.nan for column in columns}
+
+
+def _rebuild_graph4d_association_events(
+    provisional: TrackingResult,
+    four_d: FourDGraphResult,
+    time_frames: list[pd.DataFrame],
+) -> pd.DataFrame:
+    essential = [
+        "from_frame", "to_frame", "decision_type", "track_id",
+        "detection_position_index", "detection_cell_index", "pair_cost",
+        "decision_cost", "association_probability", "probability_margin",
+        "distance_um", "boundary_related", "graph4d_edge_index",
+        "graph4d_frame_gap", "graph4d_component_id", "graph4d_window_id",
+        "graph4d_solver_type", "graph4d_changed_from_provisional",
+    ]
+    columns = list(dict.fromkeys([
+        *provisional.association_events.columns.tolist(), *essential
+    ]))
+    nodes = _graph4d_node_descriptors(time_frames).set_index("node_index")
+    selected_edges = four_d.temporal_edges.loc[
+        four_d.temporal_edges["optimized_selected"].astype(bool)
+    ]
+    incoming = set(selected_edges["target_node"].astype(int))
+    outgoing = set(selected_edges["source_node"].astype(int))
+    rows: list[dict[str, object]] = []
+    for edge in selected_edges.sort_values(
+        ["target_frame", "source_node", "target_node"], kind="mergesort"
+    ).itertuples(index=False):
+        target = nodes.loc[int(edge.target_node)]
+        record = _blank_record(columns)
+        record.update({
+            "from_frame": int(edge.source_frame),
+            "to_frame": int(edge.target_frame),
+            "decision_type": "match",
+            "track_id": int(four_d.node_to_track_id[int(edge.target_node)]),
+            "detection_position_index": int(target["detection_position_index"]),
+            "detection_cell_index": target["detection_cell_index"],
+            "pair_cost": float(edge.total_effective_cost),
+            "decision_cost": float(edge.total_effective_cost),
+            "association_probability": edge.provisional_probability,
+            "probability_margin": edge.provisional_margin,
+            "distance_um": float(edge.displacement_um),
+            "boundary_related": False,
+            "graph_available": True,
+            "base_selected": bool(edge.provisional_selected),
+            "graph_selected": True,
+            "assignment_changed_by_graph": bool(edge.changed_from_provisional),
+            "graph4d_edge_index": int(edge.edge_index),
+            "graph4d_frame_gap": int(edge.frame_gap),
+            "graph4d_component_id": int(edge.component_id),
+            "graph4d_window_id": int(edge.window_id),
+            "graph4d_solver_type": str(edge.solver_type),
+            "graph4d_changed_from_provisional": bool(edge.changed_from_provisional),
+        })
+        rows.append(record)
+
+    if not nodes.empty:
+        first_frame = int(nodes["frame"].min())
+        last_frame = int(nodes["frame"].max())
+        for node, descriptor in nodes.iterrows():
+            node = int(node)
+            frame = int(descriptor["frame"])
+            if frame > first_frame and node not in incoming:
+                record = _blank_record(columns)
+                record.update({
+                    "from_frame": frame - 1,
+                    "to_frame": frame,
+                    "decision_type": "birth",
+                    "track_id": int(four_d.node_to_track_id[node]),
+                    "detection_position_index": int(descriptor["detection_position_index"]),
+                    "detection_cell_index": descriptor["detection_cell_index"],
+                    "decision_cost": float(provisional.metadata["birth_priors"]["interior"]),
+                    "boundary_related": False,
+                    "graph_available": True,
+                    "base_selected": False,
+                    "graph_selected": True,
+                    "assignment_changed_by_graph": True,
+                    "graph4d_frame_gap": 0,
+                    "graph4d_solver_type": "windowed_4d_event",
+                    "graph4d_changed_from_provisional": True,
+                })
+                rows.append(record)
+            if frame < last_frame and node not in outgoing:
+                record = _blank_record(columns)
+                record.update({
+                    "from_frame": frame,
+                    "to_frame": frame + 1,
+                    "decision_type": "miss",
+                    "track_id": int(four_d.node_to_track_id[node]),
+                    "detection_position_index": np.nan,
+                    "detection_cell_index": np.nan,
+                    "decision_cost": float(provisional.metadata["miss_priors"]["interior"]),
+                    "boundary_related": False,
+                    "graph_available": True,
+                    "base_selected": False,
+                    "graph_selected": True,
+                    "assignment_changed_by_graph": True,
+                    "graph4d_frame_gap": 0,
+                    "graph4d_solver_type": "windowed_4d_event",
+                    "graph4d_changed_from_provisional": True,
+                })
+                rows.append(record)
+    decision_order = {"match": 0, "miss": 1, "birth": 2}
+    result = pd.DataFrame(rows, columns=columns)
+    if result.empty:
+        return result
+    result["_decision_order"] = result["decision_type"].map(decision_order)
+    return result.sort_values(
+        ["to_frame", "_decision_order", "track_id", "detection_position_index"],
+        kind="mergesort",
+    ).drop(columns="_decision_order").reset_index(drop=True)
+
+
+def _rebuild_graph4d_association_candidates(
+    provisional: TrackingResult,
+    four_d: FourDGraphResult,
+    time_frames: list[pd.DataFrame],
+) -> pd.DataFrame:
+    essential = [
+        "from_frame", "to_frame", "track_id", "detection_position_index",
+        "detection_cell_index", "candidate_rank_by_pair_cost", "pair_cost",
+        "distance_um", "association_probability", "probability_margin",
+        "frame_gap", "provisional_selected", "optimized_selected",
+        "graph_expanded", "component_id", "window_id", "solver_type",
+        "changed_from_provisional", "unary_cost", "motion_cost", "graph_cost",
+        "persistent_relation_cost", "boundary_cost", "total_effective_cost",
+    ]
+    columns = list(dict.fromkeys([
+        *provisional.association_candidates.columns.tolist(), *essential
+    ]))
+    nodes = _graph4d_node_descriptors(time_frames).set_index("node_index")
+    rows: list[dict[str, object]] = []
+    for edge in four_d.temporal_edges.itertuples(index=False):
+        target = nodes.loc[int(edge.target_node)]
+        record = _blank_record(columns)
+        record.update({
+            "from_frame": int(edge.source_frame),
+            "to_frame": int(edge.target_frame),
+            "track_id": int(four_d.node_to_track_id[int(edge.source_node)]),
+            "detection_position_index": int(target["detection_position_index"]),
+            "detection_cell_index": target["detection_cell_index"],
+            "pair_cost": float(edge.base_stage7_cost) if pd.notna(edge.base_stage7_cost) else float(edge.unary_cost),
+            "distance_um": float(edge.displacement_um),
+            "association_probability": edge.provisional_probability,
+            "probability_margin": edge.provisional_margin,
+            "frame_gap": int(edge.frame_gap),
+            "provisional_selected": bool(edge.provisional_selected),
+            "optimized_selected": bool(edge.optimized_selected),
+            "graph_expanded": bool(edge.graph_expanded),
+            "component_id": int(edge.component_id),
+            "window_id": int(edge.window_id),
+            "solver_type": str(edge.solver_type),
+            "changed_from_provisional": bool(edge.changed_from_provisional),
+            "unary_cost": float(edge.unary_cost),
+            "motion_cost": float(edge.motion_cost),
+            "graph_cost": float(edge.graph_cost),
+            "persistent_relation_cost": float(edge.persistent_relation_cost),
+            "boundary_cost": float(edge.boundary_cost),
+            "total_effective_cost": float(edge.total_effective_cost),
+            "base_selected": bool(edge.provisional_selected),
+            "graph_selected": bool(edge.optimized_selected),
+            "graph_available": True,
+            "assignment_changed_by_graph": bool(edge.changed_from_provisional),
+        })
+        rows.append(record)
+    result = pd.DataFrame(rows, columns=columns)
+    if result.empty:
+        return result
+    result = result.sort_values(
+        ["from_frame", "track_id", "to_frame", "pair_cost", "detection_position_index"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    result["candidate_rank_by_pair_cost"] = (
+        result.groupby(["from_frame", "track_id"], sort=False).cumcount() + 1
+    )
+    return result
+
+
+def _rebuild_graph4d_track_states(
+    provisional: TrackingResult,
+    optimized_tracks: pd.DataFrame,
+) -> pd.DataFrame:
+    columns = list(provisional.track_states.columns)
+    for required in ("track_id", "active", "last_frame", "missed_frames"):
+        if required not in columns:
+            columns.append(required)
+    rows: list[dict[str, object]] = []
+    sequence_last = int(optimized_tracks["frame"].max()) if not optimized_tracks.empty else -1
+    for track_id, group in optimized_tracks.groupby("track_id", sort=True):
+        last = group.sort_values("frame", kind="mergesort").iloc[-1]
+        record = _blank_record(columns)
+        record.update({
+            "track_id": int(track_id),
+            "active": int(last["frame"]) == sequence_last,
+            "last_frame": int(last["frame"]),
+            "missed_frames": 0,
+            "boundary_pending": bool(last.get("touches_boundary", False)),
+            "interior_pending": False,
+            "last_boundary_faces": str(last.get("boundary_faces", "")),
+            "template_reliable": not bool(last.get("touches_boundary", False)),
+            "template_count": int(len(group)),
+            "relative_velocity_valid": False,
+            "relative_velocity_samples": 0,
+            "graph_last_confidence": 0.0,
+            "graph_anchor_support_count": 0,
+            "graph_boundary_hypothesis": "",
+            "graph_boundary_face": "",
+            "graph_boundary_confidence": 0.0,
+        })
+        rows.append(record)
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        "track_id", kind="mergesort"
+    ).reset_index(drop=True)
+
+
+def _rebuild_graph4d_tracking_diagnostics(
+    provisional: TrackingResult,
+    association_events: pd.DataFrame,
+) -> pd.DataFrame:
+    columns = list(provisional.tracking_diagnostics.columns)
+    for required in (
+        "from_frame", "to_frame", "matches", "selected_misses",
+        "selected_births", "graph_mode", "graph_algorithm",
+        "graph4d_selected_gap_edges",
+    ):
+        if required not in columns:
+            columns.append(required)
+    rows: list[dict[str, object]] = []
+    if association_events.empty:
+        return pd.DataFrame(columns=columns)
+    for to_frame, group in association_events.groupby("to_frame", sort=True):
+        record = _blank_record(columns)
+        record.update({
+            "from_frame": int(to_frame) - 1,
+            "to_frame": int(to_frame),
+            "matches": int((group["decision_type"] == "match").sum()),
+            "selected_misses": int((group["decision_type"] == "miss").sum()),
+            "selected_births": int((group["decision_type"] == "birth").sum()),
+            "new_tracks": int((group["decision_type"] == "birth").sum()),
+            "graph_mode": "apply",
+            "graph_algorithm": "windowed_4d",
+            "graph4d_selected_gap_edges": int(
+                ((group["decision_type"] == "match") & (group["graph4d_frame_gap"] > 1)).sum()
+            ),
+        })
+        rows.append(record)
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _attach_four_d_result(
+    *,
+    provisional: TrackingResult,
+    four_d: FourDGraphResult,
+    time_frames: list[pd.DataFrame],
+    graph_config: GraphTrackingConfig,
+    provisional_runtime_seconds: float,
+) -> TrackingResult:
+    apply_mode = graph_config.mode == "apply"
+    metadata = dict(provisional.metadata)
+    four_d_metadata = {
+        key: value for key, value in four_d.metadata.items()
+        if key != "configuration"
+    }
+    runtime = dict(four_d_metadata.get("runtime_seconds_by_phase", {}))
+    runtime["provisional_tracking"] = provisional_runtime_seconds
+    four_d_metadata["runtime_seconds_by_phase"] = runtime
+    metadata["architecture"] = (
+        "boundary_aware_probabilistic_provisional_tracking_with_windowed_4d_post_optimization"
+    )
+    metadata["graph_tracking"] = {
+        "mode": graph_config.mode,
+        "algorithm": graph_config.algorithm,
+        "enabled": True,
+        "configuration": asdict(graph_config),
+        **four_d_metadata,
+    }
+    summary = dict(provisional.summary)
+    summary.update({
+        "graph_mode": graph_config.mode,
+        "graph_algorithm": graph_config.algorithm,
+        "graph4d_assignment_changes": len(four_d.assignment_changes),
+        "graph4d_selected_gap_edges": four_d.summary["selected_gap_edges"],
+        "graph4d_solver_fallback_rate": four_d.summary["solver_fallback_rate"],
+        "runtime_seconds_by_phase": runtime,
+    })
+
+    values: dict[str, Any] = {
+        "graph4d_window_summary": four_d.window_summary,
+        "graph4d_component_summary": four_d.component_summary,
+        "graph4d_temporal_edges": four_d.temporal_edges,
+        "graph4d_assignment_changes": four_d.assignment_changes,
+        "graph4d_boundary_events": four_d.boundary_events,
+        "graph4d_solver_diagnostics": four_d.solver_diagnostics,
+        "graph4d_track_id_map": four_d.provisional_to_optimized_track_map,
+        "graph4d_debug_artifacts": four_d.debug_artifacts,
+        "metadata": metadata,
+        "summary": summary,
+    }
+    if apply_mode:
+        association_events = _rebuild_graph4d_association_events(
+            provisional, four_d, time_frames
+        )
+        association_candidates = _rebuild_graph4d_association_candidates(
+            provisional, four_d, time_frames
+        )
+        converted_boundary = pd.DataFrame(columns=provisional.boundary_events.columns)
+        if not four_d.boundary_events.empty:
+            converted_rows = []
+            for row in four_d.boundary_events.itertuples(index=False):
+                converted_rows.append({
+                    "track_id": int(row.optimized_track_id),
+                    "frame": int(row.frame),
+                    "event_type": str(row.event_type),
+                    "boundary_faces": str(row.boundary_face),
+                    "missing_frames": 0,
+                    "reacquired_frame": np.nan,
+                    "confidence": np.nan,
+                })
+            converted_boundary = pd.DataFrame(converted_rows)
+            for column in provisional.boundary_events.columns:
+                if column not in converted_boundary:
+                    converted_boundary[column] = np.nan
+            converted_boundary = converted_boundary[
+                provisional.boundary_events.columns
+            ]
+        values.update({
+            "tracks": four_d.optimized_tracks,
+            "boundary_events": converted_boundary,
+            "boundary_predictions": provisional.boundary_predictions.iloc[0:0].copy(),
+            "missing_predictions": provisional.missing_predictions.iloc[0:0].copy(),
+            "tracking_diagnostics": _rebuild_graph4d_tracking_diagnostics(
+                provisional, association_events
+            ),
+            "association_events": association_events,
+            "association_candidates": association_candidates,
+            "track_states": _rebuild_graph4d_track_states(
+                provisional, four_d.optimized_tracks
+            ),
+        })
+        summary.update({
+            "track_records": len(four_d.optimized_tracks),
+            "unique_tracks": int(four_d.optimized_tracks["track_id"].nunique()),
+            "selected_misses": int((association_events["decision_type"] == "miss").sum()),
+            "selected_births": int((association_events["decision_type"] == "birth").sum()),
+        })
+    return replace(provisional, **values)
+
+
+def _four_d_trace(
+    result: TrackingResult,
+    time_frames: list[pd.DataFrame],
+) -> StageTrace:
+    decisions: list[DecisionRecord] = []
+    for row in result.graph4d_assignment_changes.itertuples(index=False):
+        decisions.append(DecisionRecord(
+            decision_type=str(row.change_type),
+            outcome="selected" if row.change_type == "continuation_added" else "rejected",
+            frame=int(row.target_frame),
+            subject_id=int(row.optimized_track_id),
+            metrics={
+                "source_node": int(row.source_node),
+                "target_node": int(row.target_node),
+                "component_id": int(row.component_id),
+                "window_id": int(row.window_id),
+                "solver_type": str(row.solver_type),
+            },
+            provenance=Provenance(
+                source_type="graph4d_temporal_edge",
+                source_stage="07_cell_tracking",
+                source_frame=int(row.target_frame),
+                source_track_ids=(int(row.provisional_track_id),),
+                details={
+                    "source_detection": int(row.source_detection_index),
+                    "target_detection": int(row.target_detection_index),
+                },
+            ),
+        ))
+    selected_gaps = result.graph4d_temporal_edges.loc[
+        result.graph4d_temporal_edges["optimized_selected"].astype(bool)
+        & (result.graph4d_temporal_edges["frame_gap"] > 1)
+    ]
+    for row in selected_gaps.itertuples(index=False):
+        decisions.append(DecisionRecord(
+            decision_type="selected_gap_edge",
+            outcome="selected",
+            frame=int(row.target_frame),
+            subject_id=int(row.edge_index),
+            metrics={"frame_gap": int(row.frame_gap), "total_cost": float(row.total_effective_cost)},
+            provenance=Provenance(
+                source_type="graph4d_temporal_edge",
+                source_stage="07_cell_tracking",
+                source_frame=int(row.target_frame),
+                source_candidate_id=int(row.edge_index),
+                details={
+                    "source_frame": int(row.source_frame),
+                    "source_detection": int(row.source_detection_index),
+                    "target_detection": int(row.target_detection_index),
+                    "component_id": int(row.component_id),
+                    "window_id": int(row.window_id),
+                },
+            ),
+        ))
+    for row in result.graph4d_boundary_events.itertuples(index=False):
+        decisions.append(DecisionRecord(
+            decision_type=str(row.event_type),
+            outcome=str(row.boundary_face),
+            frame=int(row.frame),
+            subject_id=int(row.optimized_track_id),
+            metrics={"cost": row.cost, "distance_to_face_um": row.distance_to_face_um},
+            provenance=Provenance(
+                source_type="graph4d_boundary_event",
+                source_stage="07_cell_tracking",
+                source_frame=int(row.frame),
+                source_track_ids=(int(row.optimized_track_id),),
+                details={
+                    "detection_index": int(row.detection_index),
+                    "component_id": int(row.component_id),
+                    "window_id": int(row.window_id),
+                },
+            ),
+        ))
+    for row in result.graph4d_component_summary.itertuples(index=False):
+        if bool(row.fallback_used):
+            decisions.append(DecisionRecord(
+                decision_type=(
+                    "solver_failure" if row.status == "provisional_fallback"
+                    else "fallback_component"
+                ),
+                outcome=str(row.status),
+                frame=int(row.minimum_frame),
+                subject_id=int(row.component_id),
+                reason=str(row.failure_message),
+                metrics={"node_count": int(row.node_count), "edge_count": int(row.temporal_edge_count)},
+                provenance=Provenance(
+                    source_type="graph4d_component",
+                    source_stage="07_cell_tracking",
+                    source_frame=int(row.minimum_frame),
+                    source_candidate_id=int(row.component_id),
+                ),
+            ))
+            if row.status == "provisional_fallback":
+                decisions.append(DecisionRecord(
+                    decision_type="unresolved_ambiguity",
+                    outcome="provisional_component_retained",
+                    frame=int(row.minimum_frame),
+                    subject_id=int(row.component_id),
+                    reason=str(row.failure_message),
+                    metrics={
+                        "minimum_frame": int(row.minimum_frame),
+                        "maximum_frame": int(row.maximum_frame),
+                    },
+                    provenance=Provenance(
+                        source_type="graph4d_component",
+                        source_stage="07_cell_tracking",
+                        source_frame=int(row.minimum_frame),
+                        source_candidate_id=int(row.component_id),
+                    ),
+                ))
+    return StageTrace(
+        stage_name="07_cell_tracking",
+        inputs={"time_frames": time_frames},
+        outputs={"tracks": result.tracks},
+        intermediates={
+            "global_motion": result.global_motion,
+            "association_events": result.association_events,
+            "association_candidates": result.association_candidates,
+            "boundary_events": result.boundary_events,
+            "graph4d_window_summary": result.graph4d_window_summary,
+            "graph4d_component_summary": result.graph4d_component_summary,
+            "graph4d_temporal_edges": result.graph4d_temporal_edges,
+            "graph4d_assignment_changes": result.graph4d_assignment_changes,
+            "graph4d_boundary_events": result.graph4d_boundary_events,
+            "graph4d_solver_diagnostics": result.graph4d_solver_diagnostics,
+            "graph4d_track_id_map": result.graph4d_track_id_map,
+        },
+        metrics=result.summary,
+        decisions=decisions,
+    )
+
+
+def run_cell_tracking(
+    time_frames: list[pd.DataFrame],
+    *,
+    sample_id: str = "44b6_0113de3b",
+    graph_config: GraphTrackingConfig | None = None,
+    return_diagnostics: bool = False,
+) -> TrackingResult | tuple[TrackingResult, StageTrace]:
+    """Run provisional Stage 7 and optionally post-process it with a 4D graph."""
+
+    config = graph_config or GraphTrackingConfig(mode="disabled")
+    if config.mode == "disabled" or config.algorithm == "pairwise":
+        return _run_provisional_or_pairwise_tracking(
+            time_frames,
+            sample_id=sample_id,
+            graph_config=config,
+            return_diagnostics=return_diagnostics,
+        )
+
+    provisional_started = __import__("time").perf_counter()
+    provisional = _run_provisional_or_pairwise_tracking(
+        time_frames,
+        sample_id=sample_id,
+        graph_config=GraphTrackingConfig(mode="disabled"),
+        return_diagnostics=False,
+    )
+    provisional_runtime = __import__("time").perf_counter() - provisional_started
+    four_d = run_four_d_graph_tracking(
+        time_frames=time_frames,
+        provisional_tracks=provisional.tracks,
+        transition_evidence=provisional.transition_evidence,
+        spatial_shape_zyx=VOLUME_SHAPE_ZYX,
+        voxel_size_zyx_um=VOXEL_SIZE_ZYX,
+        config=config.four_d,
+    )
+    result = _attach_four_d_result(
+        provisional=provisional,
+        four_d=four_d,
+        time_frames=time_frames,
+        graph_config=config,
+        provisional_runtime_seconds=provisional_runtime,
+    )
+    if not return_diagnostics:
+        return result
+    return result, _four_d_trace(result, time_frames)

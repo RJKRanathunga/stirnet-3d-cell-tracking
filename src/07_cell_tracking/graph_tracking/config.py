@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
+
+from .four_d.config import FourDGraphConfig
 
 
 GraphMode = Literal["disabled", "shadow", "apply"]
+GraphTrackingAlgorithm = Literal["pairwise", "windowed_4d"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +21,8 @@ class GraphTrackingConfig:
     """
 
     mode: GraphMode = "disabled"
+    algorithm: GraphTrackingAlgorithm = "pairwise"
+    four_d: FourDGraphConfig = field(default_factory=FourDGraphConfig)
 
     # Spatial graph construction.
     maximum_neighbors: int = 10
@@ -95,6 +100,8 @@ class GraphTrackingConfig:
     def __post_init__(self) -> None:
         if self.mode not in {"disabled", "shadow", "apply"}:
             raise ValueError(f"Unsupported graph mode: {self.mode}")
+        if self.algorithm not in {"pairwise", "windowed_4d"}:
+            raise ValueError(f"Unsupported graph tracking algorithm: {self.algorithm}")
         if self.maximum_neighbors < 1:
             raise ValueError("maximum_neighbors must be positive")
         if self.maximum_radius_um <= 0:

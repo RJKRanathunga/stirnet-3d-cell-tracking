@@ -1,23 +1,45 @@
-# Stage 7 graph tracking package
+# Stage 7 graph tracking
 
-This archive contains an integration-ready `graph_tracking/` package for
-`src/07_cell_tracking/` in the `RJKRanathunga/cell-detection` repository.
+Stage 7 exposes two graph algorithms through the existing
+`run_cell_tracking(..., graph_config=...)` entry point.
 
-It implements:
+- `pairwise` is the original two-frame refinement. It runs inside a transition
+  after global-motion assignment and before state mutation.
+- `windowed_4d` runs the ordinary Stage 7 sequence as a provisional tracker,
+  retains its evidence in memory, and optimizes ambiguous spatiotemporal
+  components only after the entire sequence is available.
 
-- sparse physical 3D cell graphs per frame;
-- reliable temporal anchor extraction from the current Stage 7 assignment;
-- vector-preserving Hough-style forward voting;
-- local translation, similarity, and affine deformation prediction;
-- neighbour-relative volume pattern scoring without copying node features;
-- backward voting for boundary entries;
-- outside-volume forward voting for boundary exits;
-- graph-adjusted pair, miss, and birth costs;
-- `disabled`, `shadow`, and `apply` modes;
-- detailed candidate, vote, boundary, and decision diagnostics.
+The production default remains disabled:
 
-The package is integrated into the current Stage 7 production entry point.
-Graph tracking remains disabled by default; shadow and apply modes are exposed
-through `run_cell_tracking(..., graph_config=GraphTrackingConfig(...))`. See
-`INTEGRATION.md` for the wiring contract used by `step02_association.py`,
-`step03_pipeline.py`, `TrackingResult`, and the Stage 7 I/O layer.
+```python
+run_cell_tracking(time_frames, sample_id=sample_id)
+```
+
+The recommended first real-data run is diagnostic-only:
+
+```python
+from src.api import GraphTrackingConfig, run_cell_tracking
+
+result = run_cell_tracking(
+    time_frames,
+    sample_id=sample_id,
+    graph_config=GraphTrackingConfig(
+        mode="shadow",
+        algorithm="windowed_4d",
+    ),
+)
+```
+
+Modes have strict meanings:
+
+- `disabled` returns the provisional Stage 7 result and runs no graph solver.
+- `shadow` runs the selected graph algorithm and emits diagnostics while
+  returning provisional tracks and decisions.
+- `apply` returns optimized tracks and consistently rebuilt Stage 7 artifacts.
+
+The 4D solver is a one-predecessor/one-successor continuation model. Stage 8
+still owns merge reconstruction, Stage 10 owns division/lineage, and Stage 11
+owns residual post-lineage endpoint reconciliation.
+
+See [FOUR_D_ARCHITECTURE.md](FOUR_D_ARCHITECTURE.md) for the model and
+[FOUR_D_VALIDATION.md](FOUR_D_VALIDATION.md) for validation and ablations.

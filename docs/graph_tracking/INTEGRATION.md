@@ -1,165 +1,60 @@
-# Integration into the current Stage 7 pipeline
+# Stage 7 integration contract
 
-## 1. Copy the package
+## Public API
 
-Extract `graph_tracking/` into:
-
-```text
-src/07_cell_tracking/graph_tracking/
-```
-
-## 2. Preserve the current public API
-
-In `src/07_cell_tracking/step03_pipeline.py`, add an optional configuration:
+The only entry point remains `src.api.run_cell_tracking` (also exported from
+`src.07_cell_tracking`). `GraphTrackingConfig` is exported from both locations.
 
 ```python
-from .graph_tracking import GraphTrackingConfig, refine_transition_with_graph
-
-
-def run_cell_tracking(
-    time_frames: list[pd.DataFrame],
-    *,
-    sample_id: str = "44b6_0113de3b",
-    graph_config: GraphTrackingConfig | None = None,
-    return_diagnostics: bool = False,
-):
-    graph_config = graph_config or GraphTrackingConfig(mode="disabled")
-```
-
-## 3. Insertion point
-
-The current repository selects the final base assignment after its initial and
-refined global-motion passes. Insert graph refinement immediately after that
-selection and before `record_top_candidates(...)` or any track-state mutation:
-
-```python
-graph_result = refine_transition_with_graph(
-    eligible_states=eligible_states,
-    detections=detections,
-    current_frame=current_frame,
-    base_assignment=assignment,
-    volume_shape_zyx=VOLUME_SHAPE_ZYX,
-    voxel_size_zyx_um=VOXEL_SIZE_ZYX,
-    config=graph_config,
-)
-assignment = graph_result.assignment
-```
-
-- `disabled`: current Stage 7 assignment is returned unchanged.
-- `shadow`: current assignment is returned unchanged, while
-  `graph_result.graph_assignment` and diagnostics show the alternative.
-- `apply`: the graph-refined assignment is returned.
-
-## 4. Reuse the repository's augmented solver
-
-The package includes a compatible internal augmented Hungarian solver. After
-refactoring the current `augmented_assignment` into a stable callable, it can be
-passed through `assignment_solver`:
-
-```python
-def stage7_solver(pair_cost, miss_cost, birth_cost):
-    return augmented_assignment(
-        pair_cost_matrix=pair_cost,
-        miss_costs=miss_cost,
-        birth_costs=birth_cost,
-    )
-
-
-graph_result = refine_transition_with_graph(
-    ...,
-    assignment_solver=stage7_solver,
+GraphTrackingConfig(
+    mode="shadow",                 # disabled | shadow | apply
+    algorithm="windowed_4d",       # pairwise | windowed_4d
 )
 ```
 
-The callback must return:
+## Exact insertion points
 
-```text
-rows
-cols
-missed_state_indices
-birth_detection_indices
-objective_cost
-```
+For `pairwise`, refinement remains after the final per-transition global-motion
+assignment and before candidate recording or track-state mutation.
 
-## 5. Aggregate graph artifacts
+For `windowed_4d`, `step03_pipeline.py` calls the current tracker once with graph
+mode disabled. Every final provisional transition snapshot retains source and
+target identities, pair/safety/distance/probability matrices, margins,
+miss/birth costs, both predictors, decisions, and global motion. Only after the
+provisional `TrackingResult` is complete does `run_four_d_graph_tracking(...)`
+build and solve the multi-frame graph.
 
-Create frame-level record lists in `run_cell_tracking` and append:
+Shadow mode attaches the seven `graph4d_*` tables and leaves all production
+tracks/decisions provisional. Apply mode replaces `tracks` and rebuilds
+boundary events/predictions, missing predictions, tracking diagnostics,
+association events/candidates, track states, metadata, summary, and StageTrace.
+The provisional global-motion table remains the prior and is labelled as such.
 
-```python
-graph_transition_summary_records.append(graph_result.transition_summary)
-graph_candidate_evidence_records.append(graph_result.candidate_evidence)
-graph_anchor_vote_records.append(graph_result.anchor_votes)
-graph_boundary_hypothesis_records.append(graph_result.boundary_hypotheses)
-graph_refinement_event_records.append(graph_result.refinement_events)
-```
+## Artifacts
 
-At the end, concatenate with `pd.concat(..., ignore_index=True)`.
+The pairwise `graph_*.csv` files are unchanged. The optional 4D files are:
 
-## 6. Extend `TrackingResult`
+- `graph4d_window_summary.csv`
+- `graph4d_component_summary.csv`
+- `graph4d_temporal_edges.csv`
+- `graph4d_assignment_changes.csv`
+- `graph4d_boundary_events.csv`
+- `graph4d_solver_diagnostics.csv`
+- `graph4d_track_id_map.csv`
 
-Add:
+`load_stage7_outputs()` uses optional reads for every graph file, so older Stage
+7 directories remain loadable. Full dense provisional matrices remain in memory
+and are not persisted by default.
 
-```text
-graph_transition_summary
-graph_candidate_evidence
-graph_anchor_votes
-graph_boundary_hypotheses
-graph_refinement_events
-```
+When `four_d.save_detailed_debug_artifacts=True`, saving also writes
+`graph4d_spatial_edges.npz`, `graph4d_pair_factors.npz`, and
+`graph4d_relation_histories.npz`. These compact arrays are opt-in and are not
+created by ordinary disabled, shadow, or apply runs.
 
-## 7. Extend Stage 7 I/O
+## Downstream protections
 
-Update `src/io/stage_io.py` mappings with:
-
-```text
-graph_transition_summary.csv
-graph_candidate_evidence.csv
-graph_anchor_votes.csv
-graph_boundary_hypotheses.csv
-graph_refinement_events.csv
-```
-
-These files use stable columns defined in `graph_tracking/schemas.py`.
-
-## 8. Boundary event integration
-
-Do not immediately deactivate a track when graph exit evidence is present.
-Map supported exit hypotheses to a pending event, retain the current boundary
-reacquisition window, and confirm only after the existing pending period:
-
-```text
-graph_exit_predicted
-graph_exit_pending
-graph_exit_confirmed
-graph_exit_rejected_reacquired
-```
-
-For supported entries, retain the current birth decision and annotate it as
-`graph_entry_supported`.
-
-An `inside_predecessor_vote` should increase the birth cost and allow the graph
-assignment to reconnect the detection to an existing source track.
-
-## 9. State additions
-
-Optional first integration fields:
-
-```python
-"graph_last_confidence": 0.0,
-"graph_anchor_support_count": 0,
-"graph_boundary_hypothesis": "",
-"graph_boundary_face": "",
-"graph_boundary_confidence": 0.0,
-"graph_boundary_since_frame": None,
-```
-
-Persistent neighbour-history state is intentionally deferred until the
-adjacent-frame implementation is validated.
-
-## 10. Rollout
-
-1. Verify `disabled` output identity.
-2. Run `shadow` on all curated failures.
-3. Enable `apply` for interior ambiguous cases.
-4. Enable coverage-aware boundary cases.
-5. Add multi-frame graph optimization only after adjacent-frame validation.
+Optimized `tracks` keep the Stage 7 columns used by Stage 8. There is exactly one
+row per real observation and no duplicate `(track_id, frame)`. Stage 8 retains
+merge reconstruction, Stage 10 receives ordinary one-to-one segments and keeps
+its division protections, and Stage 11 continues to consume Stage 7 candidate
+evidence and enforce merge/lineage endpoint protections.

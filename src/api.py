@@ -32,9 +32,11 @@ try:
     tracking_module = import_module("src.07_cell_tracking")
 
     run_cell_tracking = tracking_module.run_cell_tracking
+    FourDGraphConfig = tracking_module.FourDGraphConfig
     GraphTrackingConfig = tracking_module.GraphTrackingConfig
 except ModuleNotFoundError:
     run_cell_tracking = _not_available("run_cell_tracking")
+    FourDGraphConfig = _not_available("FourDGraphConfig")
     GraphTrackingConfig = _not_available("GraphTrackingConfig")
 
 try:
@@ -67,6 +69,7 @@ except ModuleNotFoundError:
 
 
 __all__ = [
+    "FourDGraphConfig",
     "GraphTrackingConfig",
     "create_binary_mask",
     "detect_cells",

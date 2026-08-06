@@ -1,40 +1,50 @@
 # Implementation status
 
-## Implemented
+## Complete production path
 
-- Sparse shared-node spatial graphs using `scipy.spatial.cKDTree`.
-- Radius-limited and K-limited deterministic neighbourhoods.
-- Reliable temporal anchors selected from current Stage 7 probabilities,
-  margins, position errors, boundary state, and motion confidence.
-- Vector-preserving forward Hough voting.
-- Robust weighted geometric-median consensus and outlier rejection.
-- Translation, similarity, and affine local deformation prediction.
-- Candidate vector, radial, relative-volume, consensus, and deformation scores.
-- Bounded graph cost changes for existing Stage 7 pair costs.
-- Forward outside-volume exit hypotheses and miss-cost support.
-- Backward outside-volume entry hypotheses and birth-cost support.
-- Backward inside-volume predecessor evidence that penalizes false births.
-- Locked reliable matches during graph refinement.
-- Internal augmented Hungarian assignment with optional callback to the
-  repository's existing solver.
-- Disabled, shadow, and apply modes.
-- Stable diagnostic DataFrame schemas.
-- Strict Stage 7 integration-input validation.
-- Integration guide and synthetic unit tests.
-- Production Stage 7 integration after final base-assignment selection and
-  before state mutation.
-- Disabled, shadow, and apply behavior in the public Stage 7 entry point.
-- Graph-supported entry/exit lifecycle events, StageTrace diagnostics, and
-  backward-compatible Stage 7 artifact I/O.
-- Production integration regressions for refinement, fallbacks, boundaries,
-  deterministic output, safety gates, and legacy artifact loading.
+- Exact disabled behavior and the existing pairwise shadow/apply backend.
+- Algorithm selection with frozen nested `FourDGraphConfig` defaults.
+- Complete provisional-sequence evidence retention in memory.
+- Columnar 4D observations and physical face distances.
+- Per-frame deterministic KD-tree spatial graphs with CSR adjacency.
+- Adjacent and `t -> t+2` temporal candidates (`t -> t+3` configurable).
+- Union of provisional, row/column top-K, locally competitive, gap, and
+  neighbour-vote-expanded candidates; hard Stage 7 safety exclusions remain
+  hard.
+- Persistent neighbour-identity/vector histories with visibility-aware robust
+  confidence.
+- Ambiguity components that unlock high-confidence but motion/trajectory-
+  inconsistent provisional edges.
+- Sparse robust trajectory, spatial-vector, and persistent-relation factors.
+- Face-specific entry/exit, generic birth/death, and sequence endpoint events.
+- Sparse `scipy.optimize.milp` binary flow model with linearized pair factors.
+- Exact component limits, overlapping windows, deterministic iterative
+  reweighting fallback, and component-local provisional fallback on failure.
+- Deterministic path extraction, optimized ID assignment, and ID remap table.
+- Strict uniqueness, flow, safety, acyclicity, gap, boundary, schema, and ID
+  validation.
+- Shadow/apply Stage 7 integration, rebuilt apply artifacts, StageTrace records,
+  optional I/O, evaluation utility, and backwards-compatible legacy loading.
 
-## Intentionally deferred
+## Intentional limitations
 
-- Persistent multi-frame neighbour-history state.
-- Five-frame sliding-window graph optimization.
-- Learned GNN or graph-matching model.
-- Automatic threshold calibration from labelled competition data.
-
-These deferred items should follow only after adjacent-frame shadow-mode
-validation on the curated failure scenes.
+- The model remains one-to-one; it does not infer divisions or segmentation
+  merges.
+- Persistent histories are recomputed from the provisional identity prior for
+  each complete run; iterative fallback reweights them but does not create a
+  learned identity model.
+- Missing frames are represented by direct gap edges. Synthetic detections are
+  never written into `tracks.csv`.
+- Thresholds are conservative engineering defaults, not calibrated biological
+  claims. Apply mode should follow manual review of shadow-mode real-data diffs.
+- On the current 20-frame sample (4,421 observations), a complete default shadow
+  run exceeded the bounded 300-second development benchmark. Profiling isolated
+  the dominant cost to repeated large unary-flow solves for one oversized,
+  highly connected ambiguity component; candidate and pair-factor construction
+  were not the dominant phases. Solver calls are individually time-limited and
+  fail component-locally back to provisional edges, but the aggregate of several
+  window/iteration calls has no whole-run deadline yet.
+- Remaining performance work is deterministic subdivision of giant ambiguity
+  components, reuse of window flow-model structure across reweighting
+  iterations, and an optional whole-optimizer runtime budget. Until that work is
+  validated on all five samples, keep the backend in shadow mode.
