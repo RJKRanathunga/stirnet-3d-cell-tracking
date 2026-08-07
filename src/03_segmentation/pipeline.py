@@ -166,29 +166,48 @@ def analyze_component_crop(
         raise RuntimeError("peak collapse produced no effective peaks")
 
     effective_markers = convert_effective_peaks_to_markers(effective_peaks)
-    candidate_result = safely_detect_geometric_candidate(
-        padded_mask,
-        peak_analysis,
-        pair_evidence,
-        collapsed,
-        effective_peaks,
-        config.geometric_completion.candidate_detection,
-        config.voxel_size_zyx_um,
-        retain_debug_artifacts=retain_debug_artifacts,
+    geometry_enabled = (
+            config.enable_geometric_completion
+            or force_geometric_analysis
     )
-    should_run_geometry = force_geometric_analysis or candidate_result.candidate
-    if should_run_geometry:
-        geometric_completion = safely_complete_geometric_markers(
+
+    if geometry_enabled:
+        candidate_result = safely_detect_geometric_candidate(
             padded_mask,
             peak_analysis,
+            pair_evidence,
+            collapsed,
             effective_peaks,
-            config.geometric_completion,
+            config.geometric_completion.candidate_detection,
             config.voxel_size_zyx_um,
-            candidate_result=candidate_result,
             retain_debug_artifacts=retain_debug_artifacts,
-            force_analysis=force_geometric_analysis,
         )
+
+        should_run_geometry = (
+                force_geometric_analysis
+                or candidate_result.candidate
+        )
+
+        if should_run_geometry:
+            geometric_completion = safely_complete_geometric_markers(
+                padded_mask,
+                peak_analysis,
+                effective_peaks,
+                config.geometric_completion,
+                config.voxel_size_zyx_um,
+                candidate_result=candidate_result,
+                retain_debug_artifacts=retain_debug_artifacts,
+                force_analysis=force_geometric_analysis,
+            )
+        else:
+            geometric_completion = GeometricCompletionResult.not_candidate(
+                candidate_result
+            )
+
     else:
+        candidate_result = GeometricCandidateResult.no_candidate(
+            reasons=("geometric_completion_disabled",)
+        )
         geometric_completion = GeometricCompletionResult.not_candidate(
             candidate_result
         )

@@ -19,6 +19,7 @@ def process_dataset(
     sample_path: str | Path,
     output_directory: str | Path,
     *,
+    segmentation_config=None,
     progress: Callable[[range], object] | None = None,
 ) -> int:
     """Process every timepoint and preserve the existing Stage 6 layout."""
@@ -31,7 +32,13 @@ def process_dataset(
         raw = load_timepoint(sample_path, frame)
         preprocessed = preprocess_volume(raw)
         binary_mask = create_binary_mask(preprocessed)
-        labels = segment_instances(binary_mask)
+        if segmentation_config is None:
+            labels = segment_instances(binary_mask)
+        else:
+            labels = segment_instances(
+                binary_mask,
+                config=segmentation_config,
+            )
         cells = detect_cells(labels)
         cells = extract_cell_features(cells, labels, preprocessed)
         save_processed_frame(
