@@ -1,17 +1,15 @@
 import numpy as np
 from scipy import ndimage
 
-from learned.instance_segmentation.datasets.core.mask_corruption import build_stage2_like_component
+from ..core.mask_corruption import build_stage2_like_component
 
 
-def test_pair_is_bridged_into_one_component() -> None:
-    labels = np.zeros((12, 32, 32), dtype=np.int32)
-    labels[3:9, 8:14, 6:12] = 1
-    labels[3:9, 8:14, 18:24] = 2
+def test_synthetic_pair_becomes_one_component():
+    labels = np.zeros((12, 32, 32), np.int32)
+    labels[3:8, 5:12, 5:12] = 1
+    labels[3:8, 16:23, 16:23] = 2
     mask = build_stage2_like_component(
-        labels,
-        (1.0, 1.0, 1.0),
-        bridge_radius_um=1.0,
+        labels, (1.625, 0.40625, 0.40625), bridge_radius_um=0.45
     )
     _, count = ndimage.label(mask, structure=ndimage.generate_binary_structure(3, 1))
     assert count == 1

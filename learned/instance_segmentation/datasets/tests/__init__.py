@@ -1,1 +1,1 @@
-"""Tests for external-dataset adapters and canonical sample generation."""
+"""Tests for object-centric external-dataset sample generation."""

@@ -1,284 +1,184 @@
-# Learned Instance Segmentation — External Datasets
+# Learned Instance Segmentation — Object-Centric External Dataset Pipeline
 
-This package converts densely annotated 3-D microscopy datasets into the four
-input channels and dense supervision targets consumed by `VectorInstanceCNN`.
-The dataset-specific boundary is intentionally narrow: each adapter produces an
-`AnnotatedVolume`; every later operation is shared across C. elegans, NIS3D,
-and BlastoSPIM.
+This directory converts densely annotated 3-D microscopy volumes into the fixed
+`VectorInstanceCNN` tensor shape without forcing every source dataset to share
+Biohub's **absolute biological cell scale**.
 
-```text
-native dataset files
-        ↓
-adapters/<dataset>.py
-        ↓
-AnnotatedVolume [Z,Y,X] + physical spacing
-        ↓
-physical adjacency / neighboring-pair selection
-        ↓
-centered physical crop + resampling to Biohub grid
-        ↓
-synthetic Stage-2 merged component
-        ↓
-physical EDT + production effective-marker detector
-        ↓
-4-channel CNN input + foreground/vector/boundary/center targets
-```
-
-## Implemented adapters
-
-### C. elegans nuclei
-
-Adapter: `adapters/c_elegans.py`
-
-Default source spacing in internal ZYX order:
+## Architecture
 
 ```text
-(0.122, 0.116, 0.116) µm
+native image + dense GT labels
+        ↓
+select a single / neighboring pair / group
+        ↓
+tight union bbox in native physical coordinates
+        ↓
+ONE isotropic physical normalization scale
+        ↓
+local image + labels + valid mask → canonical [16,64,64]
+        ↓
+synthetic Stage-2 connected component
+        ↓
+canonical EDT + effective-marker heatmap
+        ↓
+4-channel CNN input
+        ↓
+foreground + canonical vectors + boundary + center supervision
 ```
 
-Root resolution:
+At inference, the exact same transform is constructed from the observed Stage-2
+connected-component bbox. Predicted canonical centers can therefore be mapped
+back to original Biohub voxel coordinates exactly.
 
-1. explicit `--root`,
-2. `C_ELEGANS_NUCLEI_DIR`,
-3. the current project Windows path when present,
-4. `data/external/c_elegans_nuclei`.
+## Why the scale is per component
 
-### NIS3D
-
-Adapter: `adapters/nis3d.py`
-
-The adapter recursively discovers sample folders containing `Data.tif` and
-`GroundTruth.tif` (with common mirror aliases such as `gt.tif`). If present,
-`ConfidenceScore.tif` is loaded and NIS3D undefined voxels are excluded through
-the canonical `valid_mask`. Physical spacing is parsed from `Info.txt` when
-possible. An explicit override can always be supplied with
-`--spacing-zyx-um Z Y X`.
-
-Root resolution:
-
-1. explicit `--root`,
-2. `NIS3D_DIR`,
-3. `data/external/nis3d` / `data/external/NIS3D`.
-
-### BlastoSPIM
-
-Adapter: `adapters/blastospim.py`
-
-The adapter recursively searches TIFF/NPY volumes and pairs raw-image files
-with instance-label files. It supports an umbrella directory containing several
-extracted BlastoSPIM archives or a root pointing directly at one archive. When
-both corrected/expert segmentation and expected/automatic segmentation are
-present, corrected/ground-truth annotations are preferred.
-
-Default source spacing in internal ZYX order:
+If a selected source component has physical bbox `B=(Bz,By,Bx)` and the usable
+canonical span is `F`, the transform chooses
 
 ```text
-(2.0, 0.208, 0.208) µm
+scale = min_i(component_occupancy * F_i / B_i)
 ```
 
-Root resolution:
+subject to safety clamps. The same scalar multiplies physical Z, Y, and X, so
+source morphology is not anisotropically stretched. The output grid itself
+remains `(16,64,64)` with canonical spacing `(1.625,0.40625,0.40625)` because
+the existing CNN backbone is designed around that anisotropic tensor geometry.
+Those values now define **canonical ROI distance units**, not the source cell's
+original biological micrometre scale.
 
-1. explicit `--root`,
-2. `BLASTOSPIM_DIR`,
-3. `data/external/blastospim` / `data/external/BlastoSPIM`.
+Default occupancy is `0.78`, leaving context around the selected group.
 
-Because BlastoSPIM releases have multiple archive/layout variants, run
-`inspect_volume --list` immediately after extraction. If your downloaded tree
-uses an unrecognized naming pattern, the adapter will fail explicitly rather
-than silently pairing unrelated files.
-
-## Canonical model grid
-
-All training samples are generated at the Biohub model grid:
-
-```text
-shape   = (16, 64, 64) [Z,Y,X]
-spacing = (1.625, 0.40625, 0.40625) µm [Z,Y,X]
-```
-
-Whole external volumes are not blindly resampled. Pair selection happens in the
-native annotation grid; only the physical crop required for a sample is
-resampled.
-
-## Valid-pair indexing
-
-Some source nuclei are too small to survive conversion to the Biohub target
-grid, especially datasets with much finer Z sampling. `SampleBuilder` correctly
-rejects those examples. Debugging `--pair-index` is therefore an index among
-**buildable/valid pairs**, not raw adjacency edges.
-
-For example, if raw pairs 0 and 1 disappear after resampling and raw pair 2 is
-valid:
-
-```text
---pair-index 0  → raw pair 2
-```
-
-Use `--raw-pair-index N` when you specifically want to reproduce one rejected
-raw candidate. Rejection messages include native voxel count, native bounding
-box, physical bounding-box size, and physical volume.
-
-## Inspect dataset discovery first
-
-All debugging commands use the same generic interface.
-
-### C. elegans
-
-```powershell
-python -m learned.instance_segmentation.datasets.debugging.inspect_volume `
-  --dataset c_elegans `
-  --root "D:\Projects\Kaggle\cell-tracking\data\external\c_elegans_nuclei" `
-  --split train --index 0
-```
-
-### NIS3D
-
-```powershell
-python -m learned.instance_segmentation.datasets.debugging.inspect_volume `
-  --dataset nis3d `
-  --root "D:\Projects\Kaggle\cell-tracking\data\external\NIS3D" `
-  --list
-```
-
-Then inspect a discovered volume:
-
-```powershell
-python -m learned.instance_segmentation.datasets.debugging.inspect_volume `
-  --dataset nis3d `
-  --root "D:\Projects\Kaggle\cell-tracking\data\external\NIS3D" `
-  --index 0 --napari
-```
-
-If a volume's `Info.txt` does not expose parseable spacing, supply the known
-spacing explicitly:
-
-```text
---spacing-zyx-um Z Y X
-```
-
-### BlastoSPIM
-
-```powershell
-python -m learned.instance_segmentation.datasets.debugging.inspect_volume `
-  --dataset blastospim `
-  --root "<PATH_TO_EXTRACTED_BLASTOSPIM>" `
-  --list
-```
-
-Inspect one record:
-
-```powershell
-python -m learned.instance_segmentation.datasets.debugging.inspect_volume `
-  --dataset blastospim `
-  --root "<PATH_TO_EXTRACTED_BLASTOSPIM>" `
-  --split train --index 0 --napari
-```
-
-If the downloaded TIFF stack is stored in a different axis order, specify it
-explicitly, for example `--source-axis-order xyz`. The code does not guess axis
-permutations.
-
-## Build one complete CNN sample
-
-The same command works for every adapter:
-
-```powershell
-python -m learned.instance_segmentation.datasets.debugging.inspect_sample `
-  --dataset c_elegans `
-  --root "D:\Projects\Kaggle\cell-tracking\data\external\c_elegans_nuclei" `
-  --split train --volume-index 0 --pair-index 0 --napari
-```
-
-Replace `--dataset` and `--root` for NIS3D or BlastoSPIM.
-
-The command:
-
-1. finds naturally neighboring GT instances,
-2. skips pairs that cannot safely survive canonical resampling,
-3. keeps the real fluorescence crop unchanged,
-4. corrupts only the Stage-2-like foreground mask to create one component,
-5. computes physical EDT from that imperfect input mask,
-6. runs the repository's actual Stage-3 effective-peak detector with geometric
-   completion disabled,
-7. creates the marker Gaussian channel,
-8. creates foreground, physical center-vector, boundary, and center targets.
-
-## Scan pair usability
-
-Before training on a new source, quantify how many neighboring pairs remain
-usable at Biohub resolution:
-
-```powershell
-python -m learned.instance_segmentation.datasets.debugging.scan_pairs `
-  --dataset c_elegans `
-  --root "D:\Projects\Kaggle\cell-tracking\data\external\c_elegans_nuclei" `
-  --split train --volume-index 0 --max-pairs 100
-```
-
-The report separates failures such as:
-
-- too small after resampling,
-- crop-border truncation,
-- merge-connectivity failure,
-- marker-generation failure,
-- target-generation failure.
-
-This is useful for deciding how strongly each external source should contribute
-to training.
-
-## CNN input contract
+## Input contract
 
 `TrainingSample.inputs` is `float32 [4,Z,Y,X]`:
 
 1. robust-normalized fluorescence,
-2. Stage-2-like foreground/component mask,
-3. normalized physical EDT,
-4. effective-marker Gaussian heatmap.
+2. synthetic Stage-2-like connected component mask,
+3. normalized canonical EDT,
+4. effective-marker Gaussian heatmap evaluated on the canonical ROI.
+
+The fluorescence and GT are resampled with the same transform. Only the mask is
+synthetically bridged; raw fluorescence is never pasted or modified to fabricate
+a merge.
 
 ## Target contract
 
 - `foreground`: `[1,Z,Y,X]`
-- `vectors_normalized`: `[3,Z,Y,X]`, physical `(Z,Y,X)` offsets divided by
-  `vector_max_distance_um`
+- `vectors_normalized`: `[3,Z,Y,X]`
 - `boundary`: `[1,Z,Y,X]`
 - `center`: `[1,Z,Y,X]`
-- `instance_labels`: `[Z,Y,X]`, local IDs `0..K`
-- `valid_mask`: `[1,Z,Y,X]`
+- `instance_labels`: `[Z,Y,X]`
 
-The default `vector_max_distance_um=16.0` must remain synchronized with
-`model.VectorCNNConfig.vector_max_distance_um`.
+Vectors are **canonical axis-fraction displacements**. For a canonical shape
+`(Z,Y,X)`, multiplying the 3 vector channels by `(Z-1,Y-1,X-1)` recovers the
+predicted displacement in canonical voxels. No `vector_max_distance_um` exists
+in the new model contract.
 
-## Anti-leakage rule
+## Coordinate transform
 
-EDT and the effective-marker channel are always calculated from the corrupted
-Stage-2-like **input mask**. They are never generated from GT centers or GT
-instance count. Dense instance labels are used only to construct supervision.
+`core/component_transform.py` owns the transform. `CanonicalTransform` exposes:
+
+```python
+canonical = transform.native_to_canonical(native_zyx)
+native = transform.canonical_to_native(canonical_zyx)
+```
+
+The transform is stored directly on every `TrainingSample` and recorded in
+sample metadata.
+
+## Training / inference symmetry
+
+Training:
+
+```text
+selected GT group bbox → canonical transform → sample
+```
+
+Inference:
+
+```text
+Stage-2 component bbox → canonical transform → CNN → inverse transform
+```
+
+Use `inference.build_inference_roi(...)` to construct the inference tensor with
+the same normalization rule.
+
+## Adapters
+
+- `c_elegans.py`: Zenodo 5942575 nuclei volumes.
+- `nis3d.py`: NIS3D dense 3-D nuclei benchmark.
+- `blastospim.py`: extracted BlastoSPIM archives.
+
+### NIS3D fixes included
+
+The adapter no longer extracts the first three numbers from arbitrary prose in
+`Info.txt`. It explicitly parses the `Resolution:` field. Therefore:
+
+```text
+Drosophila_1  -> (1.0, 1.0, 1.0) ZYX µm
+Drosophila_2  -> (1.0, 1.0, 1.0)
+MusMusculus_1 -> (1.0, 1.0, 1.0)
+MusMusculus_2 -> (1.0, 1.0, 1.0)
+Zebrafish_1   -> (2.5, 0.43, 0.43)
+Zebrafish_2   -> (1.0, 1.0, 1.0)
+```
+
+Derived `suggestive splitting` directories are excluded when discovering the
+six primary NIS3D volumes.
+
+## Debugging
+
+Inspect a volume:
+
+```powershell
+python -m learned.instance_segmentation.datasets.debugging.inspect_volume `
+  --dataset nis3d `
+  --root "D:\Projects\Kaggle\cell-tracking\data\external\NIS3D" `
+  --list
+```
+
+Build a normalized pair:
+
+```powershell
+python -m learned.instance_segmentation.datasets.debugging.inspect_sample `
+  --dataset nis3d `
+  --root "D:\Projects\Kaggle\cell-tracking\data\external\NIS3D" `
+  --volume-index 0 --pair-index 0 --napari
+```
+
+The command prints the source bbox, isotropic normalization scale, canonical
+bbox extent, canonical GT centers, and inverse-mapped native centers.
+
+Scan buildability:
+
+```powershell
+python -m learned.instance_segmentation.datasets.debugging.scan_pairs `
+  --dataset nis3d `
+  --root "D:\Projects\Kaggle\cell-tracking\data\external\NIS3D" `
+  --volume-index 0 --max-pairs 100
+```
+
+Large pairs are no longer rejected simply because their physical FOV exceeds
+Biohub's fixed 26 µm crop. They are scaled. Rejections now represent genuine
+quality problems such as insufficient canonical resolution, pathological aspect
+ratio, source-boundary truncation, or marker generation failure.
+
+## Model
+
+The existing anisotropic residual 3-D U-Net is preserved. Its output heads remain:
+
+- foreground,
+- vectors,
+- internal boundary,
+- center heatmap.
+
+Only vector semantics changed from fixed physical micrometre offsets to
+canonical axis fractions.
 
 ## Tests
 
-From the repository root:
+From the repository root after replacing `learned/instance_segmentation/`:
 
 ```powershell
 python -m pytest learned/instance_segmentation/datasets/tests -q
 ```
-
-The tests include synthetic adapter layouts for C. elegans, NIS3D and
-BlastoSPIM, axis conversion, NIS3D confidence masking, valid-pair skipping,
-resampling, mask corruption, target generation, and the complete sample-builder
-contract.
-
-## Dependencies
-
-Required:
-
-- `numpy`
-- `scipy`
-- `tifffile`
-
-Optional:
-
-- `napari` for visual debugging
-- `pytest` for tests
-
-The effective-marker channel additionally requires the repository's existing
-`src/03_segmentation` implementation at runtime.

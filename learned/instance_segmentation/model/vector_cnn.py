@@ -1,9 +1,8 @@
-"""Compact anisotropic residual 3D U-Net for instance-segmentation correction."""
+"""Compact anisotropic residual 3-D U-Net for canonical instance correction."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite
 
 import torch
 from torch import nn
@@ -15,44 +14,34 @@ from .heads import VectorCNNHeads
 
 @dataclass(frozen=True)
 class VectorCNNConfig:
-    """Architecture and physical-vector configuration for the V1 model."""
+    """Architecture configuration.
+
+    Vectors are expressed as canonical axis fractions, so no physical
+    max-distance parameter is required or allowed in the model contract.
+    """
 
     input_channels: int = 4
     channels: tuple[int, int, int, int, int] = (24, 48, 96, 160, 256)
     group_norm_groups: int = 8
     dropout: float = 0.0
-    vector_max_distance_um: float = 16.0
 
     def __post_init__(self) -> None:
         if self.input_channels <= 0:
             raise ValueError("input_channels must be positive")
-        if len(self.channels) != 5 or any(value <= 0 for value in self.channels):
+        if len(self.channels) != 5 or any(v <= 0 for v in self.channels):
             raise ValueError("channels must contain five positive values")
         if self.group_norm_groups <= 0:
             raise ValueError("group_norm_groups must be positive")
-        if not 0.0 <= self.dropout < 1.0:
-            raise ValueError("dropout must be in [0, 1)")
-        if (
-            not isfinite(float(self.vector_max_distance_um))
-            or self.vector_max_distance_um <= 0
-        ):
-            raise ValueError("vector_max_distance_um must be positive")
+        if not 0 <= self.dropout < 1:
+            raise ValueError("dropout must be in [0,1)")
 
 
 @dataclass(frozen=True)
 class VectorCNNOutput:
-    """Dense predictions produced at the same spatial resolution as the input."""
-
     foreground_logits: torch.Tensor
     vectors_normalized: torch.Tensor
     boundary_logits: torch.Tensor
     center_logits: torch.Tensor
-
-    def vectors_um(self, max_distance_um: float) -> torch.Tensor:
-        """Convert normalized offsets to physical micrometre offsets."""
-        if max_distance_um <= 0:
-            raise ValueError("max_distance_um must be positive")
-        return self.vectors_normalized * float(max_distance_um)
 
     @property
     def foreground_probability(self) -> torch.Tensor:
@@ -66,27 +55,31 @@ class VectorCNNOutput:
     def center_probability(self) -> torch.Tensor:
         return torch.sigmoid(self.center_logits)
 
+    def vectors_to_canonical_displacement(self) -> torch.Tensor:
+        """Convert axis-fraction vectors to canonical voxel displacement."""
+        spatial = torch.tensor(
+            [max(int(v) - 1, 1) for v in self.vectors_normalized.shape[-3:]],
+            dtype=self.vectors_normalized.dtype,
+            device=self.vectors_normalized.device,
+        ).view(1, 3, 1, 1, 1)
+        return self.vectors_normalized * spatial
+
 
 class VectorInstanceCNN(nn.Module):
-    """V1 learned correction model for merged-cell instance segmentation.
+    """Multi-task CNN operating on scale-normalized component-centric ROIs.
 
-    Expected input channels are, by convention:
+    Input channels:
+      0 normalized fluorescence
+      1 Stage-2-like component mask
+      2 canonical normalized EDT
+      3 canonical effective-marker heatmap
 
-    0. normalized fluorescence,
-    1. Stage-2-like foreground/component mask,
-    2. normalized physical EDT,
-    3. effective-marker Gaussian heatmap.
-
-    The architecture is intentionally component-centric and preserves full
-    resolution in Z through the first two encoder reductions. It does not
-    produce instance IDs directly; its vector, center, and boundary outputs are
-    intended for deterministic voting/marker reconciliation/watershed.
+    Output vectors are canonical axis fractions, not biological micrometres.
     """
 
     def __init__(self, config: VectorCNNConfig | None = None) -> None:
         super().__init__()
         self.config = config or VectorCNNConfig()
-
         self.encoder = VectorCNNEncoder(
             in_channels=self.config.input_channels,
             channels=self.config.channels,
@@ -99,29 +92,16 @@ class VectorInstanceCNN(nn.Module):
             dropout=self.config.dropout,
         )
         self.heads = VectorCNNHeads(
-            self.config.channels[0],
-            groups=self.config.group_norm_groups,
+            self.config.channels[0], groups=self.config.group_norm_groups
         )
-
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        """Initialize residual features strongly and task outputs near zero.
-
-        Small final-head weights avoid saturating the vector ``tanh`` before
-        learning starts while still allowing gradients to reach the shared
-        decoder on the first optimization step.
-        """
         for module in self.modules():
             if isinstance(module, nn.Conv3d):
-                nn.init.kaiming_normal_(
-                    module.weight,
-                    mode="fan_out",
-                    nonlinearity="relu",
-                )
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-
         final_layers = (
             self.heads.foreground.output,
             self.heads.vectors.output,
@@ -135,34 +115,18 @@ class VectorInstanceCNN(nn.Module):
 
     def _validate_input(self, x: torch.Tensor) -> None:
         if x.ndim != 5:
-            raise ValueError(
-                "VectorInstanceCNN expects [B, C, Z, Y, X], "
-                f"got shape {tuple(x.shape)}"
-            )
+            raise ValueError(f"VectorInstanceCNN expects [B,C,Z,Y,X], got {tuple(x.shape)}")
         if x.shape[1] != self.config.input_channels:
             raise ValueError(
-                f"expected {self.config.input_channels} input channels, "
-                f"got {x.shape[1]}"
+                f"expected {self.config.input_channels} input channels, got {x.shape[1]}"
             )
-        z, y, x_size = (int(value) for value in x.shape[-3:])
+        z, y, x_size = map(int, x.shape[-3:])
         if z < 4 or y < 16 or x_size < 16:
-            raise ValueError(
-                "spatial input is too small for the four-level encoder; "
-                "require at least Z>=4, Y>=16, X>=16"
-            )
+            raise ValueError("require at least Z>=4, Y>=16, X>=16")
 
     def forward(self, x: torch.Tensor) -> VectorCNNOutput:
         self._validate_input(x)
         features = self.encoder(x)
         decoded = self.decoder(features)
         foreground, vectors, boundary, center = self.heads(decoded)
-        return VectorCNNOutput(
-            foreground_logits=foreground,
-            vectors_normalized=vectors,
-            boundary_logits=boundary,
-            center_logits=center,
-        )
-
-    def vectors_to_um(self, vectors_normalized: torch.Tensor) -> torch.Tensor:
-        """Convert normalized vector predictions to physical micrometres."""
-        return vectors_normalized * self.config.vector_max_distance_um
+        return VectorCNNOutput(foreground, vectors, boundary, center)

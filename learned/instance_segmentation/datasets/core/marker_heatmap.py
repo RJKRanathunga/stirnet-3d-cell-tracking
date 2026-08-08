@@ -1,4 +1,4 @@
-"""Reuse Stage 3 effective peaks and convert them into a CNN marker channel."""
+"""Canonical EDT and effective-marker evidence for the CNN input."""
 
 from __future__ import annotations
 
@@ -18,12 +18,12 @@ def detect_effective_markers_stage3(
     component_mask: np.ndarray,
     spacing_zyx_um: Spacing3D,
 ) -> tuple[Index3D, ...]:
-    """Run the repository's real effective-peak detector with geometry disabled.
+    """Reuse production Stage-3 peak logic on the normalized canonical ROI.
 
-    Dynamic import is required because the existing production package is named
-    ``src.03_segmentation``. No GT information enters this detector.
+    ``spacing_zyx_um`` is intentionally kept as the argument name because the
+    Stage-3 API expects it.  Here the values represent canonical ROI distance
+    units.  Geometry completion is disabled to prevent label-derived leakage.
     """
-
     pipeline = import_module("src.03_segmentation.pipeline")
     config_module = import_module("src.03_segmentation.config")
     config = replace(
@@ -44,8 +44,6 @@ def deepest_point_marker(
     component_mask: np.ndarray,
     spacing_zyx_um: Spacing3D,
 ) -> tuple[Index3D, ...]:
-    """Simple explicit fallback useful for isolated tests, never the default."""
-
     mask = np.asarray(component_mask, dtype=bool)
     if not mask.any():
         return ()
@@ -61,14 +59,11 @@ def markers_to_heatmap(
     *,
     sigma_um: float,
 ) -> np.ndarray:
-    """Return max-composed physical Gaussian bumps centered on marker points."""
-
     if sigma_um <= 0:
         raise ValueError("sigma_um must be positive")
     heatmap = np.zeros(shape_zyx, dtype=np.float32)
     if not marker_positions_zyx:
         return heatmap
-
     spacing = np.asarray(spacing_zyx_um, dtype=np.float64)
     shape = np.asarray(shape_zyx, dtype=int)
     for raw_position in marker_positions_zyx:
@@ -78,15 +73,26 @@ def markers_to_heatmap(
         radius_vox = np.ceil(3.0 * sigma_um / spacing).astype(int)
         lo = np.maximum(0, position - radius_vox)
         hi = np.minimum(shape, position + radius_vox + 1)
-        axes = [
-            (np.arange(lo[a], hi[a]) - position[a]) * spacing[a]
-            for a in range(3)
-        ]
+        axes = [(np.arange(lo[a], hi[a]) - position[a]) * spacing[a] for a in range(3)]
         zz, yy, xx = np.meshgrid(*axes, indexing="ij")
         gaussian = np.exp(-(zz * zz + yy * yy + xx * xx) / (2.0 * sigma_um**2))
         target = tuple(slice(int(lo[a]), int(hi[a])) for a in range(3))
         heatmap[target] = np.maximum(heatmap[target], gaussian.astype(np.float32))
     return heatmap
+
+
+def normalized_canonical_edt(
+    component_mask: np.ndarray,
+    spacing_zyx: Spacing3D,
+    *,
+    clip_distance: float,
+) -> np.ndarray:
+    if clip_distance <= 0:
+        raise ValueError("clip_distance must be positive")
+    distance = ndimage.distance_transform_edt(
+        np.asarray(component_mask, dtype=bool), sampling=spacing_zyx
+    )
+    return np.clip(distance / float(clip_distance), 0.0, 1.0).astype(np.float32)
 
 
 def normalized_physical_edt(
@@ -95,12 +101,7 @@ def normalized_physical_edt(
     *,
     clip_um: float,
 ) -> np.ndarray:
-    """EDT channel in [0,1] using a fixed physical clipping scale."""
-
-    if clip_um <= 0:
-        raise ValueError("clip_um must be positive")
-    distance = ndimage.distance_transform_edt(
-        np.asarray(component_mask, dtype=bool),
-        sampling=spacing_zyx_um,
+    """Compatibility alias; the new builder supplies canonical spacing/clip."""
+    return normalized_canonical_edt(
+        component_mask, spacing_zyx_um, clip_distance=clip_um
     )
-    return np.clip(distance / float(clip_um), 0.0, 1.0).astype(np.float32)

@@ -1,32 +1,27 @@
 import numpy as np
 
-from learned.instance_segmentation.datasets.core.mask_corruption import build_stage2_like_component
-from learned.instance_segmentation.datasets.core.targets import build_targets
+from ..core.targets import build_targets, vectors_to_canonical_displacement
 
 
-def test_vectors_point_to_owning_centers_and_boundary_exists() -> None:
-    labels = np.zeros((12, 32, 32), dtype=np.int32)
-    labels[3:9, 8:14, 7:13] = 1
-    labels[3:9, 8:14, 18:24] = 2
-    spacing = (1.0, 1.0, 1.0)
-    input_mask = build_stage2_like_component(labels, spacing, bridge_radius_um=0.0)
-
+def test_vectors_point_exactly_to_centers_in_canonical_voxels():
+    labels = np.zeros((16, 32, 32), np.int32)
+    labels[4:10, 5:14, 5:14] = 1
+    labels[5:11, 17:27, 17:27] = 2
+    component = labels > 0
+    # connect component for boundary ownership
+    component[:, :, 13:18] |= np.any(component[:, :, 13:18], axis=2, keepdims=True)
     targets = build_targets(
         labels,
-        input_mask,
-        spacing,
-        vector_max_distance_um=16.0,
+        component,
+        (1.625, 0.40625, 0.40625),
         center_sigma_um=1.0,
         center_interior_fraction=0.7,
-        boundary_radius_um=1.0,
+        boundary_radius_um=0.75,
     )
-    assert len(targets.centers_zyx) == 2
-    assert targets.boundary.sum() > 0
-    assert targets.center.max() == 1.0
-
-    for instance_id, center in enumerate(targets.centers_zyx, start=1):
-        point = np.argwhere(labels == instance_id)[0]
-        z, y, x = (int(v) for v in point)
-        predicted_delta = targets.vectors_normalized[:, z, y, x] * 16.0
-        expected_delta = np.asarray(center, dtype=np.float32) - point.astype(np.float32)
-        assert np.allclose(predicted_delta, expected_delta)
+    displacement = vectors_to_canonical_displacement(targets.vectors_normalized, labels.shape)
+    for local_id, center in enumerate(targets.centers_zyx, start=1):
+        point = np.argwhere(labels == local_id)[0]
+        z, y, x = point
+        predicted = displacement[:, z, y, x]
+        expected = np.asarray(center, dtype=np.float32) - point.astype(np.float32)
+        assert np.allclose(predicted, expected, atol=1e-5)

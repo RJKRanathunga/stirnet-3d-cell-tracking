@@ -1,4 +1,4 @@
-"""Canonical data models shared by all annotated 3-D datasets."""
+"""Canonical data models shared by annotated 3-D datasets and CNN samples."""
 
 from __future__ import annotations
 
@@ -8,20 +8,14 @@ from typing import Any, Mapping
 
 import numpy as np
 
-
 Spacing3D = tuple[float, float, float]
 Shape3D = tuple[int, int, int]
 Index3D = tuple[int, int, int]
+Float3D = tuple[float, float, float]
 
 
 @dataclass(frozen=True)
 class VolumeRecord:
-    """A discoverable raw-image / instance-label pair on disk.
-
-    ``metadata`` carries adapter-specific sidecar paths or acquisition details
-    without leaking them into the dataset-agnostic ``AnnotatedVolume`` API.
-    """
-
     sample_id: str
     split: str
     image_path: Path
@@ -31,8 +25,6 @@ class VolumeRecord:
 
 @dataclass(frozen=True)
 class AnnotatedVolume:
-    """Dataset-agnostic representation of one densely annotated 3-D volume."""
-
     image: np.ndarray
     instance_labels: np.ndarray
     spacing_zyx_um: Spacing3D
@@ -49,21 +41,17 @@ class AnnotatedVolume:
         if image.ndim != 3 or labels.ndim != 3:
             raise ValueError("image and instance_labels must both be 3-D [Z,Y,X]")
         if image.shape != labels.shape:
-            raise ValueError(
-                f"image/label shape mismatch: {image.shape} versus {labels.shape}"
-            )
+            raise ValueError(f"image/label shape mismatch: {image.shape} versus {labels.shape}")
         if len(self.spacing_zyx_um) != 3 or any(float(v) <= 0 for v in self.spacing_zyx_um):
             raise ValueError("spacing_zyx_um must contain three positive values")
         if not np.issubdtype(labels.dtype, np.integer):
             raise TypeError("instance_labels must use an integer dtype")
         if np.any(labels < 0):
             raise ValueError("instance_labels cannot contain negative IDs")
-        if self.valid_mask is not None:
-            valid = np.asarray(self.valid_mask)
-            if valid.shape != image.shape:
-                raise ValueError("valid_mask must match image shape")
+        if self.valid_mask is not None and np.asarray(self.valid_mask).shape != image.shape:
+            raise ValueError("valid_mask must match image shape")
         if self.intensity_bounds is not None:
-            low, high = (float(v) for v in self.intensity_bounds)
+            low, high = map(float, self.intensity_bounds)
             if not low < high:
                 raise ValueError("intensity_bounds must satisfy low < high")
 
@@ -85,8 +73,6 @@ class AnnotatedVolume:
 
 @dataclass(frozen=True)
 class AdjacencyEdge:
-    """Physical proximity relationship between two annotated instances."""
-
     instance_a: int
     instance_b: int
     separation_um: float
@@ -103,8 +89,6 @@ class AdjacencyEdge:
 
 @dataclass(frozen=True)
 class InstanceGroup:
-    """One selected group of GT instances from which a training crop is built."""
-
     instance_ids: tuple[int, ...]
     kind: str
     score: float = 0.0
@@ -117,14 +101,74 @@ class InstanceGroup:
 
 
 @dataclass(frozen=True)
-class TargetBundle:
-    """Dense supervision at canonical CNN resolution."""
+class ComponentBBox:
+    """Tight selected-group bounding box in native index and physical coordinates."""
 
-    foreground: np.ndarray       # [1,Z,Y,X] float32
-    vectors_normalized: np.ndarray  # [3,Z,Y,X] float32
-    boundary: np.ndarray         # [1,Z,Y,X] float32
-    center: np.ndarray           # [1,Z,Y,X] float32
-    instance_labels: np.ndarray  # [Z,Y,X] int32, local IDs 0..K
+    start_zyx: Index3D
+    stop_zyx: Index3D  # exclusive
+    extent_vox_zyx: Shape3D
+    extent_um_zyx: Float3D
+    center_native_zyx: Float3D
+
+
+@dataclass(frozen=True)
+class CanonicalTransform:
+    """Invertible object-centric mapping between native and canonical indices.
+
+    ``normalization_scale`` is isotropic in physical source coordinates:
+    canonical_physical_offset = source_physical_offset * normalization_scale.
+    """
+
+    native_center_zyx: Float3D
+    normalization_scale: float
+    native_spacing_zyx_um: Spacing3D
+    canonical_spacing_zyx: Spacing3D
+    canonical_shape_zyx: Shape3D
+    component_bbox: ComponentBBox
+
+    def __post_init__(self) -> None:
+        if self.normalization_scale <= 0:
+            raise ValueError("normalization_scale must be positive")
+
+    @property
+    def canonical_center_zyx(self) -> Float3D:
+        return tuple((int(v) - 1) / 2.0 for v in self.canonical_shape_zyx)  # type: ignore[return-value]
+
+    @property
+    def effective_native_spacing_canonical(self) -> Spacing3D:
+        return tuple(
+            float(v) * float(self.normalization_scale)
+            for v in self.native_spacing_zyx_um
+        )  # type: ignore[return-value]
+
+    def native_to_canonical(self, coordinates_zyx: np.ndarray | tuple[float, float, float]) -> np.ndarray:
+        coords = np.asarray(coordinates_zyx, dtype=np.float64)
+        native_center = np.asarray(self.native_center_zyx, dtype=np.float64)
+        source_spacing = np.asarray(self.native_spacing_zyx_um, dtype=np.float64)
+        canonical_spacing = np.asarray(self.canonical_spacing_zyx, dtype=np.float64)
+        canonical_center = np.asarray(self.canonical_center_zyx, dtype=np.float64)
+        return canonical_center + (
+            (coords - native_center) * source_spacing * self.normalization_scale
+        ) / canonical_spacing
+
+    def canonical_to_native(self, coordinates_zyx: np.ndarray | tuple[float, float, float]) -> np.ndarray:
+        coords = np.asarray(coordinates_zyx, dtype=np.float64)
+        native_center = np.asarray(self.native_center_zyx, dtype=np.float64)
+        source_spacing = np.asarray(self.native_spacing_zyx_um, dtype=np.float64)
+        canonical_spacing = np.asarray(self.canonical_spacing_zyx, dtype=np.float64)
+        canonical_center = np.asarray(self.canonical_center_zyx, dtype=np.float64)
+        return native_center + (
+            (coords - canonical_center) * canonical_spacing
+        ) / (source_spacing * self.normalization_scale)
+
+
+@dataclass(frozen=True)
+class TargetBundle:
+    foreground: np.ndarray
+    vectors_normalized: np.ndarray
+    boundary: np.ndarray
+    center: np.ndarray
+    instance_labels: np.ndarray
     centers_zyx: tuple[Index3D, ...]
 
     def __post_init__(self) -> None:
@@ -144,23 +188,20 @@ class TargetBundle:
 
 @dataclass(frozen=True)
 class TrainingSample:
-    """Complete component-centric sample consumed by the Vector CNN trainer."""
-
-    inputs: np.ndarray           # [4,Z,Y,X] float32
+    inputs: np.ndarray
     targets: TargetBundle
-    valid_mask: np.ndarray       # [1,Z,Y,X] float32
-    input_component_mask: np.ndarray  # [Z,Y,X] bool
-    edt_normalized: np.ndarray   # [Z,Y,X] float32
-    marker_heatmap: np.ndarray   # [Z,Y,X] float32
+    valid_mask: np.ndarray
+    input_component_mask: np.ndarray
+    edt_normalized: np.ndarray
+    marker_heatmap: np.ndarray
     marker_positions_zyx: tuple[Index3D, ...]
+    transform: CanonicalTransform
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         spatial = self.targets.instance_labels.shape
         if self.inputs.shape != (4, *spatial):
-            raise ValueError(
-                f"inputs must have shape [4,Z,Y,X], got {self.inputs.shape}"
-            )
+            raise ValueError(f"inputs must have shape [4,Z,Y,X], got {self.inputs.shape}")
         if self.valid_mask.shape != (1, *spatial):
             raise ValueError("valid_mask must have shape [1,Z,Y,X]")
         if self.input_component_mask.shape != spatial:

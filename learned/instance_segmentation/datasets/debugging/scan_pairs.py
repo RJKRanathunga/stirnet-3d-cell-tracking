@@ -1,89 +1,76 @@
-"""Scan neighboring pair candidates and summarize TrainingSample rejection reasons."""
+"""Scan pair candidates and summarize object-centric build rejection reasons."""
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter
-from pathlib import Path
 
-from ..adapters.registry import dataset_choices, make_adapter
+from ..adapters import dataset_choices, make_adapter
 from ..config import DEFAULT_SAMPLE_BUILD_CONFIG
 from ..core.adjacency import build_instance_adjacency
 from ..core.sample_builder import SampleBuildError, SampleBuilder
 from ..core.sampling import pair_groups
 
 
-def _category(reason: str) -> str:
+def _classify(reason: str) -> str:
     lower = reason.lower()
-    if "voxels after resampling" in lower or "vanished during resampling" in lower:
-        return "too_small_after_resampling"
-    if "canonical crop border" in lower:
-        return "crop_border"
-    if "stage-2-like component" in lower:
+    if "aspect ratio" in lower:
+        return "pathological_aspect"
+    if "only" in lower and "voxels" in lower:
+        return "too_small_after_normalization"
+    if "below minimum" in lower:
+        return "too_thin_after_normalization"
+    if "border" in lower:
+        return "canonical_border"
+    if "component" in lower and "found" in lower:
         return "merge_connectivity"
     if "marker" in lower:
         return "marker_generation"
-    if "target" in lower or "center" in lower or "boundary" in lower:
-        return "target_generation"
     return "other"
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", choices=dataset_choices(), default="c_elegans")
-    parser.add_argument("--root", type=Path, default=None)
-    parser.add_argument("--split", default=None)
-    parser.add_argument("--volume-index", type=int, default=0)
-    parser.add_argument("--source-axis-order", default="zyx")
-    parser.add_argument("--spacing-zyx-um", type=float, nargs=3, metavar=("Z", "Y", "X"))
-    parser.add_argument("--max-pairs", type=int, default=100)
-    parser.add_argument("--show-failures", type=int, default=10)
-    return parser
-
-
 def main() -> None:
-    args = _parser().parse_args()
-    spacing_override = tuple(args.spacing_zyx_um) if args.spacing_zyx_um else None
+    p = argparse.ArgumentParser()
+    p.add_argument("--dataset", choices=dataset_choices(), required=True)
+    p.add_argument("--root")
+    p.add_argument("--split")
+    p.add_argument("--volume-index", type=int, default=0)
+    p.add_argument("--max-pairs", type=int, default=100)
+    p.add_argument("--source-axis-order", default="zyx")
+    p.add_argument("--spacing-zyx-um", type=float, nargs=3)
+    args = p.parse_args()
     adapter = make_adapter(
         args.dataset,
-        args.root,
+        root=args.root,
         source_axis_order=args.source_axis_order,
-        spacing_override_zyx_um=spacing_override,
+        spacing_override_zyx_um=tuple(args.spacing_zyx_um) if args.spacing_zyx_um else None,
     )
-    volume = adapter.load_index(args.volume_index, split=args.split)
-    config = DEFAULT_SAMPLE_BUILD_CONFIG
-    groups = pair_groups(
-        build_instance_adjacency(
-            volume.instance_labels,
-            volume.spacing_zyx_um,
-            max_distance_um=config.adjacency_max_distance_um,
-        )
+    records = adapter.records(split=args.split) if hasattr(adapter, "records") else adapter.discover_records()
+    volume = adapter.load(records[args.volume_index])
+    edges = build_instance_adjacency(
+        volume.instance_labels,
+        volume.spacing_zyx_um,
+        max_distance_um=DEFAULT_SAMPLE_BUILD_CONFIG.adjacency_max_distance_um,
     )
-    builder = SampleBuilder(config)
-    limit = min(len(groups), max(0, args.max_pairs))
-    if limit == 0:
-        raise SystemExit("No pair candidates to scan.")
-
-    counts: Counter[str] = Counter()
-    failures: list[tuple[int, tuple[int, ...], str]] = []
-    valid = 0
-    for index, group in enumerate(groups[:limit]):
+    groups = pair_groups(edges)
+    builder = SampleBuilder()
+    reasons = Counter()
+    scales: list[float] = []
+    checked = min(args.max_pairs, len(groups))
+    for group in groups[:checked]:
         try:
-            builder.build(volume, group)
+            sample = builder.build(volume, group)
         except SampleBuildError as error:
-            reason = str(error)
-            counts[_category(reason)] += 1
-            failures.append((index, group.instance_ids, reason))
+            reasons[_classify(str(error))] += 1
         else:
-            valid += 1
-
-    print(f"dataset={volume.dataset_name} sample={volume.sample_id}")
-    print(f"raw pair candidates total={len(groups)} scanned={limit}")
-    print(f"valid={valid} rejected={limit-valid} valid_fraction={valid/limit:.3f}")
-    for category, count in counts.most_common():
-        print(f"rejected[{category}]={count}")
-    for index, ids, reason in failures[: max(0, args.show_failures)]:
-        print(f"failure raw[{index}] {ids}: {reason}")
+            reasons["valid"] += 1
+            scales.append(float(sample.transform.normalization_scale))
+    print("checked:", checked)
+    for key, count in reasons.most_common():
+        print(f"{key:34s} {count:6d} ({100*count/max(checked,1):6.2f}%)")
+    if scales:
+        scales.sort()
+        print("normalization scale min/median/max:", scales[0], scales[len(scales)//2], scales[-1])
 
 
 if __name__ == "__main__":

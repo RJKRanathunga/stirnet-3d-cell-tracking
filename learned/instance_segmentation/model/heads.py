@@ -1,62 +1,36 @@
-"""Task heads for foreground, center vectors, boundaries, and centers."""
+"""Prediction heads for foreground, canonical vectors, boundary, and centers."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
 
-from .blocks import ResidualAnisotropicBlock
+from .blocks import ConvNormAct3D
 
 
 class ScalarPredictionHead(nn.Module):
-    """Small anisotropy-aware head returning one unnormalized logit channel."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        *,
-        hidden_channels: int = 16,
-        groups: int = 8,
-    ) -> None:
+    def __init__(self, in_channels: int, *, groups: int = 8) -> None:
         super().__init__()
-        self.features = ResidualAnisotropicBlock(
-            in_channels,
-            hidden_channels,
-            groups=groups,
-            dropout=0.0,
-        )
-        self.output = nn.Conv3d(hidden_channels, 1, kernel_size=1)
+        hidden = max(8, in_channels // 2)
+        self.features = ConvNormAct3D(in_channels, hidden, kernel_size=3, groups=groups)
+        self.output = nn.Conv3d(hidden, 1, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.output(self.features(x))
 
 
 class VectorPredictionHead(nn.Module):
-    """Predict normalized Z/Y/X offsets in the closed interval ``[-1, 1]``."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        *,
-        hidden_channels: int = 32,
-        groups: int = 8,
-    ) -> None:
+    def __init__(self, in_channels: int, *, groups: int = 8) -> None:
         super().__init__()
-        self.features = ResidualAnisotropicBlock(
-            in_channels,
-            hidden_channels,
-            groups=groups,
-            dropout=0.0,
-        )
-        self.output = nn.Conv3d(hidden_channels, 3, kernel_size=1)
+        hidden = max(12, in_channels // 2)
+        self.features = ConvNormAct3D(in_channels, hidden, kernel_size=3, groups=groups)
+        self.output = nn.Conv3d(hidden, 3, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self.output(self.features(x)))
 
 
 class VectorCNNHeads(nn.Module):
-    """Independent prediction heads attached to the full-resolution decoder map."""
-
     def __init__(self, in_channels: int, *, groups: int = 8) -> None:
         super().__init__()
         self.foreground = ScalarPredictionHead(in_channels, groups=groups)
@@ -64,9 +38,7 @@ class VectorCNNHeads(nn.Module):
         self.boundary = ScalarPredictionHead(in_channels, groups=groups)
         self.center = ScalarPredictionHead(in_channels, groups=groups)
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor):
         return (
             self.foreground(x),
             self.vectors(x),

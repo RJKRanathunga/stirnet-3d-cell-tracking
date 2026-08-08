@@ -1,10 +1,8 @@
-"""Adapter for the BlastoSPIM 1.0/2.0 mouse-embryo nuclei datasets."""
+"""Adapter for extracted BlastoSPIM 3-D mouse-embryo nuclei datasets."""
 
 from __future__ import annotations
 
-from collections import defaultdict
 from pathlib import Path
-import re
 
 import numpy as np
 
@@ -14,139 +12,53 @@ from ..core.normalization import robust_intensity_bounds
 from ._utils import (
     canonical_split,
     coerce_3d,
+    compact_stem,
     infer_split,
     load_array,
     normalize_instance_labels,
-    path_tokens,
-    sanitized_sample_id,
-    supported_volume_files,
+    supported_array_files,
     to_zyx,
-    tokens,
     validate_axis_order,
 )
 
-_LABEL_TOKENS = {
-    "label",
-    "labels",
-    "mask",
-    "masks",
-    "seg",
-    "segmentation",
-    "segmentations",
-    "groundtruth",
-    "ground",
-    "truth",
-    "gt",
-    "annotation",
-    "annotations",
-    "corrected",
+_LABEL_WORDS = {
+    "label", "labels", "mask", "masks", "seg", "segmentation", "gt",
+    "groundtruth", "corrected", "correction", "expert", "instance", "instances",
 }
-_IMAGE_TOKENS = {"image", "images", "img", "raw", "volume", "volumes", "data"}
-_IGNORE_TOKENS = {
-    "preview",
-    "projection",
-    "projections",
-    "mip",
-    "visualize",
-    "visualization",
-    "visulize",
-    "roi",
-    "rois",
-}
-_SEMANTIC_TOKENS = _LABEL_TOKENS | _IMAGE_TOKENS | {
-    "expected",
-    "corrected",
-    "manual",
-    "expert",
-}
+_AUTO_WORDS = {"expected", "automatic", "auto", "prediction", "predicted"}
+_IMAGE_WORDS = {"image", "images", "img", "raw", "volume", "stack", "data"}
 
 
-def _is_ignored(path: Path) -> bool:
-    return bool(set(path_tokens(path)) & _IGNORE_TOKENS)
+def _label_score(path: Path) -> int:
+    lower = path.stem.lower()
+    score = 0
+    if any(token in lower for token in ("correct", "expert", "groundtruth", "gt")):
+        score += 20
+    if any(token in lower for token in ("label", "mask", "seg", "instance")):
+        score += 10
+    if any(token in lower for token in _AUTO_WORDS):
+        score -= 10
+    return score
 
 
 def _is_label(path: Path) -> bool:
-    return bool(set(path_tokens(path)) & _LABEL_TOKENS)
+    return _label_score(path) > 0
 
 
-def _is_explicit_image(path: Path) -> bool:
-    path_set = set(path_tokens(path))
-    return bool(path_set & _IMAGE_TOKENS) and not bool(path_set & _LABEL_TOKENS)
+def _key(path: Path) -> str:
+    return compact_stem(path, _LABEL_WORDS | _AUTO_WORDS | _IMAGE_WORDS)
 
 
-def _pair_key(path: Path) -> str:
-    stem = [token for token in tokens(path.stem) if token not in _SEMANTIC_TOKENS]
-    if not stem:
-        stem = list(tokens(path.stem))
-    return "_".join(stem)
-
-
-def _context_tokens(path: Path) -> set[str]:
-    return {
-        token
-        for part in path.parts[:-1]
-        for token in tokens(part)
-        if token not in _SEMANTIC_TOKENS
-        and token not in {"train", "training", "val", "validation", "test", "testing"}
-    }
-
-
-def _label_preference(path: Path) -> int:
-    value = str(path).lower()
-    path_set = set(path_tokens(path))
-    if "corrected" in path_set or "groundtruth" in path_set or "gt" in path_set:
-        return 0
-    if "manual" in path_set or "expert" in path_set or "annotation" in path_set:
-        return 1
-    if "expected" in path_set:
-        return 5
-    if "segmentation" in path_set or "labels" in path_set or "label" in path_set:
-        return 2
-    return 3 + int("expected" in value)
-
-
-def _candidate_score(image: Path, label: Path) -> tuple[int, int, int, str]:
-    exact_stem = 0 if image.stem.lower() == label.stem.lower() else 1
-    shared_context = len(_context_tokens(image) & _context_tokens(label))
-    return (_label_preference(label), exact_stem, -shared_context, str(label))
-
-
-def _sample_context(image: Path, root: Path) -> tuple[str, ...]:
-    relative = image.relative_to(root)
-    parts: list[str] = []
-    for part in relative.parts[:-1]:
-        part_tokens = tokens(part)
-        if set(part_tokens) & _IMAGE_TOKENS:
-            continue
-        if part.lower().startswith(("train", "val", "test")):
-            continue
-        parts.append(part)
-    parts.append(_pair_key(image) or image.stem)
-    return tuple(parts)
-
-
-def _infer_version(path: Path) -> str:
-    compact = re.sub(r"[^a-z0-9]+", "", str(path).lower())
-    if "blastospim2" in compact:
+def _version_from_path(path: Path) -> str | None:
+    lower = str(path).lower()
+    if "blastospim2" in lower or "2.0" in lower:
         return "2.0"
-    if "blastospim1" in compact:
+    if "blastospim1" in lower or "1.0" in lower:
         return "1.0"
-    # The official site states that the series literally named "Blast" is 2.0.
-    if any(part.lower() == "blast" for part in path.parts):
-        return "2.0"
-    return "unspecified"
+    return None
 
 
 class BlastoSPIMAdapter:
-    """Discover raw/ground-truth TIFF pairs from BlastoSPIM archives.
-
-    The official downloads are split into train/validation/two test archives.
-    This adapter tolerates both an umbrella directory containing those
-    extracted archives and a root pointing directly at one extracted archive.
-    It prefers expert/corrected/ground-truth segmentation directories over
-    automatically generated ``Expected_Segmentation`` files when both exist.
-    """
-
     dataset_name = "blastospim"
 
     def __init__(
@@ -154,78 +66,46 @@ class BlastoSPIMAdapter:
         root: str | Path | None = None,
         *,
         source_axis_order: str = "zyx",
-        spacing_override_zyx_um: tuple[float, float, float] | None = None,
+        spacing_zyx_um: tuple[float, float, float] = BLASTOSPIM_SPACING_ZYX_UM,
     ) -> None:
         self.root = Path(root) if root is not None else default_blastospim_root()
         self.source_axis_order = validate_axis_order(source_axis_order)
-        spacing = spacing_override_zyx_um or BLASTOSPIM_SPACING_ZYX_UM
-        if len(spacing) != 3 or any(float(v) <= 0 for v in spacing):
-            raise ValueError("spacing_override_zyx_um must contain three positive values")
-        self.spacing_zyx_um = tuple(float(v) for v in spacing)
+        if len(spacing_zyx_um) != 3 or any(float(v) <= 0 for v in spacing_zyx_um):
+            raise ValueError("spacing_zyx_um must contain three positive values")
+        self.spacing_zyx_um = tuple(float(v) for v in spacing_zyx_um)
 
     def discover_records(self) -> tuple[VolumeRecord, ...]:
         if not self.root.exists():
             raise FileNotFoundError(
-                f"BlastoSPIM dataset directory does not exist: {self.root}. "
-                "Pass --root or set BLASTOSPIM_DIR."
+                f"BlastoSPIM directory does not exist: {self.root}. Pass --root or set BLASTOSPIM_DIR."
             )
-        files = tuple(path for path in supported_volume_files(self.root) if not _is_ignored(path))
-        if not files:
-            raise FileNotFoundError(f"no TIFF/NPY volumes found below {self.root}")
-
-        labels = [path for path in files if _is_label(path)]
-        explicit_images = [path for path in files if _is_explicit_image(path)]
-        if explicit_images:
-            images = explicit_images
-        else:
-            images = [path for path in files if path not in labels]
-
-        if not images or not labels:
+        files = supported_array_files(self.root)
+        label_files = [p for p in files if _is_label(p)]
+        image_files = [p for p in files if not _is_label(p)]
+        if not label_files or not image_files:
             raise RuntimeError(
-                "Could not identify BlastoSPIM raw images and ground-truth labels. "
-                "Expected image/raw directories plus label/segmentation/ground-truth "
-                "directories. Run inspect_volume --list after checking extraction."
+                "Could not discover BlastoSPIM raw/annotation arrays. If this release uses "
+                "different names, inspect the extracted tree and extend the adapter patterns."
             )
 
-        labels_by_split_key: dict[tuple[str, str], list[Path]] = defaultdict(list)
-        for label in labels:
-            split = infer_split(Path(self.root.name) / label.relative_to(self.root))
-            labels_by_split_key[(split, _pair_key(label))].append(label)
+        image_by_key: dict[str, list[Path]] = {}
+        for image in image_files:
+            image_by_key.setdefault(_key(image), []).append(image)
+
+        label_by_key: dict[str, list[Path]] = {}
+        for label in label_files:
+            label_by_key.setdefault(_key(label), []).append(label)
 
         records: list[VolumeRecord] = []
-        used_labels: set[Path] = set()
-        unpaired: list[Path] = []
-        for image in sorted(images):
-            relative = image.relative_to(self.root)
-            split = infer_split(Path(self.root.name) / relative)
-            key = _pair_key(image)
-            candidates = [
-                label
-                for label in labels_by_split_key.get((split, key), [])
-                if label not in used_labels
-            ]
-            if not candidates:
-                candidates = [
-                    label
-                    for label in labels
-                    if label not in used_labels
-                    and label.stem.lower() == image.stem.lower()
-                    and infer_split(Path(self.root.name) / label.relative_to(self.root)) == split
-                ]
-            if not candidates and split == "unspecified":
-                candidates = [
-                    label
-                    for label in labels
-                    if label not in used_labels and _pair_key(label) == key
-                ]
-            if not candidates:
-                unpaired.append(image)
+        for key, labels in label_by_key.items():
+            images = image_by_key.get(key)
+            if not images:
                 continue
-
-            label = min(candidates, key=lambda candidate: _candidate_score(image, candidate))
-            used_labels.add(label)
-            sample_id = sanitized_sample_id(_sample_context(image, self.root))
-            version = _infer_version(Path(self.root.name) / relative)
+            # Prefer corrected/expert labels over automatic/expected variants.
+            label = sorted(labels, key=lambda p: (-_label_score(p), str(p)))[0]
+            image = sorted(images, key=str)[0]
+            split = infer_split(label.relative_to(self.root))
+            sample_id = f"{split}_{key}" if split != "unspecified" else key
             records.append(
                 VolumeRecord(
                     sample_id=sample_id,
@@ -233,20 +113,14 @@ class BlastoSPIMAdapter:
                     image_path=image,
                     labels_path=label,
                     metadata={
-                        "version": version,
-                        "image_relative_path": str(relative),
-                        "labels_relative_path": str(label.relative_to(self.root)),
+                        "version": _version_from_path(label),
+                        "source_directory": str(label.parent),
                     },
                 )
             )
-
         if not records:
-            examples = ", ".join(str(path.relative_to(self.root)) for path in unpaired[:5])
-            raise RuntimeError(
-                "No BlastoSPIM image/label pairs could be formed. "
-                f"Example unpaired images: {examples or 'none'}"
-            )
-        records.sort(key=lambda record: (record.split, record.sample_id))
+            raise RuntimeError("No BlastoSPIM raw/annotation pairs could be matched")
+        records.sort(key=lambda r: (r.split, r.sample_id))
         return tuple(records)
 
     def records(self, *, split: str | None = None) -> tuple[VolumeRecord, ...]:
@@ -269,26 +143,21 @@ class BlastoSPIMAdapter:
         )
         if image.shape != labels.shape:
             raise ValueError(
-                f"BlastoSPIM image/GT shape mismatch for {record.sample_id}: "
-                f"{image.shape} versus {labels.shape}. If the TIFFs are stored in "
-                "a different axis order, pass --source-axis-order explicitly."
+                f"BlastoSPIM image/label shape mismatch for {record.sample_id}: "
+                f"{image.shape} versus {labels.shape}"
             )
-        valid = np.ones(image.shape, dtype=bool)
-        bounds = robust_intensity_bounds(image)
         return AnnotatedVolume(
             image=np.asarray(image),
             instance_labels=labels,
             spacing_zyx_um=self.spacing_zyx_um,
-            valid_mask=valid,
-            intensity_bounds=bounds,
             dataset_name=self.dataset_name,
             sample_id=record.sample_id,
             split=record.split,
+            intensity_bounds=robust_intensity_bounds(image),
             metadata={
+                **dict(record.metadata),
                 "image_path": str(record.image_path),
                 "labels_path": str(record.labels_path),
-                "version": record.metadata.get("version", "unspecified"),
-                "source": "BlastoSPIM 1.0/2.0",
                 "source_axis_order": self.source_axis_order,
             },
         )

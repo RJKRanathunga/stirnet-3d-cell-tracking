@@ -1,4 +1,4 @@
-"""Generate Stage-2-like connected foreground masks from GT instances."""
+"""Generate Stage-2-like connected masks in canonical ROI coordinates."""
 
 from __future__ import annotations
 
@@ -8,39 +8,38 @@ from scipy.spatial import cKDTree
 
 from .models import Spacing3D
 
-
 _STRUCTURE_6 = ndimage.generate_binary_structure(3, 1)
 
 
-def physical_ball(radius_um: float, spacing_zyx_um: Spacing3D) -> np.ndarray:
-    """Binary ellipsoidal structuring element specified in micrometres."""
-
-    if radius_um <= 0:
+def canonical_ball(radius: float, spacing_zyx: Spacing3D) -> np.ndarray:
+    if radius <= 0:
         return np.ones((1, 1, 1), dtype=bool)
-    spacing = np.asarray(spacing_zyx_um, dtype=np.float64)
-    radii = np.ceil(radius_um / spacing).astype(int)
+    spacing = np.asarray(spacing_zyx, dtype=np.float64)
+    radii = np.ceil(float(radius) / spacing).astype(int)
     axes = [np.arange(-r, r + 1) * spacing[i] for i, r in enumerate(radii)]
     zz, yy, xx = np.meshgrid(*axes, indexing="ij")
-    return (zz * zz + yy * yy + xx * xx) <= radius_um * radius_um
+    return (zz * zz + yy * yy + xx * xx) <= float(radius) ** 2
+
+
+# Backward-compatible name.  Radius is interpreted in the coordinate system
+# associated with spacing_zyx_um; in this package that is now usually canonical.
+physical_ball = canonical_ball
 
 
 def _surface_coordinates(mask: np.ndarray) -> np.ndarray:
     surface = mask & ~ndimage.binary_erosion(mask, structure=_STRUCTURE_6, border_value=0)
     coords = np.argwhere(surface)
-    if coords.size == 0:
-        coords = np.argwhere(mask)
-    return coords
+    return coords if coords.size else np.argwhere(mask)
 
 
 def _closest_component_points(
     component_labels: np.ndarray,
-    spacing_zyx_um: Spacing3D,
+    spacing_zyx: Spacing3D,
 ) -> tuple[np.ndarray, np.ndarray]:
     component_ids = [int(v) for v in np.unique(component_labels) if int(v) > 0]
     if len(component_ids) < 2:
         raise ValueError("at least two connected components are required")
-    spacing = np.asarray(spacing_zyx_um, dtype=np.float64)
-
+    spacing = np.asarray(spacing_zyx, dtype=np.float64)
     surfaces: dict[int, np.ndarray] = {}
     trees: dict[int, cKDTree] = {}
     for component_id in component_ids:
@@ -79,26 +78,22 @@ def _line_mask(shape: tuple[int, int, int], start: np.ndarray, end: np.ndarray) 
 
 def connect_components_with_bridges(
     mask: np.ndarray,
-    spacing_zyx_um: Spacing3D,
+    spacing_zyx: Spacing3D,
     *,
-    bridge_radius_um: float = 0.45,
+    bridge_radius: float = 0.45,
 ) -> np.ndarray:
-    """Connect all components using shortest surface-to-surface voxel bridges."""
-
     result = np.asarray(mask, dtype=bool).copy()
     if not result.any():
         raise ValueError("mask cannot be empty")
-
     while True:
         components, count = ndimage.label(result, structure=_STRUCTURE_6)
         if count <= 1:
             return result
-        start, end = _closest_component_points(components, spacing_zyx_um)
+        start, end = _closest_component_points(components, spacing_zyx)
         bridge = _line_mask(result.shape, start, end)
-        if bridge_radius_um > 0:
+        if bridge_radius > 0:
             bridge = ndimage.binary_dilation(
-                bridge,
-                structure=physical_ball(bridge_radius_um, spacing_zyx_um),
+                bridge, structure=canonical_ball(bridge_radius, spacing_zyx)
             )
         result |= bridge
 
@@ -110,26 +105,22 @@ def build_stage2_like_component(
     bridge_radius_um: float = 0.45,
     closing_radius_um: float = 0.0,
 ) -> np.ndarray:
-    """Turn selected GT instances into one plausible upstream foreground mask."""
+    """Turn selected GT instances into one connected canonical input component.
 
+    Parameter names retain ``_um`` for API compatibility, but when called by
+    the new SampleBuilder they are canonical-coordinate units.
+    """
     selected = np.asarray(selected_instance_labels)
     mask = selected > 0
     if not mask.any():
         raise ValueError("selected_instance_labels contain no foreground")
-
     result = connect_components_with_bridges(
-        mask,
-        spacing_zyx_um,
-        bridge_radius_um=bridge_radius_um,
+        mask, spacing_zyx_um, bridge_radius=bridge_radius_um
     )
     if closing_radius_um > 0:
-        structure = physical_ball(closing_radius_um, spacing_zyx_um)
+        structure = canonical_ball(closing_radius_um, spacing_zyx_um)
         result = ndimage.binary_closing(result, structure=structure)
-        # Closing can very rarely disconnect tiny structures after resampling;
-        # enforce the contract again.
         result = connect_components_with_bridges(
-            result,
-            spacing_zyx_um,
-            bridge_radius_um=bridge_radius_um,
+            result, spacing_zyx_um, bridge_radius=bridge_radius_um
         )
     return result.astype(bool, copy=False)
