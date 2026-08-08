@@ -1,4 +1,4 @@
-"""Generate Stage-2-like connected masks in canonical ROI coordinates."""
+"""Generate Stage-2-like merged components in cubic canonical voxels."""
 
 from __future__ import annotations
 
@@ -11,18 +11,16 @@ from .models import Spacing3D
 _STRUCTURE_6 = ndimage.generate_binary_structure(3, 1)
 
 
-def canonical_ball(radius: float, spacing_zyx: Spacing3D) -> np.ndarray:
-    if radius <= 0:
+def canonical_ball(radius_vox: float, spacing_zyx: Spacing3D = (1.0, 1.0, 1.0)) -> np.ndarray:
+    if radius_vox <= 0:
         return np.ones((1, 1, 1), dtype=bool)
     spacing = np.asarray(spacing_zyx, dtype=np.float64)
-    radii = np.ceil(float(radius) / spacing).astype(int)
+    radii = np.ceil(float(radius_vox) / spacing).astype(int)
     axes = [np.arange(-r, r + 1) * spacing[i] for i, r in enumerate(radii)]
     zz, yy, xx = np.meshgrid(*axes, indexing="ij")
-    return (zz * zz + yy * yy + xx * xx) <= float(radius) ** 2
+    return (zz * zz + yy * yy + xx * xx) <= float(radius_vox) ** 2
 
 
-# Backward-compatible name.  Radius is interpreted in the coordinate system
-# associated with spacing_zyx_um; in this package that is now usually canonical.
 physical_ball = canonical_ball
 
 
@@ -34,7 +32,7 @@ def _surface_coordinates(mask: np.ndarray) -> np.ndarray:
 
 def _closest_component_points(
     component_labels: np.ndarray,
-    spacing_zyx: Spacing3D,
+    spacing_zyx: Spacing3D = (1.0, 1.0, 1.0),
 ) -> tuple[np.ndarray, np.ndarray]:
     component_ids = [int(v) for v in np.unique(component_labels) if int(v) > 0]
     if len(component_ids) < 2:
@@ -78,9 +76,9 @@ def _line_mask(shape: tuple[int, int, int], start: np.ndarray, end: np.ndarray) 
 
 def connect_components_with_bridges(
     mask: np.ndarray,
-    spacing_zyx: Spacing3D,
+    spacing_zyx: Spacing3D = (1.0, 1.0, 1.0),
     *,
-    bridge_radius: float = 0.45,
+    bridge_radius_vox: float = 1.5,
 ) -> np.ndarray:
     result = np.asarray(mask, dtype=bool).copy()
     if not result.any():
@@ -91,36 +89,41 @@ def connect_components_with_bridges(
             return result
         start, end = _closest_component_points(components, spacing_zyx)
         bridge = _line_mask(result.shape, start, end)
-        if bridge_radius > 0:
+        if bridge_radius_vox > 0:
             bridge = ndimage.binary_dilation(
-                bridge, structure=canonical_ball(bridge_radius, spacing_zyx)
+                bridge, structure=canonical_ball(bridge_radius_vox, spacing_zyx)
             )
         result |= bridge
 
 
 def build_stage2_like_component(
     selected_instance_labels: np.ndarray,
-    spacing_zyx_um: Spacing3D,
+    spacing_zyx: Spacing3D = (1.0, 1.0, 1.0),
     *,
-    bridge_radius_um: float = 0.45,
-    closing_radius_um: float = 0.0,
+    bridge_radius_vox: float | None = None,
+    closing_radius_vox: float | None = None,
+    bridge_radius_um: float | None = None,
+    closing_radius_um: float | None = None,
 ) -> np.ndarray:
-    """Turn selected GT instances into one connected canonical input component.
+    """Turn selected GT instances into one connected cubic canonical component."""
+    bridge = bridge_radius_vox if bridge_radius_vox is not None else bridge_radius_um
+    closing = closing_radius_vox if closing_radius_vox is not None else closing_radius_um
+    if bridge is None:
+        bridge = 1.5
+    if closing is None:
+        closing = 0.0
 
-    Parameter names retain ``_um`` for API compatibility, but when called by
-    the new SampleBuilder they are canonical-coordinate units.
-    """
     selected = np.asarray(selected_instance_labels)
     mask = selected > 0
     if not mask.any():
         raise ValueError("selected_instance_labels contain no foreground")
     result = connect_components_with_bridges(
-        mask, spacing_zyx_um, bridge_radius=bridge_radius_um
+        mask, spacing_zyx, bridge_radius_vox=float(bridge)
     )
-    if closing_radius_um > 0:
-        structure = canonical_ball(closing_radius_um, spacing_zyx_um)
+    if float(closing) > 0:
+        structure = canonical_ball(float(closing), spacing_zyx)
         result = ndimage.binary_closing(result, structure=structure)
         result = connect_components_with_bridges(
-            result, spacing_zyx_um, bridge_radius=bridge_radius_um
+            result, spacing_zyx, bridge_radius_vox=float(bridge)
         )
     return result.astype(bool, copy=False)

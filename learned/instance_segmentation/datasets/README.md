@@ -1,21 +1,23 @@
-# Learned Instance Segmentation — Object-Centric External Dataset Pipeline
+# Learned Instance Segmentation — Cubic External Dataset Pipeline
 
-This directory converts densely annotated 3-D microscopy volumes into the fixed
-`VectorInstanceCNN` tensor shape without forcing every source dataset to share
-Biohub's **absolute biological cell scale**.
+This package converts densely annotated 3-D microscopy datasets into the common
+input representation used by `VectorInstanceCNN`.
 
-## Architecture
+## Canonical representation
+
+Every selected single cell / neighboring pair / group becomes a fixed
+`(64,64,64)` tensor with **cubic canonical voxels**.
 
 ```text
 native image + dense GT labels
         ↓
-select a single / neighboring pair / group
+select a single / pair / group
         ↓
-tight union bbox in native physical coordinates
+tight union bbox in true physical coordinates
         ↓
-ONE isotropic physical normalization scale
+ONE scalar normalization scale
         ↓
-local image + labels + valid mask → canonical [16,64,64]
+local image + labels + valid mask → cubic [64,64,64]
         ↓
 synthetic Stage-2 connected component
         ↓
@@ -23,162 +25,80 @@ canonical EDT + effective-marker heatmap
         ↓
 4-channel CNN input
         ↓
-foreground + canonical vectors + boundary + center supervision
+foreground + vectors + boundary + center targets
 ```
 
-At inference, the exact same transform is constructed from the observed Stage-2
-connected-component bbox. Predicted canonical centers can therefore be mapped
-back to original Biohub voxel coordinates exactly.
-
-## Why the scale is per component
-
-If a selected source component has physical bbox `B=(Bz,By,Bx)` and the usable
-canonical span is `F`, the transform chooses
+If the source bbox is `B=(Bz,By,Bx)` micrometres and the usable canonical voxel
+span is `F`, the transform chooses
 
 ```text
-scale = min_i(component_occupancy * F_i / B_i)
+scale_vox_per_um = min_i(component_occupancy * F_i / B_i)
 ```
 
-subject to safety clamps. The same scalar multiplies physical Z, Y, and X, so
-source morphology is not anisotropically stretched. The output grid itself
-remains `(16,64,64)` with canonical spacing `(1.625,0.40625,0.40625)` because
-the existing CNN backbone is designed around that anisotropic tensor geometry.
-Those values now define **canonical ROI distance units**, not the source cell's
-original biological micrometre scale.
+subject to safety clamps.  The same scalar is applied to physical Z/Y/X, so
+morphology is preserved.  The default occupancy is `0.78`.
 
-Default occupancy is `0.78`, leaving context around the selected group.
+## Why native spacing is still essential
+
+The canonical voxels are cubic, but source voxels usually are not.  For example,
+Biohub spacing `(1.625,0.40625,0.40625)` must first be used to recover physical
+geometry.  Only then is the object resampled into the normalized cube.  This is
+what prevents a physically near-spherical Biohub nucleus from remaining flat in
+canonical voxel coordinates.
 
 ## Input contract
 
-`TrainingSample.inputs` is `float32 [4,Z,Y,X]`:
+`TrainingSample.inputs` is `float32 [4,64,64,64]`:
 
-1. robust-normalized fluorescence,
-2. synthetic Stage-2-like connected component mask,
+1. normalized fluorescence,
+2. synthetic Stage-2-like component mask,
 3. normalized canonical EDT,
-4. effective-marker Gaussian heatmap evaluated on the canonical ROI.
-
-The fluorescence and GT are resampled with the same transform. Only the mask is
-synthetically bridged; raw fluorescence is never pasted or modified to fabricate
-a merge.
+4. effective-marker Gaussian heatmap.
 
 ## Target contract
 
-- `foreground`: `[1,Z,Y,X]`
-- `vectors_normalized`: `[3,Z,Y,X]`
-- `boundary`: `[1,Z,Y,X]`
-- `center`: `[1,Z,Y,X]`
-- `instance_labels`: `[Z,Y,X]`
+- `foreground`: `[1,64,64,64]`
+- `vectors_normalized`: `[3,64,64,64]`
+- `boundary`: `[1,64,64,64]`
+- `center`: `[1,64,64,64]`
+- `instance_labels`: `[64,64,64]`
 
-Vectors are **canonical axis-fraction displacements**. For a canonical shape
-`(Z,Y,X)`, multiplying the 3 vector channels by `(Z-1,Y-1,X-1)` recovers the
-predicted displacement in canonical voxels. No `vector_max_distance_um` exists
-in the new model contract.
+Vectors are canonical axis fractions.  For 64^3, multiplying by `(63,63,63)`
+recovers canonical voxel offsets.
 
-## Coordinate transform
+## Boundary quality rule
 
-`core/component_transform.py` owns the transform. `CanonicalTransform` exposes:
+Training instances that touch a native source-volume boundary are rejected by
+default because they are truncated GT objects.  This does not apply to inference.
 
-```python
-canonical = transform.native_to_canonical(native_zyx)
-native = transform.canonical_to_native(canonical_zyx)
-```
+## Inference
 
-The transform is stored directly on every `TrainingSample` and recorded in
-sample metadata.
+`inference.build_inference_roi(...)` constructs the same cubic normalization
+from a Stage-2 component and stores the invertible transform needed to map CNN
+center predictions back to native Biohub coordinates.
 
-## Training / inference symmetry
+## NIS3D
 
-Training:
-
-```text
-selected GT group bbox → canonical transform → sample
-```
-
-Inference:
-
-```text
-Stage-2 component bbox → canonical transform → CNN → inverse transform
-```
-
-Use `inference.build_inference_roi(...)` to construct the inference tensor with
-the same normalization rule.
-
-## Adapters
-
-- `c_elegans.py`: Zenodo 5942575 nuclei volumes.
-- `nis3d.py`: NIS3D dense 3-D nuclei benchmark.
-- `blastospim.py`: extracted BlastoSPIM archives.
-
-### NIS3D fixes included
-
-The adapter no longer extracts the first three numbers from arbitrary prose in
-`Info.txt`. It explicitly parses the `Resolution:` field. Therefore:
-
-```text
-Drosophila_1  -> (1.0, 1.0, 1.0) ZYX µm
-Drosophila_2  -> (1.0, 1.0, 1.0)
-MusMusculus_1 -> (1.0, 1.0, 1.0)
-MusMusculus_2 -> (1.0, 1.0, 1.0)
-Zebrafish_1   -> (2.5, 0.43, 0.43)
-Zebrafish_2   -> (1.0, 1.0, 1.0)
-```
-
-Derived `suggestive splitting` directories are excluded when discovering the
-six primary NIS3D volumes.
+The NIS3D adapter parses the dedicated `Resolution:` field, converts XYZ metadata
+to ZYX, and excludes derived `suggestive splitting` folders.  Dataset discovery
+and native spacing remain independent of the canonical cube design.
 
 ## Debugging
-
-Inspect a volume:
-
-```powershell
-python -m learned.instance_segmentation.datasets.debugging.inspect_volume `
-  --dataset nis3d `
-  --root "D:\Projects\Kaggle\cell-tracking\data\external\NIS3D" `
-  --list
-```
-
-Build a normalized pair:
 
 ```powershell
 python -m learned.instance_segmentation.datasets.debugging.inspect_sample `
   --dataset nis3d `
   --root "D:\Projects\Kaggle\cell-tracking\data\external\NIS3D" `
-  --volume-index 0 --pair-index 0 --napari
+  --volume-index 0 `
+  --instance-ids 1 106 `
+  --napari
 ```
 
-The command prints the source bbox, isotropic normalization scale, canonical
-bbox extent, canonical GT centers, and inverse-mapped native centers.
-
-Scan buildability:
-
-```powershell
-python -m learned.instance_segmentation.datasets.debugging.scan_pairs `
-  --dataset nis3d `
-  --root "D:\Projects\Kaggle\cell-tracking\data\external\NIS3D" `
-  --volume-index 0 --max-pairs 100
-```
-
-Large pairs are no longer rejected simply because their physical FOV exceeds
-Biohub's fixed 26 µm crop. They are scaled. Rejections now represent genuine
-quality problems such as insufficient canonical resolution, pathological aspect
-ratio, source-boundary truncation, or marker generation failure.
-
-## Model
-
-The existing anisotropic residual 3-D U-Net is preserved. Its output heads remain:
-
-- foreground,
-- vectors,
-- internal boundary,
-- center heatmap.
-
-Only vector semantics changed from fixed physical micrometre offsets to
-canonical axis fractions.
+The visualizer starts in 3-D and displays the cubic canonical lattice with unit
+scale.
 
 ## Tests
 
-From the repository root after replacing `learned/instance_segmentation/`:
-
 ```powershell
-python -m pytest learned/instance_segmentation/datasets/tests -q
+python -m pytest learned/instance_segmentation/datasets/tests learned/instance_segmentation/model/tests -q
 ```

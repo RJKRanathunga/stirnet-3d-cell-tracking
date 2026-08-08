@@ -1,4 +1,4 @@
-"""Object-centric isotropic scale normalization for canonical CNN ROIs."""
+"""Object-centric isotropic scaling into a fixed cubic CNN lattice."""
 
 from __future__ import annotations
 
@@ -30,7 +30,6 @@ def bbox_from_instance_slices(
     extent_vox = stop - start
     spacing = np.asarray(spacing_zyx_um, dtype=np.float64)
     extent_um = extent_vox.astype(np.float64) * spacing
-    # Bbox is [start, stop); center of first/last voxel centers is (start + stop - 1)/2.
     center = (start.astype(np.float64) + stop.astype(np.float64) - 1.0) / 2.0
     return ComponentBBox(
         start_zyx=tuple(int(v) for v in start),
@@ -42,7 +41,6 @@ def bbox_from_instance_slices(
 
 
 def bbox_from_binary_mask(mask: np.ndarray, spacing_zyx_um: Spacing3D) -> ComponentBBox:
-    """Return a tight bbox for one inference-time connected component."""
     source = np.asarray(mask, dtype=bool)
     coords = np.argwhere(source)
     if coords.size == 0:
@@ -67,20 +65,18 @@ def build_canonical_transform(
     *,
     native_spacing_zyx_um: Spacing3D,
     canonical_shape_zyx: Shape3D,
-    canonical_spacing_zyx: Spacing3D,
+    canonical_spacing_zyx: Spacing3D = (1.0, 1.0, 1.0),
     component_occupancy: float,
     border_margin_voxels: int = 1,
     min_scale: float = 0.05,
-    max_scale: float = 8.0,
+    max_scale: float = 32.0,
 ) -> CanonicalTransform:
-    """Fit a group into a canonical ROI with one isotropic physical scale.
+    """Fit a physical group into a cubic canonical ROI with one scalar scale.
 
-    The tight union bbox is guaranteed to fit within
-    ``component_occupancy * usable_span`` along all axes, subject to configured
-    scale clamps.  If a clamp prevents fitting, the caller should reject the
-    sample during post-resampling validation.
+    ``min_scale``/``max_scale`` use the transform's historic normalization-scale
+    units.  With the production unit canonical spacing they are canonical voxels
+    per source micrometre.
     """
-
     if not 0.0 < component_occupancy <= 1.0:
         raise ValueError("component_occupancy must be in (0,1]")
     if border_margin_voxels < 0:
@@ -90,6 +86,11 @@ def build_canonical_transform(
 
     shape = np.asarray(canonical_shape_zyx, dtype=np.int64)
     spacing = np.asarray(canonical_spacing_zyx, dtype=np.float64)
+    if spacing.shape != (3,) or np.any(spacing <= 0):
+        raise ValueError("canonical spacing must contain three positive values")
+    if not np.allclose(spacing, spacing[0]):
+        raise ValueError("canonical spacing must be isotropic for cubic CNN voxels")
+
     usable_intervals = shape - 1 - 2 * int(border_margin_voxels)
     if np.any(usable_intervals <= 0):
         raise ValueError("border margin leaves no usable canonical span")
@@ -113,6 +114,12 @@ def build_canonical_transform(
     )
 
 
-def transformed_bbox_extent_canonical(transform: CanonicalTransform) -> tuple[float, float, float]:
+def transformed_bbox_extent_vox(transform: CanonicalTransform) -> tuple[float, float, float]:
     extent_um = np.asarray(transform.component_bbox.extent_um_zyx, dtype=np.float64)
-    return tuple(float(v) for v in extent_um * transform.normalization_scale)
+    spacing = np.asarray(transform.canonical_spacing_zyx, dtype=np.float64)
+    return tuple(float(v) for v in extent_um * transform.normalization_scale / spacing)
+
+
+def transformed_bbox_extent_canonical(transform: CanonicalTransform) -> tuple[float, float, float]:
+    """Compatibility alias; values are canonical voxel extents for unit cubes."""
+    return transformed_bbox_extent_vox(transform)

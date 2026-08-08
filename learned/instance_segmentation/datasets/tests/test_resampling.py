@@ -6,7 +6,7 @@ from ..core.models import AnnotatedVolume
 from ..core.resampling import resample_with_transform
 
 
-def test_object_centric_resampling_produces_fixed_shape():
+def test_object_centric_resampling_produces_64_cube():
     labels = np.zeros((40, 100, 100), np.int32)
     labels[10:20, 20:70, 25:75] = 7
     image = labels.astype(np.float32) * 3
@@ -15,11 +15,11 @@ def test_object_centric_resampling_produces_fixed_shape():
     transform = build_canonical_transform(
         bbox,
         native_spacing_zyx_um=volume.spacing_zyx_um,
-        canonical_shape_zyx=(16, 64, 64),
-        canonical_spacing_zyx=(1.625, 0.40625, 0.40625),
+        canonical_shape_zyx=(64, 64, 64),
+        canonical_spacing_zyx=(1.0, 1.0, 1.0),
         component_occupancy=0.78,
     )
     crop = resample_with_transform(volume, transform)
-    assert crop.image.shape == (16, 64, 64)
-    assert crop.labels.shape == (16, 64, 64)
+    assert crop.image.shape == (64, 64, 64)
+    assert crop.labels.shape == (64, 64, 64)
     assert np.any(crop.labels == 7)

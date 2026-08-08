@@ -1,9 +1,8 @@
-"""Inference-time construction of the same canonical component ROI used in training."""
+"""Inference-time construction of the same cubic canonical ROI used in training."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
 
 import numpy as np
 
@@ -42,7 +41,7 @@ def build_inference_roi(
     intensity_bounds: tuple[float, float] | None = None,
     marker_detector: MarkerDetector = detect_effective_markers_stage3,
 ) -> InferenceROI:
-    """Normalize one Stage-2 connected component exactly like a training group."""
+    """Normalize one Stage-2 component into the fixed cubic CNN coordinate system."""
     image = np.asarray(image)
     component = np.asarray(component_mask, dtype=bool)
     if image.shape != component.shape or image.ndim != 3:
@@ -69,7 +68,7 @@ def build_inference_roi(
         max_scale=config.max_normalization_scale,
     )
 
-    # Labels carry only the observed Stage-2 component; no GT information exists here.
+    # At inference labels carry only the observed Stage-2 component; there is no GT.
     volume = AnnotatedVolume(
         image=image,
         instance_labels=component.astype(np.int32),
@@ -96,14 +95,14 @@ def build_inference_roi(
     edt = normalized_canonical_edt(
         canonical_component,
         config.canonical_spacing_zyx,
-        clip_distance=config.edt_clip_canonical,
+        clip_distance_vox=config.edt_clip_vox,
     )
     markers = marker_detector(canonical_component, config.canonical_spacing_zyx)
     marker_heatmap = markers_to_heatmap(
         canonical_component.shape,
         markers,
         config.canonical_spacing_zyx,
-        sigma_um=config.marker_sigma_canonical,
+        sigma_vox=config.marker_sigma_vox,
     )
     inputs = np.stack(
         [

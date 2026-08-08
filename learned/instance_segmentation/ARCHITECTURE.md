@@ -1,20 +1,83 @@
-# Object-centric learned instance segmentation
+# Cubic object-centric learned instance segmentation
 
-The CNN does not receive a fixed biological field of view.  Each candidate
-component/group is mapped to the fixed `(16, 64, 64)` tensor with one isotropic
-scale in source physical space.  The limiting group-bounding-box axis occupies
-`SampleBuildConfig.component_occupancy` of the usable canonical span (default
-`0.78`), leaving context around the object.
+The learned correction model operates on a fixed **64 x 64 x 64 cubic canonical
+volume**.  Native microscopy voxels are first interpreted with their true source
+spacing in micrometres.  A single scalar scale is then applied to the complete
+selected component/group so that its physical morphology and relative cell
+geometry are preserved while the group occupies about 78% of the usable cube.
 
-Training and inference share the same `CanonicalTransform` contract.  The
-transform stores source spacing, native center, normalization scale, canonical
-sampling geometry, and supports exact forward/inverse coordinate conversion.
+```text
+native voxels + native spacing
+            ↓
+true physical 3-D geometry
+            ↓
+one scalar object normalization (vox/um)
+            ↓
+64 x 64 x 64 unit-cubic canonical lattice
+            ↓
+4-channel CNN input
+```
 
-Dense center vectors are expressed in canonical axis fractions rather than
-micrometres.  EDT, marker heatmaps, center Gaussians, synthetic merge bridges,
-and boundary widths are likewise defined on the canonical ROI.  This makes the
-learned task independent of absolute organism/cell size while preserving shape
-and relative cell geometry.
+The canonical lattice is not Biohub physical space.  Its voxels are symmetric
+unit cubes.  Biohub anisotropy, NIS3D spacing, C. elegans spacing, and other
+source acquisition geometries are handled only by the native-to-canonical
+transform.
 
-Do not independently resize cells inside a pair/group.  One transform is always
-applied to the complete local scene.
+## Input channels
+
+1. robust-normalized fluorescence,
+2. Stage-2-like connected component mask,
+3. normalized Euclidean distance transform in canonical voxels,
+4. effective-marker heatmap in canonical voxels.
+
+Raw fluorescence is never fabricated to create a merge.  Only the training mask
+is synthetically connected when constructing merge examples.
+
+## Supervision
+
+The model predicts foreground, 3-D center vectors, internal boundary evidence,
+and a center heatmap.  Dense vectors are canonical axis-fraction displacements.
+For the default 64^3 tensor, multiplying each vector channel by 63 converts it to
+canonical voxel displacement.
+
+## Backbone
+
+The backbone is a fully isotropic residual 3-D U-Net:
+
+```text
+4 x 64^3
+  ↓
+16 x 64^3
+  ↓ 2x2x2
+32 x 32^3
+  ↓
+64 x 16^3
+  ↓
+128 x 8^3
+  ↓
+192 x 4^3
+```
+
+The decoder mirrors those levels with trilinear upsampling and skip connections.
+All residual spatial convolutions are isotropic 3x3x3 operations.
+
+## Marker evidence
+
+Production Stage-3 peak logic is reused, but with a dedicated normalized
+canonical marker configuration.  Its distance parameters are canonical voxel
+units rather than biological micrometres, and geometric completion is disabled
+to avoid label-derived leakage.
+
+## Training quality gates
+
+Selected GT instances that already touch a native source-volume boundary are
+rejected by default because their complete center/shape is unavailable.  This
+is a training-data rule only; inference components near Biohub boundaries are
+still processed.
+
+## Training / inference symmetry
+
+Training constructs the transform from the selected GT group bbox.  Inference
+constructs the same transform from the observed Stage-2 connected-component
+bbox.  Predicted canonical centers are inverse-mapped into native voxel
+coordinates with the stored transform.

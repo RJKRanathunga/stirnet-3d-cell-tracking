@@ -4,19 +4,18 @@ from ..core.targets import build_targets, vectors_to_canonical_displacement
 
 
 def test_vectors_point_exactly_to_centers_in_canonical_voxels():
-    labels = np.zeros((16, 32, 32), np.int32)
-    labels[4:10, 5:14, 5:14] = 1
-    labels[5:11, 17:27, 17:27] = 2
+    labels = np.zeros((32, 32, 32), np.int32)
+    labels[4:12, 5:14, 5:14] = 1
+    labels[17:27, 17:27, 17:27] = 2
     component = labels > 0
-    # connect component for boundary ownership
-    component[:, :, 13:18] |= np.any(component[:, :, 13:18], axis=2, keepdims=True)
+    component[11:18, 13:18, 13:18] = True
     targets = build_targets(
         labels,
         component,
-        (1.625, 0.40625, 0.40625),
-        center_sigma_um=1.0,
+        (1.0, 1.0, 1.0),
+        center_sigma_vox=2.0,
         center_interior_fraction=0.7,
-        boundary_radius_um=0.75,
+        boundary_radius_vox=1.5,
     )
     displacement = vectors_to_canonical_displacement(targets.vectors_normalized, labels.shape)
     for local_id, center in enumerate(targets.centers_zyx, start=1):

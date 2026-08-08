@@ -1,11 +1,11 @@
-"""U-Net decoder for the vector instance CNN."""
+"""Symmetric isotropic U-Net decoder for the cubic vector instance CNN."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
 
-from .blocks import ResidualAnisotropicBlock, ResidualIsotropicBlock, Upsample3D
+from .blocks import ResidualIsotropicBlock, Upsample3D
 from .encoder import EncoderFeatures
 
 
@@ -24,9 +24,9 @@ class VectorCNNDecoder(nn.Module):
         self.up2 = Upsample3D(c3, c2, groups=groups)
         self.fuse2 = ResidualIsotropicBlock(c2 + c2, c2, groups=groups, dropout=dropout)
         self.up1 = Upsample3D(c2, c1, groups=groups)
-        self.fuse1 = ResidualAnisotropicBlock(c1 + c1, c1, groups=groups, dropout=dropout)
+        self.fuse1 = ResidualIsotropicBlock(c1 + c1, c1, groups=groups, dropout=dropout)
         self.up0 = Upsample3D(c1, c0, groups=groups)
-        self.fuse0 = ResidualAnisotropicBlock(c0 + c0, c0, groups=groups, dropout=dropout)
+        self.fuse0 = ResidualIsotropicBlock(c0 + c0, c0, groups=groups, dropout=dropout)
 
     @staticmethod
     def _shape(x: torch.Tensor) -> tuple[int, int, int]:

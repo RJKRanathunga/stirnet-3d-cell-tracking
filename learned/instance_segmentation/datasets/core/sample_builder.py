@@ -1,4 +1,4 @@
-"""End-to-end object-centric conversion from annotated group to CNN tensors."""
+"""End-to-end conversion from annotated groups to cubic 64^3 CNN tensors."""
 
 from __future__ import annotations
 
@@ -9,7 +9,11 @@ import numpy as np
 from scipy import ndimage
 
 from ..config import DEFAULT_SAMPLE_BUILD_CONFIG, SampleBuildConfig
-from .component_transform import bbox_from_instance_slices, build_canonical_transform
+from .component_transform import (
+    bbox_from_instance_slices,
+    build_canonical_transform,
+    transformed_bbox_extent_vox,
+)
 from .marker_heatmap import (
     MarkerDetector,
     detect_effective_markers_stage3,
@@ -28,13 +32,7 @@ class SampleBuildError(RuntimeError):
 
 
 class SampleBuilder:
-    """Build scale-normalized component-centric training examples.
-
-    The selected union bbox determines one isotropic physical scale.  All raw
-    fluorescence, labels, and validity information in the local scene use the
-    same transform.  GT labels are used only for selection and supervision, not
-    for EDT/marker input evidence.
-    """
+    """Build scale-normalized cubic component-centric training examples."""
 
     def __init__(
         self,
@@ -54,7 +52,31 @@ class SampleBuilder:
             self._slice_cache_key = key
         return self._slice_cache
 
+    def _box_for_id(self, source_id: int):
+        slices = self._slice_cache
+        if slices is None:
+            return None
+        index = int(source_id) - 1
+        return slices[index] if 0 <= index < len(slices) else None
+
+    def _validate_native_selection(self, volume: AnnotatedVolume, group: InstanceGroup) -> None:
+        slices = self._object_slices(volume.instance_labels)
+        shape = np.asarray(volume.shape_zyx, dtype=int)
+        margin = int(self.config.native_boundary_margin_voxels)
+        for source_id in group.instance_ids:
+            index = int(source_id) - 1
+            box = slices[index] if 0 <= index < len(slices) else None
+            if box is None:
+                raise SampleBuildError(f"instance {source_id} does not occur in the label volume")
+            if self.config.reject_native_boundary_instances:
+                for axis, sl in enumerate(box):
+                    if int(sl.start) <= margin or int(sl.stop) >= int(shape[axis]) - margin:
+                        raise SampleBuildError(
+                            f"instance {source_id} touches native source boundary on axis {axis}"
+                        )
+
     def _transform_for_group(self, volume: AnnotatedVolume, group: InstanceGroup):
+        self._validate_native_selection(volume, group)
         try:
             bbox = bbox_from_instance_slices(
                 group.instance_ids,
@@ -151,7 +173,7 @@ class SampleBuilder:
         except SampleBuildError as error:
             native = self._native_group_diagnostics(volume, group)
             raise SampleBuildError(
-                f"{error}; scale={transform.normalization_scale:.5f}; native: {native}"
+                f"{error}; scale_vox_per_um={transform.scale_vox_per_um:.5f}; native: {native}"
             ) from error
 
         local_gt = relabel_selected_instances(crop.labels, group.instance_ids)
@@ -162,8 +184,8 @@ class SampleBuilder:
         input_mask = build_stage2_like_component(
             local_gt,
             canonical_spacing,
-            bridge_radius_um=self.config.bridge_radius_canonical,
-            closing_radius_um=self.config.closing_radius_canonical,
+            bridge_radius_vox=self.config.bridge_radius_vox,
+            closing_radius_vox=self.config.closing_radius_vox,
         )
         if self.config.require_single_input_component:
             _, count = ndimage.label(
@@ -185,7 +207,7 @@ class SampleBuilder:
         edt = normalized_canonical_edt(
             input_mask,
             canonical_spacing,
-            clip_distance=self.config.edt_clip_canonical,
+            clip_distance_vox=self.config.edt_clip_vox,
         )
         try:
             markers = self.marker_detector(input_mask, canonical_spacing)
@@ -200,16 +222,16 @@ class SampleBuilder:
             input_mask.shape,
             markers,
             canonical_spacing,
-            sigma_um=self.config.marker_sigma_canonical,
+            sigma_vox=self.config.marker_sigma_vox,
         )
 
         targets = build_targets(
             local_gt,
             input_mask,
             canonical_spacing,
-            center_sigma_um=self.config.center_sigma_canonical,
+            center_sigma_vox=self.config.center_sigma_vox,
             center_interior_fraction=self.config.center_interior_fraction,
-            boundary_radius_um=self.config.boundary_radius_canonical,
+            boundary_radius_vox=self.config.boundary_radius_vox,
         )
 
         inputs = np.stack(
@@ -234,17 +256,17 @@ class SampleBuilder:
             "canonical_spacing_zyx": tuple(float(v) for v in canonical_spacing),
             "canonical_shape_zyx": tuple(int(v) for v in self.config.crop_shape_zyx),
             "normalization_scale": float(transform.normalization_scale),
+            "scale_vox_per_um": float(transform.scale_vox_per_um),
             "native_center_zyx": tuple(float(v) for v in transform.native_center_zyx),
             "source_group_bbox_extent_um_zyx": tuple(
                 float(v) for v in transform.component_bbox.extent_um_zyx
             ),
-            "canonical_group_bbox_extent_zyx": tuple(
-                float(v) * float(transform.normalization_scale)
-                for v in transform.component_bbox.extent_um_zyx
-            ),
+            "canonical_group_bbox_extent_vox_zyx": transformed_bbox_extent_vox(transform),
+            # Compatibility metadata key.
+            "canonical_group_bbox_extent_zyx": transformed_bbox_extent_vox(transform),
             "component_occupancy": float(self.config.component_occupancy),
             "marker_count": len(markers),
-            "vector_coordinate_system": "canonical_axis_fraction",
+            "vector_coordinate_system": "canonical_axis_fraction_cubic",
             "config": asdict(self.config),
         }
 

@@ -16,7 +16,7 @@ def test_valid_index_skips_invalid_group():
     volume = AnnotatedVolume(image, labels, (1,1,1), "x", "x")
     groups = [InstanceGroup((99,), "bad"), InstanceGroup((1,2), "good")]
     builder = SampleBuilder(
-        SampleBuildConfig(min_instance_voxels_after_resampling=4, min_instance_bbox_zyx_vox=(1,2,2)),
+        SampleBuildConfig(min_instance_voxels_after_resampling=4, min_instance_bbox_zyx_vox=(2,2,2)),
         marker_detector=deepest_point_marker,
     )
     result = select_valid_sample(volume, groups, builder, valid_index=0)

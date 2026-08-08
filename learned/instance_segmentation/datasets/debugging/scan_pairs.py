@@ -1,4 +1,4 @@
-"""Scan pair candidates and summarize object-centric build rejection reasons."""
+"""Scan pair candidates and summarize cubic-normalization rejection reasons."""
 
 from __future__ import annotations
 
@@ -14,13 +14,15 @@ from ..core.sampling import pair_groups
 
 def _classify(reason: str) -> str:
     lower = reason.lower()
+    if "native source boundary" in lower:
+        return "native_boundary"
     if "aspect ratio" in lower:
         return "pathological_aspect"
     if "only" in lower and "voxels" in lower:
         return "too_small_after_normalization"
     if "below minimum" in lower:
         return "too_thin_after_normalization"
-    if "border" in lower:
+    if "canonical crop border" in lower:
         return "canonical_border"
     if "component" in lower and "found" in lower:
         return "merge_connectivity"
@@ -56,6 +58,7 @@ def main() -> None:
     builder = SampleBuilder()
     reasons = Counter()
     scales: list[float] = []
+    z_extents: list[float] = []
     checked = min(args.max_pairs, len(groups))
     for group in groups[:checked]:
         try:
@@ -64,13 +67,16 @@ def main() -> None:
             reasons[_classify(str(error))] += 1
         else:
             reasons["valid"] += 1
-            scales.append(float(sample.transform.normalization_scale))
+            scales.append(float(sample.transform.scale_vox_per_um))
+            z_extents.append(float(sample.metadata["canonical_group_bbox_extent_vox_zyx"][0]))
     print("checked:", checked)
     for key, count in reasons.most_common():
         print(f"{key:34s} {count:6d} ({100*count/max(checked,1):6.2f}%)")
     if scales:
         scales.sort()
-        print("normalization scale min/median/max:", scales[0], scales[len(scales)//2], scales[-1])
+        z_extents.sort()
+        print("scale vox/um min/median/max:", scales[0], scales[len(scales)//2], scales[-1])
+        print("canonical Z extent min/median/max:", z_extents[0], z_extents[len(z_extents)//2], z_extents[-1])
 
 
 if __name__ == "__main__":

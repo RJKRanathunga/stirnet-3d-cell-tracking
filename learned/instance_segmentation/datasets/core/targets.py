@@ -1,4 +1,4 @@
-"""Dense foreground, canonical-vector, center, and boundary supervision."""
+"""Dense foreground, vector, center, and boundary supervision in cubic voxels."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def relabel_selected_instances(
 
 def stable_interior_center(
     instance_mask: np.ndarray,
-    spacing_zyx: Spacing3D,
+    spacing_zyx: Spacing3D = (1.0, 1.0, 1.0),
     *,
     interior_fraction: float = 0.70,
 ) -> Index3D:
@@ -49,7 +49,7 @@ def stable_interior_center(
 
 def centers_for_labels(
     instance_labels: np.ndarray,
-    spacing_zyx: Spacing3D,
+    spacing_zyx: Spacing3D = (1.0, 1.0, 1.0),
     *,
     interior_fraction: float,
 ) -> tuple[Index3D, ...]:
@@ -68,12 +68,7 @@ def vector_targets_canonical(
     instance_labels: np.ndarray,
     centers_zyx: tuple[Index3D, ...],
 ) -> np.ndarray:
-    """Displacement to owning center normalized by full canonical axis span.
-
-    A value of +1 along an axis means a displacement equal to the entire index
-    span of that canonical axis.  This is scale-invariant and can be inverted at
-    inference by multiplying by ``shape-1``.  It contains no biological µm.
-    """
+    """Displacement to owning center normalized by canonical axis span."""
     labels = np.asarray(instance_labels)
     vectors = np.zeros((3, *labels.shape), dtype=np.float32)
     span = np.maximum(np.asarray(labels.shape, dtype=np.float32) - 1.0, 1.0)
@@ -100,7 +95,7 @@ def vectors_to_canonical_displacement(
 def _ownership_inside_component(
     instance_labels: np.ndarray,
     input_component_mask: np.ndarray,
-    spacing_zyx: Spacing3D,
+    spacing_zyx: Spacing3D = (1.0, 1.0, 1.0),
 ) -> np.ndarray:
     ids = [int(v) for v in np.unique(instance_labels) if int(v) > 0]
     if not ids:
@@ -120,9 +115,9 @@ def _ownership_inside_component(
 def internal_boundary_target(
     instance_labels: np.ndarray,
     input_component_mask: np.ndarray,
-    spacing_zyx: Spacing3D,
+    spacing_zyx: Spacing3D = (1.0, 1.0, 1.0),
     *,
-    radius: float,
+    radius_vox: float,
 ) -> np.ndarray:
     labels = np.asarray(instance_labels)
     component = np.asarray(input_component_mask, dtype=bool)
@@ -146,40 +141,43 @@ def internal_boundary_target(
     if not seed.any():
         return np.zeros(labels.shape, dtype=np.float32)
     distance = ndimage.distance_transform_edt(~seed, sampling=spacing_zyx)
-    return ((distance <= radius) & component).astype(np.float32)
+    return ((distance <= float(radius_vox)) & component).astype(np.float32)
 
 
 def build_targets(
     instance_labels: np.ndarray,
     input_component_mask: np.ndarray,
-    spacing_zyx_um: Spacing3D,
+    spacing_zyx: Spacing3D = (1.0, 1.0, 1.0),
     *,
-    center_sigma_um: float,
+    center_sigma_vox: float | None = None,
     center_interior_fraction: float,
-    boundary_radius_um: float,
+    boundary_radius_vox: float | None = None,
+    # Compatibility aliases for old callers.
+    center_sigma_um: float | None = None,
+    boundary_radius_um: float | None = None,
     vector_max_distance_um: float | None = None,
 ) -> TargetBundle:
-    """Build scale-invariant canonical-coordinate targets.
+    """Build scale-invariant targets on the normalized cubic lattice."""
+    del vector_max_distance_um
+    center_sigma = center_sigma_vox if center_sigma_vox is not None else center_sigma_um
+    boundary_radius = boundary_radius_vox if boundary_radius_vox is not None else boundary_radius_um
+    if center_sigma is None or boundary_radius is None:
+        raise ValueError("center sigma and boundary radius are required")
 
-    Legacy ``*_um`` argument names are accepted so existing call sites do not
-    break, but the new SampleBuilder passes canonical ROI units.  The legacy
-    vector_max_distance_um argument is ignored; vectors are normalized by the
-    fixed canonical axis spans.
-    """
     labels = np.asarray(instance_labels, dtype=np.int32)
     foreground = (labels > 0).astype(np.float32)[None, ...]
     centers = centers_for_labels(
-        labels, spacing_zyx_um, interior_fraction=center_interior_fraction
+        labels, spacing_zyx, interior_fraction=center_interior_fraction
     )
     vectors = vector_targets_canonical(labels, centers)
     center = markers_to_heatmap(
-        labels.shape, centers, spacing_zyx_um, sigma_um=center_sigma_um
+        labels.shape, centers, spacing_zyx, sigma_vox=float(center_sigma)
     )[None, ...]
     boundary = internal_boundary_target(
         labels,
         input_component_mask,
-        spacing_zyx_um,
-        radius=boundary_radius_um,
+        spacing_zyx,
+        radius_vox=float(boundary_radius),
     )[None, ...]
     return TargetBundle(
         foreground=foreground.astype(np.float32, copy=False),

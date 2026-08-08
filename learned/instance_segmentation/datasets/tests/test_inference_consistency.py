@@ -5,7 +5,7 @@ from ..config import SampleBuildConfig
 from ..core.marker_heatmap import deepest_point_marker
 
 
-def test_inference_component_uses_same_object_centric_normalization():
+def test_inference_component_uses_same_64_cube_normalization():
     image = np.zeros((40, 120, 120), np.float32)
     mask = np.zeros_like(image, dtype=bool)
     mask[8:20, 20:90, 25:85] = True
@@ -18,8 +18,9 @@ def test_inference_component_uses_same_object_centric_normalization():
         config=config,
         marker_detector=deepest_point_marker,
     )
-    assert roi.inputs.shape == (4, 16, 64, 64)
-    assert roi.transform.normalization_scale < 1.0
-    point = np.array([[7.5, 31.5, 31.5]])
+    assert roi.inputs.shape == (4, 64, 64, 64)
+    point = np.array([[31.5, 31.5, 31.5]])
     native = roi.canonical_centers_to_native(point)
     assert native.shape == (1, 3)
+    restored = roi.transform.native_to_canonical(native)
+    assert np.allclose(restored, point)

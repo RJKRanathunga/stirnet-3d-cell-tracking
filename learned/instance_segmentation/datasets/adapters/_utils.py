@@ -83,41 +83,33 @@ def to_zyx(array: np.ndarray, source_axis_order: str) -> np.ndarray:
 
 
 def normalize_instance_labels(labels: np.ndarray) -> np.ndarray:
+    """Vectorized relabeling to contiguous positive IDs."""
     source = np.asarray(labels)
-
     if not np.issubdtype(source.dtype, np.integer):
         rounded = np.rint(source)
         if not np.allclose(source, rounded):
             raise TypeError("instance labels contain non-integer values")
         source = rounded
-
     source = source.astype(np.int64, copy=False)
-
     if np.any(source < 0):
         raise ValueError("instance labels cannot contain negative IDs")
 
     unique = np.unique(source)
     positive = unique[unique > 0]
-
     if positive.size == 0:
         return np.zeros(source.shape, dtype=np.int32)
 
-    # Fast path: labels are already contiguous 1..N.
     if (
-            positive[0] == 1
-            and positive[-1] == positive.size
-            and np.all(np.diff(positive) == 1)
+        positive[0] == 1
+        and positive[-1] == positive.size
+        and np.all(np.diff(positive) == 1)
     ):
         return source.astype(np.int32, copy=False)
 
-    # Vectorized remapping for sparse/non-contiguous IDs.
     result = np.zeros(source.shape, dtype=np.int32)
-
     mask = source > 0
     values = source[mask]
-
     result[mask] = np.searchsorted(positive, values).astype(np.int32) + 1
-
     return result
 
 

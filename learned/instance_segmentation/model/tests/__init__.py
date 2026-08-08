@@ -1,1 +1,1 @@
-"""Tests for the learned instance-segmentation CNN model."""
+"""Tests for the cubic learned instance-segmentation CNN model."""

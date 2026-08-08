@@ -14,11 +14,11 @@ _WINDOWS_C_ELEGANS_ROOT = Path(
 C_ELEGANS_SPACING_ZYX_UM = (0.122, 0.116, 0.116)
 BLASTOSPIM_SPACING_ZYX_UM = (2.0, 0.208, 0.208)
 
-# The output tensor keeps the existing Biohub-shaped sampling grid.  In the new
-# architecture these numbers define CANONICAL ROI UNITS, not an assertion that
-# every normalized source cell still has its original biological micrometre size.
-CANONICAL_SPACING_ZYX = (1.625, 0.40625, 0.40625)
-CANONICAL_CROP_SHAPE_ZYX = (16, 64, 64)
+# The learned model now operates on a normalized cubic lattice.  These are
+# canonical coordinate units, not biological micrometres.  One canonical voxel
+# has the same size along Z, Y, and X.
+CANONICAL_SPACING_ZYX = (1.0, 1.0, 1.0)
+CANONICAL_CROP_SHAPE_ZYX = (64, 64, 64)
 
 
 def _default_external_root(env_name: str, *relative_candidates: str) -> Path:
@@ -51,13 +51,13 @@ def default_blastospim_root() -> Path:
 
 @dataclass(frozen=True)
 class SampleBuildConfig:
-    """Settings for canonical object-centric CNN sample generation.
+    """Settings for cubic object-centric CNN sample generation.
 
-    ``component_occupancy`` is the central design parameter.  A selected single,
-    pair, or larger group is isotropically scaled in physical source space so
-    that its tight union bounding box occupies at most this fraction of the
-    usable canonical span along its limiting axis.  The same scalar is applied
-    to Z, Y, and X physical coordinates, preserving source morphology.
+    A selected single/pair/group is interpreted in true source physical space
+    using the dataset's native voxel spacing.  One scalar ``normalization_scale``
+    (canonical voxels per source micrometre) then maps the whole group into a
+    fixed cubic ``64 x 64 x 64`` canonical lattice.  No axis-specific stretching
+    is permitted.
     """
 
     crop_shape_zyx: tuple[int, int, int] = CANONICAL_CROP_SHAPE_ZYX
@@ -66,31 +66,36 @@ class SampleBuildConfig:
     # Object-centric normalization.
     component_occupancy: float = 0.78
     border_margin_voxels: int = 1
-    min_normalization_scale: float = 0.05
-    max_normalization_scale: float = 8.0
+    min_normalization_scale: float = 0.05  # canonical voxels / source um
+    max_normalization_scale: float = 32.0  # canonical voxels / source um
 
-    # Canonical-coordinate input channels.
-    edt_clip_canonical: float = 8.0
-    marker_sigma_canonical: float = 1.1
+    # Canonical-voxel input channels.
+    edt_clip_vox: float = 16.0
+    marker_sigma_vox: float = 2.0
 
-    # Canonical-coordinate supervision.
-    center_sigma_canonical: float = 1.0
+    # Canonical-voxel supervision.
+    center_sigma_vox: float = 2.0
     center_interior_fraction: float = 0.70
-    boundary_radius_canonical: float = 0.75
+    boundary_radius_vox: float = 1.5
 
-    # Synthetic Stage-2 failure generation on the canonical ROI.
-    bridge_radius_canonical: float = 0.45
-    closing_radius_canonical: float = 0.0
+    # Synthetic Stage-2 failure generation in cubic canonical voxels.
+    bridge_radius_vox: float = 1.5
+    closing_radius_vox: float = 0.0
     require_single_input_component: bool = True
 
-    # Native candidate discovery.  This is intentionally permissive; pair
-    # geometry is normalized only after selection.
+    # Training-only source quality gates.  Boundary-truncated GT nuclei do not
+    # provide complete center/shape supervision and are rejected by default.
+    reject_native_boundary_instances: bool = True
+    native_boundary_margin_voxels: int = 0
+
+    # Native candidate discovery.  Pair discovery still happens in true source
+    # physical space before object normalization.
     adjacency_max_distance_um: float = 2.5
 
-    # Resampling quality.
+    # Resampling quality / sample validity.
     anti_alias_image: bool = True
-    min_instance_voxels_after_resampling: int = 12
-    min_instance_bbox_zyx_vox: tuple[int, int, int] = (2, 3, 3)
+    min_instance_voxels_after_resampling: int = 24
+    min_instance_bbox_zyx_vox: tuple[int, int, int] = (3, 3, 3)
     max_group_aspect_ratio: float = 12.0
 
     # Intensity normalization.
@@ -100,21 +105,29 @@ class SampleBuildConfig:
     def __post_init__(self) -> None:
         if len(self.crop_shape_zyx) != 3 or any(int(v) <= 0 for v in self.crop_shape_zyx):
             raise ValueError("crop_shape_zyx must contain three positive values")
+        if tuple(int(v) for v in self.crop_shape_zyx) != CANONICAL_CROP_SHAPE_ZYX:
+            # Custom shapes remain useful for tests, but production defaults are 64^3.
+            if any(int(v) < 16 for v in self.crop_shape_zyx):
+                raise ValueError("custom canonical shapes must be at least 16 voxels per axis")
         if len(self.canonical_spacing_zyx) != 3 or any(
             not isfinite(float(v)) or float(v) <= 0 for v in self.canonical_spacing_zyx
         ):
             raise ValueError("canonical_spacing_zyx must contain three positive values")
+        if not all(abs(float(v) - float(self.canonical_spacing_zyx[0])) < 1e-9 for v in self.canonical_spacing_zyx):
+            raise ValueError("canonical voxels must be cubic: spacing must be isotropic")
         if not 0.0 < float(self.component_occupancy) <= 1.0:
             raise ValueError("component_occupancy must be in (0, 1]")
         if self.border_margin_voxels < 0:
             raise ValueError("border_margin_voxels cannot be negative")
+        if self.native_boundary_margin_voxels < 0:
+            raise ValueError("native_boundary_margin_voxels cannot be negative")
         if not 0 < self.min_normalization_scale <= self.max_normalization_scale:
             raise ValueError("normalization scale bounds are invalid")
         positive = (
-            "edt_clip_canonical",
-            "marker_sigma_canonical",
-            "center_sigma_canonical",
-            "boundary_radius_canonical",
+            "edt_clip_vox",
+            "marker_sigma_vox",
+            "center_sigma_vox",
+            "boundary_radius_vox",
             "adjacency_max_distance_um",
             "max_group_aspect_ratio",
         )
@@ -122,7 +135,7 @@ class SampleBuildConfig:
             value = float(getattr(self, name))
             if not isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive")
-        nonnegative = ("bridge_radius_canonical", "closing_radius_canonical")
+        nonnegative = ("bridge_radius_vox", "closing_radius_vox")
         for name in nonnegative:
             value = float(getattr(self, name))
             if not isfinite(value) or value < 0:
@@ -138,52 +151,54 @@ class SampleBuildConfig:
         if not 0.0 <= self.image_percentile_low < self.image_percentile_high <= 100.0:
             raise ValueError("image percentiles must satisfy 0 <= low < high <= 100")
 
-    # Read-only migration aliases for notebooks/debugging code written against
-    # the previous fixed-physical-FOV configuration.  They intentionally return
-    # canonical ROI values; no biological-size normalization is implied.
+    @property
+    def usable_span_vox(self) -> tuple[float, float, float]:
+        """Center-to-center canonical voxel span after hard border margins."""
+        result = []
+        for shape in self.crop_shape_zyx:
+            usable_intervals = int(shape) - 1 - 2 * int(self.border_margin_voxels)
+            if usable_intervals <= 0:
+                raise ValueError("border margin leaves no usable canonical span")
+            result.append(float(usable_intervals))
+        return tuple(result)  # type: ignore[return-value]
+
+    # Compatibility aliases retained for older notebooks.  Their values now
+    # refer to unit cubic canonical voxels, never biological micrometres.
     @property
     def target_spacing_zyx_um(self) -> tuple[float, float, float]:
         return self.canonical_spacing_zyx
 
     @property
-    def edt_clip_um(self) -> float:
-        return self.edt_clip_canonical
+    def edt_clip_canonical(self) -> float:
+        return self.edt_clip_vox
 
     @property
-    def marker_sigma_um(self) -> float:
-        return self.marker_sigma_canonical
+    def marker_sigma_canonical(self) -> float:
+        return self.marker_sigma_vox
 
     @property
-    def center_sigma_um(self) -> float:
-        return self.center_sigma_canonical
+    def center_sigma_canonical(self) -> float:
+        return self.center_sigma_vox
 
     @property
-    def boundary_radius_um(self) -> float:
-        return self.boundary_radius_canonical
+    def boundary_radius_canonical(self) -> float:
+        return self.boundary_radius_vox
 
     @property
-    def bridge_radius_um(self) -> float:
-        return self.bridge_radius_canonical
+    def bridge_radius_canonical(self) -> float:
+        return self.bridge_radius_vox
 
     @property
-    def closing_radius_um(self) -> float:
-        return self.closing_radius_canonical
+    def closing_radius_canonical(self) -> float:
+        return self.closing_radius_vox
 
     @property
     def usable_span_canonical(self) -> tuple[float, float, float]:
-        """Center-to-center canonical span available after hard border margins."""
-        result = []
-        for shape, spacing in zip(self.crop_shape_zyx, self.canonical_spacing_zyx):
-            usable_intervals = int(shape) - 1 - 2 * int(self.border_margin_voxels)
-            if usable_intervals <= 0:
-                raise ValueError("border margin leaves no usable canonical span")
-            result.append(float(usable_intervals) * float(spacing))
-        return tuple(result)  # type: ignore[return-value]
+        spacing = float(self.canonical_spacing_zyx[0])
+        return tuple(v * spacing for v in self.usable_span_vox)  # type: ignore[return-value]
 
 
 DEFAULT_SAMPLE_BUILD_CONFIG = SampleBuildConfig()
 
-# Compatibility aliases for external code that imported the old names.  The
-# semantics have changed: these are canonical ROI units, not biological target
-# spacing that forces every dataset into Biohub absolute scale.
+# Deprecated compatibility names.  Canonical voxels are now cubic.
 TARGET_SPACING_ZYX_UM = CANONICAL_SPACING_ZYX

@@ -113,10 +113,13 @@ class ComponentBBox:
 
 @dataclass(frozen=True)
 class CanonicalTransform:
-    """Invertible object-centric mapping between native and canonical indices.
+    """Invertible mapping from native microscopy indices to cubic CNN voxels.
 
-    ``normalization_scale`` is isotropic in physical source coordinates:
-    canonical_physical_offset = source_physical_offset * normalization_scale.
+    ``normalization_scale`` has units of canonical voxels per source micrometre.
+    The same scalar multiplies physical Z/Y/X offsets, so biological morphology
+    is never axis-wise stretched.  ``canonical_spacing_zyx`` is retained only as
+    an explicit representation of the cubic canonical lattice and must be
+    isotropic (production uses ``(1,1,1)``).
     """
 
     native_center_zyx: Float3D
@@ -129,11 +132,27 @@ class CanonicalTransform:
     def __post_init__(self) -> None:
         if self.normalization_scale <= 0:
             raise ValueError("normalization_scale must be positive")
+        spacing = np.asarray(self.canonical_spacing_zyx, dtype=np.float64)
+        if spacing.shape != (3,) or np.any(spacing <= 0):
+            raise ValueError("canonical spacing must contain three positive values")
+        if not np.allclose(spacing, spacing[0]):
+            raise ValueError("canonical voxels must be cubic")
+
+    @property
+    def scale_vox_per_um(self) -> float:
+        """Object-normalization scale in canonical voxels per source micrometre."""
+        return float(self.normalization_scale / float(self.canonical_spacing_zyx[0]))
 
     @property
     def canonical_center_zyx(self) -> Float3D:
         return tuple((int(v) - 1) / 2.0 for v in self.canonical_shape_zyx)  # type: ignore[return-value]
 
+    @property
+    def canonical_voxels_per_native_voxel(self) -> Spacing3D:
+        spacing = np.asarray(self.native_spacing_zyx_um, dtype=np.float64)
+        return tuple(float(v) * self.scale_vox_per_um for v in spacing)  # type: ignore[return-value]
+
+    # Compatibility name used by the resampler.
     @property
     def effective_native_spacing_canonical(self) -> Spacing3D:
         return tuple(

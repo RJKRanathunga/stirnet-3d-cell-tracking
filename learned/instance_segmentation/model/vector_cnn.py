@@ -1,4 +1,4 @@
-"""Compact anisotropic residual 3-D U-Net for canonical instance correction."""
+"""Compact isotropic residual 3-D U-Net for cubic canonical instance correction."""
 
 from __future__ import annotations
 
@@ -14,16 +14,14 @@ from .heads import VectorCNNHeads
 
 @dataclass(frozen=True)
 class VectorCNNConfig:
-    """Architecture configuration.
-
-    Vectors are expressed as canonical axis fractions, so no physical
-    max-distance parameter is required or allowed in the model contract.
-    """
+    """Architecture configuration for the normalized cubic CNN."""
 
     input_channels: int = 4
-    channels: tuple[int, int, int, int, int] = (24, 48, 96, 160, 256)
+    channels: tuple[int, int, int, int, int] = (16, 32, 64, 128, 192)
     group_norm_groups: int = 8
     dropout: float = 0.0
+    input_shape_zyx: tuple[int, int, int] = (64, 64, 64)
+    enforce_input_shape: bool = True
 
     def __post_init__(self) -> None:
         if self.input_channels <= 0:
@@ -34,6 +32,10 @@ class VectorCNNConfig:
             raise ValueError("group_norm_groups must be positive")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0,1)")
+        if len(self.input_shape_zyx) != 3 or any(int(v) < 16 for v in self.input_shape_zyx):
+            raise ValueError("input_shape_zyx must contain three values >= 16")
+        if any(int(v) % 16 != 0 for v in self.input_shape_zyx):
+            raise ValueError("each input spatial dimension must be divisible by 16")
 
 
 @dataclass(frozen=True)
@@ -66,15 +68,16 @@ class VectorCNNOutput:
 
 
 class VectorInstanceCNN(nn.Module):
-    """Multi-task CNN operating on scale-normalized component-centric ROIs.
+    """Multi-task CNN operating on object-normalized cubic 3-D ROIs.
 
     Input channels:
       0 normalized fluorescence
       1 Stage-2-like component mask
-      2 canonical normalized EDT
-      3 canonical effective-marker heatmap
+      2 normalized cubic-voxel EDT
+      3 effective-marker heatmap
 
-    Output vectors are canonical axis fractions, not biological micrometres.
+    Output vectors are canonical axis fractions.  For the default 64^3 input,
+    multiplying by 63 converts each vector channel to canonical voxel offsets.
     """
 
     def __init__(self, config: VectorCNNConfig | None = None) -> None:
@@ -120,9 +123,13 @@ class VectorInstanceCNN(nn.Module):
             raise ValueError(
                 f"expected {self.config.input_channels} input channels, got {x.shape[1]}"
             )
-        z, y, x_size = map(int, x.shape[-3:])
-        if z < 4 or y < 16 or x_size < 16:
-            raise ValueError("require at least Z>=4, Y>=16, X>=16")
+        spatial = tuple(int(v) for v in x.shape[-3:])
+        if any(v < 16 or v % 16 != 0 for v in spatial):
+            raise ValueError("spatial dimensions must each be >=16 and divisible by 16")
+        if self.config.enforce_input_shape and spatial != tuple(self.config.input_shape_zyx):
+            raise ValueError(
+                f"expected spatial shape {self.config.input_shape_zyx}, got {spatial}"
+            )
 
     def forward(self, x: torch.Tensor) -> VectorCNNOutput:
         self._validate_input(x)
