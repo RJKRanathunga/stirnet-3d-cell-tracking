@@ -8,3 +8,4 @@ zarr
 dask[array]
 ipywidgets
 matplotlib
+pytest~=9.1.1
