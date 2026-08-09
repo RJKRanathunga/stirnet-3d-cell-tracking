@@ -47,7 +47,7 @@ SPATIAL_NEIGHBOR_RADIUS_DREF = 2.5
 TEMPORAL_GAUSSIAN_SIGMA_DREF = 0.75
 ```
 
-These values are expressed relative to \(d_\text{ref}\), not voxel counts.
+These values are expressed relative to $d_\text{ref}$, not voxel counts.
 
 ## 3. Query decoder mask defaults
 
@@ -57,7 +57,7 @@ INITIAL_PRIOR_LOGIT_INSIDE = +1.5
 INITIAL_PRIOR_LOGIT_OUTSIDE = -1.5
 ```
 
-Physical dilation widths should be specified in multiples of \(d_\text{ref}\) and converted to each feature grid using current effective spacing.
+Physical dilation widths should be specified in multiples of $d_\text{ref}$ and converted to each feature grid using current effective spacing.
 
 ## 4. Loss defaults
 

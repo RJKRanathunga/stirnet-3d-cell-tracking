@@ -32,15 +32,11 @@ Inference tiles are defined in physical/cell-scale space.
 
 Context size:
 
-\[
-8d_\text{ref}
-\]
+$$8d_\text{ref}$$
 
 Valid ownership core:
 
-\[
-6d_\text{ref}.
-\]
+$$6d_\text{ref}.$$
 
 Tiles overlap so every output cell center belongs to exactly one valid core.
 
@@ -91,15 +87,11 @@ Tune on validation data.
 
 For each surviving query:
 
-\[
-L_i(v)=m_i^TF_{mask}(v)+L_i^{prior}(v).
-\]
+$$L_i(v)=m_i^TF_{mask}(v)+L_i^{prior}(v).$$
 
 Probability:
 
-\[
-P_i(v)=\sigma(L_i(v)).
-\]
+$$P_i(v)=\sigma(L_i(v)).$$
 
 Do not render masks for discarded low-existence queries.
 
@@ -125,13 +117,7 @@ Multiple cell masks may overlap.
 
 Define:
 
-\[
-score_i(v)
-=
-P_i(\text{exist})
-\cdot
-P_i(v).
-\]
+$$score_i(v) = P_i(\text{exist}) \cdot P_i(v).$$
 
 Assign each voxel to the surviving query with maximal score, subject to a minimum mask score threshold.
 

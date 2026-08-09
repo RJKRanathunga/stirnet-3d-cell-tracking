@@ -99,24 +99,11 @@ reliability: [...,1]
 
 For temporal hypothesis i and spatial token j:
 
-\[
-\Delta p_{ij}
-=
-p_j^{spatial} - p_i^{temporal}.
-\]
+$$\Delta p_{ij} = p_j^{spatial} - p_i^{temporal}.$$
 
 Build normalized vector:
 
-\[
-r_{ij}
-=
-[
-\Delta z/d_\text{ref},
-\Delta y/d_\text{ref},
-\Delta x/d_\text{ref},
-\|\Delta p\|/d_\text{ref}
-].
-\]
+$$r_{ij} = [ \Delta z/d_\text{ref}, \Delta y/d_\text{ref}, \Delta x/d_\text{ref}, \|\Delta p\|/d_\text{ref} ].$$
 
 MLP:
 
@@ -130,40 +117,21 @@ produces one bias value per attention head.
 
 Queries:
 
-\[
-Q=T W_Q^T
-\]
+$$Q=T W_Q^T$$
 
 Keys/values:
 
-\[
-K=S W_K^S,\qquad V=S W_V^S.
-\]
+$$K=S W_K^S,\qquad V=S W_V^S.$$
 
 For head h:
 
-\[
-\ell_{ij}^{(h)}
-=
-\frac{
-Q_i^{(h)}\cdot K_j^{(h)}
-}{
-\sqrt{32}
-}
-+
-b_h(r_{ij})
-+
-M_{ij}.
-\]
+$$\ell_{ij}^{(h)} = \frac{ Q_i^{(h)}\cdot K_j^{(h)} }{ \sqrt{32} } + b_h(r_{ij}) + M_{ij}.$$
 
 ### Search radius
 
 For temporal hypothesis i:
 
-\[
-R_i =
-(1.5+a_i)d_\text{ref}.
-\]
+$$R_i = (1.5+a_i)d_\text{ref}.$$
 
 Thus:
 
@@ -172,44 +140,27 @@ Thus:
 
 Mask:
 
-\[
-M_{ij}=
-\begin{cases}
-0,& \|\Delta p_{ij}\|\le R_i\\
--\infty,&\text{otherwise}
-\end{cases}
-\]
+$$M_{ij}= \begin{cases} 0,& \|\Delta p_{ij}\|\le R_i\\ -\infty,&\text{otherwise} \end{cases}$$
 
 plus spatial padding masks.
 
 ### Output
 
-\[
-U_i =
-\operatorname{MHA}(T_i,S,S).
-\]
+$$U_i = \operatorname{MHA}(T_i,S,S).$$
 
 ## 7. Gated temporal update
 
 Concatenate:
 
-\[
-[T_i,U_i,a_i,r_i].
-\]
+$$[T_i,U_i,a_i,r_i].$$
 
 Gate:
 
-\[
-g_i=
-\sigma(W_g[T_i,U_i,a_i,r_i]).
-\]
+$$g_i= \sigma(W_g[T_i,U_i,a_i,r_i]).$$
 
 Update:
 
-\[
-T_i' =
-T_i + g_i\odot W_OU_i.
-\]
+$$T_i' = T_i + g_i\odot W_OU_i.$$
 
 Then LayerNorm and FFN may be applied.
 
@@ -219,10 +170,7 @@ This gate is important because Trackastra-derived hypotheses can be wrong.
 
 Run one GATv2 hypothesis block:
 
-\[
-T'' =
-\operatorname{HypothesisGATv2}(T',E_H).
-\]
+$$T'' = \operatorname{HypothesisGATv2}(T',E_H).$$
 
 The graph now reasons over **image-aware temporal hypotheses**.
 
@@ -239,41 +187,19 @@ A and B are both close to the same current instance.
 
 Spatial queries:
 
-\[
-Q=S W_Q^S
-\]
+$$Q=S W_Q^S$$
 
 Temporal keys/values:
 
-\[
-K=T'' W_K^T,\qquad V=T'' W_V^T.
-\]
+$$K=T'' W_K^T,\qquad V=T'' W_V^T.$$
 
 For spatial token j and temporal hypothesis i:
 
-\[
-\ell_{ji}^{(h)}
-=
-\frac{
-Q_j^{(h)}\cdot K_i^{(h)}
-}{
-\sqrt{32}
-}
-+
-b_h(r_{ji})
-+
-\lambda_h a_i
-+
-\eta_h\log(r_i+\epsilon)
-+
-M_{ji}.
-\]
+$$\ell_{ji}^{(h)} = \frac{ Q_j^{(h)}\cdot K_i^{(h)} }{ \sqrt{32} } + b_h(r_{ji}) + \lambda_h a_i + \eta_h\log(r_i+\epsilon) + M_{ji}.$$
 
 ### Salience bias
 
-\[
-\lambda_h=\operatorname{softplus}(\theta_h)
-\]
+$$\lambda_h=\operatorname{softplus}(\theta_h)$$
 
 so highly diagnostic anomalies can receive a learned positive prior.
 
@@ -281,7 +207,7 @@ so highly diagnostic anomalies can receive a learned positive prior.
 
 Reliability modifies influence separately from anomaly salience.
 
-The exact parameterization of \(\eta_h\) may remain unconstrained or be learned with a conservative initialization.
+The exact parameterization of $\eta_h$ may remain unconstrained or be learned with a conservative initialization.
 
 ### Empty-neighbour rule
 
@@ -295,22 +221,15 @@ Never perform softmax over all `-inf`.
 
 ## 10. Gated spatial update
 
-Let temporal message be \(U_j^S\).
+Let temporal message be $U_j^S$.
 
 Use:
 
-\[
-g_j^S=
-\sigma(W_g^S[S_j,U_j^S]).
-\]
+$$g_j^S= \sigma(W_g^S[S_j,U_j^S]).$$
 
 Then:
 
-\[
-S_j' =
-S_j +
-g_j^S\odot W_O^SU_j^S.
-\]
+$$S_j' = S_j + g_j^S\odot W_O^SU_j^S.$$
 
 ## 11. Convolution after fusion
 

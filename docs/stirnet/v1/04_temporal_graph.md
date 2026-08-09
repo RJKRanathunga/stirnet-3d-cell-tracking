@@ -24,11 +24,9 @@ V1 uses:
 TEMPORAL_RADIUS = 2
 ```
 
-Target frame \(t\) sees detections from:
+Target frame $t$ sees detections from:
 
-\[
-[t-2,t-1,t,t+1,t+2].
-\]
+$$[t-2,t-1,t,t+1,t+2].$$
 
 ## 3. Detection graph nodes
 
@@ -42,23 +40,23 @@ graph_x: [N_nodes, 32]
 
 | Dim | Feature |
 |---|---|
-| 0 | normalized time offset \(\Delta t/2\) |
-| 1–3 | relative XYZ position / \(d_\text{ref}\) |
+| 0 | normalized time offset $\Delta t/2$ |
+| 1–3 | relative XYZ position / $d_\text{ref}$ |
 | 4 | log physical volume / reference physical volume |
-| 5–7 | physical bbox dims / \(d_\text{ref}\) |
-| 8–10 | PCA axis lengths / \(d_\text{ref}\) |
+| 5–7 | physical bbox dims / $d_\text{ref}$ |
+| 8–10 | PCA axis lengths / $d_\text{ref}$ |
 | 11 | elongation |
 | 12 | flatness |
 | 13 | solidity |
 | 14 | compactness |
 | 15 | normalized mean intensity |
 | 16 | normalized intensity std |
-| 17–19 | backward velocity / \(d_\text{ref}\) |
-| 20–22 | forward velocity / \(d_\text{ref}\) |
+| 17–19 | backward velocity / $d_\text{ref}$ |
+| 20–22 | forward velocity / $d_\text{ref}$ |
 | 23 | track length before |
 | 24 | track length after |
-| 25 | distance to physical volume boundary / \(d_\text{ref}\) |
-| 26 | distance to current patch boundary / \(d_\text{ref}\) |
+| 25 | distance to physical volume boundary / $d_\text{ref}$ |
+| 26 | distance to current patch boundary / $d_\text{ref}$ |
 | 27 | target-frame indicator |
 | 28 | interior-start indicator |
 | 29 | interior-end indicator |
@@ -121,9 +119,7 @@ K_SPATIAL_NEIGHBORS = 6
 
 nearest same-frame detections within approximately:
 
-\[
-2.5d_\text{ref}.
-\]
+$$2.5d_\text{ref}.$$
 
 This lets nearby cell hypotheses interact even if Trackastra has no temporal edge between them.
 
@@ -191,19 +187,11 @@ Division points split tracklets so that each temporal hypothesis is approximatel
 
 ## 8. Tracklet attention pooling
 
-For each tracklet \(m\):
+For each tracklet $m$:
 
-\[
-a_n =
-\operatorname{softmax}_n
-\left[
-w^T\tanh(W_hh_n + W_te_{\Delta t_n})
-\right]
-\]
+$$a_n = \operatorname{softmax}_n \left[ w^T\tanh(W_hh_n + W_te_{\Delta t_n}) \right]$$
 
-\[
-T_m=\sum_{n\in m}a_nh_n.
-\]
+$$T_m=\sum_{n\in m}a_nh_n.$$
 
 Output:
 
@@ -261,11 +249,9 @@ These are clues, not labels of true biological events.
 
 Learn:
 
-\[
-a_i = \sigma(MLP_a[T_i,status_i])
-\]
+$$a_i = \sigma(MLP_a[T_i,status_i])$$
 
-where \(a_i\in[0,1]\).
+where $a_i\in[0,1]$.
 
 Interpretation:
 
@@ -281,9 +267,7 @@ The value remains learnable.
 
 Learn separately:
 
-\[
-r_i = \sigma(MLP_r[T_i,status_i])
-\]
+$$r_i = \sigma(MLP_r[T_i,status_i])$$
 
 Interpretation:
 
@@ -313,7 +297,7 @@ After tracklet pooling, construct a second graph over temporal hypotheses.
 
 Connect hypotheses if any condition holds:
 
-- reference distance < \(2.5d_\text{ref}\);
+- reference distance < $2.5d_\text{ref}$;
 - provisional lineage relationship;
 - potential gap relationship;
 - same current target-frame component.

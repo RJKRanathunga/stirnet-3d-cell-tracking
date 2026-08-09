@@ -28,48 +28,29 @@ Every geometry-carrying API must make the coordinate system explicit.
 
 ### 2.1 Native voxel coordinates
 
-\[
-p_\text{vox} = (z,y,x)
-\]
+$$p_\text{vox} = (z,y,x)$$
 
 ### 2.2 Physical coordinates
 
-\[
-p_{\mu m} =
-(zs_z, ys_y, xs_x)
-\]
+$$p_{\mu m} = (zs_z, ys_y, xs_x)$$
 
 ### 2.3 Cell-scale-normalized coordinates
 
-For sequence-level robust reference diameter \(d_\text{ref}\),
+For sequence-level robust reference diameter $d_\text{ref}$,
 
-\[
-\tilde p =
-\frac{
-p_{\mu m} - p_{\mu m,\text{patch center}}
-}{
-d_\text{ref}
-}
-\]
+$$\tilde p = \frac{ p_{\mu m} - p_{\mu m,\text{patch center}} }{ d_\text{ref} }$$
 
 Use cell-scale-normalized coordinates for cross-dataset relational features and physical coordinates when exact physical interpretation is needed.
 
 ## 3. Robust reference cell diameter
 
-Estimate \(d_\text{ref}\) from reliable current/ground-truth instances in the sequence.
+Estimate $d_\text{ref}$ from reliable current/ground-truth instances in the sequence.
 
 Preferred definition:
 
-\[
-d_\text{ref}
-=
-\operatorname{median}
-\left[
-2\left(\frac{3V_i}{4\pi}\right)^{1/3}
-\right]
-\]
+$$d_\text{ref} = \operatorname{median} \left[ 2\left(\frac{3V_i}{4\pi}\right)^{1/3} \right]$$
 
-where \(V_i\) is physical volume in \(\mu m^3\).
+where $V_i$ is physical volume in $\mu m^3$.
 
 Use robust filtering to exclude:
 
@@ -86,17 +67,13 @@ If no reliable estimate exists, use a dataset-level training statistic.
 
 Patch size is defined in physical/cell-scale space:
 
-\[
-L_\text{context}=8d_\text{ref}
-\]
+$$L_\text{context}=8d_\text{ref}$$
 
 per axis.
 
 Native voxel size:
 
-\[
-N_z=\left\lceil\frac{L_\text{context}}{s_z}\right\rceil
-\]
+$$N_z=\left\lceil\frac{L_\text{context}}{s_z}\right\rceil$$
 
 and equivalently for Y/X.
 
@@ -106,9 +83,7 @@ The patch is centered on a selected training location and extracted on the nativ
 
 Only GT cells whose centers lie in the central:
 
-\[
-L_\text{valid}=6d_\text{ref}
-\]
+$$L_\text{valid}=6d_\text{ref}$$
 
 cube are treated as required outputs.
 
@@ -164,9 +139,7 @@ Background is zero.
 
 Recommended further normalization:
 
-\[
-EDT_\text{norm} = EDT_{\mu m}/d_\text{ref}
-\]
+$$EDT_\text{norm} = EDT_{\mu m}/d_\text{ref}$$
 
 with clipping to a reasonable maximum.
 
@@ -182,13 +155,9 @@ Construct from current segmentation markers or marker positions.
 
 Gaussian width must be defined physically.
 
-For axis \(a\),
+For axis $a$,
 
-\[
-\sigma_a^\text{vox}
-=
-\frac{\sigma_{\mu m}}{s_a}
-\]
+$$\sigma_a^\text{vox} = \frac{\sigma_{\mu m}}{s_a}$$
 
 so the Gaussian represents an approximately isotropic physical object despite an anisotropic voxel lattice.
 
@@ -245,31 +214,17 @@ and used by physical-aware CNN blocks.
 
 Every CNN feature level must expose effective spacing:
 
-\[
-s^{(l)}=(s_z^{(l)},s_y^{(l)},s_x^{(l)})
-\]
+$$s^{(l)}=(s_z^{(l)},s_y^{(l)},s_x^{(l)})$$
 
 and coordinate generation utilities.
 
 For feature index:
 
-\[
-(j_z,j_y,j_x)
-\]
+$$(j_z,j_y,j_x)$$
 
 the physical coordinate relative to the patch center is:
 
-\[
-p^{(l)}_{\mu m}
-=
-(
-j_zs_z^{(l)},
-j_ys_y^{(l)},
-j_xs_x^{(l)}
-)
--
-p_{\mu m,\text{patch center}}.
-\]
+$$p^{(l)}_{\mu m} = ( j_zs_z^{(l)}, j_ys_y^{(l)}, j_xs_x^{(l)} ) - p_{\mu m,\text{patch center}}.$$
 
 Cross-attention must not use raw feature indices as spatial distances.
 

@@ -63,14 +63,7 @@ MAX_QUERIES = 128
 
 Total:
 
-\[
-Q=
-2N_\text{instances}
-+
-N_\text{temporal}
-+
-8.
-\]
+$$Q= 2N_\text{instances} + N_\text{temporal} + 8.$$
 
 Do not silently truncate.
 
@@ -82,19 +75,11 @@ Downsample each current instance mask to that feature grid.
 
 Compute:
 
-\[
-f_i^{mean}
-=
-\operatorname{MaskedMean}(F,M_i)
-\]
+$$f_i^{mean} = \operatorname{MaskedMean}(F,M_i)$$
 
 and:
 
-\[
-f_i^{max}
-=
-\operatorname{MaskedMax}(F,M_i).
-\]
+$$f_i^{max} = \operatorname{MaskedMax}(F,M_i).$$
 
 Concatenate:
 
@@ -139,37 +124,15 @@ Projection:
 
 ## 5. Instance query
 
-\[
-q_i^{primary}
-=
-LN(
-q_i^{spatial}
-+
-q_i^{geom}
-+
-e_{primary}
-).
-\]
+$$q_i^{primary} = LN( q_i^{spatial} + q_i^{geom} + e_{primary} ).$$
 
 Reference position:
 
-\[
-r_i^{primary}
-=
-\text{current instance centroid in physical/cellscale coordinates}.
-\]
+$$r_i^{primary} = \text{current instance centroid in physical/cellscale coordinates}.$$
 
 ## 6. Split companion
 
-\[
-q_i^{split}
-=
-LN(
-q_i^{primary}
-+
-e_{split}
-).
-\]
+$$q_i^{split} = LN( q_i^{primary} + e_{split} ).$$
 
 It shares the same initial reference point and same current-mask support.
 
@@ -179,23 +142,11 @@ For a merge, it can become the additional cell.
 
 ## 7. Temporal query
 
-\[
-q_i^{temp}
-=
-LN(
-T_i^{final}
-+
-e_{temporal}
-).
-\]
+$$q_i^{temp} = LN( T_i^{final} + e_{temporal} ).$$
 
 Reference position:
 
-\[
-r_i^{temp}
-=
-\text{Trackastra-derived target-frame estimate}.
-\]
+$$r_i^{temp} = \text{Trackastra-derived target-frame estimate}.$$
 
 ## 8. Discovery queries
 
@@ -229,15 +180,9 @@ Query type is part of the query representation but is not a predicted class.
 
 ### 10.1 Primary instance
 
-For current instance mask \(M_i\):
+For current instance mask $M_i$:
 
-\[
-L_i^{prior}(v)=
-\begin{cases}
-+1.5,& v\in M_i\\
--1.5,&v\notin M_i
-\end{cases}
-\]
+$$L_i^{prior}(v)= \begin{cases} +1.5,& v\in M_i\\ -1.5,&v\notin M_i \end{cases}$$
 
 ### 10.2 Split companion
 
@@ -247,9 +192,7 @@ Use the same prior initially.
 
 Use a weak physical Gaussian prior around the temporal reference:
 
-\[
-\sigma\approx0.75d_\text{ref}.
-\]
+$$\sigma\approx0.75d_\text{ref}.$$
 
 If reference falls inside a current component, union that component with the temporal support for attention initialization.
 
@@ -337,9 +280,7 @@ physical dilation by ~1 dref
 
 Radius:
 
-\[
-R_i=(1.5+a_i)d_\text{ref}.
-\]
+$$R_i=(1.5+a_i)d_\text{ref}.$$
 
 Optionally union with nearest/current component around the reference.
 
@@ -349,7 +290,7 @@ Global coarse feature map.
 
 ## 15. Progressive masked attention
 
-After layer 1, predict coarse mask \(P_i^{(1)}\).
+After layer 1, predict coarse mask $P_i^{(1)}$.
 
 Layer-2 support:
 
@@ -369,21 +310,11 @@ Centers are predicted in cell-scale normalized physical coordinates.
 
 At each layer:
 
-\[
-\Delta_i^{(l)}
-=
-MLP_{center}(q_i^{(l)}).
-\]
+$$\Delta_i^{(l)} = MLP_{center}(q_i^{(l)}).$$
 
 Update:
 
-\[
-\tilde r_i^{(l)}
-=
-\tilde r_i^{(l-1)}
-+
-\Delta_i^{(l)}.
-\]
+$$\tilde r_i^{(l)} = \tilde r_i^{(l-1)} + \Delta_i^{(l)}.$$
 
 A bounded update function may be used if instability is observed.
 
@@ -418,25 +349,15 @@ Final query:
 
 produces:
 
-\[
-m_i\in\mathbb R^{32}.
-\]
+$$m_i\in\mathbb R^{32}.$$
 
 Native mask features:
 
-\[
-F_{mask}
-\in
-\mathbb R^{B\times32\times Z\times Y\times X}.
-\]
+$$F_{mask} \in \mathbb R^{B\times32\times Z\times Y\times X}.$$
 
 Final mask logit:
 
-\[
-L_i(v)
-=
-m_i^TF_{mask}(v)+L_i^{prior}(v).
-\]
+$$L_i(v) = m_i^TF_{mask}(v)+L_i^{prior}(v).$$
 
 ## 19. Memory-aware rendering
 

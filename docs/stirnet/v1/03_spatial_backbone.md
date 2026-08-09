@@ -84,18 +84,11 @@ and apply sigmoid.
 
 Let gates be:
 
-\[
-g_z,\;g_y,\;g_x
-\]
+$$g_z,\;g_y,\;g_x$$
 
 Then:
 
-\[
-F =
-g_z\odot F_z +
-g_y\odot F_y +
-g_x\odot F_x.
-\]
+$$F = g_z\odot F_z + g_y\odot F_y + g_x\odot F_x.$$
 
 This is followed by:
 

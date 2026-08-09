@@ -14,23 +14,19 @@ The architecture documented here is intentionally frozen at the information-flow
 
 ## Core objective
 
-For target frame \(t\),
+For target frame $t$,
 
-\[
-(I_t, S_t, \mathcal{T}_t, \mathbf{s})
-\rightarrow
-S_t^*
-\]
+$$(I_t, S_t, \mathcal{T}_t, \mathbf{s}) \rightarrow S_t^*$$
 
 where:
 
-- \(I_t\) is the native-resolution fluorescence volume.
-- \(S_t\) is the imperfect current instance segmentation.
-- \(\mathcal{T}_t\) is the provisional temporal evidence produced from Trackastra pass 1.
-- \(\mathbf{s} = (s_z, s_y, s_x)\) is the native voxel spacing.
-- \(S_t^*\) is the corrected set of cell instances.
+- $I_t$ is the native-resolution fluorescence volume.
+- $S_t$ is the imperfect current instance segmentation.
+- $\mathcal{T}_t$ is the provisional temporal evidence produced from Trackastra pass 1.
+- $\mathbf{s} = (s_z, s_y, s_x)$ is the native voxel spacing.
+- $S_t^*$ is the corrected set of cell instances.
 
-Trackastra pass 2 is run on \(S_t^*\) after refinement.
+Trackastra pass 2 is run on $S_t^*$ after refinement.
 
 ## Design principles
 
@@ -104,16 +100,13 @@ physical-aware CNN          GATv2 encoder
 
 The model predicts an unordered set:
 
-\[
-\hat{\mathcal C}_t =
-\{(\hat p_i, \hat{\mathbf c}_i, \hat M_i)\}_{i=1}^{Q}
-\]
+$$\hat{\mathcal C}_t = \{(\hat p_i, \hat{\mathbf c}_i, \hat M_i)\}_{i=1}^{Q}$$
 
 where each query predicts:
 
-- \(\hat p_i\): cell-existence probability.
-- \(\hat{\mathbf c}_i\): cell center in physical/cell-normalized coordinates.
-- \(\hat M_i\): native-resolution 3D mask.
+- $\hat p_i$: cell-existence probability.
+- $\hat{\mathbf c}_i$: cell center in physical/cell-normalized coordinates.
+- $\hat M_i$: native-resolution 3D mask.
 
 There is no track identity in the output.
 

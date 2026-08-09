@@ -247,7 +247,7 @@ physical units
 Cross-dataset normalization occurs through:
 
 - explicit physical coordinates;
-- \(d_\text{ref}\)-normalized geometry;
+- $d_\text{ref}$-normalized geometry;
 - acquisition conditioning;
 - intensity augmentation.
 
