@@ -9,7 +9,7 @@ def random_flip_sample(sample: dict, p: float = 0.5) -> dict:
     """Flip dense zyx tensors and all relative zyx coordinates consistently."""
     out=dict(sample)
     dense_keys=["spatial_inputs","instance_labels"]
-    target_dense=["masks","foreground","center_heatmap","boundary"]
+    target_dense=["masks","label_map","foreground","center_heatmap","boundary"]
     coord_keys=["instance_centroids_um","temporal_ref_um"]
     for axis in range(3):
         if random.random()>=p: continue
@@ -19,7 +19,7 @@ def random_flip_sample(sample: dict, p: float = 0.5) -> dict:
         if "target" in out:
             t=dict(out["target"])
             if "masks" in t: t["masks"]=torch.flip(t["masks"],[axis+1])
-            for k in ["foreground","center_heatmap","boundary"]:
+            for k in ["label_map","foreground","center_heatmap","boundary"]:
                 if k in t: t[k]=torch.flip(t[k],[axis])
             if "centers_um" in t: t["centers_um"]=t["centers_um"].clone(); t["centers_um"][:,axis]*=-1
             if "centers_cellscale" in t: t["centers_cellscale"]=t["centers_cellscale"].clone(); t["centers_cellscale"][:,axis]*=-1

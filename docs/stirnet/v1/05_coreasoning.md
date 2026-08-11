@@ -144,6 +144,11 @@ $$M_{ij}= \begin{cases} 0,& \|\Delta p_{ij}\|\le R_i\\ -\infty,&\text{otherwise}
 
 plus spatial padding masks.
 
+The implementation must determine local candidates before materializing
+unbounded pairwise tensors, or use configurable query/key chunking with an
+online softmax. Chunking is an internal execution strategy: it must retain all
+tokens and preserve one global all-cell sample.
+
 ### Output
 
 $$U_i = \operatorname{MHA}(T_i,S,S).$$

@@ -18,6 +18,14 @@ def move_to_device(x,device):
     return x
 
 
+def move_batch_to_device(batch: dict, device: torch.device) -> dict:
+    """Move model inputs while retaining potentially huge target maps on CPU."""
+    return {
+        key: value if key == "targets" else move_to_device(value, device)
+        for key, value in batch.items()
+    }
+
+
 def model_forward_from_batch(model: StirNet,b:dict):
     return model(
         b["spatial_inputs"],b["instance_labels"],b["spacing_um"],b["dref_um"],
@@ -48,7 +56,7 @@ class Trainer:
         return torch.autocast(device_type="cuda",dtype=dtype)
 
     def train_step(self,batch:dict)->dict[str,float]:
-        self.model.train(); b=move_to_device(batch,self.device)
+        self.model.train(); b=move_batch_to_device(batch,self.device)
         self.optimizer.zero_grad(set_to_none=True)
         with self._autocast():
             out=model_forward_from_batch(self.model,b)
@@ -64,7 +72,7 @@ class Trainer:
 
     @torch.no_grad()
     def eval_step(self,batch:dict)->dict[str,float]:
-        self.model.eval();b=move_to_device(batch,self.device)
+        self.model.eval();b=move_batch_to_device(batch,self.device)
         with self._autocast():
             out=model_forward_from_batch(self.model,b);losses=self.criterion(out,b["targets"])
         return {k:float(v.detach().cpu()) for k,v in losses.items()}

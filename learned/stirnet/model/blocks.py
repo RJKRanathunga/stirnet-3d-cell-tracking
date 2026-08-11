@@ -27,10 +27,13 @@ class AxisFactorizedConv(nn.Module):
 
     def forward(self, x: Tensor, acquisition_embedding: Tensor) -> Tensor:
         gates = torch.sigmoid(self.gate(acquisition_embedding)).view(x.shape[0], 3, self.channels, 1, 1, 1)
-        z = self.conv_z(x) * gates[:, 0]
-        y = self.conv_y(x) * gates[:, 1]
-        xx = self.conv_x(x) * gates[:, 2]
-        return self.fuse(z + y + xx)
+        # Accumulate branch outputs as they are produced. This preserves
+        # g_z*F_z + g_y*F_y + g_x*F_x while avoiding three live full-resolution
+        # feature tensors at once.
+        out = self.conv_z(x) * gates[:, 0]
+        out.add_(self.conv_y(x) * gates[:, 1])
+        out.add_(self.conv_x(x) * gates[:, 2])
+        return self.fuse(out)
 
 
 class PhysicalAwareResBlock(nn.Module):

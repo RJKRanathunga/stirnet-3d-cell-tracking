@@ -36,6 +36,11 @@ $$C_{dice} = 1- \frac{ 2\sum_vp_i(v)g_j(v)+\epsilon }{ \sum_vp_i(v)+\sum_vg_j(v)
 
 Use a coarse feature grid for matching efficiency.
 
+The standard target representation may retain one integer native label map
+plus target IDs and centers. Downsample that label map once per required coarse
+resolution, then construct instance masks on the coarse grid. Do not eagerly
+materialize `K x Z x Y x X` native target masks.
+
 ## 6. Focal mask matching cost
 
 Use a binary focal mask cost over the same coarse grid.
@@ -87,6 +92,10 @@ Matched positive queries only.
 $$L_{mask}^{hi} = 5L_{Dice}^{hi} + 2L_{Focal}^{hi}.$$
 
 Average per instance before averaging over the batch. Do not allow high-resolution datasets to dominate simply because they contain more voxels.
+
+Render predictions and targets in bounded spatial/query chunks (or equivalent
+query-local supports). The streamed reduction must preserve the same per-cell
+Dice and focal objectives without allocating every matched native mask at once.
 
 ## 10. Coarse mask loss
 

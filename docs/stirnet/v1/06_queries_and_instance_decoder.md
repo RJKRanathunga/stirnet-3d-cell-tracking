@@ -58,14 +58,17 @@ Default:
 
 ```python
 N_DISCOVERY_QUERIES = 8
-MAX_QUERIES = 128
+MAX_QUERIES = None  # unbounded unless an explicit safety limit is requested
 ```
 
 Total:
 
 $$Q= 2N_\text{instances} + N_\text{temporal} + 8.$$
 
-Do not silently truncate.
+Allocate the required query count dynamically for every sample and pad only to
+the largest query count in that minibatch. Do not silently truncate. An
+optional configured maximum is only an explicit safety guard; exceeding it must
+raise rather than discard cells.
 
 ## 3. Current-instance feature pooling
 
@@ -105,8 +108,8 @@ bbox x/dref
 PCA axis 1/dref
 PCA axis 2/dref
 PCA axis 3/dref
-elongation
-flatness
+log1p elongation
+log1p flatness
 solidity
 compactness
 mean intensity
@@ -115,6 +118,9 @@ marker count
 ```
 
 This is a 14-D vector.
+
+The two PCA ratios use the same acquisition-resolution denominator floor and
+`log1p` representation as temporal graph nodes.
 
 Projection:
 

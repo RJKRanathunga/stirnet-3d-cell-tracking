@@ -39,6 +39,9 @@ class CoReasoningConfig:
     max_radius_dref: float = 2.5
     position_bias_hidden: int = 32
     dropout: float = 0.10
+    temporal_query_chunk_size: int = 8
+    spatial_query_chunk_size: int = 8192
+    spatial_key_chunk_size: int = 65536
 
 
 @dataclass
@@ -46,7 +49,7 @@ class QueryConfig:
     d_model: int = 128
     split_companions_per_instance: int = 1
     discovery_queries: int = 8
-    max_queries: int = 128
+    max_queries: int | None = None
     instance_feature_dim: int = 14
     temporal_gaussian_sigma_dref: float = 0.75
     prior_inside_logit: float = 1.5
@@ -84,6 +87,8 @@ class LossConfig:
     exist_focal_alpha_pos: float = 0.75
     exist_focal_alpha_neg: float = 0.25
     boundary_pos_weight: float = 4.0
+    native_chunk_voxels: int = 262_144
+    dense_chunk_voxels: int = 524_288
 
 
 @dataclass

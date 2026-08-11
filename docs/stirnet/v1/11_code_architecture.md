@@ -319,6 +319,9 @@ matched_gt_indices
 
 Keep matching code outside the model forward path where possible.
 
+Matching cost construction runs explicitly in FP32 and validates finiteness
+before calling the Hungarian solver.
+
 ## 17. `model/losses.py`
 
 Implement one criterion object:

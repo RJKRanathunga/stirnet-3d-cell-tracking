@@ -15,6 +15,9 @@ class DetectionRecord:
     physical_volume_um3: float
     bbox_um: tuple[float,float,float] = (0,0,0)
     pca_axes_um: tuple[float,float,float] = (0,0,0)
+    # Canonical model-ready values: log1p(non-negative PCA axis ratio), using
+    # acquisition resolution as the denominator floor. The standard
+    # extract_instance_metadata() path produces exactly this representation.
     elongation: float = 1.0
     flatness: float = 1.0
     solidity: float = 1.0

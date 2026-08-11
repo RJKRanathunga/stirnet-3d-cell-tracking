@@ -52,6 +52,24 @@ def feature_grid_coordinates_um(
     return grid
 
 
+def resize_label_map_nearest(labels: Tensor, spatial_shape: tuple[int, int, int]) -> Tensor:
+    """Nearest-neighbour resize for integer 3D label maps without float copies."""
+    if labels.ndim not in (3, 4):
+        raise ValueError(f"labels must have shape [Z,Y,X] or [B,Z,Y,X], got {tuple(labels.shape)}")
+    out = labels
+    for dim, target_size in zip(range(labels.ndim - 3, labels.ndim), spatial_shape):
+        source_size = labels.shape[dim]
+        if source_size == target_size:
+            continue
+        index = torch.div(
+            torch.arange(target_size, device=labels.device) * source_size,
+            target_size,
+            rounding_mode="floor",
+        ).clamp_max(source_size - 1)
+        out = out.index_select(dim, index)
+    return out
+
+
 def normalize_reference_to_grid(coords_um_relative: Tensor, shape: tuple[int, int, int], spacing_um: Tensor) -> Tensor:
     """Map relative physical coordinates to grid_sample coordinates in xyz order [-1, 1]."""
     if spacing_um.ndim == 1:

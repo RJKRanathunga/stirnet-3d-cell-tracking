@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from .attention import PhysicalPositionBias
 from .blocks import FeedForward
 from .config import DecoderConfig, QueryConfig
-from .coordinates import feature_grid_coordinates_um
+from .coordinates import feature_grid_coordinates_um, resize_label_map_nearest
 from .heads import CenterHead, ExistenceHead, MaskEmbeddingHead, dot_mask_logits
 from .query_builder import QUERY_DISCOVERY, QUERY_PRIMARY, QUERY_SPLIT, QUERY_TEMPORAL
 from .types import QueryState
@@ -27,7 +27,14 @@ def _cap_feature_tokens(feature: Tensor, spacing_um: Tensor, max_tokens: int) ->
         k = max(range(3), key=lambda i: target[i])
         target = tuple(v - 1 if i == k and v > 1 else v for i, v in enumerate(target))
     pooled = F.adaptive_avg_pool3d(feature, target)
-    ratio = torch.tensor([z / target[0], y / target[1], x / target[2]], device=feature.device, dtype=feature.dtype)
+    ratio = torch.tensor(
+        [
+            (size - 1) / (pooled_size - 1) if pooled_size > 1 else 1.0
+            for size, pooled_size in zip((z, y, x), target)
+        ],
+        device=feature.device,
+        dtype=spacing_um.dtype,
+    )
     return pooled, spacing_um * ratio[None]
 
 
@@ -68,7 +75,7 @@ class QueryCrossAttention(nn.Module):
             logits = torch.einsum("hqd,hnd->hqn", q, k) / math.sqrt(self.head_dim)
             delta = spatial_pos_um[b][None] - refs_um[b, valid_q][:, None]
             logits = logits + self.pos_bias(delta, dref_um[b]).permute(2,0,1)
-            sup = support[b, valid_q]
+            sup = support[b, valid_q].clone()
             # Ensure every query has at least one key.
             empty = ~sup.any(dim=-1)
             if empty.any():
@@ -78,8 +85,8 @@ class QueryCrossAttention(nn.Module):
             logits = logits.masked_fill(~sup[None], -1e4)
             weights = torch.softmax(logits, dim=-1)
             weights = F.dropout(weights, self.dropout, self.training)
-            msg = torch.einsum("hqn,hnd->hqd", weights, v).permute(1,0,2).reshape(valid_q.sum(), self.d_model)
-            out[b, valid_q] = self.out(msg)
+            msg = torch.einsum("hqn,hnd->hqd", weights, v).permute(1,0,2).reshape(int(valid_q.sum()), self.d_model)
+            out[b, valid_q] = self.out(msg).to(out.dtype)
         return out
 
 
@@ -146,7 +153,7 @@ class InstanceQueryDecoder(nn.Module):
         return support
 
     def _source_instance_support(self, q: QueryState, instance_labels: Tensor, spatial_shape: tuple[int,int,int]) -> Tensor:
-        labels = F.interpolate(instance_labels[:,None].float(), size=spatial_shape, mode="nearest").squeeze(1).long()
+        labels = resize_label_map_nearest(instance_labels, spatial_shape)
         B,Q = q.source_instance_ids.shape
         support = torch.zeros((B,Q,*spatial_shape), device=instance_labels.device, dtype=torch.bool)
         for b in range(B):

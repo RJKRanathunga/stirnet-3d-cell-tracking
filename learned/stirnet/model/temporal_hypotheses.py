@@ -24,7 +24,8 @@ class TrackletPooler(nn.Module):
         raw = self.score(h).squeeze(-1)[:, None]
         alpha = segment_softmax(raw, tracklet_id, n_tracklets).squeeze(-1)
         out = node_embeddings.new_zeros((n_tracklets, node_embeddings.shape[-1]))
-        out.index_add_(0, tracklet_id, node_embeddings * alpha[:, None])
+        source = (node_embeddings * alpha[:, None]).to(out.dtype)
+        out.index_add_(0, tracklet_id, source)
         return out
 
 

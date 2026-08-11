@@ -14,15 +14,17 @@ def segment_softmax(scores: Tensor, index: Tensor, num_segments: int) -> Tensor:
     """Softmax over edges grouped by destination index. scores=[E,H]."""
     if scores.numel() == 0:
         return scores
-    h = scores.shape[1]
+    original_dtype = scores.dtype
+    work = scores.float() if scores.dtype in (torch.float16, torch.bfloat16) else scores
+    h = work.shape[1]
     idx = index[:, None].expand(-1, h)
-    max_buf = torch.full((num_segments, h), -torch.inf, device=scores.device, dtype=scores.dtype)
-    max_buf.scatter_reduce_(0, idx, scores, reduce="amax", include_self=True)
-    stable = scores - max_buf[index]
+    max_buf = torch.full((num_segments, h), -torch.inf, device=work.device, dtype=work.dtype)
+    max_buf.scatter_reduce_(0, idx, work, reduce="amax", include_self=True)
+    stable = work - max_buf[index]
     ex = torch.exp(stable)
-    denom = torch.zeros((num_segments, h), device=scores.device, dtype=scores.dtype)
+    denom = torch.zeros((num_segments, h), device=work.device, dtype=work.dtype)
     denom.index_add_(0, index, ex)
-    return ex / denom[index].clamp_min(1e-8)
+    return (ex / denom[index].clamp_min(1e-8)).to(original_dtype)
 
 
 class EdgeGATv2Conv(nn.Module):
@@ -65,7 +67,7 @@ class EdgeGATv2Conv(nn.Module):
         alpha = F.dropout(alpha, p=self.dropout, training=self.training)
         msg = v[src] * alpha[..., None]
         out = torch.zeros((n, self.heads, self.head_dim), device=x.device, dtype=x.dtype)
-        out.index_add_(0, dst, msg)
+        out.index_add_(0, dst, msg.to(out.dtype))
         return self.out(out.reshape(n, self.d_model))
 
 

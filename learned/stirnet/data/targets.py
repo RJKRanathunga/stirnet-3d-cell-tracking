@@ -15,6 +15,25 @@ class InstanceMetadata:
     centroids_um: torch.Tensor
 
 
+def stable_log_shape_ratio(
+    numerator: float,
+    denominator: float,
+    *,
+    denominator_floor: float,
+) -> float:
+    """Return a stable model feature for a non-negative PCA axis ratio.
+
+    PCA axes estimated from voxel centres can be exactly zero for one-voxel,
+    line-like, or plane-like components. The finest physical voxel extent is
+    the smallest shape scale the acquisition can resolve, so it is a meaningful
+    denominator floor. ``log1p`` then keeps valid elongated objects on a scale
+    comparable with the other neural geometry inputs.
+    """
+    num = max(float(numerator), 0.0)
+    den = max(float(denominator), float(denominator_floor), np.finfo(np.float32).tiny)
+    return float(np.log1p(num / den))
+
+
 def _pca_axes_um(coords_um: np.ndarray) -> np.ndarray:
     if len(coords_um) < 3:
         return np.zeros(3, np.float32)
@@ -35,6 +54,7 @@ def extract_instance_metadata(
     ids = np.unique(labels)
     ids = ids[ids > 0]
     spacing = np.asarray(spacing_um, np.float32)
+    shape_resolution_um = float(np.min(spacing[spacing > 0])) if np.any(spacing > 0) else 1.0
     patch_center_um = 0.5 * (np.asarray(labels.shape, np.float32) - 1) * spacing
     voxel_volume = float(np.prod(spacing))
     feats, centers = [], []
@@ -47,8 +67,12 @@ def extract_instance_metadata(
         lo = coords.min(0); hi = coords.max(0) + 1
         bbox_um = (hi - lo).astype(np.float32) * spacing
         axes = _pca_axes_um(coords_um_abs)
-        elong = float(axes[0] / max(axes[1], 1e-6))
-        flat = float(axes[1] / max(axes[2], 1e-6))
+        elong = stable_log_shape_ratio(
+            axes[0], axes[1], denominator_floor=shape_resolution_um
+        )
+        flat = stable_log_shape_ratio(
+            axes[1], axes[2], denominator_floor=shape_resolution_um
+        )
         bbox_volume = float(np.prod(np.maximum(bbox_um, 1e-6)))
         compact = float(volume_um3 / max(bbox_volume, 1e-6))
         solidity = 1.0
@@ -134,9 +158,23 @@ def make_boundary_target(labels: np.ndarray, spacing_um, width_um: float = 1.0) 
     return ndi.binary_dilation(boundary, structure=structure).astype(np.float32)
 
 
-def build_gt_targets(gt_labels: np.ndarray, spacing_um, dref_um: float, center_sigma_um: float = 2.0, boundary_width_um: float = 1.0) -> dict:
+def build_gt_targets(
+    gt_labels: np.ndarray,
+    spacing_um,
+    dref_um: float,
+    center_sigma_um: float = 2.0,
+    boundary_width_um: float = 1.0,
+    *,
+    include_dense_masks: bool = False,
+) -> dict:
+    """Build targets around one integer label map.
+
+    Per-instance native-resolution masks are optional because their
+    ``K x Z x Y x X`` allocation is prohibitive for full all-cell scenes. The
+    matcher and criterion derive coarse masks and matched native target chunks
+    from ``label_map`` and ``ids`` instead.
+    """
     ids=np.unique(gt_labels); ids=ids[ids>0]
-    masks=np.stack([(gt_labels==i) for i in ids],axis=0) if len(ids) else np.zeros((0,*gt_labels.shape),bool)
     spacing=np.asarray(spacing_um,np.float32)
     center_abs=0.5*(np.asarray(gt_labels.shape,np.float32)-1)*spacing
     centers=[]
@@ -144,12 +182,16 @@ def build_gt_targets(gt_labels: np.ndarray, spacing_um, dref_um: float, center_s
         c=np.argwhere(gt_labels==i).mean(0)*spacing-center_abs
         centers.append(c)
     centers=np.asarray(centers,np.float32).reshape(len(ids),3)
-    return {
+    target = {
         "ids": torch.as_tensor(ids,dtype=torch.long),
-        "masks": torch.as_tensor(masks,dtype=torch.bool),
+        "label_map": torch.as_tensor(np.asarray(gt_labels, dtype=np.int32)),
         "centers_um": torch.as_tensor(centers,dtype=torch.float32),
         "centers_cellscale": torch.as_tensor(centers/max(dref_um,1e-6),dtype=torch.float32),
         "foreground": torch.as_tensor((gt_labels>0).astype(np.float32)),
         "center_heatmap": torch.as_tensor(make_center_heatmap(gt_labels.shape,centers,spacing_um,center_sigma_um)),
         "boundary": torch.as_tensor(make_boundary_target(gt_labels,spacing_um,boundary_width_um)),
     }
+    if include_dense_masks:
+        masks=np.stack([(gt_labels==i) for i in ids],axis=0) if len(ids) else np.zeros((0,*gt_labels.shape),bool)
+        target["masks"] = torch.as_tensor(masks,dtype=torch.bool)
+    return target

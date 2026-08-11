@@ -45,8 +45,8 @@ graph_x: [N_nodes, 32]
 | 4 | log physical volume / reference physical volume |
 | 5–7 | physical bbox dims / $d_\text{ref}$ |
 | 8–10 | PCA axis lengths / $d_\text{ref}$ |
-| 11 | elongation |
-| 12 | flatness |
+| 11 | log1p elongation (PCA axis 1 / axis 2) |
+| 12 | log1p flatness (PCA axis 2 / axis 3) |
 | 13 | solidity |
 | 14 | compactness |
 | 15 | normalized mean intensity |
@@ -64,6 +64,12 @@ graph_x: [N_nodes, 32]
 | 31 | physical-boundary-related indicator |
 
 All undefined quantities must have a corresponding validity convention or zero value produced by preprocessing.
+
+For the two PCA ratios, floor the denominator at the finest physical voxel
+extent before applying `log1p`. This represents unresolved thin axes at the
+acquisition resolution and prevents degenerate components from producing
+million-scale neural inputs. The same convention is used by current-instance
+geometry features.
 
 ## 4. Detection graph edges
 

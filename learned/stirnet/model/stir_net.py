@@ -20,18 +20,49 @@ class StirNet(nn.Module):
     def __init__(self, cfg: StirNetConfig | None = None):
         super().__init__()
         self.cfg = cfg or StirNetConfig()
+        self._validate_config()
+        c0, c1, c2, c3 = self.cfg.spatial.channels
         self.acquisition = AcquisitionEmbedding(self.cfg.spatial.acquisition_dim)
         self.encoder = SpatialEncoder(self.cfg.spatial)
         self.decoder = SpatialDecoder(self.cfg.spatial)
         self.graph_encoder = DetectionGraphEncoder(self.cfg.temporal)
         self.tracklet_pooler = TrackletPooler(self.cfg.temporal.d_model)
         self.temporal_builder = TemporalStateBuilder(self.cfg.temporal)
-        self.cr1 = CoReasoningBlock(128,self.cfg.spatial,self.cfg.temporal,self.cfg.coreasoning)
-        self.cr2 = CoReasoningBlock(64,self.cfg.spatial,self.cfg.temporal,self.cfg.coreasoning)
-        self.query_builder = InstanceQueryBuilder(self.cfg.queries, feature_channels=64)
-        self.query_decoder = InstanceQueryDecoder((128,64,32),self.cfg.decoder,self.cfg.queries)
+        self.cr1 = CoReasoningBlock(c3,self.cfg.spatial,self.cfg.temporal,self.cfg.coreasoning)
+        self.cr2 = CoReasoningBlock(c2,self.cfg.spatial,self.cfg.temporal,self.cfg.coreasoning)
+        self.query_builder = InstanceQueryBuilder(self.cfg.queries, feature_channels=c2)
+        self.query_decoder = InstanceQueryDecoder((c3,c2,c1),self.cfg.decoder,self.cfg.queries)
         self.native_mask_head = MaskEmbeddingHead(self.cfg.decoder.d_model,self.cfg.spatial.mask_dim)
-        self.dense_heads = DenseAuxiliaryHeads(16)
+        self.dense_heads = DenseAuxiliaryHeads(c0)
+
+    def _validate_config(self) -> None:
+        channels = self.cfg.spatial.channels
+        if len(channels) != 4 or any(c <= 0 for c in channels):
+            raise ValueError(
+                "STIR-Net V1 requires four positive spatial channel widths "
+                f"(E0..E3); got {channels}."
+            )
+        dims = {
+            "temporal.d_model": self.cfg.temporal.d_model,
+            "coreasoning.d_model": self.cfg.coreasoning.d_model,
+            "queries.d_model": self.cfg.queries.d_model,
+            "decoder.d_model": self.cfg.decoder.d_model,
+        }
+        if len(set(dims.values())) != 1:
+            values = ", ".join(f"{name}={value}" for name, value in dims.items())
+            raise ValueError(
+                "STIR-Net V1 shares one representation width across temporal, "
+                f"co-reasoning, query, and decoder modules; got {values}."
+            )
+        if self.cfg.decoder.layers != 3:
+            raise ValueError("STIR-Net V1 requires exactly three query decoder layers")
+        for name, d_model, heads in (
+            ("temporal", self.cfg.temporal.d_model, self.cfg.temporal.graph_heads),
+            ("coreasoning", self.cfg.coreasoning.d_model, self.cfg.coreasoning.heads),
+            ("decoder", self.cfg.decoder.d_model, self.cfg.decoder.heads),
+        ):
+            if heads <= 0 or d_model % heads:
+                raise ValueError(f"{name} d_model={d_model} must be divisible by heads={heads}")
 
     def _build_temporal(
         self, graph_x: Tensor, graph_edge_index: Tensor, graph_edge_attr: Tensor,

@@ -268,10 +268,15 @@ A training sample should provide at least:
     "hyp_edge_index": LongTensor[2, Eh],
     "hyp_edge_attr": FloatTensor[Eh, 8],
 
-    "gt_masks": BoolTensor[K, Z, Y, X] or sparse equivalent,
+    "gt_label_map": IntTensor[Z, Y, X],
+    "gt_instance_ids": LongTensor[K],
     "gt_centers_um": FloatTensor[K, 3],
     "gt_valid": BoolTensor[K],
 }
 ```
 
 Variable-sized tensors are collated through index/batch vectors rather than forced into dense per-sample padding unless required by attention.
+
+The preferred training representation keeps one integer GT label map. Coarse
+per-instance masks are derived after downsampling, and native masks are rendered
+only for matched queries in bounded chunks.

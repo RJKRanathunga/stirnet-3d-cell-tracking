@@ -7,6 +7,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from .config import QueryConfig
+from .coordinates import resize_label_map_nearest
 from .types import QueryState, TemporalState
 
 
@@ -40,7 +41,7 @@ class InstanceQueryBuilder(nn.Module):
         instance_centroids_um: Tensor,
     ) -> Tensor:
         B, C = feature.shape[:2]
-        labels_ds = F.interpolate(instance_labels[:, None].float(), size=feature.shape[-3:], mode="nearest").squeeze(1).long()
+        labels_ds = resize_label_map_nearest(instance_labels, feature.shape[-3:])
         pooled = feature.new_zeros((instance_ids.shape[0], 2 * C))
         for idx in range(instance_ids.shape[0]):
             b = int(instance_batch[idx].item())
@@ -56,9 +57,9 @@ class InstanceQueryBuilder(nn.Module):
                 vox = torch.round(vox).long()
                 vox = torch.minimum(torch.maximum(vox, torch.zeros_like(vox)), shape.long() - 1)
                 f = feature[b, :, vox[0], vox[1], vox[2]]
-                pooled[idx] = torch.cat([f, f], dim=0)
+                pooled[idx] = torch.cat([f, f], dim=0).to(pooled.dtype)
             else:
-                pooled[idx] = torch.cat([flat.mean(dim=0), flat.max(dim=0).values], dim=0)
+                pooled[idx] = torch.cat([flat.mean(dim=0), flat.max(dim=0).values], dim=0).to(pooled.dtype)
         return pooled
 
     def forward(
@@ -86,8 +87,8 @@ class InstanceQueryBuilder(nn.Module):
             if inst_idx.numel():
                 p = inst_emb[inst_idx]
                 pref = instance_centroids_um[inst_idx] / dref_um[b].clamp_min(1e-8)
-                primary = p + self.type_embedding.weight[QUERY_PRIMARY]
-                split = p + self.type_embedding.weight[QUERY_SPLIT]
+                primary = p + self.type_embedding.weight[QUERY_PRIMARY].to(p.dtype)
+                split = p + self.type_embedding.weight[QUERY_SPLIT].to(p.dtype)
                 parts += [primary, split]
                 refs += [pref, pref]
                 types += [torch.full((len(inst_idx),), QUERY_PRIMARY, device=feature.device, dtype=torch.long),
@@ -99,7 +100,8 @@ class InstanceQueryBuilder(nn.Module):
 
             tidx = torch.nonzero(temporal.batch_index == b, as_tuple=False).flatten() if not temporal.is_empty else torch.empty(0, dtype=torch.long, device=feature.device)
             if tidx.numel():
-                tq = temporal.tokens[tidx] + self.type_embedding.weight[QUERY_TEMPORAL]
+                tq = temporal.tokens[tidx]
+                tq = tq + self.type_embedding.weight[QUERY_TEMPORAL].to(tq.dtype)
                 parts.append(tq)
                 refs.append(temporal.ref_cellscale[tidx])
                 types.append(torch.full((len(tidx),), QUERY_TEMPORAL, device=feature.device, dtype=torch.long))
@@ -107,7 +109,8 @@ class InstanceQueryBuilder(nn.Module):
                 sal.append(temporal.salience[tidx])
                 rel.append(temporal.reliability[tidx])
 
-            dq = self.discovery_queries + self.type_embedding.weight[QUERY_DISCOVERY]
+            dq = self.discovery_queries.to(feature.dtype)
+            dq = dq + self.type_embedding.weight[QUERY_DISCOVERY].to(dq.dtype)
             parts.append(dq)
             refs.append(self.discovery_refs)
             types.append(torch.full((self.cfg.discovery_queries,), QUERY_DISCOVERY, device=feature.device, dtype=torch.long))
@@ -116,25 +119,30 @@ class InstanceQueryBuilder(nn.Module):
             rel.append(feature.new_zeros((self.cfg.discovery_queries, 1)))
 
             q = torch.cat(parts, dim=0)
-            if q.shape[0] > self.cfg.max_queries:
-                raise RuntimeError(f"Query count {q.shape[0]} exceeds MAX_QUERIES={self.cfg.max_queries}; use a smaller physical patch.")
+            if self.cfg.max_queries is not None and q.shape[0] > self.cfg.max_queries:
+                raise RuntimeError(
+                    f"Query count {q.shape[0]} exceeds the explicit safety limit "
+                    f"max_queries={self.cfg.max_queries}; raise or disable that limit "
+                    "to retain the complete all-cell sample."
+                )
             per_batch.append((q, torch.cat(refs), torch.cat(types), torch.cat(srcids), torch.cat(sal), torch.cat(rel)))
 
         qmax = max(x[0].shape[0] for x in per_batch)
-        embeddings = feature.new_zeros((B, qmax, self.cfg.d_model))
-        references = feature.new_zeros((B, qmax, 3))
+        query_dtype = per_batch[0][0].dtype
+        embeddings = torch.zeros((B, qmax, self.cfg.d_model), device=feature.device, dtype=query_dtype)
+        references = torch.zeros((B, qmax, 3), device=feature.device, dtype=dref_um.dtype)
         query_types = torch.full((B, qmax), -1, device=feature.device, dtype=torch.long)
         source_ids = torch.full((B, qmax), -1, device=feature.device, dtype=torch.long)
-        salience = feature.new_zeros((B, qmax, 1))
-        reliability = feature.new_zeros((B, qmax, 1))
+        salience = torch.zeros((B, qmax, 1), device=feature.device, dtype=query_dtype)
+        reliability = torch.zeros((B, qmax, 1), device=feature.device, dtype=query_dtype)
         padding = torch.ones((B, qmax), device=feature.device, dtype=torch.bool)
         for b, (q, r, t, s, sa, re) in enumerate(per_batch):
             n = q.shape[0]
-            embeddings[b, :n] = q
-            references[b, :n] = r
+            embeddings[b, :n] = q.to(embeddings.dtype)
+            references[b, :n] = r.to(references.dtype)
             query_types[b, :n] = t
             source_ids[b, :n] = s
-            salience[b, :n] = sa
-            reliability[b, :n] = re
+            salience[b, :n] = sa.to(salience.dtype)
+            reliability[b, :n] = re.to(reliability.dtype)
             padding[b, :n] = False
         return QueryState(embeddings, references, query_types, padding, source_ids, salience, reliability)
