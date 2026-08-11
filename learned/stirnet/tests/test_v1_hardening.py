@@ -186,6 +186,79 @@ def test_chunked_local_attention_is_chunk_boundary_invariant_and_local() -> None
     ) == 0
 
 
+def test_checkpointed_local_attention_preserves_outputs_and_gradients() -> None:
+    torch.manual_seed(5)
+    cfg = _attention_config(
+        temporal_query_chunk_size=2,
+        spatial_query_chunk_size=3,
+        spatial_key_chunk_size=2,
+    )
+    direct = LocalPhysicalCrossAttention(cfg).train()
+    checkpointed = LocalPhysicalCrossAttention(
+        cfg, activation_checkpointing=True
+    ).train()
+    checkpointed.load_state_dict(direct.state_dict())
+
+    spatial_direct = torch.randn(1, 7, 8, requires_grad=True)
+    temporal_direct = torch.randn(4, 8, requires_grad=True)
+    spatial_checkpointed = spatial_direct.detach().clone().requires_grad_()
+    temporal_checkpointed = temporal_direct.detach().clone().requires_grad_()
+    positions = torch.randn(1, 7, 3)
+    refs = torch.randn(4, 3)
+    salience = torch.rand(4, 1)
+    reliability = torch.rand(4, 1).clamp_min(0.1)
+    batch = torch.zeros(4, dtype=torch.long)
+    dref = torch.tensor([2.0])
+
+    def run(
+        module: LocalPhysicalCrossAttention,
+        spatial: torch.Tensor,
+        temporal: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        temporal_output = module.temporal_reads_spatial(
+            temporal, refs, salience, spatial, positions, batch, dref
+        )
+        spatial_output = module.spatial_reads_temporal(
+            spatial,
+            positions,
+            temporal,
+            refs,
+            salience,
+            reliability,
+            batch,
+            dref,
+        )
+        return temporal_output, spatial_output
+
+    direct_outputs = run(direct, spatial_direct, temporal_direct)
+    checkpointed_outputs = run(
+        checkpointed, spatial_checkpointed, temporal_checkpointed
+    )
+    for actual, expected in zip(checkpointed_outputs, direct_outputs):
+        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+
+    sum(output.square().mean() for output in direct_outputs).backward()
+    sum(output.square().mean() for output in checkpointed_outputs).backward()
+    torch.testing.assert_close(
+        spatial_checkpointed.grad, spatial_direct.grad, atol=2e-6, rtol=2e-5
+    )
+    torch.testing.assert_close(
+        temporal_checkpointed.grad, temporal_direct.grad, atol=2e-6, rtol=2e-5
+    )
+    direct_grads = dict(direct.named_parameters())
+    checkpointed_grads = dict(checkpointed.named_parameters())
+    assert direct_grads.keys() == checkpointed_grads.keys()
+    for name, parameter in direct_grads.items():
+        assert parameter.grad is not None, name
+        assert checkpointed_grads[name].grad is not None, name
+        torch.testing.assert_close(
+            checkpointed_grads[name].grad,
+            parameter.grad,
+            atol=3e-6,
+            rtol=3e-5,
+        )
+
+
 def test_query_cross_attention_cpu_autocast_preserves_destination_dtype() -> None:
     cfg = StirNetConfig().decoder
     cfg.d_model = 8

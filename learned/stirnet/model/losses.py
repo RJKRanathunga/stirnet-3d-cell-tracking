@@ -4,7 +4,8 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from .config import LossConfig, QueryConfig
+from .checkpointing import checkpoint_if_enabled
+from .config import LossConfig, QueryConfig, TrainingConfig
 from .matcher import (
     HungarianMatcher3D,
     MatchResult,
@@ -54,10 +55,19 @@ def _tensor_chunk(tensor: Tensor, start: int, end: int, device: torch.device) ->
 
 
 class RefinementCriterion(nn.Module):
-    def __init__(self, loss_cfg: LossConfig, query_cfg: QueryConfig):
+    def __init__(
+        self,
+        loss_cfg: LossConfig,
+        query_cfg: QueryConfig,
+        training_cfg: TrainingConfig | None = None,
+    ):
         super().__init__()
         self.cfg = loss_cfg
         self.query_cfg = query_cfg
+        training_cfg = training_cfg or TrainingConfig()
+        self.activation_checkpointing = (
+            training_cfg.activation_checkpointing and training_cfg.checkpoint_losses
+        )
         self.matcher = HungarianMatcher3D()
 
     def _coarse_targets(self, out: dict[str, Tensor], targets: list[dict]) -> list[Tensor]:
@@ -221,47 +231,112 @@ class RefinementCriterion(nn.Module):
 
                 for start in range(0, voxel_count, spatial_chunk):
                     end = min(start + spatial_chunk, voxel_count)
-                    logits = torch.einsum("qc,cv->qv", embeddings, feature_flat[:, start:end])
-                    prior = torch.zeros_like(logits)
-
-                    seeded = (query_types == QUERY_PRIMARY) | (query_types == QUERY_SPLIT)
-                    if seeded.any():
-                        inside = current_labels[start:end][None] == source_ids[seeded, None]
-                        seeded_prior = torch.where(
-                            inside,
-                            logits.new_tensor(self.query_cfg.prior_inside_logit),
-                            logits.new_tensor(self.query_cfg.prior_outside_logit),
+                    def chunk_statistics(
+                        chunk_embeddings: Tensor,
+                        feature_chunk: Tensor,
+                        chunk_query_types: Tensor,
+                        chunk_source_ids: Tensor,
+                        chunk_refs_um: Tensor,
+                        chunk_spacing: Tensor,
+                        chunk_extent: Tensor,
+                        *,
+                        chunk_start: int = start,
+                        chunk_end: int = end,
+                        target=targets[b],
+                        target_indices: Tensor = gt_indices,
+                        current_label_volume: Tensor = current_labels,
+                        dref: Tensor = outputs.dref_um[b],
+                    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+                        logits = torch.einsum(
+                            "qc,cv->qv", chunk_embeddings, feature_chunk
                         )
-                        prior[seeded] = seeded_prior.to(prior.dtype)
-
-                    temporal = query_types == QUERY_TEMPORAL
-                    if temporal.any():
-                        linear = torch.arange(start, end, device=feature_flat.device)
-                        z_coord = torch.div(linear, y_size * x_size, rounding_mode="floor")
-                        remainder = linear.remainder(y_size * x_size)
-                        y_coord = torch.div(remainder, x_size, rounding_mode="floor")
-                        x_coord = remainder.remainder(x_size)
-                        coords = torch.stack([z_coord, y_coord, x_coord], dim=-1).float()
-                        coords_um = coords * spacing[None] - 0.5 * extent[None]
-                        delta = coords_um[None] - refs_um[temporal, None]
-                        sigma = self.query_cfg.temporal_gaussian_sigma_dref * outputs.dref_um[b].float()
-                        temporal_prior = self.query_cfg.prior_inside_logit * torch.exp(
-                            -0.5 * delta.square().sum(dim=-1) / sigma.clamp_min(1e-6).square()
+                        prior = torch.zeros_like(logits)
+                        seeded = (chunk_query_types == QUERY_PRIMARY) | (
+                            chunk_query_types == QUERY_SPLIT
                         )
-                        prior[temporal] = temporal_prior.to(prior.dtype)
+                        if seeded.any():
+                            inside = (
+                                current_label_volume[chunk_start:chunk_end][None]
+                                == chunk_source_ids[seeded, None]
+                            )
+                            seeded_prior = torch.where(
+                                inside,
+                                logits.new_tensor(self.query_cfg.prior_inside_logit),
+                                logits.new_tensor(self.query_cfg.prior_outside_logit),
+                            )
+                            prior[seeded] = seeded_prior.to(prior.dtype)
 
-                    target_chunk = self._native_target_chunk(
-                        targets[b], gt_indices, start, end, feature_flat.device
+                        temporal = chunk_query_types == QUERY_TEMPORAL
+                        if temporal.any():
+                            linear = torch.arange(
+                                chunk_start, chunk_end, device=feature_chunk.device
+                            )
+                            z_coord = torch.div(
+                                linear, y_size * x_size, rounding_mode="floor"
+                            )
+                            remainder = linear.remainder(y_size * x_size)
+                            y_coord = torch.div(
+                                remainder, x_size, rounding_mode="floor"
+                            )
+                            x_coord = remainder.remainder(x_size)
+                            coords = torch.stack(
+                                [z_coord, y_coord, x_coord], dim=-1
+                            ).float()
+                            coords_um = (
+                                coords * chunk_spacing[None]
+                                - 0.5 * chunk_extent[None]
+                            )
+                            delta = coords_um[None] - chunk_refs_um[temporal, None]
+                            sigma = (
+                                self.query_cfg.temporal_gaussian_sigma_dref
+                                * dref.float()
+                            )
+                            temporal_prior = (
+                                self.query_cfg.prior_inside_logit
+                                * torch.exp(
+                                    -0.5
+                                    * delta.square().sum(dim=-1)
+                                    / sigma.clamp_min(1e-6).square()
+                                )
+                            )
+                            prior[temporal] = temporal_prior.to(prior.dtype)
+
+                        target_chunk = self._native_target_chunk(
+                            target,
+                            target_indices,
+                            chunk_start,
+                            chunk_end,
+                            feature_chunk.device,
+                        )
+                        with torch.autocast(
+                            device_type=feature_chunk.device.type, enabled=False
+                        ):
+                            work_logits = (logits + prior).float()
+                            probability = work_logits.sigmoid()
+                            return (
+                                (probability * target_chunk).sum(dim=-1),
+                                probability.sum(dim=-1),
+                                target_chunk.sum(dim=-1),
+                                binary_focal_loss_with_logits(
+                                    work_logits, target_chunk, reduction="none"
+                                ).sum(dim=-1),
+                            )
+
+                    chunk_values = checkpoint_if_enabled(
+                        chunk_statistics,
+                        embeddings,
+                        feature_flat[:, start:end],
+                        query_types,
+                        source_ids,
+                        refs_um,
+                        spacing,
+                        extent,
+                        enabled=self.activation_checkpointing and self.training,
                     )
-                    with torch.autocast(device_type=feature_flat.device.type, enabled=False):
-                        work_logits = (logits + prior).float()
-                        probability = work_logits.sigmoid()
-                        intersection = intersection + (probability * target_chunk).sum(dim=-1)
-                        probability_sum = probability_sum + probability.sum(dim=-1)
-                        target_sum = target_sum + target_chunk.sum(dim=-1)
-                        focal_sum = focal_sum + binary_focal_loss_with_logits(
-                            work_logits, target_chunk, reduction="none"
-                        ).sum(dim=-1)
+                    intersection = intersection + chunk_values[0]
+                    probability_sum = probability_sum + chunk_values[1]
+                    target_sum = target_sum + chunk_values[2]
+                    focal_sum = focal_sum + chunk_values[3]
 
                 dice_values.append(
                     1 - (2 * intersection + 1e-6) / (
@@ -307,41 +382,77 @@ class RefinementCriterion(nn.Module):
         element_count = 0
         dice_values = []
         for b, target in enumerate(targets):
+            has_target = key in target or (
+                key == "foreground" and "label_map" in target
+            )
+            if not has_target:
+                continue
             intersection = logits.sum() * 0
             probability_sum = logits.sum() * 0
             target_sum = logits.sum() * 0
-            has_target = True
             for start in range(0, voxel_count, chunk_size):
                 end = min(start + chunk_size, voxel_count)
-                target_chunk = self._dense_target_chunk(
-                    target, key, start, end, logits.device
-                )
-                if target_chunk is None:
-                    has_target = False
-                    break
-                with torch.autocast(device_type=logits.device.type, enabled=False):
-                    pred = flat_logits[b, start:end].float()
-                    if focal:
-                        value = binary_focal_loss_with_logits(
-                            pred, target_chunk, reduction="sum"
-                        )
-                    else:
-                        weight = None
-                        if pos_weight is not None:
-                            weight = torch.tensor(
-                                pos_weight, device=pred.device, dtype=pred.dtype
+                def chunk_statistics(
+                    prediction_chunk: Tensor,
+                    *,
+                    chunk_start: int = start,
+                    chunk_end: int = end,
+                    chunk_target=target,
+                ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+                    target_chunk = self._dense_target_chunk(
+                        chunk_target,
+                        key,
+                        chunk_start,
+                        chunk_end,
+                        prediction_chunk.device,
+                    )
+                    if target_chunk is None:
+                        raise RuntimeError(f"Missing dense target '{key}'")
+                    with torch.autocast(
+                        device_type=prediction_chunk.device.type, enabled=False
+                    ):
+                        prediction = prediction_chunk.float()
+                        if focal:
+                            value = binary_focal_loss_with_logits(
+                                prediction, target_chunk, reduction="sum"
                             )
-                        value = F.binary_cross_entropy_with_logits(
-                            pred, target_chunk, pos_weight=weight, reduction="sum"
-                        )
-                    element_sum = element_sum + value
-                    element_count += end - start
-                    if include_dice:
-                        probability = pred.sigmoid()
-                        intersection = intersection + (probability * target_chunk).sum()
-                        probability_sum = probability_sum + probability.sum()
-                        target_sum = target_sum + target_chunk.sum()
-            if has_target and include_dice:
+                        else:
+                            weight = None
+                            if pos_weight is not None:
+                                weight = torch.tensor(
+                                    pos_weight,
+                                    device=prediction.device,
+                                    dtype=prediction.dtype,
+                                )
+                            value = F.binary_cross_entropy_with_logits(
+                                prediction,
+                                target_chunk,
+                                pos_weight=weight,
+                                reduction="sum",
+                            )
+                        if include_dice:
+                            probability = prediction.sigmoid()
+                            return (
+                                value,
+                                (probability * target_chunk).sum(),
+                                probability.sum(),
+                                target_chunk.sum(),
+                            )
+                        zero = value * 0
+                        return value, zero, zero, zero
+
+                chunk_values = checkpoint_if_enabled(
+                    chunk_statistics,
+                    flat_logits[b, start:end],
+                    enabled=self.activation_checkpointing and self.training,
+                )
+                element_sum = element_sum + chunk_values[0]
+                element_count += end - start
+                if include_dice:
+                    intersection = intersection + chunk_values[1]
+                    probability_sum = probability_sum + chunk_values[2]
+                    target_sum = target_sum + chunk_values[3]
+            if include_dice:
                 dice_values.append(
                     1 - (2 * intersection + 1e-6) / (
                         probability_sum + target_sum + 1e-6

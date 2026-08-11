@@ -344,6 +344,11 @@ cosine decay
 
 Use mixed precision where supported.
 
+Activation checkpointing is enabled by default for the spatial backbone,
+co-reasoning, and streamed losses. It trades additional backward recomputation
+for bounded retained activations and must not be implemented by shrinking the
+all-cell sample, temporal tracklet set, or dynamic query set.
+
 ## 15. Checkpoints
 
 Save:

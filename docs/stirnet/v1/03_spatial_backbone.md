@@ -348,3 +348,14 @@ co-reasoning blocks = identity on spatial stream
 ```
 
 This is required for curriculum Phase A and ablation testing.
+
+## 13. Training activation memory
+
+The encoder residual blocks are checkpointed one level at a time, and each
+decoder upsample/fusion/residual stage is checkpointed as one region when
+training activation checkpointing is enabled. Recalculation uses non-reentrant
+PyTorch checkpointing (`use_reentrant=False`). Native spatial tensors, samples,
+and skip connections are not cropped or detached; the optimization changes only
+which intermediate activations are retained for backward.
+
+Checkpointing is inactive in evaluation mode and under `torch.no_grad()`.

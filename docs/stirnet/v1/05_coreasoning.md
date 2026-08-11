@@ -149,6 +149,12 @@ unbounded pairwise tensors, or use configurable query/key chunking with an
 online softmax. Chunking is an internal execution strategy: it must retain all
 tokens and preserve one global all-cell sample.
 
+During gradient-enabled training, each bounded query/key chunk may also use
+non-reentrant activation checkpointing. Backward then recomputes the local
+physical-position bias, attention logits, masking, and message projection for
+that chunk rather than retaining all chunk intermediates. Both attention
+directions keep their exact token sets, radii, and online-softmax semantics.
+
 ### Output
 
 $$U_i = \operatorname{MHA}(T_i,S,S).$$
@@ -252,6 +258,11 @@ Reason:
 - convolution restores local geometric coherence.
 
 The final mask boundary is not inferred directly from attention weights.
+
+The gated spatial update and post-fusion spatial residual refinement are also
+checkpointed when co-reasoning checkpointing is enabled. This covers the dense
+feature activations surrounding the two attention directions without changing
+the block's residual equations.
 
 ## 12. Residual outputs
 

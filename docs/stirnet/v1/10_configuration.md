@@ -38,7 +38,21 @@ QUERY_FFN_DIM = 512
 COREASONING_TEMPORAL_QUERY_CHUNK = 8
 COREASONING_SPATIAL_QUERY_CHUNK = 8192
 COREASONING_SPATIAL_KEY_CHUNK = 65536
+
+# training activation-memory controls
+ACTIVATION_CHECKPOINTING = True
+CHECKPOINT_SPATIAL = True
+CHECKPOINT_COREASONING = True
+CHECKPOINT_LOSSES = True
 ```
+
+Activation checkpointing recomputes selected forward regions during backward
+instead of retaining their intermediate activations. The three component flags
+allow the spatial encoder/decoder, co-reasoning blocks, and streamed loss chunks
+to be controlled independently under the master flag. Checkpointing is applied
+only while the corresponding module is in training mode, gradients are enabled,
+and at least one tensor input requires a gradient. Evaluation and `torch.no_grad()`
+therefore use the direct forward path and preserve inference behavior.
 
 ## 2. Physical/cell-scale defaults
 

@@ -6,15 +6,17 @@ import torch
 from torch import Tensor, nn
 
 from .blocks import DownsampleBlock, PhysicalAwareResBlock
+from .checkpointing import checkpoint_if_enabled
 from .config import SpatialConfig
 from .spacing import choose_downsample_stride, propagate_spacing
 from .types import SpatialPyramid
 
 
 class SpatialEncoder(nn.Module):
-    def __init__(self, cfg: SpatialConfig):
+    def __init__(self, cfg: SpatialConfig, *, activation_checkpointing: bool = False):
         super().__init__()
         self.cfg = cfg
+        self.activation_checkpointing = activation_checkpointing
         ch = cfg.channels
         self.stem = nn.Conv3d(cfg.in_channels, ch[0], 1, bias=False)
         self.levels = nn.ModuleList()
@@ -48,8 +50,22 @@ class SpatialEncoder(nn.Module):
         current_spacing = spacing_um
         current_mask = padding_mask
         for level_idx, blocks in enumerate(self.levels):
-            for block in blocks:
-                x = block(x, acquisition_embedding)
+            def run_level(
+                level_input: Tensor,
+                embedding: Tensor,
+                level_blocks: nn.ModuleList = blocks,
+            ) -> Tensor:
+                result = level_input
+                for block in level_blocks:
+                    result = block(result, embedding)
+                return result
+
+            x = checkpoint_if_enabled(
+                run_level,
+                x,
+                acquisition_embedding,
+                enabled=self.activation_checkpointing and self.training,
+            )
             features.append(x)
             spacings.append(current_spacing)
             if current_mask is not None:

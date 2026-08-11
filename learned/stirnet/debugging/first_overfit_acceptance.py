@@ -191,10 +191,8 @@ def _build_temporal_inputs(
     )
 
 
-def run(data_dir: Path) -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("The real acceptance gate requires CUDA")
-    start_time = time.perf_counter()
+def build_real_batch(data_dir: Path) -> tuple[dict, dict[str, object]]:
+    """Build the uncropped all-cell acceptance sample on CPU."""
     trackastra_dir = data_dir / "trackastra"
     source_dir = data_dir / "stirnet_source"
     raw_movie = np.load(data_dir / "raw_movie.npy", mmap_mode="r")
@@ -261,21 +259,44 @@ def run(data_dir: Path) -> None:
         + len(temporal["temporal_ref_um"])
         + _reduced_config().queries.discovery_queries
     )
-    print(f"ROI: {roi_shape}; current={current_count}; GT={target_count}")
+    return batch, {
+        "roi_shape": roi_shape,
+        "current_count": current_count,
+        "target_count": target_count,
+        "graph_nodes": len(temporal["graph_x"]),
+        "temporal_tracklets": len(temporal["temporal_ref_um"]),
+        "required_queries": required_queries,
+        "instance_geometry_max": float(instance_metadata.features[:, 7:9].max()),
+        "graph_geometry_max": float(temporal["graph_x"][:, 11:13].max()),
+    }
+
+
+def run(data_dir: Path) -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError("The real acceptance gate requires CUDA")
+    start_time = time.perf_counter()
+    batch, sample = build_real_batch(data_dir)
     print(
-        f"graph nodes={len(temporal['graph_x'])}; temporal tracklets={len(temporal['temporal_ref_um'])}; "
-        f"required queries={required_queries}"
+        f"ROI: {sample['roi_shape']}; current={sample['current_count']}; "
+        f"GT={sample['target_count']}"
+    )
+    print(
+        f"graph nodes={sample['graph_nodes']}; "
+        f"temporal tracklets={sample['temporal_tracklets']}; "
+        f"required queries={sample['required_queries']}"
     )
     print(
         "geometry maxima: instance="
-        f"{float(instance_metadata.features[:, 7:9].max()):.5f}, "
-        f"graph={float(temporal['graph_x'][:, 11:13].max()):.5f}"
+        f"{sample['instance_geometry_max']:.5f}, "
+        f"graph={sample['graph_geometry_max']:.5f}"
     )
 
     cfg = _reduced_config()
     device = torch.device("cuda")
     model = StirNet(cfg).to(device).eval()
-    criterion = RefinementCriterion(cfg.losses, cfg.queries).to(device).eval()
+    criterion = RefinementCriterion(
+        cfg.losses, cfg.queries, cfg.training
+    ).to(device).eval()
     batch_device = {}
     for key, value in batch.items():
         if key == "targets":

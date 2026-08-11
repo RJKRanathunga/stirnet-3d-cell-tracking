@@ -6,6 +6,7 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from .checkpointing import checkpoint_if_enabled
 from .config import CoReasoningConfig
 
 
@@ -31,13 +32,19 @@ class LocalPhysicalCrossAttention(nn.Module):
     attention uses an online softmax over spatial key chunks, so its result is
     mathematically equivalent to attending over every local key at once.
     """
-    def __init__(self, cfg: CoReasoningConfig):
+    def __init__(
+        self,
+        cfg: CoReasoningConfig,
+        *,
+        activation_checkpointing: bool = False,
+    ):
         super().__init__()
         d, h = cfg.d_model, cfg.heads
         if d % h:
             raise ValueError("d_model must be divisible by heads")
         self.d_model, self.heads, self.head_dim = d, h, d // h
         self.dropout = cfg.dropout
+        self.activation_checkpointing = activation_checkpointing
         self.temporal_query_chunk_size = cfg.temporal_query_chunk_size
         self.spatial_query_chunk_size = cfg.spatial_query_chunk_size
         self.spatial_key_chunk_size = cfg.spatial_key_chunk_size
@@ -65,6 +72,97 @@ class LocalPhysicalCrossAttention(nn.Module):
 
     def _split(self, x: Tensor) -> Tensor:
         return x.view(*x.shape[:-1], self.heads, self.head_dim)
+
+    def _temporal_key_update(
+        self,
+        q: Tensor,
+        query_ref_um: Tensor,
+        query_radius_um: Tensor,
+        running_max: Tensor,
+        denominator: Tensor,
+        weighted_value: Tensor,
+        spatial_chunk: Tensor,
+        spatial_pos_chunk_um: Tensor,
+        dref_um: Tensor,
+        padding_chunk: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Apply one online-softmax spatial key chunk."""
+        key = self._split(self.s_k(spatial_chunk)).permute(1, 0, 2)
+        value = self._split(self.s_v(spatial_chunk)).permute(1, 0, 2)
+        logits = torch.einsum("hmd,hnd->hmn", q, key) / math.sqrt(self.head_dim)
+        delta = spatial_pos_chunk_um[None, :, :] - query_ref_um[:, None, :]
+        bias = self.pos_bias(delta, dref_um).permute(2, 0, 1)
+        logits = (logits + bias).float()
+        valid = torch.linalg.vector_norm(delta, dim=-1) <= query_radius_um[:, None]
+        valid = valid & (~padding_chunk[None, :])
+        logits = logits.masked_fill(~valid[None], -torch.inf)
+
+        chunk_max = logits.amax(dim=-1)
+        new_max = torch.maximum(running_max, chunk_max)
+        safe_new_max = torch.where(
+            torch.isfinite(new_max), new_max, torch.zeros_like(new_max)
+        )
+        old_scale = torch.where(
+            torch.isfinite(running_max),
+            torch.exp(running_max - safe_new_max),
+            torch.zeros_like(running_max),
+        )
+        exp_logits = torch.where(
+            valid[None],
+            torch.exp(logits - safe_new_max[..., None]),
+            torch.zeros_like(logits),
+        )
+        dropped_exp = F.dropout(exp_logits, self.dropout, self.training)
+        new_weighted_value = (
+            weighted_value * old_scale[..., None]
+            + torch.einsum("hmn,hnd->hmd", dropped_exp, value.float())
+        )
+        new_denominator = denominator * old_scale + exp_logits.sum(dim=-1)
+        return new_max, new_denominator, new_weighted_value
+
+    def _spatial_query_chunk(
+        self,
+        spatial_chunk: Tensor,
+        spatial_pos_chunk_um: Tensor,
+        temporal_key: Tensor,
+        temporal_value: Tensor,
+        temporal_ref_um: Tensor,
+        salience: Tensor,
+        reliability: Tensor,
+        radius_um: Tensor,
+        dref_um: Tensor,
+        salience_scale: Tensor,
+        reliability_scale: Tensor,
+        padding_chunk: Tensor,
+    ) -> Tensor:
+        """Compute one bounded spatial-query chunk."""
+        query = self._split(self.s_q(spatial_chunk)).permute(1, 0, 2)
+        delta = temporal_ref_um[None, :, :] - spatial_pos_chunk_um[:, None, :]
+        bias = self.pos_bias(delta, dref_um).permute(2, 0, 1)
+        logits = torch.einsum("hnd,hmd->hnm", query, temporal_key)
+        logits = logits / math.sqrt(self.head_dim)
+        logits = (
+            logits.float()
+            + bias.float()
+            + salience_scale.float() * salience.float()[None, None, :]
+            + reliability_scale.float()
+            * torch.log(reliability.float())[None, None, :]
+        )
+        valid = torch.linalg.vector_norm(delta, dim=-1) <= radius_um[None, :]
+        valid_any = valid.any(dim=-1)
+        safe_logits = logits.masked_fill(~valid[None], -torch.inf)
+        safe_logits = torch.where(
+            valid_any[None, :, None], safe_logits, torch.zeros_like(safe_logits)
+        )
+        weights = torch.softmax(safe_logits, dim=-1)
+        weights = F.dropout(weights, self.dropout, self.training)
+        weights = weights * valid_any[None, :, None]
+        message = torch.einsum("hnm,hmd->hnd", weights, temporal_value.float())
+        message = message.permute(1, 0, 2).reshape(
+            spatial_chunk.shape[0], self.d_model
+        )
+        projected = self.s_out(message).to(spatial_chunk.dtype)
+        return projected.masked_fill(padding_chunk[:, None], 0)
 
     def temporal_reads_spatial(
         self,
@@ -114,37 +212,27 @@ class LocalPhysicalCrossAttention(nn.Module):
                 for k_start in range(0, s.shape[0], self.spatial_key_chunk_size):
                     k_end = min(k_start + self.spatial_key_chunk_size, s.shape[0])
                     s_chunk = s[k_start:k_end]
-                    k = self._split(self.s_k(s_chunk)).permute(1, 0, 2)
-                    v = self._split(self.s_v(s_chunk)).permute(1, 0, 2)
-                    logits = torch.einsum("hmd,hnd->hmn", q, k) / math.sqrt(self.head_dim)
-                    delta = spos[k_start:k_end][None, :, :] - qref[:, None, :]
-                    bias = self.pos_bias(delta, dref_um[b]).permute(2, 0, 1)
-                    logits = (logits + bias).float()
-                    valid = torch.linalg.vector_norm(delta, dim=-1) <= qradius[:, None]
-                    if padding is not None:
-                        valid = valid & (~padding[k_start:k_end][None, :])
-                    logits = logits.masked_fill(~valid[None], -torch.inf)
-
-                    chunk_max = logits.amax(dim=-1)
-                    new_max = torch.maximum(running_max, chunk_max)
-                    safe_new_max = torch.where(torch.isfinite(new_max), new_max, torch.zeros_like(new_max))
-                    old_scale = torch.where(
-                        torch.isfinite(running_max),
-                        torch.exp(running_max - safe_new_max),
-                        torch.zeros_like(running_max),
+                    padding_chunk = (
+                        padding[k_start:k_end]
+                        if padding is not None
+                        else torch.zeros(
+                            k_end - k_start, device=s.device, dtype=torch.bool
+                        )
                     )
-                    exp_logits = torch.where(
-                        valid[None],
-                        torch.exp(logits - safe_new_max[..., None]),
-                        torch.zeros_like(logits),
+                    running_max, denominator, weighted_value = checkpoint_if_enabled(
+                        self._temporal_key_update,
+                        q,
+                        qref,
+                        qradius,
+                        running_max,
+                        denominator,
+                        weighted_value,
+                        s_chunk,
+                        spos[k_start:k_end],
+                        dref_um[b],
+                        padding_chunk,
+                        enabled=self.activation_checkpointing and self.training,
                     )
-                    dropped_exp = F.dropout(exp_logits, self.dropout, self.training)
-                    weighted_value = (
-                        weighted_value * old_scale[..., None]
-                        + torch.einsum("hmn,hnd->hmd", dropped_exp, v.float())
-                    )
-                    denominator = denominator * old_scale + exp_logits.sum(dim=-1)
-                    running_max = new_max
 
                 msg = weighted_value / denominator.clamp_min(1e-12)[..., None]
                 msg = torch.where(denominator[..., None] > 0, msg, torch.zeros_like(msg))
@@ -187,31 +275,28 @@ class LocalPhysicalCrossAttention(nn.Module):
             padding = spatial_padding_mask[b].reshape(-1) if spatial_padding_mask is not None else None
             for q_start in range(0, s.shape[0], self.spatial_query_chunk_size):
                 q_end = min(q_start + self.spatial_query_chunk_size, s.shape[0])
-                q = self._split(self.s_q(s[q_start:q_end])).permute(1, 0, 2)
-                delta = tref[None, :, :] - spos[q_start:q_end, None, :]
-                bias = self.pos_bias(delta, dref_um[b]).permute(2, 0, 1)
-                logits = torch.einsum("hnd,hmd->hnm", q, k) / math.sqrt(self.head_dim)
-                logits = (
-                    logits.float()
-                    + bias.float()
-                    + sal_scale.float() * sal.float()[None, None, :]
-                    + rel_scale.float() * torch.log(rel.float())[None, None, :]
+                padding_chunk = (
+                    padding[q_start:q_end]
+                    if padding is not None
+                    else torch.zeros(
+                        q_end - q_start, device=s.device, dtype=torch.bool
+                    )
                 )
-                valid = torch.linalg.vector_norm(delta, dim=-1) <= radius[None, :]
-                valid_any = valid.any(dim=-1)
-                # Softmax receives finite values for empty rows, after which
-                # their messages are explicitly zeroed.
-                safe_logits = logits.masked_fill(~valid[None], -torch.inf)
-                safe_logits = torch.where(
-                    valid_any[None, :, None], safe_logits, torch.zeros_like(safe_logits)
-                )
-                weights = torch.softmax(safe_logits, dim=-1)
-                weights = F.dropout(weights, self.dropout, self.training)
-                weights = weights * valid_any[None, :, None]
-                msg = torch.einsum("hnm,hmd->hnd", weights, v.float())
-                msg = msg.permute(1, 0, 2).reshape(q_end - q_start, self.d_model)
-                projected = self.s_out(msg).to(out.dtype)
-                if padding is not None:
-                    projected = projected.masked_fill(padding[q_start:q_end, None], 0)
+                projected = checkpoint_if_enabled(
+                    self._spatial_query_chunk,
+                    s[q_start:q_end],
+                    spos[q_start:q_end],
+                    k,
+                    v,
+                    tref,
+                    sal,
+                    rel,
+                    radius,
+                    dref_um[b],
+                    sal_scale,
+                    rel_scale,
+                    padding_chunk,
+                    enabled=self.activation_checkpointing and self.training,
+                ).to(out.dtype)
                 out[b, q_start:q_end] = projected
         return out

@@ -22,14 +22,32 @@ class StirNet(nn.Module):
         self.cfg = cfg or StirNetConfig()
         self._validate_config()
         c0, c1, c2, c3 = self.cfg.spatial.channels
+        checkpoint_spatial = (
+            self.cfg.training.activation_checkpointing
+            and self.cfg.training.checkpoint_spatial
+        )
+        checkpoint_coreasoning = (
+            self.cfg.training.activation_checkpointing
+            and self.cfg.training.checkpoint_coreasoning
+        )
         self.acquisition = AcquisitionEmbedding(self.cfg.spatial.acquisition_dim)
-        self.encoder = SpatialEncoder(self.cfg.spatial)
-        self.decoder = SpatialDecoder(self.cfg.spatial)
+        self.encoder = SpatialEncoder(
+            self.cfg.spatial, activation_checkpointing=checkpoint_spatial
+        )
+        self.decoder = SpatialDecoder(
+            self.cfg.spatial, activation_checkpointing=checkpoint_spatial
+        )
         self.graph_encoder = DetectionGraphEncoder(self.cfg.temporal)
         self.tracklet_pooler = TrackletPooler(self.cfg.temporal.d_model)
         self.temporal_builder = TemporalStateBuilder(self.cfg.temporal)
-        self.cr1 = CoReasoningBlock(c3,self.cfg.spatial,self.cfg.temporal,self.cfg.coreasoning)
-        self.cr2 = CoReasoningBlock(c2,self.cfg.spatial,self.cfg.temporal,self.cfg.coreasoning)
+        self.cr1 = CoReasoningBlock(
+            c3, self.cfg.spatial, self.cfg.temporal, self.cfg.coreasoning,
+            activation_checkpointing=checkpoint_coreasoning,
+        )
+        self.cr2 = CoReasoningBlock(
+            c2, self.cfg.spatial, self.cfg.temporal, self.cfg.coreasoning,
+            activation_checkpointing=checkpoint_coreasoning,
+        )
         self.query_builder = InstanceQueryBuilder(self.cfg.queries, feature_channels=c2)
         self.query_decoder = InstanceQueryDecoder((c3,c2,c1),self.cfg.decoder,self.cfg.queries)
         self.native_mask_head = MaskEmbeddingHead(self.cfg.decoder.d_model,self.cfg.spatial.mask_dim)

@@ -103,6 +103,10 @@ class TrainingConfig:
     temporal_position_jitter_dref: float = 0.10
     temporal_large_jitter_dref: float = 0.50
     temporal_false_clue_prob: float = 0.05
+    activation_checkpointing: bool = True
+    checkpoint_spatial: bool = True
+    checkpoint_coreasoning: bool = True
+    checkpoint_losses: bool = True
 
 
 @dataclass

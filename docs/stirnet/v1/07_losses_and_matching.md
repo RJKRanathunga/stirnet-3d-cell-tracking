@@ -97,6 +97,13 @@ Render predictions and targets in bounded spatial/query chunks (or equivalent
 query-local supports). The streamed reduction must preserve the same per-cell
 Dice and focal objectives without allocating every matched native mask at once.
 
+In training, native-mask and dense auxiliary loss chunks use non-reentrant
+activation checkpointing when configured. Their backward recomputation
+rematerializes only the current target chunk, so CPU-backed label maps remain
+the canonical target representation and the full set of per-chunk logits is not
+retained on the accelerator. Evaluation and no-gradient loss calculation use
+the direct streamed path.
+
 ## 10. Coarse mask loss
 
 Applied to matched queries at decoder scales:
