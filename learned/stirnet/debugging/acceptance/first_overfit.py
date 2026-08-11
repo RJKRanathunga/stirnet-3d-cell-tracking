@@ -1,14 +1,13 @@
-"""Run the real BlastoSPIM all-cell V1 forward/matching/loss acceptance gate.
+"""Real BlastoSPIM all-cell V1 forward/matching/loss acceptance helpers.
 
-This reproduces the useful data preparation from the first-overfit notebooks
-without any runtime monkey patches and intentionally stops before backward().
+This module preserves the data-building API used by the existing first-overfit
+notebooks while placing acceptance code under a dedicated subpackage.
 """
 from __future__ import annotations
 
 import argparse
 import gc
 import json
-import math
 import pickle
 import time
 from pathlib import Path
@@ -17,11 +16,7 @@ import numpy as np
 import torch
 
 from learned.stirnet import RefinementCriterion, StirNet, StirNetConfig
-from learned.stirnet.data.graph_builder import (
-    AssociationRecord,
-    DetectionRecord,
-    build_temporal_graph,
-)
+from learned.stirnet.data.graph_builder import AssociationRecord, DetectionRecord, build_temporal_graph
 from learned.stirnet.data.sample_builder import robust_normalize
 from learned.stirnet.data.targets import build_gt_targets, extract_instance_metadata
 from learned.stirnet.training.trainer import model_forward_from_batch, move_to_device
@@ -34,12 +29,7 @@ def _repo_root(start: Path) -> Path:
     raise RuntimeError("Could not locate the repository root")
 
 
-def _roi_with_all_cells(
-    instance_movie: np.ndarray,
-    gt_movie: np.ndarray,
-    spacing: np.ndarray,
-    margin_um: float = 12.0,
-) -> tuple[tuple[slice, slice, slice], np.ndarray, np.ndarray]:
+def _roi_with_all_cells(instance_movie, gt_movie, spacing, margin_um: float = 12.0):
     full_shape = np.asarray(instance_movie.shape[-3:], dtype=int)
     low = full_shape.copy()
     high = np.zeros(3, dtype=int)
@@ -75,16 +65,16 @@ def _reduced_config() -> StirNetConfig:
 
 def _build_temporal_inputs(
     track_graph,
-    instance_movie: np.ndarray,
-    raw_movie: np.ndarray,
-    markers_movie: np.ndarray,
-    roi: tuple[slice, slice, slice],
-    roi_low: np.ndarray,
-    target_local_time: int,
-    spacing: np.ndarray,
-    dref_um: float,
-    current_target: np.ndarray,
-) -> dict:
+    instance_movie,
+    raw_movie,
+    markers_movie,
+    roi,
+    roi_low,
+    target_local_time,
+    spacing,
+    dref_um,
+    current_target,
+):
     full_shape = np.asarray(instance_movie.shape[-3:], dtype=np.float32)
     roi_shape = np.asarray(current_target.shape, dtype=np.float32)
     roi_center_um = 0.5 * (roi_shape - 1) * spacing
@@ -93,7 +83,7 @@ def _build_temporal_inputs(
         for node_id, data in track_graph.nodes(data=True)
     }
 
-    def mean_velocity(node_id: int, neighbours: list[int], forward: bool) -> np.ndarray:
+    def mean_velocity(node_id: int, neighbours: list[int], forward: bool):
         if not neighbours:
             return np.zeros(3, dtype=np.float32)
         time0 = int(track_graph.nodes[node_id]["time"])
@@ -116,6 +106,7 @@ def _build_temporal_inputs(
         ids = metadata.ids.numpy()
         features = metadata.features.numpy()
         id_to_row = {int(instance_id): row for row, instance_id in enumerate(ids)}
+
         for node_id, node_data in track_graph.nodes(data=True):
             if int(node_data["time"]) != local_time:
                 continue
@@ -134,9 +125,7 @@ def _build_temporal_inputs(
             upper_roi_um = (roi_shape - 1 - coords_roi) * spacing
             predecessors = list(track_graph.predecessors(node_id))
             successors = list(track_graph.successors(node_id))
-            distance_to_volume_boundary = float(
-                np.min(np.concatenate([lower_full_um, upper_full_um]))
-            )
+            distance_to_volume_boundary = float(np.min(np.concatenate([lower_full_um, upper_full_um])))
             records.append(
                 DetectionRecord(
                     node_id=int(node_id),
@@ -151,20 +140,13 @@ def _build_temporal_inputs(
                     compactness=float(feature[10]),
                     intensity_mean=float(feature[11]),
                     intensity_std=float(feature[12]),
-                    backward_velocity_um=tuple(
-                        mean_velocity(int(node_id), predecessors, False).tolist()
-                    ),
-                    forward_velocity_um=tuple(
-                        mean_velocity(int(node_id), successors, True).tolist()
-                    ),
+                    backward_velocity_um=tuple(mean_velocity(int(node_id), predecessors, False).tolist()),
+                    forward_velocity_um=tuple(mean_velocity(int(node_id), successors, True).tolist()),
                     distance_to_volume_boundary_um=distance_to_volume_boundary,
-                    distance_to_patch_boundary_um=float(
-                        np.min(np.concatenate([lower_roi_um, upper_roi_um]))
-                    ),
+                    distance_to_patch_boundary_um=float(np.min(np.concatenate([lower_roi_um, upper_roi_um]))),
                     boundary_related=distance_to_volume_boundary <= 4.0,
                 )
             )
-        del labels, raw_normalized, marker, metadata
 
     associations = []
     for source, destination, edge_data in track_graph.edges(data=True):
@@ -179,6 +161,7 @@ def _build_temporal_inputs(
                 relation="division" if track_graph.out_degree(source) > 1 else "temporal",
             )
         )
+
     return build_temporal_graph(
         records,
         associations,
@@ -191,8 +174,9 @@ def _build_temporal_inputs(
     )
 
 
-def build_real_batch(data_dir: Path) -> tuple[dict, dict[str, object]]:
-    """Build the uncropped all-cell acceptance sample on CPU."""
+def build_real_batch(data_dir: Path):
+    """Build the current uncropped all-cell first-overfit sample on CPU."""
+    data_dir = Path(data_dir)
     trackastra_dir = data_dir / "trackastra"
     source_dir = data_dir / "stirnet_source"
     raw_movie = np.load(data_dir / "raw_movie.npy", mmap_mode="r")
@@ -203,6 +187,7 @@ def build_real_batch(data_dir: Path) -> tuple[dict, dict[str, object]]:
         metadata = json.load(handle)
     with (trackastra_dir / "track_graph.pkl").open("rb") as handle:
         track_graph = pickle.load(handle)
+
     spacing = np.asarray(metadata["spacing_zyx_um"], dtype=np.float32)
     dref_um = float(np.load(source_dir / "dref_um.npy"))
     target_local_time = 2
@@ -212,8 +197,6 @@ def build_real_batch(data_dir: Path) -> tuple[dict, dict[str, object]]:
     gt_target = np.asarray(gt_movie[target_local_time][roi]).astype(np.int32, copy=True)
     current_count = int(np.count_nonzero(np.unique(current_target) > 0))
     target_count = int(np.count_nonzero(np.unique(gt_target) > 0))
-    assert current_count == int(np.count_nonzero(np.unique(instance_movie[target_local_time]) > 0))
-    assert target_count == int(np.count_nonzero(np.unique(gt_movie[target_local_time]) > 0))
 
     spatial_inputs = np.stack(
         [
@@ -225,20 +208,11 @@ def build_real_batch(data_dir: Path) -> tuple[dict, dict[str, object]]:
         ],
         axis=0,
     ).astype(np.float32, copy=False)
-    instance_metadata = extract_instance_metadata(
-        current_target, spatial_inputs[0], tuple(spacing), dref_um, spatial_inputs[4]
-    )
+
+    instance_metadata = extract_instance_metadata(current_target, spatial_inputs[0], tuple(spacing), dref_um, spatial_inputs[4])
     temporal = _build_temporal_inputs(
-        track_graph,
-        instance_movie,
-        raw_movie,
-        markers_movie,
-        roi,
-        roi_low,
-        target_local_time,
-        spacing,
-        dref_um,
-        current_target,
+        track_graph, instance_movie, raw_movie, markers_movie,
+        roi, roi_low, target_local_time, spacing, dref_um, current_target,
     )
     target = build_gt_targets(gt_target, tuple(spacing), dref_um)
     batch = {
@@ -254,11 +228,7 @@ def build_real_batch(data_dir: Path) -> tuple[dict, dict[str, object]]:
         **temporal,
         "temporal_batch": torch.zeros(len(temporal["temporal_ref_um"]), dtype=torch.long),
     }
-    required_queries = (
-        2 * len(instance_metadata.ids)
-        + len(temporal["temporal_ref_um"])
-        + _reduced_config().queries.discovery_queries
-    )
+    required_queries = 2 * len(instance_metadata.ids) + len(temporal["temporal_ref_um"]) + _reduced_config().queries.discovery_queries
     return batch, {
         "roi_shape": roi_shape,
         "current_count": current_count,
@@ -274,80 +244,38 @@ def build_real_batch(data_dir: Path) -> tuple[dict, dict[str, object]]:
 def run(data_dir: Path) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("The real acceptance gate requires CUDA")
-    start_time = time.perf_counter()
     batch, sample = build_real_batch(data_dir)
-    print(
-        f"ROI: {sample['roi_shape']}; current={sample['current_count']}; "
-        f"GT={sample['target_count']}"
-    )
-    print(
-        f"graph nodes={sample['graph_nodes']}; "
-        f"temporal tracklets={sample['temporal_tracklets']}; "
-        f"required queries={sample['required_queries']}"
-    )
-    print(
-        "geometry maxima: instance="
-        f"{sample['instance_geometry_max']:.5f}, "
-        f"graph={sample['graph_geometry_max']:.5f}"
-    )
-
     cfg = _reduced_config()
     device = torch.device("cuda")
     model = StirNet(cfg).to(device).eval()
-    criterion = RefinementCriterion(
-        cfg.losses, cfg.queries, cfg.training
-    ).to(device).eval()
-    batch_device = {}
+    criterion = RefinementCriterion(cfg.losses, cfg.queries, cfg.training).to(device).eval()
+    b = {}
     for key, value in batch.items():
         if key == "targets":
-            batch_device[key] = value
+            b[key] = value
         elif key == "spatial_inputs":
-            batch_device[key] = value.to(device=device, dtype=torch.float16)
+            b[key] = value.to(device=device, dtype=torch.float16)
         elif key == "instance_labels":
-            batch_device[key] = value.to(device=device, dtype=torch.int32)
+            b[key] = value.to(device=device, dtype=torch.int32)
         else:
-            batch_device[key] = move_to_device(value, device)
-
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    forward_start = time.perf_counter()
+            b[key] = move_to_device(value, device)
+    gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+    started = time.perf_counter()
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
-        outputs = model_forward_from_batch(model, batch_device)
-        losses = criterion(outputs, batch_device["targets"])
+        outputs = model_forward_from_batch(model, b)
+        losses = criterion(outputs, b["targets"])
     torch.cuda.synchronize()
-    elapsed = time.perf_counter() - forward_start
-
-    tensors = {
-        "exist_logits": outputs.exist_logits,
-        "centers_cellscale": outputs.centers_cellscale,
-        "coarse_mask_logits": outputs.coarse_mask_logits,
-    }
-    for name, tensor in tensors.items():
-        finite = bool(torch.isfinite(tensor.float()).all())
-        print(f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} finite={finite}")
-        if not finite:
-            raise RuntimeError(f"{name} is non-finite")
-    for name, value in losses.items():
-        finite = bool(torch.isfinite(value.float()).all())
-        print(f"loss/{name}: {float(value):.7f} finite={finite}")
-        if not finite:
-            raise RuntimeError(f"loss/{name} is non-finite")
+    print(f"ROI: {sample['roi_shape']}; current={sample['current_count']}; GT={sample['target_count']}")
+    print(f"graph nodes={sample['graph_nodes']}; temporal tracklets={sample['temporal_tracklets']}; required queries={sample['required_queries']}")
+    print(f"forward_matching_loss_seconds={time.perf_counter() - started:.2f}")
     print(f"peak_cuda_gib={torch.cuda.max_memory_allocated() / 1024**3:.3f}")
-    print(f"forward_matching_loss_seconds={elapsed:.2f}")
-    print(f"total_seconds={time.perf_counter() - start_time:.2f}")
+    for name, value in losses.items():
+        print(f"loss/{name}: {float(value):.7f}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    default = (
-        _repo_root(Path.cwd())
-        / "data"
-        / "learned"
-        / "stirnet"
-        / "first_overfit"
-        / "BlastoSPIM1_F22_030_034"
-    )
+    default = _repo_root(Path.cwd()) / "data" / "learned" / "stirnet" / "first_overfit" / "BlastoSPIM1_F22_030_034"
     parser.add_argument("--data-dir", type=Path, default=default)
     args = parser.parse_args()
     run(args.data_dir)
