@@ -114,7 +114,36 @@ class RefinementCriterion(nn.Module):
             mask_supervision_radius_dref=self.cfg.mask_supervision_radius_dref,
             mask_focal_alpha_pos=self.cfg.mask_focal_alpha_pos,
             mask_focal_gamma=self.cfg.mask_focal_gamma,
+            temporal_match_radius_dref=self.query_cfg.temporal_match_radius_dref,
+            discovery_match_radius_dref=self.query_cfg.discovery_match_radius_dref,
         )
+        self.loss_weight_overrides: dict[str, float] = {}
+
+    def set_loss_weight_overrides(
+        self, overrides: dict[str, float] | None
+    ) -> None:
+        valid = {
+            "exist", "dice_hi", "focal_hi", "dice_coarse", "focal_coarse",
+            "center", "count", "overlap", "foreground", "center_heatmap",
+            "boundary", "aux_layer",
+        }
+        overrides = {} if overrides is None else dict(overrides)
+        unknown = set(overrides) - valid
+        if unknown:
+            raise KeyError(f"Unknown STIR-Net loss-weight overrides: {sorted(unknown)}")
+        self.loss_weight_overrides = {
+            key: float(value) for key, value in overrides.items()
+        }
+
+    def _effective_loss_weights(self) -> dict[str, float]:
+        names = (
+            "exist", "dice_hi", "focal_hi", "dice_coarse", "focal_coarse",
+            "center", "count", "overlap", "foreground", "center_heatmap",
+            "boundary", "aux_layer",
+        )
+        weights = {name: float(getattr(self.cfg, name)) for name in names}
+        weights.update(self.loss_weight_overrides)
+        return weights
 
     def _coarse_targets(self, out: dict[str, Tensor], targets: list[dict]) -> list[Tensor]:
         shape = tuple(int(v) for v in out["coarse_mask_logits"].shape[-3:])
@@ -217,11 +246,13 @@ class RefinementCriterion(nn.Module):
         )
         return dice, focal, F.smooth_l1_loss(pred_centers, target_centers)
 
-    def _count_loss(self, logits: Tensor, padding: Tensor, targets: list[dict]) -> Tensor:
+    def _count_loss(
+        self, logits: Tensor, padding: Tensor, matches: list[MatchResult]
+    ) -> Tensor:
         probability = torch.sigmoid(logits).masked_fill(padding, 0)
         predicted = probability.sum(dim=-1)
         target_count = torch.tensor(
-            [_target_count(target) for target in targets],
+            [len(match.pred_indices) for match in matches],
             device=logits.device,
             dtype=logits.dtype,
         )
@@ -552,6 +583,7 @@ class RefinementCriterion(nn.Module):
         return foreground, center, boundary
 
     def forward(self, outputs: StirNetOutput, targets: list[dict]) -> dict[str, Tensor]:
+        weights = self._effective_loss_weights()
         final = {
             "exist_logits": outputs.exist_logits,
             "centers_cellscale": outputs.centers_cellscale,
@@ -560,47 +592,82 @@ class RefinementCriterion(nn.Module):
             "dref_um": outputs.dref_um,
             "query_types": outputs.query_types,
             "source_instance_ids": outputs.source_instance_ids,
+            "query_initial_references_cellscale": outputs.query_initial_references_cellscale,
         }
-        final_targets = self._coarse_targets(final, targets)
-        matches = self._match(final, outputs.query_padding_mask, targets, final_targets)
-        loss_exist = self._existence_loss(
-            outputs.exist_logits, outputs.query_padding_mask, matches
+        zero = outputs.exist_logits.sum() * 0
+        query_active = any(
+            weights[name] > 0
+            for name in (
+                "exist", "dice_hi", "focal_hi", "dice_coarse",
+                "focal_coarse", "center", "count", "overlap",
+            )
+        ) or weights["aux_layer"] > 0
+        if query_active:
+            final_targets = self._coarse_targets(final, targets)
+            matches = self._match(
+                final, outputs.query_padding_mask, targets, final_targets
+            )
+        else:
+            final_targets = []
+            matches = [
+                MatchResult(
+                    torch.empty(0, device=outputs.exist_logits.device, dtype=torch.long),
+                    torch.empty(0, device=outputs.exist_logits.device, dtype=torch.long),
+                )
+                for _ in targets
+            ]
+        loss_exist = (
+            self._existence_loss(
+                outputs.exist_logits, outputs.query_padding_mask, matches
+            )
+            if weights["exist"] > 0 or weights["aux_layer"] > 0
+            else zero
         )
-        loss_coarse_dice, loss_coarse_focal, loss_center = self._coarse_losses(
-            final, matches, targets, final_targets
-        )
-        loss_count = self._count_loss(
-            outputs.exist_logits, outputs.query_padding_mask, targets
+        if any(weights[name] > 0 for name in ("dice_coarse", "focal_coarse", "center")) or weights["aux_layer"] > 0:
+            loss_coarse_dice, loss_coarse_focal, loss_center = self._coarse_losses(
+                final, matches, targets, final_targets
+            )
+        else:
+            loss_coarse_dice = loss_coarse_focal = loss_center = zero
+        loss_count = (
+            self._count_loss(outputs.exist_logits, outputs.query_padding_mask, matches)
+            if weights["count"] > 0
+            else zero
         )
         loss_overlap = (
             self._overlap_loss(outputs.coarse_mask_logits, matches)
-            if self.cfg.overlap > 0
-            else outputs.coarse_mask_logits.sum() * 0
+            if weights["overlap"] > 0
+            else zero
         )
-        loss_high_dice, loss_high_focal = self._native_mask_losses(
-            outputs, targets, matches
-        )
-        loss_foreground, loss_heatmap, loss_boundary = self._dense_losses(
-            outputs.dense_outputs, targets
-        )
+        if weights["dice_hi"] > 0 or weights["focal_hi"] > 0:
+            loss_high_dice, loss_high_focal = self._native_mask_losses(
+                outputs, targets, matches
+            )
+        else:
+            loss_high_dice = loss_high_focal = zero
+        if any(weights[name] > 0 for name in ("foreground", "center_heatmap", "boundary")):
+            loss_foreground, loss_heatmap, loss_boundary = self._dense_losses(
+                outputs.dense_outputs, targets
+            )
+        else:
+            loss_foreground = loss_heatmap = loss_boundary = zero
 
         total = (
-            self.cfg.exist * loss_exist
-            + self.cfg.dice_hi * loss_high_dice
-            + self.cfg.focal_hi * loss_high_focal
-            + self.cfg.dice_coarse * loss_coarse_dice
-            + self.cfg.focal_coarse * loss_coarse_focal
-            + self.cfg.center * loss_center
-            + self.cfg.count * loss_count
-            + self.cfg.overlap * loss_overlap
-            + self.cfg.foreground * loss_foreground
-            + self.cfg.center_heatmap * loss_heatmap
-            + self.cfg.boundary * loss_boundary
+            weights["exist"] * loss_exist
+            + weights["dice_hi"] * loss_high_dice
+            + weights["focal_hi"] * loss_high_focal
+            + weights["dice_coarse"] * loss_coarse_dice
+            + weights["focal_coarse"] * loss_coarse_focal
+            + weights["center"] * loss_center
+            + weights["count"] * loss_count
+            + weights["overlap"] * loss_overlap
+            + weights["foreground"] * loss_foreground
+            + weights["center_heatmap"] * loss_heatmap
+            + weights["boundary"] * loss_boundary
         )
 
-        zero = outputs.exist_logits.sum() * 0
         aux_total = zero
-        for aux in outputs.aux_outputs:
+        for aux in outputs.aux_outputs if weights["aux_layer"] > 0 else ():
             aux_for_loss = {
                 **aux,
                 "dref_um": outputs.dref_um,
@@ -612,11 +679,11 @@ class RefinementCriterion(nn.Module):
             aux_dice, aux_focal, aux_center = self._coarse_losses(
                 aux_for_loss, matches, targets, aux_targets
             )
-            aux_total = aux_total + self.cfg.aux_layer * (
-                self.cfg.exist * aux_exist
-                + self.cfg.dice_coarse * aux_dice
-                + self.cfg.focal_coarse * aux_focal
-                + self.cfg.center * aux_center
+            aux_total = aux_total + weights["aux_layer"] * (
+                weights["exist"] * aux_exist
+                + weights["dice_coarse"] * aux_dice
+                + weights["focal_coarse"] * aux_focal
+                + weights["center"] * aux_center
             )
         total = total + aux_total
         return {
@@ -633,4 +700,10 @@ class RefinementCriterion(nn.Module):
             "center_heatmap": loss_heatmap,
             "boundary": loss_boundary,
             "aux": aux_total,
+            "raw_gt_count": outputs.exist_logits.new_tensor(
+                [_target_count(target) for target in targets]
+            ).float().mean(),
+            "matched_count": outputs.exist_logits.new_tensor(
+                [len(match.pred_indices) for match in matches]
+            ).float().mean(),
         }

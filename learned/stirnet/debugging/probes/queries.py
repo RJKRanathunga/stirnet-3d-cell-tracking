@@ -92,7 +92,12 @@ def build_query_table(outputs, targets, matching: MatchingProbeResult, hook_capt
 
             if initial is not None:
                 ref_um = initial["references_cellscale"][b, q].numpy() * dref
-                row.update(initial_z_um=float(ref_um[0]), initial_y_um=float(ref_um[1]), initial_x_um=float(ref_um[2]))
+            else:
+                ref_um = (
+                    outputs.query_initial_references_cellscale[b, q]
+                    .detach().float().cpu().numpy() * dref
+                )
+            row.update(initial_z_um=float(ref_um[0]), initial_y_um=float(ref_um[1]), initial_x_um=float(ref_um[2]))
 
             target_idx = matching.query_to_target.get((b, q))
             if target_idx is not None:

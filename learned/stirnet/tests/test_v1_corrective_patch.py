@@ -249,6 +249,7 @@ def _criterion_fixture() -> tuple[StirNetOutput, dict]:
         query_types=torch.tensor([[QUERY_TEMPORAL, QUERY_DISCOVERY]]),
         query_padding_mask=torch.zeros(1, 2, dtype=torch.bool),
         source_instance_ids=torch.full((1, 2), -1, dtype=torch.long),
+        query_initial_references_cellscale=final_centers.clone(),
         temporal_salience=torch.zeros(1, 2, 1),
         temporal_reliability=torch.zeros(1, 2, 1),
         aux_outputs=[

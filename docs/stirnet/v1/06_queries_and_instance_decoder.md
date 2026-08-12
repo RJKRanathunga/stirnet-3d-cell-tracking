@@ -30,13 +30,17 @@ Meaning:
 
 ### 2.2 Split-companion queries
 
-One additional query per current input instance.
+A configurable baseline number per current input instance, with additional
+companions for unusually large current components.
 
 Meaning:
 
 > Could this current instance contain an additional biological cell?
 
-This allows geometry alone to correct merges even when Trackastra provides no useful temporal hypothesis.
+This allows geometry alone to correct multi-cell merges even when Trackastra
+provides no useful temporal hypothesis. One companion is insufficient for a
+component containing many cells: a nine-cell component needs one primary plus
+at least eight split companions.
 
 ### 2.3 Temporal repair queries
 
@@ -61,9 +65,21 @@ N_DISCOVERY_QUERIES = 8
 MAX_QUERIES = None  # unbounded unless an explicit safety limit is requested
 ```
 
-Total:
+The split multiplicity is inferred without GT. For source $i$ in a batch item,
+compute its current voxel volume $V_i$ and the median positive source volume
+$V_{med}$. Same-frame voxel ratios equal physical-volume ratios because spacing
+is constant within the volume. The default estimate is:
 
-$$Q= 2N_\text{instances} + N_\text{temporal} + 8.$$
+$$N_i^{total}=\left\lceil\frac{V_i/V_{med}}
+{\text{split\_volume\_ratio\_per\_hypothesis}}\right\rceil,$$
+
+$$N_i^{split}=\operatorname{clamp}\left(
+\max(N_{baseline}^{split},N_i^{total}-1),0,N_{max}^{split}\right).$$
+
+Defaults use one baseline companion and at most eight companions. The total is
+therefore dynamic:
+
+$$Q=N_\text{instances}+\sum_i N_i^{split}+N_\text{temporal}+8.$$
 
 Allocate the required query count dynamically for every sample and pad only to
 the largest query count in that minibatch. Do not silently truncate. An
@@ -136,11 +152,17 @@ Reference position:
 
 $$r_i^{primary} = \text{current instance centroid in physical/cellscale coordinates}.$$
 
-## 6. Split companion
+## 6. Split companions
 
-$$q_i^{split} = LN( q_i^{primary} + e_{split} ).$$
+For split slot $s$:
 
-It shares the same initial reference point and same current-mask support.
+$$q_{i,s}^{split} = q_i^{source} + e_{split} + e_s^{split-slot}.$$
+
+The learned slot table has shape
+`[max_split_companions_per_instance, d_model]`. Companions share the source
+centroid and source support, retain `QUERY_SPLIT` and the original source ID,
+but the slot embedding breaks permutation symmetry so the decoder can
+specialize them. Dropout is not the only symmetry breaker.
 
 For correct single cells, it should predict `no-object`.
 
@@ -433,6 +455,8 @@ native-resolution mask rendering
     "coarse_spacing_um": [B,3],
     "query_embeddings": [B,Q,128],
     "query_types": [B,Q],
+    "source_instance_ids": [B,Q],
+    "query_initial_references_cellscale": [B,Q,3],
     "aux_outputs": [
         layer1_dict,
         layer2_dict,
@@ -443,3 +467,6 @@ native-resolution mask rendering
 Native high-resolution masks are generated lazily through a dedicated renderer.
 `coarse_spacing_um` is the exact effective spacing after spatial-token capping
 and is used for physical matching and mask-loss supports.
+The immutable initial references are a production output, not debug-only state:
+temporal matching uses them to validate the physical meaning of a temporal
+clue even after decoder center refinement.

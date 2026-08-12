@@ -192,6 +192,8 @@ class HungarianMatcher3D(nn.Module):
         mask_supervision_radius_dref: float = 1.5,
         mask_focal_alpha_pos: float = 0.75,
         mask_focal_gamma: float = 2.0,
+        temporal_match_radius_dref: float = 1.0,
+        discovery_match_radius_dref: float = 1.5,
     ):
         super().__init__()
         self.w_exist = w_exist
@@ -201,6 +203,8 @@ class HungarianMatcher3D(nn.Module):
         self.mask_supervision_radius_dref = mask_supervision_radius_dref
         self.mask_focal_alpha_pos = mask_focal_alpha_pos
         self.mask_focal_gamma = mask_focal_gamma
+        self.temporal_match_radius_dref = temporal_match_radius_dref
+        self.discovery_match_radius_dref = discovery_match_radius_dref
 
     @staticmethod
     def _assignment(cost: Tensor) -> tuple[Tensor, Tensor]:
@@ -213,6 +217,49 @@ class HungarianMatcher3D(nn.Module):
             torch.as_tensor(col, device=cost.device, dtype=torch.long),
         )
 
+    @classmethod
+    def _eligible_assignment(
+        cls, cost: Tensor, eligible: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Maximum-cardinality, then minimum-cost assignment on eligible edges.
+
+        The augmented square problem gives every real query and GT its own
+        dummy. Its unmatched penalty dominates every possible change in real
+        edge costs, so cardinality is optimized before cost. Ineligible real
+        edges are more expensive than remaining unmatched and are filtered as
+        a final invariant.
+        """
+        if cost.shape != eligible.shape:
+            raise ValueError("cost and eligibility matrices must have one shape")
+        query_count, target_count = cost.shape
+        if query_count == 0 or target_count == 0 or not bool(eligible.any()):
+            empty = torch.empty(0, device=cost.device, dtype=torch.long)
+            return empty, empty
+        work = cost.float()
+        eligible_device = eligible.to(device=cost.device, dtype=torch.bool)
+        valid_costs = work[eligible_device]
+        shifted = work - valid_costs.min()
+        cost_span = (valid_costs.max() - valid_costs.min()).clamp_min(1.0)
+        max_cardinality = min(query_count, target_count)
+        unmatched_cost = cost_span * (max_cardinality + 1)
+        forbidden_cost = unmatched_cost * (query_count + target_count + 2)
+        size = query_count + target_count
+        augmented = work.new_full((size, size), forbidden_cost)
+        augmented[:query_count, :target_count] = torch.where(
+            eligible_device, shifted, forbidden_cost
+        )
+        augmented[:query_count, target_count:] = unmatched_cost
+        augmented[query_count:, :target_count] = unmatched_cost
+        augmented[query_count:, target_count:] = 0.0
+        rows, cols = cls._assignment(augmented)
+        real = (rows < query_count) & (cols < target_count)
+        rows, cols = rows[real], cols[real]
+        keep = eligible_device[rows, cols]
+        rows, cols = rows[keep], cols[keep]
+        if rows.unique().numel() != rows.numel() or cols.unique().numel() != cols.numel():
+            raise AssertionError("Eligible assignment is not one-to-one")
+        return rows, cols
+
     def _structured_assignment(
         self,
         cost: Tensor,
@@ -220,6 +267,9 @@ class HungarianMatcher3D(nn.Module):
         valid_gt: Tensor,
         query_types: Tensor,
         source_instance_ids: Tensor,
+        initial_references_cellscale: Tensor,
+        final_centers_cellscale: Tensor,
+        gt_centers_cellscale: Tensor,
         target: dict,
     ) -> tuple[Tensor, Tensor] | None:
         """Two-stage source-aware assignment in valid-query/valid-GT space."""
@@ -260,29 +310,57 @@ class HungarianMatcher3D(nn.Module):
         if seeded_rows.numel() and seeded_cols.numel():
             eligible_sub = eligible[seeded_rows][:, seeded_cols].to(cost.device)
             seeded_cost = cost[seeded_rows.to(cost.device)][:, seeded_cols.to(cost.device)]
-            scale = seeded_cost.abs().max() + 1.0
-            invalid_cost = scale * (min(seeded_cost.shape) + 1)
-            seeded_cost = torch.where(eligible_sub, seeded_cost, invalid_cost)
-            row, col = self._assignment(seeded_cost)
-            keep = eligible_sub[row, col]
-            row = seeded_rows.to(cost.device)[row[keep]]
-            col = seeded_cols.to(cost.device)[col[keep]]
+            row, col = self._eligible_assignment(seeded_cost, eligible_sub)
+            row = seeded_rows.to(cost.device)[row]
+            col = seeded_cols.to(cost.device)[col]
             if row.numel():
                 matched_rows.append(row)
                 matched_cols.append(col)
                 used_cols[col.detach().cpu()] = True
 
-        # Stage B: temporal/discovery queries see only GTs not owned in Stage A.
-        fallback_rows = torch.nonzero(
-            (qtypes == QUERY_TEMPORAL) | (qtypes == QUERY_DISCOVERY),
-            as_tuple=False,
-        ).flatten()
+        # Stage B1: temporal clues use their immutable initial references.
+        temporal_rows = torch.nonzero(qtypes == QUERY_TEMPORAL, as_tuple=False).flatten()
         remaining_cols = torch.nonzero(~used_cols, as_tuple=False).flatten()
-        if fallback_rows.numel() and remaining_cols.numel():
-            fallback_cost = cost[fallback_rows.to(cost.device)][:, remaining_cols.to(cost.device)]
-            row, col = self._assignment(fallback_cost)
-            matched_rows.append(fallback_rows.to(cost.device)[row])
-            matched_cols.append(remaining_cols.to(cost.device)[col])
+        if temporal_rows.numel() and remaining_cols.numel():
+            temporal_refs = initial_references_cellscale[valid_q][
+                temporal_rows.to(valid_q.device)
+            ].float()
+            remaining_centers = gt_centers_cellscale[
+                remaining_cols.to(gt_centers_cellscale.device)
+            ].float()
+            temporal_eligible = torch.cdist(
+                temporal_refs, remaining_centers, p=2
+            ) <= float(self.temporal_match_radius_dref)
+            temporal_cost = cost[temporal_rows.to(cost.device)][:, remaining_cols.to(cost.device)]
+            row, col = self._eligible_assignment(temporal_cost, temporal_eligible)
+            row = temporal_rows.to(cost.device)[row]
+            col = remaining_cols.to(cost.device)[col]
+            if row.numel():
+                matched_rows.append(row)
+                matched_cols.append(col)
+                used_cols[col.detach().cpu()] = True
+
+        # Stage B2: discovery uses decoded centers and sees only B1 leftovers.
+        discovery_rows = torch.nonzero(qtypes == QUERY_DISCOVERY, as_tuple=False).flatten()
+        remaining_cols = torch.nonzero(~used_cols, as_tuple=False).flatten()
+        if discovery_rows.numel() and remaining_cols.numel():
+            discovery_centers = final_centers_cellscale[valid_q][
+                discovery_rows.to(valid_q.device)
+            ].float()
+            remaining_centers = gt_centers_cellscale[
+                remaining_cols.to(gt_centers_cellscale.device)
+            ].float()
+            discovery_eligible = torch.cdist(
+                discovery_centers, remaining_centers, p=2
+            ) <= float(self.discovery_match_radius_dref)
+            discovery_cost = cost[discovery_rows.to(cost.device)][:, remaining_cols.to(cost.device)]
+            row, col = self._eligible_assignment(discovery_cost, discovery_eligible)
+            row = discovery_rows.to(cost.device)[row]
+            col = remaining_cols.to(cost.device)[col]
+            if row.numel():
+                matched_rows.append(row)
+                matched_cols.append(col)
+                used_cols[col.detach().cpu()] = True
 
         if not matched_rows:
             empty = torch.empty(0, device=cost.device, dtype=torch.long)
@@ -298,6 +376,32 @@ class HungarianMatcher3D(nn.Module):
         )
         if seeded.any() and not eligible[rows.cpu()[seeded], cols.cpu()[seeded]].all():
             raise AssertionError("Structured Hungarian produced a source-incompatible seeded match")
+        temporal = qtypes[rows.cpu()] == QUERY_TEMPORAL
+        if temporal.any():
+            rows_cpu = rows.detach().cpu()
+            cols_cpu = cols.detach().cpu()
+            initial_cpu = initial_references_cellscale.detach().float().cpu()
+            gt_centers_cpu = gt_centers_cellscale.detach().float().cpu()
+            distance = torch.linalg.vector_norm(
+                initial_cpu[valid_q.detach().cpu()][rows_cpu[temporal]]
+                - gt_centers_cpu[cols_cpu[temporal]],
+                dim=-1,
+            )
+            if bool((distance > self.temporal_match_radius_dref + 1e-6).any()):
+                raise AssertionError("Temporal match violates initial-reference radius")
+        discovery = qtypes[rows.cpu()] == QUERY_DISCOVERY
+        if discovery.any():
+            rows_cpu = rows.detach().cpu()
+            cols_cpu = cols.detach().cpu()
+            final_cpu = final_centers_cellscale.detach().float().cpu()
+            gt_centers_cpu = gt_centers_cellscale.detach().float().cpu()
+            distance = torch.linalg.vector_norm(
+                final_cpu[valid_q.detach().cpu()][rows_cpu[discovery]]
+                - gt_centers_cpu[cols_cpu[discovery]],
+                dim=-1,
+            )
+            if bool((distance > self.discovery_match_radius_dref + 1e-6).any()):
+                raise AssertionError("Discovery match violates decoded-center radius")
         return rows, cols
 
     @torch.no_grad()
@@ -366,6 +470,12 @@ class HungarianMatcher3D(nn.Module):
                     valid_gt,
                     output["query_types"][b],
                     output["source_instance_ids"][b],
+                    output.get(
+                        "query_initial_references_cellscale",
+                        output["centers_cellscale"],
+                    )[b],
+                    output["centers_cellscale"][b],
+                    gt_centers,
                     targets[b],
                 )
             row_t, col_t = (

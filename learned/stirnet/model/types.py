@@ -54,6 +54,7 @@ class StirNetOutput:
     query_types: Tensor
     query_padding_mask: Tensor
     source_instance_ids: Tensor
+    query_initial_references_cellscale: Tensor
     temporal_salience: Tensor
     temporal_reliability: Tensor
     aux_outputs: List[Dict[str, Tensor]]

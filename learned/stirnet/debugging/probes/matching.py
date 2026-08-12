@@ -29,6 +29,7 @@ def run_matching_probe(outputs, targets: list[dict]) -> MatchingProbeResult:
         "dref_um": outputs.dref_um,
         "query_types": outputs.query_types,
         "source_instance_ids": outputs.source_instance_ids,
+        "query_initial_references_cellscale": outputs.query_initial_references_cellscale,
     }
     matches = matcher(output_dict, outputs.query_padding_mask, targets)
 

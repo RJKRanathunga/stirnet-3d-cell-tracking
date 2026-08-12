@@ -55,6 +55,7 @@ learned/stirnet/
 ├── training/
 │   ├── __init__.py
 │   ├── trainer.py
+│   ├── curriculum.py
 │   ├── train.py
 │   ├── evaluate.py
 │   ├── metrics.py
@@ -112,7 +113,7 @@ class QueryState:
     references_cellscale: Tensor
     query_types: Tensor
     padding_mask: Tensor
-    priors: object
+    source_instance_ids: Tensor
 
 @dataclass
 class StirNetOutput:
@@ -120,6 +121,10 @@ class StirNetOutput:
     centers_cellscale: Tensor
     coarse_mask_logits: Tensor
     query_embeddings: Tensor
+    query_types: Tensor
+    query_padding_mask: Tensor
+    source_instance_ids: Tensor
+    query_initial_references_cellscale: Tensor
     aux_outputs: list
     dense_outputs: dict
     mask_features: Tensor
@@ -268,7 +273,9 @@ DiscoveryQueryBank
 QueryAssembler
 ```
 
-It owns query-type embeddings and initial references.
+It owns query-type embeddings, learned split-slot embeddings, dynamic
+source-volume split multiplicity, and initial references. Query construction
+uses current-source geometry only and pads to the largest per-batch count.
 
 ## 14. `model/query_decoder.py`
 
@@ -305,6 +312,8 @@ Inputs:
 existence logits
 coarse masks
 centers
+query types and source IDs
+initial query references
 GT masks
 GT centers
 valid flags
@@ -318,6 +327,10 @@ matched_gt_indices
 ```
 
 Keep matching code outside the model forward path where possible.
+
+Structured matching runs source-compatible seeded assignment, gated temporal
+recovery, then gated discovery recovery. Each gated stage implements
+maximum-cardinality/minimum-cost assignment with legal unmatched rows/columns.
 
 Matching cost construction runs explicitly in FP32 and validates finiteness
 before calling the Hungarian solver.
@@ -333,7 +346,17 @@ loss_dict = criterion(outputs, targets)
 
 Return a dict of named losses before weighted reduction.
 
-## 18. `model/stir_net.py`
+The criterion accepts non-destructive loss-weight overrides from the curriculum
+and reports raw GT count separately from the matched-positive count used by the
+count objective.
+
+## 18. `training/curriculum.py`
+
+Own the five stage definitions, persistent named model/optimizer parameter
+groups, trainability switches, LR scales, loss gates, and Stage-1 co-reasoning
+bypass flag. Stage transitions must preserve model and optimizer objects.
+
+## 19. `model/stir_net.py`
 
 Top-level network.
 
@@ -369,7 +392,7 @@ outputs = model(
 
 `stir_net.py` orchestrates modules but should contain little low-level math.
 
-## 19. High-resolution mask renderer
+## 20. High-resolution mask renderer
 
 Expose separately:
 
@@ -384,7 +407,7 @@ mask_logits = model.render_masks(
 
 This supports memory-efficient training and inference.
 
-## 20. Data layer responsibilities
+## 21. Data layer responsibilities
 
 `data/` owns all Trackastra-specific conversion.
 
@@ -392,7 +415,7 @@ The neural model must not receive Trackastra Python classes.
 
 `graph_builder.py` converts Trackastra output to plain tensors.
 
-## 21. Test strategy
+## 22. Test strategy
 
 At minimum create tests for:
 
@@ -410,7 +433,7 @@ variable native spacing
 full forward shape
 ```
 
-## 22. Debugging hooks
+## 23. Debugging hooks
 
 Model forward should optionally return:
 

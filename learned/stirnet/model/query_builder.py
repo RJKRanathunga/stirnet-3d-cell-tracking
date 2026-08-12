@@ -27,9 +27,85 @@ class InstanceQueryBuilder(nn.Module):
             nn.Linear(cfg.instance_feature_dim, 64), nn.SiLU(), nn.Linear(64, cfg.d_model)
         )
         self.type_embedding = nn.Embedding(NUM_QUERY_TYPES, cfg.d_model)
+        if cfg.split_companions_per_instance < 0:
+            raise ValueError("split_companions_per_instance must be non-negative")
+        if cfg.max_split_companions_per_instance < cfg.split_companions_per_instance:
+            raise ValueError(
+                "max_split_companions_per_instance must be at least the baseline "
+                "split_companions_per_instance"
+            )
+        if cfg.split_volume_ratio_per_hypothesis <= 0:
+            raise ValueError("split_volume_ratio_per_hypothesis must be positive")
+        self.split_slot_embedding = nn.Embedding(
+            cfg.max_split_companions_per_instance, cfg.d_model
+        )
+        nn.init.normal_(self.split_slot_embedding.weight, std=0.02)
         self.discovery_queries = nn.Parameter(torch.randn(cfg.discovery_queries, cfg.d_model) * 0.02)
         self.discovery_refs = nn.Parameter(torch.empty(cfg.discovery_queries, 3))
         nn.init.uniform_(self.discovery_refs, -2.0, 2.0)
+
+    @torch.no_grad()
+    def split_companion_counts(
+        self,
+        instance_labels: Tensor,
+        instance_ids: Tensor,
+        instance_batch: Tensor,
+    ) -> Tensor:
+        """Estimate per-source split multiplicity from current-source volume only.
+
+        Voxel-volume ratios equal physical-volume ratios within one batch item
+        because spacing is constant over that volume. The robust within-batch
+        median defines one typical cell, and no GT information is consumed.
+        """
+        counts = torch.zeros_like(instance_ids, dtype=torch.float32)
+        for batch_index in range(instance_labels.shape[0]):
+            rows = torch.nonzero(
+                instance_batch == batch_index, as_tuple=False
+            ).flatten()
+            if rows.numel() == 0:
+                continue
+            ids = instance_ids[rows]
+            max_id = int(ids.max().item())
+            labels = instance_labels[batch_index]
+            if max_id <= max(4096, 16 * int(rows.numel())):
+                histogram = torch.histc(
+                    labels.float(),
+                    bins=max_id + 1,
+                    min=-0.5,
+                    max=max_id + 0.5,
+                )
+                volumes = histogram[ids.long()].float()
+            else:
+                unique_ids, unique_counts = torch.unique(
+                    labels, return_counts=True
+                )
+                order = torch.argsort(unique_ids)
+                unique_ids = unique_ids[order]
+                unique_counts = unique_counts[order]
+                positions = torch.searchsorted(unique_ids, ids.to(unique_ids.dtype))
+                valid = positions < len(unique_ids)
+                safe_positions = positions.clamp_max(max(len(unique_ids) - 1, 0))
+                valid = valid & (unique_ids[safe_positions] == ids.to(unique_ids.dtype))
+                volumes = torch.zeros(len(ids), device=labels.device, dtype=torch.float32)
+                volumes[valid] = unique_counts[safe_positions[valid]].float()
+            positive = volumes[volumes > 0]
+            median = (
+                positive.median()
+                if positive.numel()
+                else volumes.new_tensor(1.0)
+            )
+            ratio = volumes / median.clamp_min(1.0)
+            estimated_total = torch.ceil(
+                ratio / float(self.cfg.split_volume_ratio_per_hypothesis)
+            ).long().clamp_min(1)
+            companions = torch.maximum(
+                estimated_total - 1,
+                torch.full_like(
+                    estimated_total, self.cfg.split_companions_per_instance
+                ),
+            ).clamp_max(self.cfg.max_split_companions_per_instance)
+            counts[rows] = companions.float()
+        return counts.long()
 
     def _pool_instances(
         self,
@@ -79,6 +155,9 @@ class InstanceQueryBuilder(nn.Module):
             feature, feature_spacing_um, instance_labels, instance_ids, instance_batch, instance_centroids_um
         )
         inst_emb = self.feature_proj(pooled) + self.geom_proj(instance_features)
+        split_counts = self.split_companion_counts(
+            instance_labels, instance_ids, instance_batch
+        )
 
         per_batch = []
         for b in range(B):
@@ -88,15 +167,30 @@ class InstanceQueryBuilder(nn.Module):
                 p = inst_emb[inst_idx]
                 pref = instance_centroids_um[inst_idx] / dref_um[b].clamp_min(1e-8)
                 primary = p + self.type_embedding.weight[QUERY_PRIMARY].to(p.dtype)
-                split = p + self.type_embedding.weight[QUERY_SPLIT].to(p.dtype)
-                parts += [primary, split]
-                refs += [pref, pref]
-                types += [torch.full((len(inst_idx),), QUERY_PRIMARY, device=feature.device, dtype=torch.long),
-                          torch.full((len(inst_idx),), QUERY_SPLIT, device=feature.device, dtype=torch.long)]
-                srcids += [instance_ids[inst_idx], instance_ids[inst_idx]]
+                parts.append(primary)
+                refs.append(pref)
+                types.append(torch.full((len(inst_idx),), QUERY_PRIMARY, device=feature.device, dtype=torch.long))
+                srcids.append(instance_ids[inst_idx])
                 zeros = feature.new_zeros((len(inst_idx), 1))
-                sal += [zeros, zeros]
-                rel += [zeros, zeros]
+                sal.append(zeros)
+                rel.append(zeros)
+                per_instance_splits = split_counts[inst_idx]
+                for slot in range(self.cfg.max_split_companions_per_instance):
+                    eligible = per_instance_splits > slot
+                    if not eligible.any():
+                        continue
+                    split = (
+                        p[eligible]
+                        + self.type_embedding.weight[QUERY_SPLIT].to(p.dtype)
+                        + self.split_slot_embedding.weight[slot].to(p.dtype)
+                    )
+                    split_count = int(eligible.sum())
+                    parts.append(split)
+                    refs.append(pref[eligible])
+                    types.append(torch.full((split_count,), QUERY_SPLIT, device=feature.device, dtype=torch.long))
+                    srcids.append(instance_ids[inst_idx][eligible])
+                    sal.append(feature.new_zeros((split_count, 1)))
+                    rel.append(feature.new_zeros((split_count, 1)))
 
             tidx = torch.nonzero(temporal.batch_index == b, as_tuple=False).flatten() if not temporal.is_empty else torch.empty(0, dtype=torch.long, device=feature.device)
             if tidx.numel():

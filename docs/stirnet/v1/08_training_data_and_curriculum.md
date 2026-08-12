@@ -275,53 +275,56 @@ Easy isolated cells should not dominate optimization.
 
 ## 13. Curriculum
 
-### Phase A — spatial correction pretraining
+The optional five-stage curriculum is controlled by configured step durations.
+It changes `requires_grad`, named optimizer-group learning rates, effective loss
+weights, and the Stage-1 co-reasoning bypass without reconstructing the model or
+AdamW optimizer. Optimizer state therefore survives transitions. With
+`curriculum.enabled = False`, all modules and base losses retain the legacy
+all-at-once behavior.
 
-Enable:
+Persistent parameter groups are:
 
-- physical-aware spatial encoder/decoder;
-- primary queries;
-- split companion queries;
-- discovery queries;
-- query decoder;
-- matcher/losses.
+```text
+spatial  = acquisition + encoder + decoder
+dense    = dense_heads
+temporal = graph_encoder + tracklet_pooler + temporal_builder + CR1 + CR2
+query    = query_builder + query_decoder
+native   = native_mask_head
+```
 
-Disable:
+### Stage 1 — `spatial_dense`
 
-- graph encoder;
-- temporal queries;
-- co-reasoning.
+Train only `spatial` and `dense`. CR1/CR2 are genuinely bypassed so frozen
+random co-reasoning cannot transform spatial features. Only foreground,
+boundary, and center-heatmap losses are active; all query, native, count, and
+auxiliary-layer weights are effectively zero.
 
-Goal:
+### Stage 2 — `temporal_dense`
 
-> Geometry alone must learn useful instance correction.
+Train `spatial`, `dense`, and `temporal`, including both co-reasoning blocks.
+Query and native groups remain frozen, and only the three dense losses are
+active.
 
-### Phase B — temporal integration
+### Stage 3 — `query_bootstrap`
 
-Load Phase-A weights.
+Train `dense`, `temporal`, and `query`; protect the spatial backbone with LR
+scale zero and keep `native` frozen. Existence, center, coarse Dice/focal,
+dense, and auxiliary-layer losses are active. Native Dice/focal, count, and
+overlap are zero.
 
-Enable:
+### Stage 4 — `native_bootstrap`
 
-- detection graph encoder;
-- temporal hypothesis construction;
-- temporal repair queries;
-- one coarse co-reasoning block.
+Enable `native` while retaining the Stage-3 trainable groups and protected
+spatial backbone. Add native Dice/focal. Count and overlap remain zero.
 
-Goal:
+### Stage 5 — `joint`
 
-> Prove temporal clues improve ambiguous cases.
-
-### Phase C — full V1
-
-Enable:
-
-- second co-reasoning block;
-- anomaly salience;
-- reliability;
-- temporal clue corruption;
-- end-to-end training of STIR-Net.
-
-Trackastra remains frozen and external.
+Unfreeze every group and enable the complete corrected V1 objective, including
+matched-positive count. Overlap stays disabled. Defaults scale the learned
+spatial path to `0.1 * base_lr`, dense heads to `0.5 * base_lr`, and temporal,
+query, and native groups to the base LR. These scales and all stage durations
+are configuration, not architectural constants. Trackastra remains frozen and
+external.
 
 ## 14. Optimizer defaults
 

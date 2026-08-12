@@ -8,6 +8,10 @@ from torch import nn
 
 from ..model import RefinementCriterion, StirNet, StirNetConfig
 from .checkpoint import save_checkpoint
+from .curriculum import (
+    CurriculumController,
+    optimizer_parameter_groups,
+)
 
 
 def move_to_device(x,device):
@@ -26,7 +30,9 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     }
 
 
-def model_forward_from_batch(model: StirNet,b:dict):
+def model_forward_from_batch(
+    model: StirNet, b: dict, *, bypass_coreasoning: bool = False
+):
     return model(
         b["spatial_inputs"],b["instance_labels"],b["spacing_um"],b["dref_um"],
         b["instance_features"],b["instance_ids"],b["instance_batch"],b["instance_centroids_um"],
@@ -34,6 +40,7 @@ def model_forward_from_batch(model: StirNet,b:dict):
         b["temporal_ref_um"],b["temporal_status"],b["hypothesis_edge_index"],
         b["hypothesis_edge_attr"],b["temporal_batch"],
         b.get("spatial_padding_mask"),
+        bypass_coreasoning=bypass_coreasoning,
     )
 
 
@@ -46,7 +53,18 @@ class Trainer:
         self.criterion=RefinementCriterion(
             cfg.losses, cfg.queries, cfg.training
         ).to(self.device)
-        self.optimizer=torch.optim.AdamW(model.parameters(),lr=cfg.training.lr,weight_decay=cfg.training.weight_decay)
+        self.optimizer=torch.optim.AdamW(
+            optimizer_parameter_groups(model, cfg.training.lr),
+            lr=cfg.training.lr,
+            weight_decay=cfg.training.weight_decay,
+        )
+        self.curriculum = CurriculumController(
+            model, self.optimizer, cfg.curriculum, cfg.training.lr
+        )
+        self.curriculum_stage = self.curriculum.apply(0)
+        self.criterion.set_loss_weight_overrides(
+            self.curriculum_stage.loss_weight_overrides
+        )
         self.scheduler=None
         self.amp_dtype=amp_dtype
         self.scaler=torch.amp.GradScaler("cuda",enabled=self.device.type=="cuda" and amp_dtype=="fp16")
@@ -58,10 +76,18 @@ class Trainer:
         return torch.autocast(device_type="cuda",dtype=dtype)
 
     def train_step(self,batch:dict)->dict[str,float]:
+        self.curriculum_stage = self.curriculum.apply(self.global_step)
+        self.criterion.set_loss_weight_overrides(
+            self.curriculum_stage.loss_weight_overrides
+        )
         self.model.train(); b=move_batch_to_device(batch,self.device)
         self.optimizer.zero_grad(set_to_none=True)
         with self._autocast():
-            out=model_forward_from_batch(self.model,b)
+            out=model_forward_from_batch(
+                self.model,
+                b,
+                bypass_coreasoning=self.curriculum_stage.bypass_coreasoning,
+            )
             losses=self.criterion(out,b["targets"])
             loss=losses["loss"]
         self.scaler.scale(loss).backward()
@@ -76,7 +102,11 @@ class Trainer:
     def eval_step(self,batch:dict)->dict[str,float]:
         self.model.eval();b=move_batch_to_device(batch,self.device)
         with self._autocast():
-            out=model_forward_from_batch(self.model,b);losses=self.criterion(out,b["targets"])
+            out=model_forward_from_batch(
+                self.model,
+                b,
+                bypass_coreasoning=self.curriculum_stage.bypass_coreasoning,
+            );losses=self.criterion(out,b["targets"])
         return {k:float(v.detach().cpu()) for k,v in losses.items()}
 
     def fit(self,train_loader,val_loader=None,epochs=1,out_dir="runs/stirnet",checkpoint_every=1):

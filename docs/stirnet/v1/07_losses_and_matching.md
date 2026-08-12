@@ -2,9 +2,10 @@
 
 ## 1. Principle
 
-Temporal and discovery queries form an unordered fallback set, but primary and
-split queries are seeded from a specific current instance. Matching therefore
-preserves source semantics before globally assigning fallback queries.
+Primary/split, temporal, and discovery queries have different semantics.
+Matching preserves source ownership first, then admits only physically
+plausible recovery queries. A GT without a plausible candidate is legally
+unmatched.
 
 Tracking identities are not used.
 
@@ -35,9 +36,23 @@ more GTs, primary and split compete for compatible GTs. The global seeded
 assignment also resolves oversegmentation: when multiple source fragments
 overlap one GT, at most one primary owns it.
 
-Stage B removes Stage-A-owned GTs and matches temporal/discovery queries
-globally to the remainder. Seeded queries never enter Stage B. Both stages are
-one-to-one, and incompatible seeded matches are filtered rather than forced.
+Stage B1 considers temporal queries against GTs left by Stage A. An edge is
+eligible only when the immutable temporal initial reference is within
+`temporal_match_radius_dref` (default `1.0`) of the GT center in Euclidean
+cell-scale distance. The final decoded center cannot redefine the temporal
+clue's semantic eligibility.
+
+Stage B2 considers discovery queries only against GTs left by B1. Because a
+discovery query has no temporal anchor, eligibility uses its final decoded
+center and `discovery_match_radius_dref` (default `1.5`). Seeded queries never
+enter either recovery stage.
+
+Every stage is one-to-one. Within a recovery stage, an augmented Hungarian
+problem gives real queries and GTs legal dummy assignments. The unmatched
+penalty dominates all variation among eligible real costs, while forbidden
+edges cost more than remaining unmatched. This produces maximum eligible-edge
+cardinality first and minimum cost second; an ineligible edge is never returned.
+Unmatched queries and unmatched GTs are both valid outcomes.
 
 ## 4. Existence matching cost
 
@@ -153,9 +168,18 @@ Expected number of cells:
 
 $$\hat N= \sum_i\sigma(e_i).$$
 
-$$L_{count} = \frac{ SmoothL1(\hat N,N_{GT}) }{ \max(1,N_{GT}) }.$$
+Let $N_{matched}$ be the number of positive existence targets created by the
+final structured assignment:
 
-This is a weak auxiliary loss.
+$$L_{count} = \frac{ SmoothL1(\hat N,N_{matched}) }
+{ \max(1,N_{matched}) }.$$
+
+This is a weak auxiliary loss. When all GTs are matched it is identical to the
+old GT-count target. When recovery candidates are exhausted it does not force
+unrelated queries positive merely to reach the raw GT count. Diagnostics report
+both raw GT count and matched-positive count. The staged curriculum delays this
+loss until joint training because early count gradients can oppose positive
+existence gradients.
 
 ## 13. Overlap loss
 

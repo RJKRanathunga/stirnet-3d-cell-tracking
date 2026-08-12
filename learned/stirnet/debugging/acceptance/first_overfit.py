@@ -20,7 +20,13 @@ from learned.stirnet.data.graph_builder import AssociationRecord, DetectionRecor
 from learned.stirnet.data.sample_builder import robust_normalize
 from learned.stirnet.data.targets import build_gt_targets, extract_instance_metadata
 from learned.stirnet.debugging.probes.matching import run_matching_probe
-from learned.stirnet.model.query_builder import QUERY_PRIMARY, QUERY_SPLIT
+from learned.stirnet.model.query_builder import (
+    InstanceQueryBuilder,
+    QUERY_DISCOVERY,
+    QUERY_PRIMARY,
+    QUERY_SPLIT,
+    QUERY_TEMPORAL,
+)
 from learned.stirnet.training.trainer import model_forward_from_batch, move_to_device
 
 
@@ -232,7 +238,28 @@ def build_real_batch(data_dir: Path):
         **temporal,
         "temporal_batch": torch.zeros(len(temporal["temporal_ref_um"]), dtype=torch.long),
     }
-    required_queries = 2 * len(instance_metadata.ids) + len(temporal["temporal_ref_um"]) + _reduced_config().queries.discovery_queries
+    acceptance_cfg = _reduced_config()
+    split_estimator = InstanceQueryBuilder(
+        acceptance_cfg.queries,
+        feature_channels=acceptance_cfg.spatial.channels[2],
+    )
+    split_counts = split_estimator.split_companion_counts(
+        torch.as_tensor(current_target).unsqueeze(0),
+        instance_metadata.ids,
+        torch.zeros(len(instance_metadata.ids), dtype=torch.long),
+    )
+    split_companions_by_source = {
+        int(source_id): int(companions)
+        for source_id, companions in zip(
+            instance_metadata.ids.tolist(), split_counts.tolist()
+        )
+    }
+    required_queries = (
+        len(instance_metadata.ids)
+        + int(split_counts.sum())
+        + len(temporal["temporal_ref_um"])
+        + acceptance_cfg.queries.discovery_queries
+    )
     return batch, {
         "roi_shape": roi_shape,
         "current_count": current_count,
@@ -240,6 +267,7 @@ def build_real_batch(data_dir: Path):
         "graph_nodes": len(temporal["graph_x"]),
         "temporal_tracklets": len(temporal["temporal_ref_um"]),
         "required_queries": required_queries,
+        "split_companions_by_source": split_companions_by_source,
         "instance_geometry_max": float(instance_metadata.features[:, 7:9].max()),
         "graph_geometry_max": float(temporal["graph_x"][:, 11:13].max()),
     }
@@ -279,19 +307,71 @@ def run(data_dir: Path) -> None:
         for row, source_id in enumerate(target["source_ids"].tolist())
     }
     incompatible_seeded = 0
+    one_gt_split_positives = 0
+    matched_by_type = {
+        QUERY_PRIMARY: 0,
+        QUERY_SPLIT: 0,
+        QUERY_TEMPORAL: 0,
+        QUERY_DISCOVERY: 0,
+    }
+    temporal_distances_dref = []
+    discovery_distances_dref = []
+    target_centers = torch.as_tensor(target["centers_cellscale"]).float()
     for pred_index, target_index in zip(
         matching.matches[0].pred_indices.detach().cpu().tolist(),
         matching.matches[0].target_indices.detach().cpu().tolist(),
     ):
         query_type = int(outputs.query_types[0, pred_index].detach().cpu())
+        matched_by_type[query_type] += 1
+        if query_type == QUERY_TEMPORAL:
+            initial = outputs.query_initial_references_cellscale[
+                0, pred_index
+            ].detach().float().cpu()
+            temporal_distances_dref.append(
+                float(torch.linalg.vector_norm(initial - target_centers[target_index]))
+            )
+        if query_type == QUERY_DISCOVERY:
+            center = outputs.centers_cellscale[0, pred_index].detach().float().cpu()
+            discovery_distances_dref.append(
+                float(torch.linalg.vector_norm(center - target_centers[target_index]))
+            )
         if query_type not in (QUERY_PRIMARY, QUERY_SPLIT):
             continue
         source_id = int(outputs.source_instance_ids[0, pred_index].detach().cpu())
         source_row = source_rows.get(source_id)
         if source_row is None or int(target["source_gt_overlap"][source_row, target_index]) <= 0:
             incompatible_seeded += 1
+        if (
+            query_type == QUERY_SPLIT
+            and source_row is not None
+            and int((target["source_gt_overlap"][source_row] > 0).sum()) == 1
+        ):
+            one_gt_split_positives += 1
     valid_query_count = int((~outputs.query_padding_mask[0]).sum().detach().cpu())
     matched_count = len(matching.matches[0].pred_indices)
+    valid = ~outputs.query_padding_mask[0]
+    query_types = outputs.query_types[0, valid].detach().cpu()
+    query_sources = outputs.source_instance_ids[0, valid].detach().cpu()
+    query_type_counts = {
+        "primary": int((query_types == QUERY_PRIMARY).sum()),
+        "split": int((query_types == QUERY_SPLIT).sum()),
+        "temporal": int((query_types == QUERY_TEMPORAL).sum()),
+        "discovery": int((query_types == QUERY_DISCOVERY).sum()),
+    }
+    split_companions_by_source = {
+        int(source_id): int(
+            ((query_types == QUERY_SPLIT) & (query_sources == source_id)).sum()
+        )
+        for source_id in b["instance_ids"].detach().cpu().tolist()
+    }
+    source_nine_seeded = int(
+        (
+            ((query_types == QUERY_PRIMARY) | (query_types == QUERY_SPLIT))
+            & (query_sources == 9)
+        ).sum()
+    )
+    max_temporal_dref = max(temporal_distances_dref, default=0.0)
+    max_discovery_dref = max(discovery_distances_dref, default=0.0)
     output_tensors = (
         outputs.exist_logits,
         outputs.centers_cellscale,
@@ -302,17 +382,44 @@ def run(data_dir: Path) -> None:
     assert all(torch.isfinite(value.float()).all() for value in output_tensors)
     assert all(torch.isfinite(value.float()) for value in losses.values())
     assert incompatible_seeded == 0
+    assert one_gt_split_positives == 0
+    assert max_temporal_dref <= cfg.queries.temporal_match_radius_dref + 1e-6
+    assert max_discovery_dref <= cfg.queries.discovery_match_radius_dref + 1e-6
     assert float(losses["overlap"]) == 0.0
     assert valid_query_count == sample["required_queries"]
-    assert matched_count == sample["target_count"]
+    assert split_companions_by_source == sample["split_companions_by_source"]
+    assert source_nine_seeded >= 9
+    assert int(losses["raw_gt_count"]) == sample["target_count"]
+    assert int(losses["matched_count"]) == matched_count
     torch.cuda.synchronize()
     print(f"ROI: {sample['roi_shape']}; current={sample['current_count']}; GT={sample['target_count']}")
-    print(f"graph nodes={sample['graph_nodes']}; temporal tracklets={sample['temporal_tracklets']}; required queries={sample['required_queries']}")
+    print(f"graph nodes={sample['graph_nodes']}; temporal tracklets={sample['temporal_tracklets']}; total_queries={valid_query_count}")
+    print(f"query_type_counts={query_type_counts}")
+    print(f"split_companions_by_source={split_companions_by_source}")
+    print(f"source_9_seeded_hypotheses={source_nine_seeded}")
     print(f"forward_matching_loss_seconds={time.perf_counter() - started:.2f}")
     print(f"peak_cuda_gib={torch.cuda.max_memory_allocated() / 1024**3:.3f}")
     print(f"source_incompatible_seeded_matches={incompatible_seeded}")
+    print(f"one_gt_split_positive_matches={one_gt_split_positives}")
     print("auxiliary_identity_switching=0 (final assignment reused by criterion)")
-    print(f"matched_gt={matched_count}/{sample['target_count']}; all_cells_retained={matched_count == sample['target_count']}")
+    print(
+        "matches: "
+        f"stage_a={matched_by_type[QUERY_PRIMARY] + matched_by_type[QUERY_SPLIT]}; "
+        f"temporal={matched_by_type[QUERY_TEMPORAL]}; "
+        f"discovery={matched_by_type[QUERY_DISCOVERY]}; "
+        f"unmatched_gt={sample['target_count'] - matched_count}"
+    )
+    print(
+        "eligibility_max: "
+        f"temporal={max_temporal_dref:.6f} dref/"
+        f"{max_temporal_dref * float(b['dref_um'][0]):.3f} um; "
+        f"discovery={max_discovery_dref:.6f} dref/"
+        f"{max_discovery_dref * float(b['dref_um'][0]):.3f} um"
+    )
+    print(
+        f"counts: raw_gt={int(losses['raw_gt_count'])}; "
+        f"matched_count_target={int(losses['matched_count'])}"
+    )
     for name, value in losses.items():
         print(f"loss/{name}: {float(value):.7f}")
 

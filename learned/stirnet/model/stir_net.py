@@ -122,6 +122,7 @@ class StirNet(nn.Module):
         temporal_batch: Tensor,
         spatial_padding_mask: Tensor | None = None,
         return_debug: bool = False,
+        bypass_coreasoning: bool = False,
     ) -> StirNetOutput:
         acq=self.acquisition(spacing_um,dref_um)
         pyramid=self.encoder(spatial_inputs,spacing_um,acq,spatial_padding_mask)
@@ -129,11 +130,15 @@ class StirNet(nn.Module):
                                       temporal_ref_um,temporal_status,hypothesis_edge_index,
                                       hypothesis_edge_attr,temporal_batch,dref_um)
 
-        e3,temporal=self.cr1(pyramid.features[3],pyramid.spacings_um[3],temporal,dref_um,acq,
-                             pyramid.padding_masks[3] if pyramid.padding_masks else None)
+        if bypass_coreasoning:
+            e3=pyramid.features[3]
+        else:
+            e3,temporal=self.cr1(pyramid.features[3],pyramid.spacings_um[3],temporal,dref_um,acq,
+                                 pyramid.padding_masks[3] if pyramid.padding_masks else None)
         e2=self.decoder.decode_to_e2(e3,pyramid,acq)
-        e2,temporal=self.cr2(e2,pyramid.spacings_um[2],temporal,dref_um,acq,
-                             pyramid.padding_masks[2] if pyramid.padding_masks else None)
+        if not bypass_coreasoning:
+            e2,temporal=self.cr2(e2,pyramid.spacings_um[2],temporal,dref_um,acq,
+                                 pyramid.padding_masks[2] if pyramid.padding_masks else None)
         d1,d0,mask_features=self.decoder.decode_from_e2(e2,pyramid,acq)
         dense=self.dense_heads(d0)
 
@@ -167,6 +172,7 @@ class StirNet(nn.Module):
             query_types=qstate.query_types,
             query_padding_mask=qstate.padding_mask,
             source_instance_ids=qstate.source_instance_ids,
+            query_initial_references_cellscale=initial_query_references,
             temporal_salience=qstate.temporal_salience,
             temporal_reliability=qstate.temporal_reliability,
             aux_outputs=dec_outputs[:-1],

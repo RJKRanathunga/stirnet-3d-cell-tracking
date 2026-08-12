@@ -48,6 +48,8 @@ class CoReasoningConfig:
 class QueryConfig:
     d_model: int = 128
     split_companions_per_instance: int = 1
+    max_split_companions_per_instance: int = 8
+    split_volume_ratio_per_hypothesis: float = 1.0
     discovery_queries: int = 8
     max_queries: int | None = None
     instance_feature_dim: int = 14
@@ -57,6 +59,8 @@ class QueryConfig:
     native_support_radius_dref: float = 1.5
     native_source_dilation_dref: float = 0.5
     native_background_logit: float = -20.0
+    temporal_match_radius_dref: float = 1.0
+    discovery_match_radius_dref: float = 1.5
 
 
 @dataclass
@@ -120,6 +124,17 @@ class TrainingConfig:
 
 
 @dataclass
+class CurriculumConfig:
+    enabled: bool = False
+    spatial_dense_steps: int = 0
+    temporal_dense_steps: int = 0
+    query_bootstrap_steps: int = 0
+    native_bootstrap_steps: int = 0
+    joint_spatial_lr_scale: float = 0.10
+    joint_dense_lr_scale: float = 0.50
+
+
+@dataclass
 class InferenceConfig:
     patch_context_diameters: float = 8.0
     patch_valid_diameters: float = 6.0
@@ -138,6 +153,7 @@ class StirNetConfig:
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     losses: LossConfig = field(default_factory=LossConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
 
     def to_dict(self) -> dict:
