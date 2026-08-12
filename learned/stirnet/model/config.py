@@ -54,6 +54,9 @@ class QueryConfig:
     temporal_gaussian_sigma_dref: float = 0.75
     prior_inside_logit: float = 1.5
     prior_outside_logit: float = -1.5
+    native_support_radius_dref: float = 1.5
+    native_source_dilation_dref: float = 0.5
+    native_background_logit: float = -20.0
 
 
 @dataclass
@@ -67,6 +70,10 @@ class DecoderConfig:
     mask_attention_threshold: float = 0.20
     max_spatial_tokens: int = 16384
     support_dilation_dref: float = 0.5
+    primary_center_step_dref: float = 0.50
+    split_center_step_dref: float = 0.75
+    temporal_center_step_dref: float = 0.25
+    discovery_center_step_dref: float = 1.00
 
 
 @dataclass
@@ -78,7 +85,7 @@ class LossConfig:
     focal_coarse: float = 0.5
     center: float = 2.0
     count: float = 0.25
-    overlap: float = 0.10
+    overlap: float = 0.0
     foreground: float = 0.50
     center_heatmap: float = 1.00
     boundary: float = 0.50
@@ -86,6 +93,9 @@ class LossConfig:
     exist_focal_gamma: float = 2.0
     exist_focal_alpha_pos: float = 0.75
     exist_focal_alpha_neg: float = 0.25
+    mask_supervision_radius_dref: float = 1.5
+    mask_focal_alpha_pos: float = 0.75
+    mask_focal_gamma: float = 2.0
     boundary_pos_weight: float = 4.0
     native_chunk_voxels: int = 262_144
     dense_chunk_voxels: int = 524_288

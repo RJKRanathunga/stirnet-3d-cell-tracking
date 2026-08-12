@@ -3,6 +3,12 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
+from .native_masks import (
+    compose_native_query_logits,
+    native_chunk_coordinates_um,
+    source_dilation_support_chunk,
+)
+
 
 class ExistenceHead(nn.Module):
     def __init__(self, d_model: int = 128):
@@ -17,6 +23,8 @@ class CenterHead(nn.Module):
     def __init__(self, d_model: int = 128):
         super().__init__()
         self.net = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, 3))
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, q: Tensor) -> Tensor:
         return self.net(q)
@@ -65,13 +73,13 @@ def render_native_masks(
     prior_inside_logit: float = 1.5,
     prior_outside_logit: float = -1.5,
     temporal_sigma_dref: float = 0.75,
+    native_support_radius_dref: float = 1.5,
+    native_source_dilation_dref: float = 0.5,
+    native_background_logit: float = -20.0,
 ) -> list[Tensor]:
     """Render only selected native-resolution masks; returns one tensor per batch item."""
-    from .query_builder import QUERY_PRIMARY, QUERY_SPLIT, QUERY_TEMPORAL
-    from .coordinates import feature_grid_coordinates_um
-
     B, C, Z, Y, X = mask_features.shape
-    pos = feature_grid_coordinates_um((Z, Y, X), spacing_um, relative_to_center=True).reshape(B, Z, Y, X, 3)
+    voxel_count = Z * Y * X
     results = []
     for b in range(B):
         idx = selected_indices[b]
@@ -79,20 +87,35 @@ def render_native_masks(
             results.append(mask_features.new_zeros((0, Z, Y, X)))
             continue
         emb = native_mask_embeddings[b, idx]
-        logits = torch.einsum("qc,czyx->qzyx", emb, mask_features[b])
-        for local, qi in enumerate(idx.tolist()):
-            qtype = int(query_types[b, qi].item())
-            sid = int(source_instance_ids[b, qi].item())
-            if qtype in (QUERY_PRIMARY, QUERY_SPLIT) and sid >= 0:
-                inside = instance_labels[b] == sid
-                prior = torch.full_like(logits[local], prior_outside_logit)
-                prior[inside] = prior_inside_logit
-                logits[local] = logits[local] + prior
-            elif qtype == QUERY_TEMPORAL:
-                ref_um = refs_cellscale[b, qi] * dref_um[b]
-                delta = pos[b] - ref_um
-                dist2 = (delta * delta).sum(dim=-1)
-                sigma = temporal_sigma_dref * dref_um[b]
-                logits[local] = logits[local] + prior_inside_logit * torch.exp(-0.5 * dist2 / sigma.clamp_min(1e-6).pow(2))
-        results.append(logits)
+        learned = torch.einsum("qc,cv->qv", emb, mask_features[b].flatten(1))
+        selected_types = query_types[b, idx]
+        selected_sources = source_instance_ids[b, idx]
+        coords_um = native_chunk_coordinates_um(
+            (Z, Y, X), spacing_um[b], 0, voxel_count
+        )
+        source_support = source_dilation_support_chunk(
+            instance_labels[b],
+            selected_sources,
+            spacing_um[b],
+            dref_um[b],
+            native_source_dilation_dref,
+            0,
+            voxel_count,
+        )
+        logits, _, _ = compose_native_query_logits(
+            learned,
+            selected_types,
+            selected_sources,
+            refs_cellscale[b, idx].float() * dref_um[b].float(),
+            instance_labels[b].flatten(),
+            source_support,
+            coords_um,
+            dref_um[b],
+            support_radius_dref=native_support_radius_dref,
+            temporal_sigma_dref=temporal_sigma_dref,
+            prior_inside_logit=prior_inside_logit,
+            prior_outside_logit=prior_outside_logit,
+            background_logit=native_background_logit,
+        )
+        results.append(logits.reshape(len(idx), Z, Y, X))
     return results

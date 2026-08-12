@@ -64,6 +64,8 @@ TEMPORAL_BASE_RADIUS_DREF = 1.5
 TEMPORAL_MAX_RADIUS_DREF = 2.5
 SPATIAL_NEIGHBOR_RADIUS_DREF = 2.5
 TEMPORAL_GAUSSIAN_SIGMA_DREF = 0.75
+NATIVE_SUPPORT_RADIUS_DREF = 1.5
+NATIVE_SOURCE_DILATION_DREF = 0.5
 ```
 
 These values are expressed relative to $d_\text{ref}$, not voxel counts.
@@ -74,6 +76,12 @@ These values are expressed relative to $d_\text{ref}$, not voxel counts.
 MASK_ATTENTION_THRESHOLD = 0.20
 INITIAL_PRIOR_LOGIT_INSIDE = +1.5
 INITIAL_PRIOR_LOGIT_OUTSIDE = -1.5
+NATIVE_BACKGROUND_LOGIT = -20.0
+
+PRIMARY_CENTER_STEP_DREF = 0.50
+SPLIT_CENTER_STEP_DREF = 0.75
+TEMPORAL_CENTER_STEP_DREF = 0.25
+DISCOVERY_CENTER_STEP_DREF = 1.00
 ```
 
 Physical dilation widths should be specified in multiples of $d_\text{ref}$ and converted to each feature grid using current effective spacing.
@@ -91,13 +99,17 @@ LOSS_FOCAL_COARSE = 0.5
 
 LOSS_CENTER = 2.0
 LOSS_COUNT = 0.25
-LOSS_OVERLAP = 0.10
+LOSS_OVERLAP = 0.00
 
 LOSS_FOREGROUND = 0.50
 LOSS_CENTER_HEATMAP = 1.00
 LOSS_BOUNDARY = 0.50
 
 AUX_LAYER_WEIGHT = 0.50
+
+MASK_SUPERVISION_RADIUS_DREF = 1.5
+MASK_FOCAL_ALPHA_POS = 0.75
+MASK_FOCAL_GAMMA = 2.0
 ```
 
 These are tuning defaults, not permanent architecture constraints.

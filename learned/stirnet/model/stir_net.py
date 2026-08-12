@@ -139,6 +139,7 @@ class StirNet(nn.Module):
 
         qstate=self.query_builder(e2,pyramid.spacings_um[2],instance_labels,instance_features,
                                   instance_ids,instance_batch,instance_centroids_um,dref_um,temporal)
+        initial_query_references=qstate.references_cellscale
         qstate,dec_outputs=self.query_decoder(qstate,[e3,e2,d1],
                                               [pyramid.spacings_um[3],pyramid.spacings_um[2],pyramid.spacings_um[1]],
                                               instance_labels,dref_um)
@@ -150,12 +151,17 @@ class StirNet(nn.Module):
                 "temporal_salience":temporal.salience.detach(),
                 "temporal_reliability":temporal.reliability.detach(),
                 "temporal_refs_um":temporal.ref_um.detach(),
+                "query_initial_references_cellscale":initial_query_references.detach(),
+                "query_layer_references_cellscale":torch.stack(
+                    [layer["centers_cellscale"] for layer in dec_outputs], dim=0
+                ).detach(),
                 "query_references_cellscale":qstate.references_cellscale.detach(),
             }
         return StirNetOutput(
             exist_logits=final["exist_logits"],
             centers_cellscale=final["centers_cellscale"],
             coarse_mask_logits=final["coarse_mask_logits"],
+            coarse_spacing_um=final["coarse_spacing_um"],
             query_embeddings=qstate.embeddings,
             native_mask_embeddings=native_emb,
             query_types=qstate.query_types,
@@ -180,4 +186,7 @@ class StirNet(nn.Module):
             prior_inside_logit=self.cfg.queries.prior_inside_logit,
             prior_outside_logit=self.cfg.queries.prior_outside_logit,
             temporal_sigma_dref=self.cfg.queries.temporal_gaussian_sigma_dref,
+            native_support_radius_dref=self.cfg.queries.native_support_radius_dref,
+            native_source_dilation_dref=self.cfg.queries.native_source_dilation_dref,
+            native_background_logit=self.cfg.queries.native_background_logit,
         )

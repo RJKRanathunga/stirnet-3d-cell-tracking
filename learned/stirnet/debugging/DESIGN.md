@@ -52,8 +52,8 @@ For a small selected query set, decompose the native mask into:
 
 ```text
 learned logits = native_mask_embedding dot mask_features
-prior logits   = seeded-instance prior OR temporal Gaussian OR zero
-combined       = learned + prior
+prior logits   = primary source prior OR interpolated temporal Gaussian OR zero
+combined       = learned + prior inside role-specific support; background outside
 ```
 
 Compute full-scene metrics in chunks and save only compact query-centric crops.

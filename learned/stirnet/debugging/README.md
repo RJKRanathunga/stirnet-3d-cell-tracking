@@ -122,8 +122,8 @@ For selected queries the debugger computes three full-scene metrics:
 
 ```text
 learned-only mask      = native_mask_embedding · mask_features
-prior-only mask        = seeded-instance prior or temporal Gaussian prior
-combined mask          = learned logits + prior logits
+prior-only mask        = primary source prior, interpolated temporal Gaussian, or zero
+combined mask          = learned + prior inside role-specific support; background outside
 ```
 
 Metrics are streamed in bounded voxel chunks, so a full `[Q,Z,Y,X]` tensor is

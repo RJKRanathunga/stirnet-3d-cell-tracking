@@ -186,25 +186,38 @@ Query type is part of the query representation but is not a predicted class.
 
 ### 10.1 Primary instance
 
-For current instance mask $M_i$:
+The current source localizes the primary query. At native resolution its
+support is the source instance plus physical dilation, union a bounded region
+around the refined reference. A moderate source prior remains:
 
 $$L_i^{prior}(v)= \begin{cases} +1.5,& v\in M_i\\ -1.5,&v\notin M_i \end{cases}$$
 
 ### 10.2 Split companion
 
-Use the same prior initially.
+Use the source instance plus physical dilation as attention/rendering support,
+but do **not** apply the whole-source positive shape prior. The learned mask
+embedding must select the daughter shape within that support.
 
 ### 10.3 Temporal query
 
-Use a weak physical Gaussian prior around the temporal reference:
+Use a weak physical Gaussian prior around the temporal reference, within a
+bounded physical support:
 
 $$\sigma\approx0.75d_\text{ref}.$$
 
 If reference falls inside a current component, union that component with the temporal support for attention initialization.
 
+The prior interpolates from `prior_inside_logit` at the reference to
+`prior_outside_logit` in the far field; it does not tend to logit zero.
+
 ### 10.4 Discovery query
 
-No mask prior.
+No shape prior. A physical region around the refined discovery reference bounds
+native rendering.
+
+Outside every query's native support, the combined logit is forced to the
+configured background logit. Training and inference call the same native
+prior/support helper, including in streamed training chunks.
 
 ## 11. Query decoder
 
@@ -316,13 +329,26 @@ Centers are predicted in cell-scale normalized physical coordinates.
 
 At each layer:
 
-$$\Delta_i^{(l)} = MLP_{center}(q_i^{(l)}).$$
+$$\Delta_i^{(l)} = \tanh(MLP_{center}(q_i^{(l)}))s_{type}.$$
 
 Update:
 
 $$\tilde r_i^{(l)} = \tilde r_i^{(l-1)} + \Delta_i^{(l)}.$$
 
-A bounded update function may be used if instability is observed.
+The final center-head projection is zero initialized, so a fresh decoder starts
+with zero correction. Per-layer, per-coordinate limits in cell-scale units are:
+
+```text
+primary   0.50 dref
+split     0.75 dref
+temporal  0.25 dref
+discovery 1.00 dref
+```
+
+Padding queries receive no update. Refinement remains iterative and cumulative
+over the three layers. Decoder outputs expose the reference before each update
+and the bounded delta; optional debug output records the initial and all three
+layer references.
 
 Only when accessing dense feature grids do we convert physical coordinates to native voxel coordinates.
 
@@ -404,6 +430,7 @@ native-resolution mask rendering
     "exist_logits": [B,Q],
     "centers_cellscale": [B,Q,3],
     "coarse_mask_logits": [...],
+    "coarse_spacing_um": [B,3],
     "query_embeddings": [B,Q,128],
     "query_types": [B,Q],
     "aux_outputs": [
@@ -414,3 +441,5 @@ native-resolution mask rendering
 ```
 
 Native high-resolution masks are generated lazily through a dedicated renderer.
+`coarse_spacing_um` is the exact effective spacing after spatial-token capping
+and is used for physical matching and mask-loss supports.

@@ -9,11 +9,16 @@ from .config import LossConfig, QueryConfig, TrainingConfig
 from .matcher import (
     HungarianMatcher3D,
     MatchResult,
+    build_local_support_masks,
     target_ids,
     target_masks_at_shape,
     valid_target_indices,
 )
-from .query_builder import QUERY_PRIMARY, QUERY_SPLIT, QUERY_TEMPORAL
+from .native_masks import (
+    compose_native_query_logits,
+    native_chunk_coordinates_um,
+    source_dilation_support_chunk,
+)
 from .types import StirNetOutput
 
 
@@ -45,6 +50,43 @@ def dice_loss(logits: Tensor, targets: Tensor, eps: float = 1e-6) -> Tensor:
     return (1 - score).mean() if score.numel() else logits.sum() * 0
 
 
+def local_matched_mask_losses(
+    logits: Tensor,
+    targets: Tensor,
+    support: Tensor,
+    *,
+    alpha: float,
+    gamma: float,
+    eps: float = 1e-6,
+) -> tuple[Tensor, Tensor]:
+    """Dice/focal reductions restricted to per-GT physical support."""
+    with torch.autocast(device_type=logits.device.type, enabled=False):
+        prediction = logits.float()
+        target = targets.float()
+        local = support.float()
+        probability = prediction.sigmoid()
+        intersection = (probability * target).flatten(1).sum(-1)
+        probability_sum = (probability * local).flatten(1).sum(-1)
+        target_sum = target.flatten(1).sum(-1)
+        dice = 1 - (2 * intersection + eps) / (
+            probability_sum + target_sum + eps
+        )
+        focal = binary_focal_loss_with_logits(
+            prediction,
+            target,
+            alpha=alpha,
+            gamma=gamma,
+            reduction="none",
+        )
+        dims = tuple(range(1, focal.ndim))
+        focal = (focal * local).sum(dim=dims) / local.sum(dim=dims).clamp_min(1)
+    zero = logits.sum() * 0
+    return (
+        dice.mean() if dice.numel() else zero,
+        focal.mean() if focal.numel() else zero,
+    )
+
+
 def _target_count(target: dict) -> int:
     return int(valid_target_indices(target).numel())
 
@@ -68,7 +110,11 @@ class RefinementCriterion(nn.Module):
         self.activation_checkpointing = (
             training_cfg.activation_checkpointing and training_cfg.checkpoint_losses
         )
-        self.matcher = HungarianMatcher3D()
+        self.matcher = HungarianMatcher3D(
+            mask_supervision_radius_dref=self.cfg.mask_supervision_radius_dref,
+            mask_focal_alpha_pos=self.cfg.mask_focal_alpha_pos,
+            mask_focal_gamma=self.cfg.mask_focal_gamma,
+        )
 
     def _coarse_targets(self, out: dict[str, Tensor], targets: list[dict]) -> list[Tensor]:
         shape = tuple(int(v) for v in out["coarse_mask_logits"].shape[-3:])
@@ -121,19 +167,37 @@ class RefinementCriterion(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         masks_pred = []
         masks_target = []
+        masks_support = []
         centers_pred = []
         centers_target = []
         for b, match in enumerate(matches):
             if match.pred_indices.numel() == 0:
                 continue
             pred = out["coarse_mask_logits"][b, match.pred_indices]
+            target_mask = coarse_targets[b][match.target_indices]
             masks_pred.append(pred)
-            masks_target.append(coarse_targets[b][match.target_indices])
+            masks_target.append(target_mask)
             centers_pred.append(out["centers_cellscale"][b, match.pred_indices])
             target_centers = torch.as_tensor(targets[b]["centers_cellscale"])
-            centers_target.append(
-                target_centers[match.target_indices.to(target_centers.device)].to(
-                    pred.device, dtype=out["centers_cellscale"].dtype, non_blocking=True
+            selected_centers = target_centers[
+                match.target_indices.to(target_centers.device)
+            ].to(
+                pred.device,
+                dtype=out["centers_cellscale"].dtype,
+                non_blocking=True,
+            )
+            centers_target.append(selected_centers)
+            spacing = out["coarse_spacing_um"]
+            spacing_b = spacing[b] if spacing.ndim == 2 else spacing
+            dref = out["dref_um"]
+            dref_b = dref[b] if dref.ndim else dref
+            masks_support.append(
+                build_local_support_masks(
+                    target_mask,
+                    selected_centers,
+                    spacing_b,
+                    dref_b,
+                    self.cfg.mask_supervision_radius_dref,
                 )
             )
         zero = out["exist_logits"].sum() * 0
@@ -141,13 +205,17 @@ class RefinementCriterion(nn.Module):
             return zero, zero, zero
         pred = torch.cat(masks_pred)
         target = torch.cat(masks_target)
+        support = torch.cat(masks_support)
         pred_centers = torch.cat(centers_pred)
         target_centers = torch.cat(centers_target)
-        return (
-            dice_loss(pred, target),
-            binary_focal_loss_with_logits(pred, target),
-            F.smooth_l1_loss(pred_centers, target_centers),
+        dice, focal = local_matched_mask_losses(
+            pred,
+            target,
+            support,
+            alpha=self.cfg.mask_focal_alpha_pos,
+            gamma=self.cfg.mask_focal_gamma,
         )
+        return dice, focal, F.smooth_l1_loss(pred_centers, target_centers)
 
     def _count_loss(self, logits: Tensor, padding: Tensor, targets: list[dict]) -> Tensor:
         probability = torch.sigmoid(logits).masked_fill(padding, 0)
@@ -195,7 +263,7 @@ class RefinementCriterion(nn.Module):
         targets: list[dict],
         matches: list[MatchResult],
     ) -> tuple[Tensor, Tensor]:
-        """Exact matched native Dice/focal losses with bounded spatial chunks."""
+        """GT-local matched native Dice/focal losses with bounded chunks."""
         dice_values = []
         focal_values = []
         _, _, z_size, y_size, x_size = outputs.mask_features.shape
@@ -207,13 +275,8 @@ class RefinementCriterion(nn.Module):
             if match.pred_indices.numel() == 0:
                 continue
             feature_flat = outputs.mask_features[b].reshape(outputs.mask_features.shape[1], -1)
-            current_labels = outputs.instance_labels[b].reshape(-1)
+            current_labels = outputs.instance_labels[b]
             spacing = outputs.spacing_um[b].float()
-            extent = torch.tensor(
-                [z_size - 1, y_size - 1, x_size - 1],
-                device=feature_flat.device,
-                dtype=torch.float32,
-            ) * spacing
 
             for query_start in range(0, match.pred_indices.numel(), query_chunk):
                 query_end = min(query_start + query_chunk, match.pred_indices.numel())
@@ -223,11 +286,20 @@ class RefinementCriterion(nn.Module):
                 query_types = outputs.query_types[b, pred_indices]
                 source_ids = outputs.source_instance_ids[b, pred_indices]
                 refs_um = outputs.centers_cellscale[b, pred_indices].float() * outputs.dref_um[b].float()
+                target_centers = torch.as_tensor(
+                    targets[b].get("centers_um", targets[b]["centers_cellscale"])
+                )
+                target_centers = target_centers[
+                    gt_indices.detach().cpu().to(target_centers.device)
+                ].to(feature_flat.device, dtype=torch.float32, non_blocking=True)
+                if "centers_um" not in targets[b]:
+                    target_centers = target_centers * outputs.dref_um[b].float()
                 count = query_end - query_start
                 intersection = torch.zeros(count, device=feature_flat.device, dtype=torch.float32)
                 probability_sum = torch.zeros_like(intersection)
                 target_sum = torch.zeros_like(intersection)
                 focal_sum = torch.zeros_like(intersection)
+                support_count = torch.zeros_like(intersection)
 
                 for start in range(0, voxel_count, spatial_chunk):
                     end = min(start + spatial_chunk, voxel_count)
@@ -238,7 +310,7 @@ class RefinementCriterion(nn.Module):
                         chunk_source_ids: Tensor,
                         chunk_refs_um: Tensor,
                         chunk_spacing: Tensor,
-                        chunk_extent: Tensor,
+                        chunk_target_centers_um: Tensor,
                         *,
                         chunk_start: int = start,
                         chunk_end: int = end,
@@ -246,61 +318,43 @@ class RefinementCriterion(nn.Module):
                         target_indices: Tensor = gt_indices,
                         current_label_volume: Tensor = current_labels,
                         dref: Tensor = outputs.dref_um[b],
-                    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-                        logits = torch.einsum(
+                    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+                        learned_logits = torch.einsum(
                             "qc,cv->qv", chunk_embeddings, feature_chunk
                         )
-                        prior = torch.zeros_like(logits)
-                        seeded = (chunk_query_types == QUERY_PRIMARY) | (
-                            chunk_query_types == QUERY_SPLIT
+                        coords_um = native_chunk_coordinates_um(
+                            (z_size, y_size, x_size),
+                            chunk_spacing,
+                            chunk_start,
+                            chunk_end,
                         )
-                        if seeded.any():
-                            inside = (
-                                current_label_volume[chunk_start:chunk_end][None]
-                                == chunk_source_ids[seeded, None]
-                            )
-                            seeded_prior = torch.where(
-                                inside,
-                                logits.new_tensor(self.query_cfg.prior_inside_logit),
-                                logits.new_tensor(self.query_cfg.prior_outside_logit),
-                            )
-                            prior[seeded] = seeded_prior.to(prior.dtype)
-
-                        temporal = chunk_query_types == QUERY_TEMPORAL
-                        if temporal.any():
-                            linear = torch.arange(
-                                chunk_start, chunk_end, device=feature_chunk.device
-                            )
-                            z_coord = torch.div(
-                                linear, y_size * x_size, rounding_mode="floor"
-                            )
-                            remainder = linear.remainder(y_size * x_size)
-                            y_coord = torch.div(
-                                remainder, x_size, rounding_mode="floor"
-                            )
-                            x_coord = remainder.remainder(x_size)
-                            coords = torch.stack(
-                                [z_coord, y_coord, x_coord], dim=-1
-                            ).float()
-                            coords_um = (
-                                coords * chunk_spacing[None]
-                                - 0.5 * chunk_extent[None]
-                            )
-                            delta = coords_um[None] - chunk_refs_um[temporal, None]
-                            sigma = (
-                                self.query_cfg.temporal_gaussian_sigma_dref
-                                * dref.float()
-                            )
-                            temporal_prior = (
-                                self.query_cfg.prior_inside_logit
-                                * torch.exp(
-                                    -0.5
-                                    * delta.square().sum(dim=-1)
-                                    / sigma.clamp_min(1e-6).square()
-                                )
-                            )
-                            prior[temporal] = temporal_prior.to(prior.dtype)
-
+                        source_support = source_dilation_support_chunk(
+                            current_label_volume,
+                            chunk_source_ids,
+                            chunk_spacing,
+                            dref,
+                            self.query_cfg.native_source_dilation_dref,
+                            chunk_start,
+                            chunk_end,
+                        )
+                        current_chunk = current_label_volume.reshape(-1)[
+                            chunk_start:chunk_end
+                        ]
+                        work_logits, _, _ = compose_native_query_logits(
+                            learned_logits,
+                            chunk_query_types,
+                            chunk_source_ids,
+                            chunk_refs_um,
+                            current_chunk,
+                            source_support,
+                            coords_um,
+                            dref,
+                            support_radius_dref=self.query_cfg.native_support_radius_dref,
+                            temporal_sigma_dref=self.query_cfg.temporal_gaussian_sigma_dref,
+                            prior_inside_logit=self.query_cfg.prior_inside_logit,
+                            prior_outside_logit=self.query_cfg.prior_outside_logit,
+                            background_logit=self.query_cfg.native_background_logit,
+                        )
                         target_chunk = self._native_target_chunk(
                             target,
                             target_indices,
@@ -311,15 +365,28 @@ class RefinementCriterion(nn.Module):
                         with torch.autocast(
                             device_type=feature_chunk.device.type, enabled=False
                         ):
-                            work_logits = (logits + prior).float()
+                            work_logits = work_logits.float()
                             probability = work_logits.sigmoid()
+                            radius_um = (
+                                self.cfg.mask_supervision_radius_dref * dref.float()
+                            )
+                            local_support = (
+                                coords_um[None] - chunk_target_centers_um[:, None]
+                            ).square().sum(dim=-1) <= radius_um.square()
+                            local_support = local_support | target_chunk.bool()
+                            local_float = local_support.float()
                             return (
                                 (probability * target_chunk).sum(dim=-1),
-                                probability.sum(dim=-1),
+                                (probability * local_float).sum(dim=-1),
                                 target_chunk.sum(dim=-1),
                                 binary_focal_loss_with_logits(
-                                    work_logits, target_chunk, reduction="none"
-                                ).sum(dim=-1),
+                                    work_logits,
+                                    target_chunk,
+                                    alpha=self.cfg.mask_focal_alpha_pos,
+                                    gamma=self.cfg.mask_focal_gamma,
+                                    reduction="none",
+                                ).mul(local_float).sum(dim=-1),
+                                local_float.sum(dim=-1),
                             )
 
                     chunk_values = checkpoint_if_enabled(
@@ -330,20 +397,21 @@ class RefinementCriterion(nn.Module):
                         source_ids,
                         refs_um,
                         spacing,
-                        extent,
+                        target_centers,
                         enabled=self.activation_checkpointing and self.training,
                     )
                     intersection = intersection + chunk_values[0]
                     probability_sum = probability_sum + chunk_values[1]
                     target_sum = target_sum + chunk_values[2]
                     focal_sum = focal_sum + chunk_values[3]
+                    support_count = support_count + chunk_values[4]
 
                 dice_values.append(
                     1 - (2 * intersection + 1e-6) / (
                         probability_sum + target_sum + 1e-6
                     )
                 )
-                focal_values.append(focal_sum / voxel_count)
+                focal_values.append(focal_sum / support_count.clamp_min(1))
 
         zero = outputs.exist_logits.sum() * 0
         if not dice_values:
@@ -488,6 +556,10 @@ class RefinementCriterion(nn.Module):
             "exist_logits": outputs.exist_logits,
             "centers_cellscale": outputs.centers_cellscale,
             "coarse_mask_logits": outputs.coarse_mask_logits,
+            "coarse_spacing_um": outputs.coarse_spacing_um,
+            "dref_um": outputs.dref_um,
+            "query_types": outputs.query_types,
+            "source_instance_ids": outputs.source_instance_ids,
         }
         final_targets = self._coarse_targets(final, targets)
         matches = self._match(final, outputs.query_padding_mask, targets, final_targets)
@@ -500,7 +572,11 @@ class RefinementCriterion(nn.Module):
         loss_count = self._count_loss(
             outputs.exist_logits, outputs.query_padding_mask, targets
         )
-        loss_overlap = self._overlap_loss(outputs.coarse_mask_logits, matches)
+        loss_overlap = (
+            self._overlap_loss(outputs.coarse_mask_logits, matches)
+            if self.cfg.overlap > 0
+            else outputs.coarse_mask_logits.sum() * 0
+        )
         loss_high_dice, loss_high_focal = self._native_mask_losses(
             outputs, targets, matches
         )
@@ -525,15 +601,16 @@ class RefinementCriterion(nn.Module):
         zero = outputs.exist_logits.sum() * 0
         aux_total = zero
         for aux in outputs.aux_outputs:
-            aux_targets = self._coarse_targets(aux, targets)
-            aux_matches = self._match(
-                aux, outputs.query_padding_mask, targets, aux_targets
-            )
+            aux_for_loss = {
+                **aux,
+                "dref_um": outputs.dref_um,
+            }
+            aux_targets = self._coarse_targets(aux_for_loss, targets)
             aux_exist = self._existence_loss(
-                aux["exist_logits"], outputs.query_padding_mask, aux_matches
+                aux["exist_logits"], outputs.query_padding_mask, matches
             )
             aux_dice, aux_focal, aux_center = self._coarse_losses(
-                aux, aux_matches, targets, aux_targets
+                aux_for_loss, matches, targets, aux_targets
             )
             aux_total = aux_total + self.cfg.aux_layer * (
                 self.cfg.exist * aux_exist

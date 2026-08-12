@@ -48,6 +48,7 @@ class StirNetOutput:
     exist_logits: Tensor
     centers_cellscale: Tensor
     coarse_mask_logits: Tensor
+    coarse_spacing_um: Tensor
     query_embeddings: Tensor
     native_mask_embeddings: Tensor
     query_types: Tensor

@@ -95,6 +95,20 @@ $$P_i(v)=\sigma(L_i(v)).$$
 
 Do not render masks for discarded low-existence queries.
 
+Native rendering is physically bounded and shares its implementation with the
+streamed training loss:
+
+```text
+primary   source + physical dilation + reference region; moderate source prior
+split     source + physical dilation; no whole-source positive shape prior
+temporal  reference region; Gaussian prior interpolates to negative outside logit
+discovery reference region; learned shape with no positive shape prior
+```
+
+Outside support the combined logit is the configured strong-background value.
+The learned mask embedding dot native mask features remains the shape model;
+support and priors only localize where it operates.
+
 ## 7. One connected component per query
 
 Threshold each candidate mask.

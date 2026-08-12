@@ -103,6 +103,20 @@ class QueryDecoderLayer(nn.Module):
         self.center = CenterHead(cfg.d_model)
         self.mask_embed = MaskEmbeddingHead(cfg.d_model, cfg.mask_dim)
 
+        self.center_step_by_type = (
+            cfg.primary_center_step_dref,
+            cfg.split_center_step_dref,
+            cfg.temporal_center_step_dref,
+            cfg.discovery_center_step_dref,
+        )
+
+    def _bounded_center_delta(self, raw_delta: Tensor, q: QueryState) -> Tensor:
+        limits = raw_delta.new_tensor(self.center_step_by_type)
+        safe_types = q.query_types.clamp(0, len(self.center_step_by_type) - 1)
+        max_step = limits[safe_types]
+        delta = torch.tanh(raw_delta) * max_step[..., None]
+        return delta.masked_fill(q.padding_mask[..., None], 0)
+
     def forward(self, q: QueryState, spatial_tokens: Tensor, spatial_pos_um: Tensor, support: Tensor, dref_um: Tensor, spatial_mask_features: Tensor):
         x = q.embeddings
         n = self.self_norm(x)
@@ -113,8 +127,10 @@ class QueryDecoderLayer(nn.Module):
         x = x + c
         x = x + self.ffn(self.ffn_norm(x))
         x = x.masked_fill(q.padding_mask[..., None], 0)
-        delta = self.center(x)
-        refs = q.references_cellscale + delta.masked_fill(q.padding_mask[..., None], 0)
+        reference_before_update = q.references_cellscale
+        raw_delta = self.center(x)
+        delta = self._bounded_center_delta(raw_delta, q)
+        refs = reference_before_update + delta
         emb = self.mask_embed(x)
         masks = dot_mask_logits(emb, spatial_mask_features)
         masks = masks.masked_fill(q.padding_mask[..., None, None, None], -20.0)
@@ -123,6 +139,8 @@ class QueryDecoderLayer(nn.Module):
             "centers_cellscale": refs,
             "coarse_mask_logits": masks,
             "query_embeddings": x,
+            "center_delta_cellscale": delta,
+            "reference_before_update_cellscale": reference_before_update,
         }
 
 
@@ -206,6 +224,7 @@ class InstanceQueryDecoder(nn.Module):
                 support = support | prev_support
             support_flat = support.flatten(2)
             q, out = layer(q, spatial_tokens, pos_um, support_flat, dref_um, mask_feat)
+            out["coarse_spacing_um"] = spacing
             outputs.append(out)
             previous_mask = out["coarse_mask_logits"]
         return q, outputs

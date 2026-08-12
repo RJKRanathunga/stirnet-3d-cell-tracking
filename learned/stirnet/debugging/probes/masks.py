@@ -6,7 +6,11 @@ from typing import Any
 import numpy as np
 import torch
 
-from ...model.query_builder import QUERY_PRIMARY, QUERY_SPLIT, QUERY_TEMPORAL
+from ...model.native_masks import (
+    compose_native_query_logits,
+    native_chunk_coordinates_um,
+    source_dilation_support_chunk,
+)
 
 
 @dataclass
@@ -54,42 +58,54 @@ class MaskMetricState:
         }
 
 
-def _coords(start, end, *, y_size, x_size, device):
-    linear = torch.arange(start, end, device=device, dtype=torch.long)
-    z = torch.div(linear, y_size * x_size, rounding_mode="floor")
-    rem = linear.remainder(y_size * x_size)
-    y = torch.div(rem, x_size, rounding_mode="floor")
-    x = rem.remainder(x_size)
-    return torch.stack([z, y, x], dim=-1)
-
-
-def _prior_logits_chunk(outputs, b, q, start, end, *, prior_inside_logit, prior_outside_logit, temporal_sigma_dref):
-    device = outputs.mask_features.device
-    dtype = outputs.mask_features.dtype
+def _composed_logits_chunk(
+    outputs,
+    b,
+    q,
+    learned_logits,
+    start,
+    end,
+    *,
+    prior_inside_logit,
+    prior_outside_logit,
+    temporal_sigma_dref,
+    native_support_radius_dref,
+    native_source_dilation_dref,
+    native_background_logit,
+):
     _, _, z_size, y_size, x_size = outputs.mask_features.shape
-    qtype = int(outputs.query_types[b, q].item())
-    source_id = int(outputs.source_instance_ids[b, q].item())
-    prior = torch.zeros(end - start, device=device, dtype=dtype)
-
-    if qtype in (int(QUERY_PRIMARY), int(QUERY_SPLIT)) and source_id >= 0:
-        labels = outputs.instance_labels[b].reshape(-1)[start:end]
-        return torch.where(
-            labels == source_id,
-            prior.new_tensor(prior_inside_logit),
-            prior.new_tensor(prior_outside_logit),
-        )
-
-    if qtype == int(QUERY_TEMPORAL):
-        coords = _coords(start, end, y_size=y_size, x_size=x_size, device=device).float()
-        spacing = outputs.spacing_um[b].float()
-        extent = torch.tensor([z_size - 1, y_size - 1, x_size - 1], device=device, dtype=torch.float32) * spacing
-        coords_um = coords * spacing[None] - 0.5 * extent[None]
-        ref_um = outputs.centers_cellscale[b, q].float() * outputs.dref_um[b].float()
-        sigma = temporal_sigma_dref * outputs.dref_um[b].float()
-        delta = coords_um - ref_um[None]
-        return (prior_inside_logit * torch.exp(-0.5 * delta.square().sum(-1) / sigma.clamp_min(1e-6).square())).to(dtype)
-
-    return prior
+    spacing = outputs.spacing_um[b]
+    dref = outputs.dref_um[b]
+    query_types = outputs.query_types[b, q : q + 1]
+    source_ids = outputs.source_instance_ids[b, q : q + 1]
+    coords_um = native_chunk_coordinates_um(
+        (z_size, y_size, x_size), spacing, start, end
+    )
+    source_support = source_dilation_support_chunk(
+        outputs.instance_labels[b],
+        source_ids,
+        spacing,
+        dref,
+        native_source_dilation_dref,
+        start,
+        end,
+    )
+    combined, prior, _ = compose_native_query_logits(
+        learned_logits[None],
+        query_types,
+        source_ids,
+        outputs.centers_cellscale[b, q : q + 1].float() * dref.float(),
+        outputs.instance_labels[b].reshape(-1)[start:end],
+        source_support,
+        coords_um,
+        dref,
+        support_radius_dref=native_support_radius_dref,
+        temporal_sigma_dref=temporal_sigma_dref,
+        prior_inside_logit=prior_inside_logit,
+        prior_outside_logit=prior_outside_logit,
+        background_logit=native_background_logit,
+    )
+    return prior[0], combined[0]
 
 
 def _target_chunk(target, target_index, start, end, device):
@@ -134,41 +150,45 @@ def _crop_bounds(outputs, target, target_index, q, *, margin_dref, unmatched_rad
 
 
 @torch.no_grad()
-def _render_crop(outputs, target, target_index, q, low, high, *, prior_inside_logit, prior_outside_logit, temporal_sigma_dref, mask_threshold, out_dtype):
+def _render_crop(outputs, target, target_index, q, low, high, *, prior_inside_logit, prior_outside_logit, temporal_sigma_dref, native_support_radius_dref, native_source_dilation_dref, native_background_logit, mask_threshold, out_dtype):
     b = 0
     z0, y0, x0 = map(int, low)
     z1, y1, x1 = map(int, high)
-    feature = outputs.mask_features[b, :, z0:z1, y0:y1, x0:x1]
+    feature_flat = outputs.mask_features[b].flatten(1)
     embedding = outputs.native_mask_embeddings[b, q]
-    learned = torch.einsum("c,czyx->zyx", embedding, feature).float()
-
     shape = outputs.instance_labels.shape[-3:]
-    spacing = outputs.spacing_um[b].float()
-    dref = outputs.dref_um[b].float()
-    extent = torch.tensor([shape[0]-1, shape[1]-1, shape[2]-1], device=feature.device, dtype=torch.float32) * spacing
-    zz, yy, xx = torch.meshgrid(
-        torch.arange(z0, z1, device=feature.device),
-        torch.arange(y0, y1, device=feature.device),
-        torch.arange(x0, x1, device=feature.device),
-        indexing="ij",
-    )
-    coords_um = torch.stack([zz, yy, xx], dim=-1).float() * spacing - 0.5 * extent
-    qtype = int(outputs.query_types[b, q].item())
-    source_id = int(outputs.source_instance_ids[b, q].item())
-    prior = torch.zeros_like(learned)
-
-    if qtype in (int(QUERY_PRIMARY), int(QUERY_SPLIT)) and source_id >= 0:
-        labels = outputs.instance_labels[b, z0:z1, y0:y1, x0:x1]
-        prior = torch.where(labels == source_id, learned.new_tensor(prior_inside_logit), learned.new_tensor(prior_outside_logit))
-    elif qtype == int(QUERY_TEMPORAL):
-        ref_um = outputs.centers_cellscale[b, q].float() * dref
-        delta = coords_um - ref_um
-        sigma = temporal_sigma_dref * dref
-        prior = prior_inside_logit * torch.exp(-0.5 * delta.square().sum(-1) / sigma.clamp_min(1e-6).square())
+    _, y_size, x_size = shape
+    crop_shape = (z1 - z0, y1 - y0, x1 - x0)
+    learned = feature_flat.new_empty(crop_shape, dtype=torch.float32)
+    prior = feature_flat.new_empty(crop_shape, dtype=torch.float32)
+    combined = feature_flat.new_empty(crop_shape, dtype=torch.float32)
+    plane = y_size * x_size
+    for local_z, z_coord in enumerate(range(z0, z1)):
+        start, end = z_coord * plane, (z_coord + 1) * plane
+        learned_plane = torch.einsum(
+            "c,cv->v", embedding, feature_flat[:, start:end]
+        ).float()
+        prior_plane, combined_plane = _composed_logits_chunk(
+            outputs,
+            b,
+            q,
+            learned_plane,
+            start,
+            end,
+            prior_inside_logit=prior_inside_logit,
+            prior_outside_logit=prior_outside_logit,
+            temporal_sigma_dref=temporal_sigma_dref,
+            native_support_radius_dref=native_support_radius_dref,
+            native_source_dilation_dref=native_source_dilation_dref,
+            native_background_logit=native_background_logit,
+        )
+        learned[local_z] = learned_plane.reshape(y_size, x_size)[y0:y1, x0:x1]
+        prior[local_z] = prior_plane.reshape(y_size, x_size)[y0:y1, x0:x1]
+        combined[local_z] = combined_plane.reshape(y_size, x_size)[y0:y1, x0:x1]
 
     learned_prob = torch.sigmoid(learned)
     prior_prob = torch.sigmoid(prior)
-    combined_prob = torch.sigmoid(learned + prior)
+    combined_prob = torch.sigmoid(combined)
 
     if target_index is not None:
         ids = torch.as_tensor(target["ids"], dtype=torch.long)
@@ -190,7 +210,7 @@ def _render_crop(outputs, target, target_index, q, low, high, *, prior_inside_lo
 
 
 @torch.no_grad()
-def probe_native_masks(outputs, target, selected_queries, query_to_target, *, mask_threshold, chunk_voxels, prior_inside_logit, prior_outside_logit, temporal_sigma_dref, crop_margin_dref, unmatched_crop_radius_dref, out_dtype):
+def probe_native_masks(outputs, target, selected_queries, query_to_target, *, mask_threshold, chunk_voxels, prior_inside_logit, prior_outside_logit, temporal_sigma_dref, native_support_radius_dref, native_source_dilation_dref, native_background_logit, crop_margin_dref, unmatched_crop_radius_dref, out_dtype):
     """Stream full-scene mask metrics; store only compact query-centric crops."""
 
     b = 0
@@ -208,16 +228,21 @@ def probe_native_masks(outputs, target, selected_queries, query_to_target, *, ma
         for start in range(0, voxel_count, chunk_voxels):
             end = min(start + chunk_voxels, voxel_count)
             learned_logits = torch.einsum("c,cv->v", embedding, feature_flat[:, start:end]).float()
-            prior_logits = _prior_logits_chunk(
-                outputs, b, q, start, end,
+            prior_logits, combined_logits = _composed_logits_chunk(
+                outputs, b, q, learned_logits, start, end,
                 prior_inside_logit=prior_inside_logit,
                 prior_outside_logit=prior_outside_logit,
                 temporal_sigma_dref=temporal_sigma_dref,
-            ).float()
+                native_support_radius_dref=native_support_radius_dref,
+                native_source_dilation_dref=native_source_dilation_dref,
+                native_background_logit=native_background_logit,
+            )
+            prior_logits = prior_logits.float()
+            combined_logits = combined_logits.float()
             target_chunk = _target_chunk(target, target_index, start, end, learned_logits.device)
             learned_state.update(torch.sigmoid(learned_logits), target_chunk, mask_threshold)
             prior_state.update(torch.sigmoid(prior_logits), target_chunk, mask_threshold)
-            combined_state.update(torch.sigmoid(learned_logits + prior_logits), target_chunk, mask_threshold)
+            combined_state.update(torch.sigmoid(combined_logits), target_chunk, mask_threshold)
 
         low, high, center_vox = _crop_bounds(
             outputs, target, target_index, q,
@@ -229,6 +254,9 @@ def probe_native_masks(outputs, target, selected_queries, query_to_target, *, ma
             prior_inside_logit=prior_inside_logit,
             prior_outside_logit=prior_outside_logit,
             temporal_sigma_dref=temporal_sigma_dref,
+            native_support_radius_dref=native_support_radius_dref,
+            native_source_dilation_dref=native_source_dilation_dref,
+            native_background_logit=native_background_logit,
             mask_threshold=mask_threshold,
             out_dtype=out_dtype,
         )

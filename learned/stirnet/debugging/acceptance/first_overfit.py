@@ -19,6 +19,8 @@ from learned.stirnet import RefinementCriterion, StirNet, StirNetConfig
 from learned.stirnet.data.graph_builder import AssociationRecord, DetectionRecord, build_temporal_graph
 from learned.stirnet.data.sample_builder import robust_normalize
 from learned.stirnet.data.targets import build_gt_targets, extract_instance_metadata
+from learned.stirnet.debugging.probes.matching import run_matching_probe
+from learned.stirnet.model.query_builder import QUERY_PRIMARY, QUERY_SPLIT
 from learned.stirnet.training.trainer import model_forward_from_batch, move_to_device
 
 
@@ -214,7 +216,9 @@ def build_real_batch(data_dir: Path):
         track_graph, instance_movie, raw_movie, markers_movie,
         roi, roi_low, target_local_time, spacing, dref_um, current_target,
     )
-    target = build_gt_targets(gt_target, tuple(spacing), dref_um)
+    target = build_gt_targets(
+        gt_target, tuple(spacing), dref_um, current_labels=current_target
+    )
     batch = {
         "spatial_inputs": torch.as_tensor(spatial_inputs).unsqueeze(0),
         "instance_labels": torch.as_tensor(current_target).unsqueeze(0),
@@ -261,14 +265,54 @@ def run(data_dir: Path) -> None:
             b[key] = move_to_device(value, device)
     gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
+    print("acceptance: starting fresh-model forward", flush=True)
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
         outputs = model_forward_from_batch(model, b)
+    print("acceptance: forward complete; starting matching and streamed losses", flush=True)
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
         losses = criterion(outputs, b["targets"])
+    print("acceptance: losses complete; validating structured matches", flush=True)
+    matching = run_matching_probe(outputs, b["targets"])
+    target = b["targets"][0]
+    source_rows = {
+        int(source_id): row
+        for row, source_id in enumerate(target["source_ids"].tolist())
+    }
+    incompatible_seeded = 0
+    for pred_index, target_index in zip(
+        matching.matches[0].pred_indices.detach().cpu().tolist(),
+        matching.matches[0].target_indices.detach().cpu().tolist(),
+    ):
+        query_type = int(outputs.query_types[0, pred_index].detach().cpu())
+        if query_type not in (QUERY_PRIMARY, QUERY_SPLIT):
+            continue
+        source_id = int(outputs.source_instance_ids[0, pred_index].detach().cpu())
+        source_row = source_rows.get(source_id)
+        if source_row is None or int(target["source_gt_overlap"][source_row, target_index]) <= 0:
+            incompatible_seeded += 1
+    valid_query_count = int((~outputs.query_padding_mask[0]).sum().detach().cpu())
+    matched_count = len(matching.matches[0].pred_indices)
+    output_tensors = (
+        outputs.exist_logits,
+        outputs.centers_cellscale,
+        outputs.coarse_mask_logits,
+        outputs.native_mask_embeddings,
+        outputs.mask_features,
+    )
+    assert all(torch.isfinite(value.float()).all() for value in output_tensors)
+    assert all(torch.isfinite(value.float()) for value in losses.values())
+    assert incompatible_seeded == 0
+    assert float(losses["overlap"]) == 0.0
+    assert valid_query_count == sample["required_queries"]
+    assert matched_count == sample["target_count"]
     torch.cuda.synchronize()
     print(f"ROI: {sample['roi_shape']}; current={sample['current_count']}; GT={sample['target_count']}")
     print(f"graph nodes={sample['graph_nodes']}; temporal tracklets={sample['temporal_tracklets']}; required queries={sample['required_queries']}")
     print(f"forward_matching_loss_seconds={time.perf_counter() - started:.2f}")
     print(f"peak_cuda_gib={torch.cuda.max_memory_allocated() / 1024**3:.3f}")
+    print(f"source_incompatible_seeded_matches={incompatible_seeded}")
+    print("auxiliary_identity_switching=0 (final assignment reused by criterion)")
+    print(f"matched_gt={matched_count}/{sample['target_count']}; all_cells_retained={matched_count == sample['target_count']}")
     for name, value in losses.items():
         print(f"loss/{name}: {float(value):.7f}")
 

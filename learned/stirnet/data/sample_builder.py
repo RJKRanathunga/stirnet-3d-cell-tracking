@@ -44,7 +44,9 @@ def build_cached_sample(
     dref=float(dref_um if dref_um is not None else estimate_dref_um(gt_labels,spacing))
     spatial=build_spatial_channels(raw_norm,np.asarray(instance_labels),spacing,dref,marker_heatmap)
     inst=extract_instance_metadata(np.asarray(instance_labels),raw_norm,spacing,dref,spatial[4])
-    target=build_gt_targets(np.asarray(gt_labels),spacing,dref)
+    target=build_gt_targets(
+        np.asarray(gt_labels), spacing, dref, current_labels=np.asarray(instance_labels)
+    )
     sample={
         "spatial_inputs":torch.as_tensor(spatial,dtype=torch.float32),
         "instance_labels":torch.as_tensor(instance_labels,dtype=torch.long),

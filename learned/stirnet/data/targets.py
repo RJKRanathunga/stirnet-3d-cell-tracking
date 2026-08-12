@@ -158,6 +158,76 @@ def make_boundary_target(labels: np.ndarray, spacing_um, width_um: float = 1.0) 
     return ndi.binary_dilation(boundary, structure=structure).astype(np.float32)
 
 
+def build_source_gt_compatibility(
+    current_labels: np.ndarray,
+    gt_labels: np.ndarray,
+    gt_ids: np.ndarray | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build compact current-source x GT overlap counts on CPU.
+
+    The returned tensors scale with the number of instances, not the native
+    volume. A positive count is the source-aware matching compatibility rule.
+    """
+    current = np.asarray(current_labels)
+    ground_truth = np.asarray(gt_labels)
+    if current.shape != ground_truth.shape:
+        raise ValueError(
+            "current_labels and gt_labels must share one native shape; got "
+            f"{current.shape} and {ground_truth.shape}"
+        )
+    source_ids = np.unique(current)
+    source_ids = source_ids[source_ids > 0].astype(np.int64, copy=False)
+    if gt_ids is None:
+        gt_ids = np.unique(ground_truth)
+        gt_ids = gt_ids[gt_ids > 0]
+    gt_ids = np.asarray(gt_ids, dtype=np.int64)
+    overlap = np.zeros((len(source_ids), len(gt_ids)), dtype=np.int64)
+    if len(source_ids) and len(gt_ids):
+        source_flat = current.reshape(-1)
+        gt_flat = ground_truth.reshape(-1)
+        positive = (source_flat > 0) & (gt_flat > 0)
+        if np.any(positive):
+            pairs, counts = np.unique(
+                np.stack([source_flat[positive], gt_flat[positive]], axis=1),
+                axis=0,
+                return_counts=True,
+            )
+            source_rows = np.searchsorted(source_ids, pairs[:, 0])
+            gt_cols = np.searchsorted(gt_ids, pairs[:, 1])
+            valid = (
+                (source_rows < len(source_ids))
+                & (gt_cols < len(gt_ids))
+                & (source_ids[source_rows] == pairs[:, 0])
+                & (gt_ids[gt_cols] == pairs[:, 1])
+            )
+            overlap[source_rows[valid], gt_cols[valid]] = counts[valid]
+    return (
+        torch.as_tensor(source_ids, dtype=torch.long),
+        torch.as_tensor(overlap, dtype=torch.long),
+    )
+
+
+def add_source_gt_compatibility(
+    target: dict,
+    current_labels: np.ndarray | torch.Tensor,
+) -> dict:
+    """Return a shallow target copy carrying compact source-aware metadata."""
+    if "source_ids" in target and "source_gt_overlap" in target:
+        return target
+    if "label_map" not in target:
+        return target
+    result = dict(target)
+    gt_labels = torch.as_tensor(target["label_map"]).cpu().numpy()
+    source_ids, overlap = build_source_gt_compatibility(
+        torch.as_tensor(current_labels).cpu().numpy(),
+        gt_labels,
+        torch.as_tensor(target["ids"]).cpu().numpy(),
+    )
+    result["source_ids"] = source_ids
+    result["source_gt_overlap"] = overlap
+    return result
+
+
 def build_gt_targets(
     gt_labels: np.ndarray,
     spacing_um,
@@ -166,6 +236,7 @@ def build_gt_targets(
     boundary_width_um: float = 1.0,
     *,
     include_dense_masks: bool = False,
+    current_labels: np.ndarray | None = None,
 ) -> dict:
     """Build targets around one integer label map.
 
@@ -194,4 +265,10 @@ def build_gt_targets(
     if include_dense_masks:
         masks=np.stack([(gt_labels==i) for i in ids],axis=0) if len(ids) else np.zeros((0,*gt_labels.shape),bool)
         target["masks"] = torch.as_tensor(masks,dtype=torch.bool)
+    if current_labels is not None:
+        source_ids, overlap = build_source_gt_compatibility(
+            current_labels, gt_labels, ids
+        )
+        target["source_ids"] = source_ids
+        target["source_gt_overlap"] = overlap
     return target

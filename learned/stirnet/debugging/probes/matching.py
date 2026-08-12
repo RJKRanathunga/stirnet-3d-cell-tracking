@@ -25,6 +25,10 @@ def run_matching_probe(outputs, targets: list[dict]) -> MatchingProbeResult:
         "exist_logits": outputs.exist_logits,
         "coarse_mask_logits": outputs.coarse_mask_logits,
         "centers_cellscale": outputs.centers_cellscale,
+        "coarse_spacing_um": outputs.coarse_spacing_um,
+        "dref_um": outputs.dref_um,
+        "query_types": outputs.query_types,
+        "source_instance_ids": outputs.source_instance_ids,
     }
     matches = matcher(output_dict, outputs.query_padding_mask, targets)
 

@@ -7,7 +7,13 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
-from .coordinates import resize_label_map_nearest
+from .coordinates import feature_grid_coordinates_um, resize_label_map_nearest
+from .query_builder import (
+    QUERY_DISCOVERY,
+    QUERY_PRIMARY,
+    QUERY_SPLIT,
+    QUERY_TEMPORAL,
+)
 
 
 def target_ids(target: dict) -> Tensor:
@@ -53,20 +59,57 @@ def target_masks_at_shape(
     return masks.to(device=device, dtype=torch.float32, non_blocking=True)
 
 
-def _pairwise_dice_cost(pred_logits: Tensor, gt: Tensor, eps: float = 1e-6) -> Tensor:
+def build_local_support_masks(
+    gt_masks: Tensor,
+    gt_centers_cellscale: Tensor,
+    spacing_um: Tensor,
+    dref_um: Tensor,
+    radius_dref: float,
+) -> Tensor:
+    """Return coarse GT-local physical supports, always retaining positives."""
+    if gt_masks.shape[0] == 0:
+        return torch.zeros_like(gt_masks, dtype=torch.bool)
+    shape = tuple(int(v) for v in gt_masks.shape[-3:])
+    spacing = spacing_um.to(device=gt_masks.device, dtype=torch.float32)
+    coords_um = feature_grid_coordinates_um(
+        shape, spacing[None], relative_to_center=True
+    )[0]
+    centers_um = gt_centers_cellscale.to(
+        device=gt_masks.device, dtype=torch.float32
+    ) * torch.as_tensor(dref_um, device=gt_masks.device, dtype=torch.float32)
+    radius_um = float(radius_dref) * torch.as_tensor(
+        dref_um, device=gt_masks.device, dtype=torch.float32
+    )
+    radial = (
+        coords_um[None] - centers_um[:, None]
+    ).square().sum(dim=-1) <= radius_um.square()
+    return (radial | gt_masks.bool().flatten(1)).reshape_as(gt_masks)
+
+
+def _pairwise_dice_cost(
+    pred_logits: Tensor,
+    gt: Tensor,
+    support: Tensor | None = None,
+    eps: float = 1e-6,
+) -> Tensor:
     """FP32 pairwise Dice cost for pred [Q,V] and gt [K,V]."""
     pred_logits = pred_logits.float()
     gt = gt.float()
     p = pred_logits.sigmoid()
     inter = 2 * torch.einsum("qv,kv->qk", p, gt)
-    denom = p.sum(-1)[:, None] + gt.sum(-1)[None, :]
+    if support is None:
+        pred_sum = p.sum(-1)[:, None].expand(-1, gt.shape[0])
+    else:
+        pred_sum = torch.einsum("qv,kv->qk", p, support.float())
+    denom = pred_sum + gt.sum(-1)[None, :]
     return 1 - (inter + eps) / (denom + eps)
 
 
 def _pairwise_focal_cost(
     pred_logits: Tensor,
     gt: Tensor,
-    alpha: float = 0.25,
+    support: Tensor | None = None,
+    alpha: float = 0.75,
     gamma: float = 2.0,
 ) -> Tensor:
     """Stable FP32 focal matching cost using logit-space log probabilities."""
@@ -78,7 +121,12 @@ def _pairwise_focal_cost(
     costs = []
     for k in range(gt.shape[0]):
         target = gt[k][None]
-        costs.append((positive * target + negative * (1 - target)).mean(dim=-1))
+        value = positive * target + negative * (1 - target)
+        if support is None:
+            costs.append(value.mean(dim=-1))
+        else:
+            local = support[k].float()[None]
+            costs.append((value * local).sum(dim=-1) / local.sum().clamp_min(1))
     return torch.stack(costs, dim=1) if costs else logits.new_zeros((logits.shape[0], 0))
 
 
@@ -89,17 +137,27 @@ def build_cost_matrix(
     gt_masks: Tensor,
     gt_centers_cellscale: Tensor,
     *,
+    gt_support: Tensor | None = None,
     w_exist: float = 2.0,
     w_dice: float = 5.0,
     w_focal: float = 2.0,
     w_center: float = 2.0,
+    mask_focal_alpha_pos: float = 0.75,
+    mask_focal_gamma: float = 2.0,
 ) -> Tensor:
     """Construct the complete Hungarian cost explicitly in FP32."""
     with torch.autocast(device_type=coarse_mask_logits.device.type, enabled=False):
         masks = coarse_mask_logits.float().flatten(1)
         gt = gt_masks.float().flatten(1)
-        dice = _pairwise_dice_cost(masks, gt)
-        focal = _pairwise_focal_cost(masks, gt)
+        support = None if gt_support is None else gt_support.bool().flatten(1)
+        dice = _pairwise_dice_cost(masks, gt, support)
+        focal = _pairwise_focal_cost(
+            masks,
+            gt,
+            support,
+            alpha=mask_focal_alpha_pos,
+            gamma=mask_focal_gamma,
+        )
         exist = -F.logsigmoid(exist_logits.float())[:, None].expand(-1, gt.shape[0])
         center = torch.cdist(
             centers_cellscale.float(), gt_centers_cellscale.float(), p=1
@@ -131,12 +189,116 @@ class HungarianMatcher3D(nn.Module):
         w_dice: float = 5.0,
         w_focal: float = 2.0,
         w_center: float = 2.0,
+        mask_supervision_radius_dref: float = 1.5,
+        mask_focal_alpha_pos: float = 0.75,
+        mask_focal_gamma: float = 2.0,
     ):
         super().__init__()
         self.w_exist = w_exist
         self.w_dice = w_dice
         self.w_focal = w_focal
         self.w_center = w_center
+        self.mask_supervision_radius_dref = mask_supervision_radius_dref
+        self.mask_focal_alpha_pos = mask_focal_alpha_pos
+        self.mask_focal_gamma = mask_focal_gamma
+
+    @staticmethod
+    def _assignment(cost: Tensor) -> tuple[Tensor, Tensor]:
+        if cost.numel() == 0:
+            empty = torch.empty(0, device=cost.device, dtype=torch.long)
+            return empty, empty
+        row, col = linear_sum_assignment(cost.detach().cpu().numpy())
+        return (
+            torch.as_tensor(row, device=cost.device, dtype=torch.long),
+            torch.as_tensor(col, device=cost.device, dtype=torch.long),
+        )
+
+    def _structured_assignment(
+        self,
+        cost: Tensor,
+        valid_q: Tensor,
+        valid_gt: Tensor,
+        query_types: Tensor,
+        source_instance_ids: Tensor,
+        target: dict,
+    ) -> tuple[Tensor, Tensor] | None:
+        """Two-stage source-aware assignment in valid-query/valid-GT space."""
+        if "source_ids" not in target or "source_gt_overlap" not in target:
+            return None
+        source_ids = torch.as_tensor(target["source_ids"], dtype=torch.long).cpu()
+        overlap = torch.as_tensor(target["source_gt_overlap"], dtype=torch.long).cpu()
+        all_gt_count = len(target_ids(target))
+        if overlap.shape != (len(source_ids), all_gt_count):
+            raise ValueError(
+                "source_gt_overlap must have shape [num_sources, num_targets]; "
+                f"got {tuple(overlap.shape)}, expected {(len(source_ids), all_gt_count)}"
+            )
+        overlap = overlap[:, valid_gt.detach().cpu().long()] > 0
+        source_row = {int(source_id): row for row, source_id in enumerate(source_ids.tolist())}
+        qtypes = query_types[valid_q].detach().cpu().long()
+        query_sources = source_instance_ids[valid_q].detach().cpu().long()
+        eligible = torch.zeros((len(valid_q), len(valid_gt)), dtype=torch.bool)
+        for row, (query_type, source_id) in enumerate(
+            zip(qtypes.tolist(), query_sources.tolist())
+        ):
+            source_index = source_row.get(int(source_id))
+            if source_index is None:
+                continue
+            compatible = overlap[source_index]
+            compatible_count = int(compatible.sum())
+            if query_type == QUERY_PRIMARY and compatible_count >= 1:
+                eligible[row] = compatible
+            elif query_type == QUERY_SPLIT and compatible_count >= 2:
+                eligible[row] = compatible
+
+        # Stage A: compatible primary/split candidates only.
+        seeded_rows = torch.nonzero(eligible.any(dim=1), as_tuple=False).flatten()
+        seeded_cols = torch.nonzero(eligible.any(dim=0), as_tuple=False).flatten()
+        matched_rows: list[Tensor] = []
+        matched_cols: list[Tensor] = []
+        used_cols = torch.zeros(len(valid_gt), dtype=torch.bool)
+        if seeded_rows.numel() and seeded_cols.numel():
+            eligible_sub = eligible[seeded_rows][:, seeded_cols].to(cost.device)
+            seeded_cost = cost[seeded_rows.to(cost.device)][:, seeded_cols.to(cost.device)]
+            scale = seeded_cost.abs().max() + 1.0
+            invalid_cost = scale * (min(seeded_cost.shape) + 1)
+            seeded_cost = torch.where(eligible_sub, seeded_cost, invalid_cost)
+            row, col = self._assignment(seeded_cost)
+            keep = eligible_sub[row, col]
+            row = seeded_rows.to(cost.device)[row[keep]]
+            col = seeded_cols.to(cost.device)[col[keep]]
+            if row.numel():
+                matched_rows.append(row)
+                matched_cols.append(col)
+                used_cols[col.detach().cpu()] = True
+
+        # Stage B: temporal/discovery queries see only GTs not owned in Stage A.
+        fallback_rows = torch.nonzero(
+            (qtypes == QUERY_TEMPORAL) | (qtypes == QUERY_DISCOVERY),
+            as_tuple=False,
+        ).flatten()
+        remaining_cols = torch.nonzero(~used_cols, as_tuple=False).flatten()
+        if fallback_rows.numel() and remaining_cols.numel():
+            fallback_cost = cost[fallback_rows.to(cost.device)][:, remaining_cols.to(cost.device)]
+            row, col = self._assignment(fallback_cost)
+            matched_rows.append(fallback_rows.to(cost.device)[row])
+            matched_cols.append(remaining_cols.to(cost.device)[col])
+
+        if not matched_rows:
+            empty = torch.empty(0, device=cost.device, dtype=torch.long)
+            return empty, empty
+        rows = torch.cat(matched_rows)
+        cols = torch.cat(matched_cols)
+        order = torch.argsort(rows)
+        rows, cols = rows[order], cols[order]
+        if rows.unique().numel() != rows.numel() or cols.unique().numel() != cols.numel():
+            raise AssertionError("Structured Hungarian assignment is not one-to-one")
+        seeded = (qtypes[rows.cpu()] == QUERY_PRIMARY) | (
+            qtypes[rows.cpu()] == QUERY_SPLIT
+        )
+        if seeded.any() and not eligible[rows.cpu()[seeded], cols.cpu()[seeded]].all():
+            raise AssertionError("Structured Hungarian produced a source-incompatible seeded match")
+        return rows, cols
 
     @torch.no_grad()
     def forward(
@@ -169,24 +331,50 @@ class HungarianMatcher3D(nn.Module):
             )
             gt_centers = torch.as_tensor(targets[b]["centers_cellscale"])[valid_gt]
             gt_centers = gt_centers.to(coarse.device, dtype=torch.float32, non_blocking=True)
+            gt_support = None
+            if "coarse_spacing_um" in output and "dref_um" in output:
+                spacing = output["coarse_spacing_um"]
+                spacing_b = spacing[b] if spacing.ndim == 2 else spacing
+                dref = output["dref_um"]
+                dref_b = dref[b] if dref.ndim else dref
+                gt_support = build_local_support_masks(
+                    gt_masks,
+                    gt_centers,
+                    spacing_b,
+                    dref_b,
+                    self.mask_supervision_radius_dref,
+                )
             cost = build_cost_matrix(
                 output["exist_logits"][b, valid_q],
                 coarse[b, valid_q],
                 output["centers_cellscale"][b, valid_q],
                 gt_masks,
                 gt_centers,
+                gt_support=gt_support,
                 w_exist=self.w_exist,
                 w_dice=self.w_dice,
                 w_focal=self.w_focal,
                 w_center=self.w_center,
+                mask_focal_alpha_pos=self.mask_focal_alpha_pos,
+                mask_focal_gamma=self.mask_focal_gamma,
             )
-            row, col = linear_sum_assignment(cost.cpu().numpy())
-            row_t = torch.as_tensor(row, device=coarse.device, dtype=torch.long)
-            col_t = torch.as_tensor(col, device=valid_gt.device, dtype=torch.long)
+            structured = None
+            if "query_types" in output and "source_instance_ids" in output:
+                structured = self._structured_assignment(
+                    cost,
+                    valid_q,
+                    valid_gt,
+                    output["query_types"][b],
+                    output["source_instance_ids"][b],
+                    targets[b],
+                )
+            row_t, col_t = (
+                self._assignment(cost) if structured is None else structured
+            )
             results.append(
                 MatchResult(
                     valid_q[row_t],
-                    valid_gt[col_t].to(coarse.device),
+                    valid_gt.to(coarse.device)[col_t],
                 )
             )
         return results

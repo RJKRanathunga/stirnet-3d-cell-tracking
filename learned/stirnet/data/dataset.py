@@ -7,7 +7,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .targets import build_gt_targets, estimate_dref_um, extract_instance_metadata, make_instance_boundary
+from .targets import (
+    add_source_gt_compatibility,
+    build_gt_targets,
+    estimate_dref_um,
+    extract_instance_metadata,
+    make_instance_boundary,
+)
 
 
 class CachedStirNetDataset(Dataset):
@@ -35,6 +41,11 @@ class CachedStirNetDataset(Dataset):
 
     def _materialize(self,s:dict)->dict:
         if "spatial_inputs" in s:
+            if "target" in s and "instance_labels" in s:
+                s = dict(s)
+                s["target"] = add_source_gt_compatibility(
+                    s["target"], s["instance_labels"]
+                )
             return s
         raw=np.asarray(s["raw"],np.float32)
         labels=np.asarray(s["instance_labels"],np.int64)
@@ -52,7 +63,7 @@ class CachedStirNetDataset(Dataset):
         marker=np.asarray(s.get("marker_heatmap",np.zeros_like(raw)),np.float32)
         spatial=np.stack([raw,foreground,edt,boundary,marker])
         meta=extract_instance_metadata(labels,raw,spacing,dref,marker)
-        target=build_gt_targets(gt,spacing,dref)
+        target=build_gt_targets(gt,spacing,dref,current_labels=labels)
         s=dict(s)
         s.update({
             "spatial_inputs":torch.as_tensor(spatial),
