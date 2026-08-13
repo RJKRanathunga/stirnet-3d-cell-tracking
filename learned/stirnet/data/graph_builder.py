@@ -14,6 +14,8 @@ from .historical_instances import (
 )
 
 
+DETECTION_EDGE_DIM = 15
+DETECTION_EDGE_ACCEPTED_COLUMN = 14
 HYPOTHESIS_EDGE_DIM = 22
 
 
@@ -74,11 +76,15 @@ def _tracklets(records: list[DetectionRecord], associations: list[AssociationRec
     for s,d in temporal:
         if outdeg[s]==1 and indeg[d]==1:
             uf.union(s,d)
-    roots={}; ids=[]
+    members: dict[int,list[int]]={}
     for i in range(len(records)):
-        root=uf.find(i)
-        if root not in roots: roots[root]=len(roots)
-        ids.append(roots[root])
+        members.setdefault(uf.find(i),[]).append(i)
+    ordered_roots=sorted(
+        members,
+        key=lambda root:min(records[i].node_id for i in members[root]),
+    )
+    roots={root:index for index,root in enumerate(ordered_roots)}
+    ids=[roots[uf.find(i)] for i in range(len(records))]
     return np.asarray(ids,np.int64),len(roots)
 
 
@@ -116,14 +122,22 @@ def build_temporal_graph(
     node_instance_grid: torch.Tensor | None = None,
     node_history_valid: torch.Tensor | None = None,
     history_extent_dref: float = 2.5,
+    candidate_graph_enabled: bool = True,
+    max_candidate_edges: int | None = None,
+    candidate_edge_chunk_size: int = 65_536,
 ) -> dict:
     records=list(records); associations=list(associations)
     if not records:
         return {
             "graph_x":torch.zeros((0,32),dtype=torch.float32),
             "graph_edge_index":torch.zeros((2,0),dtype=torch.long),
-            "graph_edge_attr":torch.zeros((0,14),dtype=torch.float32),
+            "graph_edge_attr":torch.zeros((0,DETECTION_EDGE_DIM),dtype=torch.float32),
+            "accepted_association_edge_index":torch.zeros((2,0),dtype=torch.long),
+            "accepted_association_edge_attr":torch.zeros((0,3),dtype=torch.float32),
             "tracklet_id":torch.zeros((0,),dtype=torch.long),
+            "node_ids":torch.zeros((0,),dtype=torch.long),
+            "node_observed_ref_um":torch.zeros((0,3),dtype=torch.float32),
+            "node_time_offset":torch.zeros((0,),dtype=torch.float32),
             "temporal_ref_um":torch.zeros((0,3),dtype=torch.float32),
             "temporal_status":torch.zeros((0,10),dtype=torch.float32),
             "hypothesis_edge_index":torch.zeros((2,0),dtype=torch.long),
@@ -213,7 +227,29 @@ def build_temporal_graph(
     assert gx.shape[1]==32
 
     edges=[]; attrs=[]
-    def add_edge(si,di,relation,score=None):
+    accepted_edges=[]; accepted_attrs=[]
+
+    # Accepted associations remain a separate prior. They determine tracklets
+    # above and only annotate candidate-GNN edges below; candidate topology
+    # never feeds back into `_tracklets`.
+    accepted: dict[tuple[int,int], tuple[str,float|None]] = {}
+    for association in associations:
+        if association.src_node_id not in id_to_idx or association.dst_node_id not in id_to_idx:
+            continue
+        source=id_to_idx[association.src_node_id]
+        destination=id_to_idx[association.dst_node_id]
+        relation="division" if association.relation=="division" else "temporal_fwd"
+        accepted[(source,destination)]=(relation,association.score)
+        accepted_edges.append((source,destination))
+        accepted_attrs.append([
+            0.0 if association.score is None else float(association.score),
+            float(association.score is not None),
+            float(association.relation=="division"),
+        ])
+        if association.relation=="temporal":
+            accepted[(destination,source)]=( "temporal_rev",association.score)
+
+    def add_edge(si,di,relation,score=None,is_accepted=False):
         s=records[si]; d=records[di]
         delta=np.asarray(d.position_um)-np.asarray(s.position_um)
         dist=float(np.linalg.norm(delta))
@@ -226,30 +262,65 @@ def build_temporal_graph(
             np.log(max(d.physical_volume_um3,1e-6)/max(s.physical_volume_um3,1e-6)),
             d.intensity_mean-s.intensity_mean,residual/dref_um,
             0.0 if score is None else float(score),float(score is not None),*rel_types,
+            float(is_accepted),
         ])
         edges.append((si,di))
-    for a in associations:
-        if a.src_node_id not in id_to_idx or a.dst_node_id not in id_to_idx:continue
-        s=id_to_idx[a.src_node_id]; d=id_to_idx[a.dst_node_id]
-        if a.relation=="division": add_edge(s,d,"division",a.score)
-        else:
-            add_edge(s,d,"temporal_fwd",a.score); add_edge(d,s,"temporal_rev",a.score)
-    # same-frame spatial edges
-    for t in sorted(set(r.time_offset for r in records)):
-        idx=np.asarray([i for i,r in enumerate(records) if r.time_offset==t],dtype=int)
-        if len(idx)<2:continue
-        pos=np.asarray([records[i].position_um for i in idx])
-        D=np.linalg.norm(pos[:,None]-pos[None],axis=-1)
-        for a,i in enumerate(idx):
-            order=np.argsort(D[a])
-            count=0
-            for b in order:
-                if b==a:continue
-                if D[a,b]>spatial_radius_dref*dref_um:break
-                add_edge(i,int(idx[b]),"spatial",None);count+=1
-                if count>=k_spatial_neighbors:break
+    if candidate_graph_enabled:
+        n=len(records)
+        edge_count=n*(n-1)
+        if max_candidate_edges is not None and edge_count>max_candidate_edges:
+            raise RuntimeError(
+                f"Complete candidate detection graph requires {edge_count} directed edges, "
+                f"exceeding max_candidate_edges={max_candidate_edges}. Increase or disable "
+                "the explicit safety limit; STIR-Net will not silently drop observations."
+            )
+        if candidate_edge_chunk_size<=0:
+            raise ValueError("candidate_edge_chunk_size must be positive")
+        # CPU chunks bound temporary construction state without changing the
+        # exact all-pairs directed semantics.
+        for start in range(0,n,candidate_edge_chunk_size):
+            stop=min(start+candidate_edge_chunk_size,n)
+            for si in range(start,stop):
+                for di in range(n):
+                    if si==di:
+                        continue
+                    relation=(
+                        "temporal_fwd" if records[di].time_offset>records[si].time_offset
+                        else "temporal_rev" if records[di].time_offset<records[si].time_offset
+                        else "spatial"
+                    )
+                    accepted_relation=accepted.get((si,di))
+                    score=None
+                    is_accepted=accepted_relation is not None
+                    if accepted_relation is not None:
+                        relation,score=accepted_relation
+                    add_edge(si,di,relation,score,is_accepted)
+    else:
+        for (source,destination),(relation,score) in accepted.items():
+            add_edge(source,destination,relation,score,True)
+        # Legacy accepted-graph topology retains bounded same-frame neighbours.
+        for time in sorted(set(record.time_offset for record in records)):
+            indices=np.asarray([i for i,record in enumerate(records) if record.time_offset==time],dtype=int)
+            if len(indices)<2:continue
+            positions=np.asarray([records[i].position_um for i in indices])
+            distances=np.linalg.norm(positions[:,None]-positions[None],axis=-1)
+            for row,source in enumerate(indices):
+                count=0
+                for column in np.argsort(distances[row]):
+                    if column==row:continue
+                    if distances[row,column]>spatial_radius_dref*dref_um:break
+                    destination=int(indices[column])
+                    if (int(source),destination) not in accepted:
+                        add_edge(int(source),destination,"spatial",None,False)
+                    count+=1
+                    if count>=k_spatial_neighbors:break
     edge_index=np.asarray(edges,np.int64).T if edges else np.zeros((2,0),np.int64)
-    edge_attr=np.asarray(attrs,np.float32).reshape(-1,14)
+    edge_attr=np.asarray(attrs,np.float32).reshape(-1,DETECTION_EDGE_DIM)
+    accepted_edge_index=(
+        np.asarray(accepted_edges,np.int64).T
+        if accepted_edges else np.zeros((2,0),np.int64)
+    )
+    accepted_edge_attr=np.asarray(accepted_attrs,np.float32).reshape(-1,3)
 
     refs=np.stack([_reference_for_tracklet(g) for g in track_groups]).astype(np.float32)
     status=np.zeros((M,10),np.float32)
@@ -354,7 +425,16 @@ def build_temporal_graph(
         "graph_x":torch.as_tensor(gx),
         "graph_edge_index":torch.as_tensor(edge_index,dtype=torch.long),
         "graph_edge_attr":torch.as_tensor(edge_attr),
+        "accepted_association_edge_index":torch.as_tensor(accepted_edge_index,dtype=torch.long),
+        "accepted_association_edge_attr":torch.as_tensor(accepted_edge_attr),
         "tracklet_id":torch.as_tensor(tracklet_id,dtype=torch.long),
+        "node_ids":torch.tensor([record.node_id for record in records],dtype=torch.long),
+        "node_observed_ref_um":torch.tensor(
+            [record.position_um for record in records],dtype=torch.float32
+        ),
+        "node_time_offset":torch.tensor(
+            [record.time_offset for record in records],dtype=torch.float32
+        ),
         "temporal_ref_um":torch.as_tensor(refs),
         "temporal_status":torch.as_tensor(status),
         "hypothesis_edge_index":torch.as_tensor(hidx,dtype=torch.long),

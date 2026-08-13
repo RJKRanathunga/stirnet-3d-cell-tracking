@@ -31,7 +31,14 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
 
 
 def model_forward_from_batch(
-    model: StirNet, b: dict, *, bypass_coreasoning: bool = False
+    model: StirNet,
+    b: dict,
+    *,
+    bypass_coreasoning: bool = False,
+    return_debug: bool = False,
+    return_full_temporal_attention: bool = False,
+    temporal_memory_ablation: str = "full",
+    detection_graph_ablation: str = "full",
 ):
     return model(
         b["spatial_inputs"],b["instance_labels"],b["spacing_um"],b["dref_um"],
@@ -40,6 +47,7 @@ def model_forward_from_batch(
         b["temporal_ref_um"],b["temporal_status"],b["hypothesis_edge_index"],
         b["hypothesis_edge_attr"],b["temporal_batch"],
         b.get("spatial_padding_mask"),
+        return_debug=return_debug,
         bypass_coreasoning=bypass_coreasoning,
         node_instance_grid=b.get("node_instance_grid"),
         node_history_valid=b.get("node_history_valid"),
@@ -51,6 +59,12 @@ def model_forward_from_batch(
         best_current_component_id=b.get("best_current_component_id"),
         best_component_overlap=b.get("best_component_overlap"),
         second_best_component_overlap=b.get("second_best_component_overlap"),
+        node_observed_ref_um=b.get("node_observed_ref_um"),
+        node_time_offset=b.get("node_time_offset"),
+        node_ids=b.get("node_ids"),
+        temporal_memory_ablation=temporal_memory_ablation,
+        detection_graph_ablation=detection_graph_ablation,
+        return_full_temporal_attention=return_full_temporal_attention,
     )
 
 

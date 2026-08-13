@@ -373,13 +373,15 @@ The model code is expected under `learned/stirnet/`, but checkpoints should be s
 
 ## Historical evidence cache and augmentation contract
 
-History-capable caches are explicit contract version 2. In addition to existing
-graph data they store float16 `node_instance_grid`, `node_history_valid`, nearest
-past/future occupancy-SDF support and transforms, component-overlap summaries,
-and 22-D hypothesis edges. Full historical native volumes are referenced
-externally, not duplicated per patch. Unversioned/version-1 caches remain
-loadable: collation supplies invalid zero history, pads legacy 8-D edges with
-zero new columns, and retains reference-lookup fallback behavior.
+Temporal caches are explicit contract version 3 and live in the reusable sample
+directory, normally `temporal_v3/temporal_graph.pt`. They store the complete
+candidate graph, accepted-association metadata, node order/physical metadata,
+float16 `node_instance_grid`, `node_history_valid`, nearest past/future
+occupancy-SDF support and transforms, component-overlap summaries, and 22-D
+hypothesis edges. Full historical native volumes are referenced externally, not
+duplicated per patch, and learned node tokens are never cached. Older nonempty
+contracts are rejected with a rebuild instruction because their sparse graph
+cannot unambiguously satisfy candidate-graph semantics.
 
 Axis flips reverse the corresponding spatial axis of node grids and hypothesis
 support, negate centers, node velocities, edge displacements, and hypothesis
@@ -402,3 +404,6 @@ group; support-bias MLPs live inside CR1/CR2 in that same group. There is no
 sixth curriculum stage. They are frozen/bypassed in `spatial_dense`, enabled in
 `temporal_dense`, and continue through query bootstrap, native bootstrap, and
 joint training. The parameter checker must assign every parameter exactly once.
+Component and per-decoder-layer hierarchical-memory modules are nested under
+`query_builder`/`query_decoder`, belong to the `query` group, and first become
+trainable in `query_bootstrap`.

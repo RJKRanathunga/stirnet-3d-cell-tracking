@@ -264,6 +264,12 @@ residual
  |
 pre-norm
  |
+query -> fine node memory + coarse tracklet memory
+ |
+conservative gated residuals
+ |
+pre-norm
+ |
 query -> spatial masked cross-attention
  |
 residual
@@ -288,6 +294,22 @@ This enables:
 - primary and split queries to compete;
 - temporal and current-instance queries to merge duplicate hypotheses;
 - discovery queries to avoid duplicating seeded cells.
+
+### Hierarchical temporal reads
+
+Before primary/split construction, every current-component embedding attends
+separately to all fine node-memory observations and all coarse tracklet tokens
+in its logical sample. The two messages use conservative learned residual gates
+and a gated FFN. Split slots therefore inherit a temporally informed component
+token but retain distinct learned slot embeddings; no slot is assigned to a
+historical track.
+
+Every decoder layer repeats the same two memory reads after query self-attention
+and before spatial cross-attention. Its relation bias uses the query's current
+physical reference. The center update produced by one layer is consequently
+used by the next layer's temporal read. Padded queries and other batch items are
+never visible. `QUERY_TEMPORAL` hypotheses remain present as explicit
+trajectory-originated queries.
 
 ## 13. Decoder spatial scales
 

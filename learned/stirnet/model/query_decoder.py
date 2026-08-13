@@ -9,11 +9,12 @@ import torch.nn.functional as F
 
 from .attention import PhysicalPositionBias
 from .blocks import FeedForward
-from .config import DecoderConfig, QueryConfig
+from .config import DecoderConfig, QueryConfig, TemporalConfig
 from .coordinates import feature_grid_coordinates_um, resize_label_map_nearest
 from .heads import CenterHead, ExistenceHead, MaskEmbeddingHead, dot_mask_logits
 from .query_builder import QUERY_DISCOVERY, QUERY_PRIMARY, QUERY_SPLIT, QUERY_TEMPORAL
-from .types import QueryState
+from .temporal_memory import HierarchicalTemporalFusion
+from .types import QueryState, TemporalState
 
 
 def _cap_feature_tokens(feature: Tensor, spacing_um: Tensor, max_tokens: int) -> tuple[Tensor, Tensor]:
@@ -91,10 +92,16 @@ class QueryCrossAttention(nn.Module):
 
 
 class QueryDecoderLayer(nn.Module):
-    def __init__(self, cfg: DecoderConfig):
+    def __init__(
+        self, cfg: DecoderConfig, temporal_cfg: TemporalConfig | None = None
+    ):
         super().__init__()
         self.self_norm = nn.LayerNorm(cfg.d_model)
         self.self_attn = nn.MultiheadAttention(cfg.d_model, cfg.heads, cfg.dropout, batch_first=True)
+        temporal_cfg = temporal_cfg or TemporalConfig(d_model=cfg.d_model)
+        self.temporal_fusion = HierarchicalTemporalFusion(temporal_cfg)
+        self.query_memory_enabled = temporal_cfg.query_memory_enabled
+        self.last_temporal_debug: dict | None = None
         self.cross_norm = nn.LayerNorm(cfg.d_model)
         self.cross_attn = QueryCrossAttention(cfg)
         self.ffn_norm = nn.LayerNorm(cfg.d_model)
@@ -117,11 +124,52 @@ class QueryDecoderLayer(nn.Module):
         delta = torch.tanh(raw_delta) * max_step[..., None]
         return delta.masked_fill(q.padding_mask[..., None], 0)
 
-    def forward(self, q: QueryState, spatial_tokens: Tensor, spatial_pos_um: Tensor, support: Tensor, dref_um: Tensor, spatial_mask_features: Tensor):
+    def forward(
+        self,
+        q: QueryState,
+        spatial_tokens: Tensor,
+        spatial_pos_um: Tensor,
+        support: Tensor,
+        dref_um: Tensor,
+        spatial_mask_features: Tensor,
+        temporal: TemporalState | None = None,
+        *,
+        memory_ablation: str = "full",
+        return_debug: bool = False,
+        full_attention: bool = False,
+    ):
         x = q.embeddings
         n = self.self_norm(x)
         a, _ = self.self_attn(n, n, n, key_padding_mask=q.padding_mask, need_weights=False)
         x = x + a
+        self.last_temporal_debug = None
+        if self.query_memory_enabled and temporal is not None:
+            valid = ~q.padding_mask
+            flat_batch = torch.arange(
+                x.shape[0], device=x.device, dtype=torch.long
+            )[:, None].expand_as(valid)
+            temporal_message, self.last_temporal_debug = self.temporal_fusion(
+                x[valid],
+                (q.references_cellscale * dref_um[:, None, None])[valid],
+                flat_batch[valid],
+                temporal,
+                dref_um,
+                memory_ablation=memory_ablation,
+                return_debug=return_debug,
+                full_attention=full_attention,
+            )
+            if self.last_temporal_debug is not None:
+                query_slots = torch.arange(
+                    x.shape[1], device=x.device, dtype=torch.long
+                )[None].expand_as(valid)
+                self.last_temporal_debug["query_slot_index"] = query_slots[valid].detach()
+                self.last_temporal_debug["query_type"] = q.query_types[valid].detach()
+                self.last_temporal_debug["source_instance_id"] = (
+                    q.source_instance_ids[valid].detach()
+                )
+            updated = x.clone()
+            updated[valid] = temporal_message
+            x = updated
         c = self.cross_attn(self.cross_norm(x), spatial_tokens, spatial_pos_um,
                             q.references_cellscale * dref_um[:, None, None], support, q.padding_mask, dref_um)
         x = x + c
@@ -145,13 +193,21 @@ class QueryDecoderLayer(nn.Module):
 
 
 class InstanceQueryDecoder(nn.Module):
-    def __init__(self, input_channels: tuple[int,int,int], cfg: DecoderConfig, query_cfg: QueryConfig):
+    def __init__(
+        self,
+        input_channels: tuple[int,int,int],
+        cfg: DecoderConfig,
+        query_cfg: QueryConfig,
+        temporal_cfg: TemporalConfig | None = None,
+    ):
         super().__init__()
         self.cfg = cfg
         self.query_cfg = query_cfg
         self.feature_proj = nn.ModuleList([nn.Conv3d(c, cfg.d_model, 1) for c in input_channels])
         self.mask_feature_proj = nn.ModuleList([nn.Conv3d(c, cfg.mask_dim, 1) for c in input_channels])
-        self.layers = nn.ModuleList([QueryDecoderLayer(cfg) for _ in range(cfg.layers)])
+        self.layers = nn.ModuleList([
+            QueryDecoderLayer(cfg, temporal_cfg) for _ in range(cfg.layers)
+        ])
 
     def _reference_support(self, q: QueryState, pos_um: Tensor, dref_um: Tensor, layer_idx: int) -> Tensor:
         B, Q = q.query_types.shape
@@ -202,6 +258,11 @@ class InstanceQueryDecoder(nn.Module):
         spatial_spacings_um: list[Tensor],
         instance_labels: Tensor,
         dref_um: Tensor,
+        temporal: TemporalState | None = None,
+        *,
+        memory_ablation: str = "full",
+        return_debug: bool = False,
+        full_attention: bool = False,
     ) -> tuple[QueryState, list[dict[str,Tensor]]]:
         q = query_state
         outputs = []
@@ -223,7 +284,18 @@ class InstanceQueryDecoder(nn.Module):
                 prev_support = self._dilate(prev_support, spacing, dref_um)
                 support = support | prev_support
             support_flat = support.flatten(2)
-            q, out = layer(q, spatial_tokens, pos_um, support_flat, dref_um, mask_feat)
+            q, out = layer(
+                q,
+                spatial_tokens,
+                pos_um,
+                support_flat,
+                dref_um,
+                mask_feat,
+                temporal,
+                memory_ablation=memory_ablation,
+                return_debug=return_debug,
+                full_attention=full_attention,
+            )
             out["coarse_spacing_um"] = spacing
             outputs.append(out)
             previous_mask = out["coarse_mask_logits"]

@@ -331,3 +331,19 @@ hypothesis, and query counts; compact tensor bytes; spatial feature shapes; and
 peak memory. Initial marginal allocated-memory target is 0.5-0.7 GB. If it is
 exceeded, optimize checkpointing, chunks, dtype, and chunk-local sampling before
 reducing support channels or the 12-cube resolution.
+
+## 17. Hierarchical temporal-memory validation
+
+`test_v1_temporal_memory.py` covers complete directed candidate topology,
+accepted-relation marking, tracklet invariance, no cross-batch edges, explicit
+safety errors, node retention, permutation equivariance, empty/missing memory,
+split-slot attention diversity, query-to-history gradient reachability,
+checkpoint migration, and curriculum ownership.
+
+`debugging/acceptance/hierarchical_memory.py` trains one synthetic converging
+two-cell/current-merge scene whose accepted graph explains only one branch, then
+evaluates the same weights under full, zero/shuffled node, tracklet-only,
+node-only, and accepted-graph-only modes. It reports split attention and
+per-layer sibling center separation. `backward_gate.py` accepts the same memory
+and graph ablation switches for the uncropped real scene and reports path-level
+gradient sums plus per-phase CUDA peaks.

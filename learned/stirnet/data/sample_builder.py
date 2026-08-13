@@ -5,6 +5,7 @@ import torch
 from scipy import ndimage as ndi
 
 from .targets import build_gt_targets, estimate_dref_um, extract_instance_metadata, make_instance_boundary
+from .graph_builder import DETECTION_EDGE_DIM
 
 
 def robust_normalize(raw: np.ndarray, low_pct: float = 1.0, high_pct: float = 99.8) -> np.ndarray:
@@ -61,8 +62,11 @@ def build_cached_sample(
     if temporal_graph: sample.update(temporal_graph)
     else:
         sample.update({
-            "graph_x":torch.zeros((0,32)),"graph_edge_index":torch.zeros((2,0),dtype=torch.long),"graph_edge_attr":torch.zeros((0,14)),
+            "graph_x":torch.zeros((0,32)),"graph_edge_index":torch.zeros((2,0),dtype=torch.long),"graph_edge_attr":torch.zeros((0,DETECTION_EDGE_DIM)),
+            "accepted_association_edge_index":torch.zeros((2,0),dtype=torch.long),
+            "accepted_association_edge_attr":torch.zeros((0,3)),
             "tracklet_id":torch.zeros((0,),dtype=torch.long),"temporal_ref_um":torch.zeros((0,3)),"temporal_status":torch.zeros((0,10)),
+            "node_ids":torch.zeros((0,),dtype=torch.long),"node_observed_ref_um":torch.zeros((0,3)),"node_time_offset":torch.zeros((0,)),
             "hypothesis_edge_index":torch.zeros((2,0),dtype=torch.long),"hypothesis_edge_attr":torch.zeros((0,22)),
             "node_instance_grid":torch.zeros((0,4,12,12,12),dtype=torch.float16),
             "node_history_valid":torch.zeros((0,),dtype=torch.bool),

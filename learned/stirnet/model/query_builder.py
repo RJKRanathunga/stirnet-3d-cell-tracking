@@ -6,8 +6,9 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from .config import QueryConfig
+from .config import QueryConfig, TemporalConfig
 from .coordinates import resize_label_map_nearest
+from .temporal_memory import HierarchicalTemporalFusion
 from .types import QueryState, TemporalState
 
 
@@ -19,7 +20,12 @@ NUM_QUERY_TYPES = 4
 
 
 class InstanceQueryBuilder(nn.Module):
-    def __init__(self, cfg: QueryConfig, feature_channels: int = 64):
+    def __init__(
+        self,
+        cfg: QueryConfig,
+        feature_channels: int = 64,
+        temporal_cfg: TemporalConfig | None = None,
+    ):
         super().__init__()
         self.cfg = cfg
         self.feature_proj = nn.Linear(2 * feature_channels, cfg.d_model)
@@ -43,6 +49,10 @@ class InstanceQueryBuilder(nn.Module):
         self.discovery_queries = nn.Parameter(torch.randn(cfg.discovery_queries, cfg.d_model) * 0.02)
         self.discovery_refs = nn.Parameter(torch.empty(cfg.discovery_queries, 3))
         nn.init.uniform_(self.discovery_refs, -2.0, 2.0)
+        temporal_cfg = temporal_cfg or TemporalConfig(d_model=cfg.d_model)
+        self.temporal_fusion = HierarchicalTemporalFusion(temporal_cfg)
+        self.component_memory_enabled = temporal_cfg.component_memory_enabled
+        self.last_temporal_debug: dict | None = None
 
     @torch.no_grad()
     def split_companion_counts(
@@ -149,12 +159,35 @@ class InstanceQueryBuilder(nn.Module):
         instance_centroids_um: Tensor,
         dref_um: Tensor,
         temporal: TemporalState,
+        *,
+        memory_ablation: str = "full",
+        return_debug: bool = False,
+        full_attention: bool = False,
     ) -> QueryState:
         B = feature.shape[0]
         pooled = self._pool_instances(
             feature, feature_spacing_um, instance_labels, instance_ids, instance_batch, instance_centroids_um
         )
         inst_emb = self.feature_proj(pooled) + self.geom_proj(instance_features)
+        self.last_temporal_debug = None
+        if self.component_memory_enabled and inst_emb.shape[0]:
+            inst_emb, self.last_temporal_debug = self.temporal_fusion(
+                inst_emb,
+                instance_centroids_um,
+                instance_batch,
+                temporal,
+                dref_um,
+                memory_ablation=memory_ablation,
+                return_debug=return_debug,
+                full_attention=full_attention,
+            )
+            if self.last_temporal_debug is not None:
+                self.last_temporal_debug["component_instance_ids"] = (
+                    instance_ids.detach()
+                )
+                self.last_temporal_debug["component_batch_index"] = (
+                    instance_batch.detach()
+                )
         split_counts = self.split_companion_counts(
             instance_labels, instance_ids, instance_batch
         )

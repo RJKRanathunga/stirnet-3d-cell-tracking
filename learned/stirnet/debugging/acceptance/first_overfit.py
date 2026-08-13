@@ -17,6 +17,7 @@ import torch
 
 from learned.stirnet import RefinementCriterion, StirNet, StirNetConfig
 from learned.stirnet.data.graph_builder import AssociationRecord, DetectionRecord, build_temporal_graph
+from learned.stirnet.data.trackastra_cache import load_cache, save_cache
 from learned.stirnet.data.sample_builder import robust_normalize
 from learned.stirnet.data.targets import build_gt_targets, extract_instance_metadata
 from learned.stirnet.debugging.probes.matching import run_matching_probe
@@ -82,6 +83,7 @@ def _build_temporal_inputs(
     spacing,
     dref_um,
     current_target,
+    history_v2: dict | None = None,
 ):
     full_shape = np.asarray(instance_movie.shape[-3:], dtype=np.float32)
     roi_shape = np.asarray(current_target.shape, dtype=np.float32)
@@ -104,6 +106,13 @@ def _build_temporal_inputs(
                 delta = node_position_abs_um[other] - position0
                 values.append((delta if forward else -delta) / dt)
         return np.mean(values, axis=0).astype(np.float32) if values else np.zeros(3, dtype=np.float32)
+
+    history_rows = {}
+    if history_v2 is not None:
+        for row, metadata_row in enumerate(history_v2.get("_build_rows", [])):
+            history_rows[
+                (int(metadata_row["node_id"]), int(metadata_row["time_offset"]))
+            ] = row
 
     records = []
     for local_time in range(len(instance_movie)):
@@ -134,6 +143,17 @@ def _build_temporal_inputs(
             predecessors = list(track_graph.predecessors(node_id))
             successors = list(track_graph.successors(node_id))
             distance_to_volume_boundary = float(np.min(np.concatenate([lower_full_um, upper_full_um])))
+            history_row = history_rows.get(
+                (int(node_id), local_time - target_local_time)
+            )
+            history_grid = (
+                history_v2["node_instance_grid"][history_row]
+                if history_v2 is not None and history_row is not None
+                else None
+            )
+            history_valid = bool(
+                history_v2["node_history_valid"][history_row]
+            ) if history_v2 is not None and history_row is not None else False
             records.append(
                 DetectionRecord(
                     node_id=int(node_id),
@@ -153,6 +173,8 @@ def _build_temporal_inputs(
                     distance_to_volume_boundary_um=distance_to_volume_boundary,
                     distance_to_patch_boundary_um=float(np.min(np.concatenate([lower_roi_um, upper_roi_um]))),
                     boundary_related=distance_to_volume_boundary <= 4.0,
+                    instance_grid=history_grid,
+                    history_valid=history_valid,
                 )
             )
 
@@ -218,10 +240,22 @@ def build_real_batch(data_dir: Path):
     ).astype(np.float32, copy=False)
 
     instance_metadata = extract_instance_metadata(current_target, spatial_inputs[0], tuple(spacing), dref_um, spatial_inputs[4])
-    temporal = _build_temporal_inputs(
-        track_graph, instance_movie, raw_movie, markers_movie,
-        roi, roi_low, target_local_time, spacing, dref_um, current_target,
-    )
+    temporal_cache_path = data_dir / "temporal_v3" / "temporal_graph.pt"
+    if temporal_cache_path.exists():
+        temporal = load_cache(temporal_cache_path)
+    else:
+        legacy_history_path = data_dir / "history_v2" / "real_history_temporal_v2.pt"
+        legacy_history = (
+            torch.load(legacy_history_path, map_location="cpu", weights_only=False)
+            if legacy_history_path.exists()
+            else None
+        )
+        temporal = _build_temporal_inputs(
+            track_graph, instance_movie, raw_movie, markers_movie,
+            roi, roi_low, target_local_time, spacing, dref_um, current_target,
+            history_v2=legacy_history,
+        )
+        save_cache(temporal_cache_path, temporal)
     target = build_gt_targets(
         gt_target, tuple(spacing), dref_um, current_labels=current_target
     )
@@ -295,7 +329,7 @@ def run(data_dir: Path) -> None:
     started = time.perf_counter()
     print("acceptance: starting fresh-model forward", flush=True)
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
-        outputs = model_forward_from_batch(model, b)
+        outputs = model_forward_from_batch(model, b, return_debug=True)
     print("acceptance: forward complete; starting matching and streamed losses", flush=True)
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
         losses = criterion(outputs, b["targets"])
@@ -370,6 +404,50 @@ def run(data_dir: Path) -> None:
             & (query_sources == 9)
         ).sum()
     )
+    source_nine_attention = []
+    source_nine_center_separation = []
+    if outputs.debug is not None:
+        node_debug = outputs.debug.get("node_memory") or {}
+        node_ids = node_debug.get("node_ids")
+        node_time = node_debug.get("time_offset")
+        for layer_index, layer_debug in enumerate(
+            outputs.debug.get("query_temporal_attention") or []
+        ):
+            if not layer_debug or "node" not in layer_debug:
+                continue
+            source_mask = layer_debug["source_instance_id"] == 9
+            seeded_mask = (
+                (layer_debug["query_type"] == QUERY_PRIMARY)
+                | (layer_debug["query_type"] == QUERY_SPLIT)
+            )
+            for row in torch.nonzero(
+                source_mask & seeded_mask, as_tuple=False
+            ).flatten():
+                memory_index = int(layer_debug["node"]["top_indices"][row, 0])
+                source_nine_attention.append(
+                    {
+                        "layer": layer_index,
+                        "query": int(layer_debug["query_slot_index"][row]),
+                        "node_index": memory_index,
+                        "node_id": int(node_ids[memory_index]) if node_ids is not None else memory_index,
+                        "time_offset": float(node_time[memory_index]) if node_time is not None else 0.0,
+                        "weight": float(layer_debug["node"]["top_weights"][row, 0]),
+                    }
+                )
+        centers = outputs.debug.get("query_layer_references_cellscale")
+        source_nine_queries = torch.nonzero(
+            (
+                (outputs.query_types[0] == QUERY_PRIMARY)
+                | (outputs.query_types[0] == QUERY_SPLIT)
+            )
+            & (outputs.source_instance_ids[0] == 9),
+            as_tuple=False,
+        ).flatten()
+        if centers is not None and len(source_nine_queries) > 1:
+            source_nine_center_separation = [
+                float(torch.pdist(layer[0, source_nine_queries].float()).mean())
+                for layer in centers
+            ]
     max_temporal_dref = max(temporal_distances_dref, default=0.0)
     max_discovery_dref = max(discovery_distances_dref, default=0.0)
     output_tensors = (
@@ -397,6 +475,11 @@ def run(data_dir: Path) -> None:
     print(f"query_type_counts={query_type_counts}")
     print(f"split_companions_by_source={split_companions_by_source}")
     print(f"source_9_seeded_hypotheses={source_nine_seeded}")
+    print(f"source_9_temporal_attention={source_nine_attention}")
+    print(
+        "source_9_decoder_layer_mean_pair_separation_dref="
+        f"{source_nine_center_separation}"
+    )
     print(f"forward_matching_loss_seconds={time.perf_counter() - started:.2f}")
     print(f"peak_cuda_gib={torch.cuda.max_memory_allocated() / 1024**3:.3f}")
     print(f"source_incompatible_seeded_matches={incompatible_seeded}")

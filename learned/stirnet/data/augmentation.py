@@ -10,7 +10,7 @@ def random_flip_sample(sample: dict, p: float = 0.5) -> dict:
     out=dict(sample)
     dense_keys=["spatial_inputs","instance_labels"]
     target_dense=["masks","label_map","foreground","center_heatmap","boundary"]
-    coord_keys=["instance_centroids_um","temporal_ref_um"]
+    coord_keys=["instance_centroids_um","temporal_ref_um","node_observed_ref_um"]
     for axis in range(3):
         if random.random()>=p: continue
         dense_axis=axis+1  # spatial_inputs C,Z,Y,X
@@ -92,12 +92,20 @@ def corrupt_temporal_clues(sample: dict, *, hypothesis_dropout=0.10, edge_dropou
         out["graph_x"]=out["graph_x"][node_keep]
         if "node_instance_grid" in out: out["node_instance_grid"]=out["node_instance_grid"][node_keep]
         if "node_history_valid" in out: out["node_history_valid"]=out["node_history_valid"][node_keep]
+        if "node_ids" in out: out["node_ids"]=out["node_ids"][node_keep]
+        if "node_observed_ref_um" in out: out["node_observed_ref_um"]=out["node_observed_ref_um"][node_keep]
+        if "node_time_offset" in out: out["node_time_offset"]=out["node_time_offset"][node_keep]
         out["tracklet_id"]=old_to_new[ti[node_keep]]
         ei=out["graph_edge_index"]
         if ei.numel():
             ek=node_keep[ei[0]] & node_keep[ei[1]] & (torch.rand(ei.shape[1])>=edge_dropout)
             out["graph_edge_index"]=node_map[ei[:,ek]]
             out["graph_edge_attr"]=out["graph_edge_attr"][ek]
+        accepted=out.get("accepted_association_edge_index",torch.zeros((2,0),dtype=torch.long))
+        if accepted.numel():
+            accepted_keep=node_keep[accepted[0]] & node_keep[accepted[1]]
+            out["accepted_association_edge_index"]=node_map[accepted[:,accepted_keep]]
+            out["accepted_association_edge_attr"]=out["accepted_association_edge_attr"][accepted_keep]
     out["temporal_ref_um"]=tref[keep].clone()
     out["temporal_status"]=out["temporal_status"][keep]
     for key in (

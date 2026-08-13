@@ -8,7 +8,9 @@ import torch
 from scipy import ndimage as ndi
 
 
-HISTORY_CACHE_CONTRACT_VERSION = 2
+TEMPORAL_CACHE_CONTRACT_VERSION = 3
+# Compatibility name for callers that imported the earlier history-only label.
+HISTORY_CACHE_CONTRACT_VERSION = TEMPORAL_CACHE_CONTRACT_VERSION
 
 
 @dataclass(frozen=True)

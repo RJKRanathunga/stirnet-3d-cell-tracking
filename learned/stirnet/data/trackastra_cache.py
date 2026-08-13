@@ -5,7 +5,7 @@ import os
 import tempfile
 import torch
 
-from .historical_instances import HISTORY_CACHE_CONTRACT_VERSION
+from .historical_instances import TEMPORAL_CACHE_CONTRACT_VERSION
 
 
 CACHE_CONTRACT_KEY = "stirnet_cache_contract_version"
@@ -14,7 +14,7 @@ CACHE_CONTRACT_KEY = "stirnet_cache_contract_version"
 def save_cache(path: str | Path, payload: dict) -> None:
     path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
     payload=dict(payload)
-    payload[CACHE_CONTRACT_KEY]=HISTORY_CACHE_CONTRACT_VERSION
+    payload[CACHE_CONTRACT_KEY]=TEMPORAL_CACHE_CONTRACT_VERSION
     fd,tmp=tempfile.mkstemp(prefix=path.name,suffix=".tmp",dir=path.parent)
     os.close(fd)
     try:
@@ -28,6 +28,11 @@ def load_cache(path: str | Path, map_location="cpu") -> dict:
     payload=torch.load(Path(path),map_location=map_location,weights_only=False)
     if not isinstance(payload,dict):
         raise TypeError("STIR-Net cache payload must be a dictionary")
-    # Version 1/unversioned caches are accepted through explicit no-history defaults.
-    payload.setdefault(CACHE_CONTRACT_KEY,1)
+    version=int(payload.get(CACHE_CONTRACT_KEY,1))
+    if version != TEMPORAL_CACHE_CONTRACT_VERSION:
+        raise ValueError(
+            f"STIR-Net temporal cache contract v{version} cannot be loaded as v"
+            f"{TEMPORAL_CACHE_CONTRACT_VERSION}. Rebuild under temporal_v3 so an old "
+            "accepted-edge graph is not silently treated as a complete candidate graph."
+        )
     return payload

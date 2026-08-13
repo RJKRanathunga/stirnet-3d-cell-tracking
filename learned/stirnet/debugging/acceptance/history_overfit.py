@@ -34,7 +34,7 @@ def _tiny_config() -> StirNetConfig:
     return cfg
 
 
-def build_converging_merge_batch() -> dict:
+def build_converging_merge_batch(*, accepted_second_branch: bool = True) -> dict:
     shape=(8,24,24);spacing=(1.5,0.75,0.75);dref=6.0
     zz,yy,xx=np.indices(shape)
     def ball(center,radius=3.2):
@@ -54,14 +54,16 @@ def build_converging_merge_batch() -> dict:
         for time,extra in ((-2,5),(-1,2),(1,2)):
             center_vox=np.array((4,12,target_x+direction*extra),np.float32)
             labels=ball(tuple(center_vox)).astype(np.int32)*cell
-            hist_raw=(0.1+0.8*ndi_gaussian(labels>0,0.8)).astype(np.float32)
+            history_scale=0.7 if cell==1 else 0.9
+            hist_raw=(0.1+history_scale*ndi_gaussian(labels>0,0.8)).astype(np.float32)
             center_abs=center_vox*np.asarray(spacing)
             patch_center=0.5*(np.asarray(shape)-1)*np.asarray(spacing)
             records.append(DetectionRecord(node_id,time,tuple(center_abs-patch_center),float((labels>0).sum()*np.prod(spacing))))
             observations.append((hist_raw,labels,cell,spacing,dref,center_abs))
             ids.append(node_id);node_id+=1
         tracks.append(ids)
-        associations.extend([AssociationRecord(ids[0],ids[1],0.9),AssociationRecord(ids[1],ids[2],0.8)])
+        if cell==1 or accepted_second_branch:
+            associations.extend([AssociationRecord(ids[0],ids[1],0.9),AssociationRecord(ids[1],ids[2],0.8)])
     grids,valid=build_node_instance_grids(observations)
     graph=build_temporal_graph(
         records,associations,dref_um=dref,current_labels=current_labels,spacing_um=spacing,

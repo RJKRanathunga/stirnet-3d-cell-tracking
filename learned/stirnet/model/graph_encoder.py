@@ -101,6 +101,16 @@ class DetectionGraphEncoder(nn.Module):
         return self.input_proj(graph_x)
 
     def message_pass(self, node_embedding: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
+        if edge_attr.shape[-1] != self.cfg.edge_dim:
+            if edge_attr.shape[-1] == 14 and self.cfg.edge_dim == 15:
+                # Direct model callers may still provide the legacy accepted-
+                # topology tensor; the appended accepted flag is unknown/zero.
+                edge_attr = F.pad(edge_attr, (0, 1))
+            else:
+                raise ValueError(
+                    f"detection edge width {edge_attr.shape[-1]} does not match "
+                    f"configured edge_dim={self.cfg.edge_dim}"
+                )
         x = node_embedding
         for layer in self.layers:
             x = layer(x, edge_index, edge_attr)

@@ -5,11 +5,13 @@ import torch
 
 
 def migrate_history_checkpoint_state_dict(model, state_dict: dict) -> tuple[dict, list[str]]:
-    """Migrate pre-history V1 weights without discarding the hypothesis GNN.
+    """Migrate earlier V1 weights into hierarchical temporal-memory V1.
 
     The legacy eight hypothesis-edge semantics are the unchanged prefix of the
-    22-D schema. New columns are initialized to zero; newly introduced history
-    modules retain the receiving model's conservative initialization.
+    22-D schema. The legacy 14 detection-edge semantics are likewise the exact
+    prefix of the 15-D candidate-edge schema. New columns are initialized to
+    zero; newly introduced history/memory modules retain the receiving model's
+    conservative initialization.
     """
     current=model.state_dict()
     migrated=dict(state_dict)
@@ -17,6 +19,21 @@ def migrate_history_checkpoint_state_dict(model, state_dict: dict) -> tuple[dict
     edge_suffix="hyp_graph.block.attn.edge.weight"
     for key,target in current.items():
         source=migrated.get(key)
+        if (
+            source is not None
+            and source.shape != target.shape
+            and key.startswith("graph_encoder.layers.")
+            and key.endswith("attn.edge.weight")
+            and source.ndim == 2
+            and source.shape[0] == target.shape[0]
+            and source.shape[1] == 14
+            and target.shape[1] == 15
+        ):
+            value=torch.zeros_like(target)
+            value[:,:14]=source.to(value.dtype)
+            migrated[key]=value
+            notes.append(f"expanded {key}: 14 -> 15 edge inputs")
+            continue
         if source is not None and source.shape!=target.shape and key.endswith(edge_suffix):
             if source.ndim==2 and source.shape[0]==target.shape[0] and source.shape[1]==8 and target.shape[1]==22:
                 value=torch.zeros_like(target)
@@ -28,6 +45,7 @@ def migrate_history_checkpoint_state_dict(model, state_dict: dict) -> tuple[dict
             key.startswith("history_encoder.")
             or key.startswith("history_fusion.")
             or ".cross.history_bias." in key
+            or ".temporal_fusion." in key
         ):
             migrated[key]=target.clone()
             notes.append(f"initialized new history parameter {key}")
@@ -47,14 +65,33 @@ def save_checkpoint(path, *, model, optimizer=None, scheduler=None, scaler=None,
     torch.save(payload,path)
 
 
+def _optimizer_structure_matches(optimizer, state: dict) -> bool:
+    current=optimizer.state_dict()
+    old_groups=state.get("param_groups",[])
+    new_groups=current.get("param_groups",[])
+    return len(old_groups)==len(new_groups) and all(
+        len(old.get("params",[]))==len(new.get("params",[]))
+        for old,new in zip(old_groups,new_groups)
+    )
+
+
 def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, map_location="cpu", strict=True, migrate_history=True):
     ckpt=torch.load(path,map_location=map_location,weights_only=False)
     state=ckpt["model"]
     if migrate_history:
         state,notes=migrate_history_checkpoint_state_dict(model,state)
-        if notes: ckpt["history_migration"]=notes
+        if notes:
+            ckpt["history_migration"]=notes
+            ckpt["temporal_migration"]=notes
     model.load_state_dict(state,strict=strict)
-    if optimizer is not None and "optimizer" in ckpt: optimizer.load_state_dict(ckpt["optimizer"])
+    if optimizer is not None and "optimizer" in ckpt:
+        if not _optimizer_structure_matches(optimizer,ckpt["optimizer"]):
+            raise ValueError(
+                "Checkpoint optimizer state is incompatible with the current hierarchical "
+                "temporal-memory parameter groups. The model state was migrated, but optimizer "
+                "state cannot be mapped safely; load without an optimizer and start a new one."
+            )
+        optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and "scheduler" in ckpt: scheduler.load_state_dict(ckpt["scheduler"])
     if scaler is not None and "scaler" in ckpt: scaler.load_state_dict(ckpt["scaler"])
     return ckpt

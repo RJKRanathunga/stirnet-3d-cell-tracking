@@ -73,6 +73,10 @@ geometry features.
 
 ## 4. Detection graph edges
 
+The detection GNN uses a complete directed candidate graph within each logical
+sample. A candidate edge means only that the network may inspect the pair. It
+does not assert identity or association. Never connect different batch items.
+
 Use four relation types:
 
 1. Trackastra forward temporal association.
@@ -89,7 +93,7 @@ Use four relation types:
 `edge_attr`:
 
 ```python
-[E, 14]
+[E, 15]
 ```
 
 ### Edge schema
@@ -104,6 +108,7 @@ Use four relation types:
 8      Trackastra association score
 9      association score available
 10-13  one-hot relation type
+14     accepted Trackastra relation
 ```
 
 If association confidence is unavailable:
@@ -115,19 +120,28 @@ edge_attr[:,9] = 0
 
 Do not insert fake calibrated confidence.
 
-## 5. Same-frame spatial edges
+Columns 0-13 are the exact legacy schema. Appending column 14 permits exact
+14-to-15 checkpoint migration. Generic candidates have score, score-valid, and
+accepted all zero. Accepted temporal associations mark forward and reverse
+message-passing directions; a directed accepted division marks its division
+direction. Relation type is otherwise inferred generically from signed dt.
 
-For every node, connect up to:
+Tracklet identity is built separately from accepted Trackastra temporal
+associations before candidate edges are constructed. Candidate edges can never
+merge or split a tracklet.
+
+## 5. Candidate topology and legacy ablation
+
+Production/default topology materializes every non-self directed pair:
 
 ```python
-K_SPATIAL_NEIGHBORS = 6
+E = N * (N - 1)
 ```
 
-nearest same-frame detections within approximately:
-
-$$2.5d_\text{ref}.$$
-
-This lets nearby cell hypotheses interact even if Trackastra has no temporal edge between them.
+Construction is chunked on CPU. No semantic top-k pruning occurs. An optional
+`max_candidate_edges` is an explicit safety limit that raises instead of
+dropping observations. `candidate_graph_enabled=False` exists for the
+accepted-graph/same-frame-neighbour ablation, not as the production default.
 
 ## 6. Detection graph encoder
 
@@ -333,10 +347,28 @@ TemporalState(
     hyp_edge_index=[2,Eh],
     hyp_edge_attr=[Eh,22],
     batch_index=[M],
+    node_memory=TemporalNodeMemory(...),
 )
 ```
 
 The spatial/query network must not depend on Trackastra-specific Python objects.
+
+`TemporalNodeMemory` retains the post-GNN detection tokens rather than
+discarding them during tracklet pooling:
+
+```text
+tokens             [N,D]
+observed_ref_um    [N,3]
+projected_ref_um   [N,3]
+time_offset        [N]
+tracklet_id        [N]
+batch_index        [N]
+history_valid      [N]
+node_ids           [N] optional diagnostic identity
+```
+
+`TemporalState.tokens [M,D]` remains the coarse tracklet memory. The two
+levels are complementary; CR1/CR2 continue to consume only the coarse level.
 
 ## 15. Historical instance fusion
 

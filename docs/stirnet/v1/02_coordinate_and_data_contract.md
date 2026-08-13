@@ -258,9 +258,14 @@ A training sample should provide at least:
 
     "graph_x": FloatTensor[N, 32],
     "graph_edge_index": LongTensor[2, E],
-    "graph_edge_attr": FloatTensor[E, 14],
+    "graph_edge_attr": FloatTensor[E, 15],
+    "accepted_association_edge_index": LongTensor[2, Ea],
+    "accepted_association_edge_attr": FloatTensor[Ea, 3],
 
     "tracklet_id": LongTensor[N],
+    "node_ids": LongTensor[N],
+    "node_observed_ref_um": FloatTensor[N, 3],
+    "node_time_offset": FloatTensor[N],
 
     "temporal_ref_um": FloatTensor[M, 3],
     "temporal_status": FloatTensor[M, 10],

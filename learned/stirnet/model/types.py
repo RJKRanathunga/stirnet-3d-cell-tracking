@@ -16,6 +16,24 @@ class SpatialPyramid:
 
 
 @dataclass
+class TemporalNodeMemory:
+    """Fine per-detection memory retained after detection-GNN message passing."""
+
+    tokens: Tensor                    # [N,D]
+    observed_ref_um: Tensor           # [N,3], physical observed zyx
+    projected_ref_um: Tensor          # [N,3], tracklet target-frame zyx
+    time_offset: Tensor               # [N], signed frames from target
+    tracklet_id: Tensor               # [N], packed coarse-memory index
+    batch_index: Tensor               # [N], logical sample index
+    history_valid: Tensor             # [N]
+    node_ids: Optional[Tensor] = None  # [N], preprocessing/debug identity
+
+    @property
+    def is_empty(self) -> bool:
+        return self.tokens.shape[0] == 0
+
+
+@dataclass
 class TemporalState:
     tokens: Tensor
     ref_um: Tensor
@@ -36,6 +54,7 @@ class TemporalState:
     best_current_component_id: Optional[Tensor] = None
     best_component_overlap: Optional[Tensor] = None
     second_best_component_overlap: Optional[Tensor] = None
+    node_memory: Optional[TemporalNodeMemory] = None
 
     @property
     def is_empty(self) -> bool:

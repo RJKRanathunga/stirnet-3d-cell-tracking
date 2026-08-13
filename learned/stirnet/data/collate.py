@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from .graph_builder import HYPOTHESIS_EDGE_DIM
+from .graph_builder import DETECTION_EDGE_DIM, HYPOTHESIS_EDGE_DIM
 
 
 def _hypothesis_edges_compatible(value: torch.Tensor) -> torch.Tensor:
@@ -48,13 +48,24 @@ def stirnet_collate(samples:list[dict])->dict:
     batch["instance_batch"]=torch.cat(inst_batch) if inst_batch else torch.zeros((0,),dtype=torch.long)
 
     # packed detection graph + hypothesis graph
-    gx=[]; gei=[]; gea=[]; tid=[]; tref=[]; tstatus=[]; hei=[]; hea=[]; tb=[]
+    gx=[]; gei=[]; gea=[]; aei=[]; aea=[]; tid=[]; node_ids=[]; node_refs=[]; node_dt=[]
+    tref=[]; tstatus=[]; hei=[]; hea=[]; tb=[]
     node_grids=[];node_valid=[]
     supports=[];support_valid=[];support_dt=[];support_centers=[];support_extents=[]
     best_ids=[];best_overlap=[];second_overlap=[]
     node_off=0; hyp_off=0
     for b,s in enumerate(samples):
-        x=s.get("graph_x",torch.zeros((0,32))); ei=s.get("graph_edge_index",torch.zeros((2,0),dtype=torch.long)); ea=s.get("graph_edge_attr",torch.zeros((0,14)))
+        x=s.get("graph_x",torch.zeros((0,32))); ei=s.get("graph_edge_index",torch.zeros((2,0),dtype=torch.long)); ea=s.get("graph_edge_attr",torch.zeros((0,DETECTION_EDGE_DIM)))
+        if len(x) and ea.shape[-1] != DETECTION_EDGE_DIM:
+            raise ValueError(
+                f"Non-empty cached detection graph has edge width {ea.shape[-1]}; "
+                f"temporal cache contract v3 requires {DETECTION_EDGE_DIM}. Rebuild the cache "
+                "so legacy accepted-edge topology is not mistaken for the candidate graph."
+            )
+        if not len(x) and ea.shape[-1] != DETECTION_EDGE_DIM:
+            ea=torch.zeros((0,DETECTION_EDGE_DIM),dtype=ea.dtype,device=ea.device)
+        accepted_ei=s.get("accepted_association_edge_index",torch.zeros((2,0),dtype=torch.long))
+        accepted_ea=s.get("accepted_association_edge_attr",torch.zeros((0,3)))
         tr=s.get("temporal_ref_um",torch.zeros((0,3))); st=s.get("temporal_status",torch.zeros((len(tr),10)))
         ti=s.get("tracklet_id",torch.zeros((len(x),),dtype=torch.long))
         hi=s.get("hypothesis_edge_index",torch.zeros((2,0),dtype=torch.long)); ha=_hypothesis_edges_compatible(s.get("hypothesis_edge_attr",torch.zeros((0,HYPOTHESIS_EDGE_DIM))))
@@ -72,6 +83,11 @@ def stirnet_collate(samples:list[dict])->dict:
         best_overlap.append(s.get("best_component_overlap",torch.zeros((len(tr),))))
         second_overlap.append(s.get("second_best_component_overlap",torch.zeros((len(tr),))))
         gx.append(x); gea.append(ea); gei.append(ei+node_off if ei.numel() else ei)
+        aei.append(accepted_ei+node_off if accepted_ei.numel() else accepted_ei)
+        aea.append(accepted_ea)
+        node_ids.append(s.get("node_ids",torch.arange(len(x),dtype=torch.long)))
+        node_refs.append(s.get("node_observed_ref_um",x[:,1:4]*torch.as_tensor(s["dref_um"])))
+        node_dt.append(s.get("node_time_offset",x[:,0]*2.0))
         # local tracklet ids become global hypothesis ids
         tid.append(ti+hyp_off if ti.numel() else ti)
         tref.append(tr);tstatus.append(st);tb.append(torch.full((len(tr),),b,dtype=torch.long))
@@ -79,8 +95,13 @@ def stirnet_collate(samples:list[dict])->dict:
         node_off+=len(x);hyp_off+=len(tr)
     batch["graph_x"]=torch.cat(gx) if gx else torch.zeros((0,32))
     batch["graph_edge_index"]=torch.cat(gei,dim=1) if gei else torch.zeros((2,0),dtype=torch.long)
-    batch["graph_edge_attr"]=torch.cat(gea) if gea else torch.zeros((0,14))
+    batch["graph_edge_attr"]=torch.cat(gea) if gea else torch.zeros((0,DETECTION_EDGE_DIM))
+    batch["accepted_association_edge_index"]=torch.cat(aei,dim=1) if aei else torch.zeros((2,0),dtype=torch.long)
+    batch["accepted_association_edge_attr"]=torch.cat(aea) if aea else torch.zeros((0,3))
     batch["tracklet_id"]=torch.cat(tid) if tid else torch.zeros((0,),dtype=torch.long)
+    batch["node_ids"]=torch.cat(node_ids) if node_ids else torch.zeros((0,),dtype=torch.long)
+    batch["node_observed_ref_um"]=torch.cat(node_refs) if node_refs else torch.zeros((0,3))
+    batch["node_time_offset"]=torch.cat(node_dt) if node_dt else torch.zeros((0,))
     batch["temporal_ref_um"]=torch.cat(tref) if tref else torch.zeros((0,3))
     batch["temporal_status"]=torch.cat(tstatus) if tstatus else torch.zeros((0,10))
     batch["temporal_batch"]=torch.cat(tb) if tb else torch.zeros((0,),dtype=torch.long)

@@ -18,7 +18,9 @@ class SpatialConfig:
 @dataclass
 class TemporalConfig:
     node_dim: int = 32
-    edge_dim: int = 14
+    # Detection edges retain the legacy 14-D schema as an exact prefix and
+    # append the accepted-Trackastra indicator at column 14.
+    edge_dim: int = 15
     hypothesis_edge_dim: int = 22
     d_model: int = 128
     graph_layers: int = 2
@@ -28,6 +30,15 @@ class TemporalConfig:
     k_spatial_neighbors: int = 6
     spatial_neighbor_radius_dref: float = 2.5
     status_dim: int = 10
+    candidate_graph_enabled: bool = True
+    max_candidate_edges: int | None = None
+    memory_heads: int = 4
+    memory_ffn_dim: int = 256
+    relation_bias_hidden: int = 32
+    memory_gate_init_bias: float = -2.0
+    component_memory_enabled: bool = True
+    query_memory_enabled: bool = True
+    memory_debug_topk: int = 5
 
 
 @dataclass

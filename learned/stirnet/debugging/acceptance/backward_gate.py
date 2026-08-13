@@ -28,7 +28,12 @@ def _end_phase(name, started):
     torch.cuda.synchronize(); print(f"{name}: seconds={time.perf_counter()-started:.2f}; {_memory()}", flush=True)
 
 
-def run(data_dir: Path) -> None:
+def run(
+    data_dir: Path,
+    *,
+    temporal_memory_ablation: str = "full",
+    detection_graph_ablation: str = "full",
+) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("The real backward gate requires CUDA")
     batch, sample = build_real_batch(data_dir)
@@ -45,12 +50,24 @@ def run(data_dir: Path) -> None:
         else: b[key] = move_to_device(value, device)
     del batch
     gc.collect(); torch.cuda.empty_cache(); optimizer.zero_grad(set_to_none=True)
+    print(
+        f"ablation: temporal_memory={temporal_memory_ablation}; "
+        f"detection_graph={detection_graph_ablation}; "
+        f"nodes={len(b['graph_x'])}; candidate_edges={b['graph_edge_index'].shape[1]}; "
+        f"accepted_edges={int((b['graph_edge_attr'][:,14]>0.5).sum())}",
+        flush=True,
+    )
 
     phase = "model forward"
     try:
         started = _begin_phase()
         with torch.autocast(device_type="cuda", dtype=torch.float16):
-            outputs = model_forward_from_batch(model, b)
+            outputs = model_forward_from_batch(
+                model,
+                b,
+                temporal_memory_ablation=temporal_memory_ablation,
+                detection_graph_ablation=detection_graph_ablation,
+            )
         _end_phase(phase, started)
 
         phase = "matching and loss forward"; started = _begin_phase()
@@ -78,6 +95,22 @@ def run(data_dir: Path) -> None:
         if not math.isfinite(float(grad_norm)) or float(grad_norm) <= 0:
             raise RuntimeError(f"Invalid gradient norm: {float(grad_norm)}")
         print(f"gradients: finite={finite}/{total}; nonzero={nonzero}; preclip_norm={float(grad_norm):.7f}")
+        path_prefixes = {
+            "query_temporal_memory":"query_decoder.layers.0.temporal_fusion.node_attention.",
+            "detection_graph":"graph_encoder.",
+            "history_encoder":"history_encoder.",
+            "history_fusion":"history_fusion.",
+        }
+        for label,prefix in path_prefixes.items():
+            values=[
+                parameter.grad.detach().float().abs().sum()
+                for name,parameter in model.named_parameters()
+                if name.startswith(prefix) and parameter.grad is not None
+            ]
+            gradient_sum=float(torch.stack(values).sum()) if values else 0.0
+            print(f"gradient_path/{label}_abs_sum={gradient_sum:.9g}")
+            if temporal_memory_ablation=="full" and gradient_sum<=0:
+                raise RuntimeError(f"No gradient reached required path: {label}")
 
         phase = "optimizer step"; started = _begin_phase(); scale_before = scaler.get_scale(); scaler.step(optimizer); scaler.update(); _end_phase(phase, started)
         if changed_name is not None:
@@ -93,7 +126,20 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     default = _repo_root(Path.cwd()) / "data" / "learned" / "stirnet" / "first_overfit" / "BlastoSPIM1_F22_030_034"
     parser.add_argument("--data-dir", type=Path, default=default)
-    args = parser.parse_args(); run(args.data_dir)
+    parser.add_argument(
+        "--temporal-memory-ablation",
+        choices=("full","zero_node","shuffle_node","tracklet_only","node_only"),
+        default="full",
+    )
+    parser.add_argument(
+        "--detection-graph-ablation",choices=("full","accepted_only"),default="full"
+    )
+    args = parser.parse_args()
+    run(
+        args.data_dir,
+        temporal_memory_ablation=args.temporal_memory_ablation,
+        detection_graph_ablation=args.detection_graph_ablation,
+    )
 
 
 if __name__ == "__main__":

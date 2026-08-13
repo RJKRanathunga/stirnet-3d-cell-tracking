@@ -106,6 +106,7 @@ class TemporalState:
     edge_index: Tensor
     edge_attr: Tensor
     batch_index: Tensor
+    node_memory: TemporalNodeMemory
 
 @dataclass
 class QueryState:
@@ -289,6 +290,13 @@ MaskAttentionSupportBuilder
 
 The decoder must operate on progressively finer spatial features.
 
+Each decoder layer calls the shared `HierarchicalTemporalFusion` from
+`model/temporal_memory.py` between self-attention and spatial cross-attention.
+The same primitive is used by `InstanceQueryBuilder` for component-level
+fusion. Its learned relation bias consumes raw physical observed/projected
+displacement, distance, time offset, and validity; it contains no
+merge/parent/frame-importance labels.
+
 ## 15. `model/heads.py`
 
 Implement:
@@ -468,9 +476,13 @@ extent, node validity/gate, and component-overlap summaries. Empty and
 no-history states remain valid. Trackastra-specific objects are confined to data
 conversion.
 
-`trackastra_cache.py` writes contract version 2 atomically. `collate.py` supplies
-old-cache defaults. `training/checkpoint.py` migrates old CR1/CR2 hypothesis
-edge projections by copying columns 0-7, zero-initializing columns 8-21, and
-retaining conservative initialization for new history parameters; it does not
-discard the hypothesis GNN. `stir_net.py` orchestrates but does not own physical
-sampling or grid construction.
+`trackastra_cache.py` writes temporal contract version 3 atomically under a
+reusable sample-local `temporal_v3/` directory. Nonempty v1/v2 temporal caches
+are rejected explicitly because their sparse accepted-edge topology is not a
+candidate graph. `training/checkpoint.py` migrates old CR1/CR2 hypothesis edge
+projections by copying columns 0-7 and zero-initializing columns 8-21. It also
+copies detection-edge columns 0-13 into the 15-D projection and zeros column
+14. New history and hierarchical-memory parameters retain the receiving
+model's conservative initialization. Incompatible optimizer state raises a
+clear model-only reload instruction. `stir_net.py` orchestrates but does not
+own physical sampling or grid construction.

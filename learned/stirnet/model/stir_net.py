@@ -14,7 +14,7 @@ from .spacing import AcquisitionEmbedding
 from .spatial_decoder import SpatialDecoder
 from .spatial_encoder import SpatialEncoder
 from .temporal_hypotheses import TemporalStateBuilder, TrackletPooler
-from .types import StirNetOutput, TemporalState
+from .types import StirNetOutput, TemporalNodeMemory, TemporalState
 
 
 class StirNet(nn.Module):
@@ -66,8 +66,12 @@ class StirNet(nn.Module):
             history_cfg=self.cfg.history,
             activation_checkpointing=checkpoint_coreasoning,
         )
-        self.query_builder = InstanceQueryBuilder(self.cfg.queries, feature_channels=c2)
-        self.query_decoder = InstanceQueryDecoder((c3,c2,c1),self.cfg.decoder,self.cfg.queries)
+        self.query_builder = InstanceQueryBuilder(
+            self.cfg.queries, feature_channels=c2, temporal_cfg=self.cfg.temporal
+        )
+        self.query_decoder = InstanceQueryDecoder(
+            (c3,c2,c1),self.cfg.decoder,self.cfg.queries,self.cfg.temporal
+        )
         self.native_mask_head = MaskEmbeddingHead(self.cfg.decoder.d_model,self.cfg.spatial.mask_dim)
         self.dense_heads = DenseAuxiliaryHeads(c0)
 
@@ -94,6 +98,7 @@ class StirNet(nn.Module):
             raise ValueError("STIR-Net V1 requires exactly three query decoder layers")
         for name, d_model, heads in (
             ("temporal", self.cfg.temporal.d_model, self.cfg.temporal.graph_heads),
+            ("temporal memory", self.cfg.temporal.d_model, self.cfg.temporal.memory_heads),
             ("coreasoning", self.cfg.coreasoning.d_model, self.cfg.coreasoning.heads),
             ("decoder", self.cfg.decoder.d_model, self.cfg.decoder.heads),
         ):
@@ -105,6 +110,15 @@ class StirNet(nn.Module):
             raise ValueError("STIR-Net history attention requires occupancy and SDF support")
         if self.cfg.history.grid_size <= 1 or self.cfg.history.extent_dref <= 0:
             raise ValueError("history grid size and physical extent must be positive")
+        if self.cfg.temporal.edge_dim != 15:
+            raise ValueError("STIR-Net candidate detection edge contract requires edge_dim=15")
+        if self.cfg.temporal.memory_debug_topk < 0:
+            raise ValueError("memory_debug_topk must be non-negative")
+        if (
+            self.cfg.temporal.max_candidate_edges is not None
+            and self.cfg.temporal.max_candidate_edges < 0
+        ):
+            raise ValueError("max_candidate_edges must be non-negative or None")
 
     def _build_temporal(
         self, graph_x: Tensor, graph_edge_index: Tensor, graph_edge_attr: Tensor,
@@ -121,8 +135,35 @@ class StirNet(nn.Module):
         best_current_component_id: Tensor | None = None,
         best_component_overlap: Tensor | None = None,
         second_best_component_overlap: Tensor | None = None,
+        node_observed_ref_um: Tensor | None = None,
+        node_time_offset: Tensor | None = None,
+        node_ids: Tensor | None = None,
+        detection_graph_ablation: str = "full",
     ) -> TemporalState:
         M=temporal_ref_um.shape[0]
+        if graph_edge_attr.shape[-1] != self.cfg.temporal.edge_dim:
+            if graph_edge_attr.shape[-1] == 14 and self.cfg.temporal.edge_dim == 15:
+                graph_edge_attr=torch.nn.functional.pad(graph_edge_attr,(0,1))
+            else:
+                raise ValueError(
+                    "graph_edge_attr width must match temporal.edge_dim "
+                    f"({self.cfg.temporal.edge_dim}); got {graph_edge_attr.shape[-1]}"
+                )
+        if detection_graph_ablation not in {"full","accepted_only"}:
+            raise ValueError("detection_graph_ablation must be 'full' or 'accepted_only'")
+        if (
+            self.cfg.temporal.max_candidate_edges is not None
+            and graph_edge_index.shape[1] > self.cfg.temporal.max_candidate_edges
+        ):
+            raise RuntimeError(
+                f"Detection graph has {graph_edge_index.shape[1]} edges, exceeding "
+                f"max_candidate_edges={self.cfg.temporal.max_candidate_edges}; "
+                "STIR-Net will not silently truncate candidate evidence."
+            )
+        if detection_graph_ablation=="accepted_only" and graph_edge_attr.shape[0]:
+            accepted=graph_edge_attr[:,14]>0.5
+            graph_edge_index=graph_edge_index[:,accepted]
+            graph_edge_attr=graph_edge_attr[accepted]
         if hypothesis_edge_attr.shape[-1] != self.cfg.temporal.hypothesis_edge_dim:
             if hypothesis_edge_attr.shape[-1] == 8 and self.cfg.temporal.hypothesis_edge_dim == 22:
                 hypothesis_edge_attr=torch.nn.functional.pad(hypothesis_edge_attr,(0,14))
@@ -131,9 +172,44 @@ class StirNet(nn.Module):
                     "hypothesis_edge_attr width must match temporal.hypothesis_edge_dim "
                     f"({self.cfg.temporal.hypothesis_edge_dim}); got {hypothesis_edge_attr.shape[-1]}"
                 )
+        node_count=graph_x.shape[0]
+        if node_count:
+            if tracklet_id.shape != (node_count,):
+                raise ValueError("tracklet_id must align one-to-one with graph_x")
+            node_batch=temporal_batch[tracklet_id]
+            if node_observed_ref_um is None:
+                node_observed_ref_um=(
+                    graph_x[:,1:4].float()*dref_um[node_batch,None].float()
+                )
+            if node_time_offset is None:
+                node_time_offset=(
+                    graph_x[:,0].float()*float(self.cfg.temporal.temporal_radius)
+                )
+            if node_history_valid is None:
+                node_history_valid=torch.zeros(
+                    node_count,device=graph_x.device,dtype=torch.bool
+                )
+        else:
+            node_batch=tracklet_id.new_zeros((0,))
+            node_observed_ref_um=graph_x.new_zeros((0,3))
+            node_time_offset=graph_x.new_zeros((0,))
+            if node_history_valid is None:
+                node_history_valid=torch.zeros(
+                    0,device=graph_x.device,dtype=torch.bool
+                )
         if M==0:
             tokens=graph_x.new_zeros((0,self.cfg.temporal.d_model))
             z1=graph_x.new_zeros((0,1))
+            node_memory=TemporalNodeMemory(
+                tokens=graph_x.new_zeros((node_count,self.cfg.temporal.d_model)),
+                observed_ref_um=node_observed_ref_um,
+                projected_ref_um=graph_x.new_zeros((node_count,3)),
+                time_offset=node_time_offset,
+                tracklet_id=tracklet_id,
+                batch_index=node_batch,
+                history_valid=node_history_valid,
+                node_ids=node_ids,
+            )
             return TemporalState(
                 tokens,temporal_ref_um,temporal_ref_um,z1,z1,temporal_status,
                 hypothesis_edge_index,hypothesis_edge_attr,temporal_batch,
@@ -147,6 +223,7 @@ class StirNet(nn.Module):
                 best_current_component_id=best_current_component_id,
                 best_component_overlap=best_component_overlap,
                 second_best_component_overlap=second_best_component_overlap,
+                node_memory=node_memory,
             )
         if graph_x.shape[0]:
             scalar_embedding=self.graph_encoder.project_scalars(graph_x)
@@ -170,6 +247,16 @@ class StirNet(nn.Module):
             node_emb=graph_x.new_zeros((0,self.cfg.temporal.d_model))
             history_gate=graph_x.new_zeros((0,1))
         pooled=self.tracklet_pooler(node_emb,tracklet_id,graph_x[:,0] if graph_x.shape[0] else graph_x.new_zeros((0,)),n_tracklets=M)
+        node_memory=TemporalNodeMemory(
+            tokens=node_emb,
+            observed_ref_um=node_observed_ref_um,
+            projected_ref_um=temporal_ref_um[tracklet_id],
+            time_offset=node_time_offset,
+            tracklet_id=tracklet_id,
+            batch_index=node_batch,
+            history_valid=node_history_valid,
+            node_ids=node_ids,
+        )
         dref_h=dref_um[temporal_batch]
         return self.temporal_builder(pooled,temporal_ref_um,temporal_status,hypothesis_edge_index,
                                      hypothesis_edge_attr,temporal_batch,dref_h,
@@ -182,7 +269,8 @@ class StirNet(nn.Module):
                                      history_gate=history_gate,
                                      best_current_component_id=best_current_component_id,
                                      best_component_overlap=best_component_overlap,
-                                     second_best_component_overlap=second_best_component_overlap)
+                                     second_best_component_overlap=second_best_component_overlap,
+                                     node_memory=node_memory)
 
     def forward(
         self,
@@ -216,6 +304,12 @@ class StirNet(nn.Module):
         best_current_component_id: Tensor | None = None,
         best_component_overlap: Tensor | None = None,
         second_best_component_overlap: Tensor | None = None,
+        node_observed_ref_um: Tensor | None = None,
+        node_time_offset: Tensor | None = None,
+        node_ids: Tensor | None = None,
+        temporal_memory_ablation: str = "full",
+        detection_graph_ablation: str = "full",
+        return_full_temporal_attention: bool = False,
     ) -> StirNetOutput:
         acq=self.acquisition(spacing_um,dref_um)
         pyramid=self.encoder(spatial_inputs,spacing_um,acq,spatial_padding_mask)
@@ -226,7 +320,9 @@ class StirNet(nn.Module):
                                       history_support_valid,history_support_dt,
                                       history_support_center_um,history_support_extent_um,
                                       best_current_component_id,best_component_overlap,
-                                      second_best_component_overlap)
+                                      second_best_component_overlap,
+                                      node_observed_ref_um,node_time_offset,node_ids,
+                                      detection_graph_ablation)
 
         if bypass_coreasoning:
             e3=pyramid.features[3]
@@ -240,12 +336,22 @@ class StirNet(nn.Module):
         d1,d0,mask_features=self.decoder.decode_from_e2(e2,pyramid,acq)
         dense=self.dense_heads(d0)
 
-        qstate=self.query_builder(e2,pyramid.spacings_um[2],instance_labels,instance_features,
-                                  instance_ids,instance_batch,instance_centroids_um,dref_um,temporal)
+        qstate=self.query_builder(
+            e2,pyramid.spacings_um[2],instance_labels,instance_features,
+            instance_ids,instance_batch,instance_centroids_um,dref_um,temporal,
+            memory_ablation=temporal_memory_ablation,
+            return_debug=return_debug,
+            full_attention=return_full_temporal_attention,
+        )
         initial_query_references=qstate.references_cellscale
-        qstate,dec_outputs=self.query_decoder(qstate,[e3,e2,d1],
-                                              [pyramid.spacings_um[3],pyramid.spacings_um[2],pyramid.spacings_um[1]],
-                                              instance_labels,dref_um)
+        qstate,dec_outputs=self.query_decoder(
+            qstate,[e3,e2,d1],
+            [pyramid.spacings_um[3],pyramid.spacings_um[2],pyramid.spacings_um[1]],
+            instance_labels,dref_um,temporal,
+            memory_ablation=temporal_memory_ablation,
+            return_debug=return_debug,
+            full_attention=return_full_temporal_attention,
+        )
         final=dec_outputs[-1]
         native_emb=self.native_mask_head(qstate.embeddings)
         debug=None
@@ -261,6 +367,7 @@ class StirNet(nn.Module):
             valid_gate=gate[node_valid] if gate is not None and node_valid is not None else graph_x.new_zeros((0,1))
             invalid_gate=gate[~node_valid] if gate is not None and node_valid is not None else graph_x.new_zeros((0,1))
             same_pairs=same_conf>0
+            node_memory=temporal.node_memory
             debug={
                 "temporal_salience":temporal.salience.detach(),
                 "temporal_reliability":temporal.reliability.detach(),
@@ -293,6 +400,31 @@ class StirNet(nn.Module):
                     [layer["centers_cellscale"] for layer in dec_outputs], dim=0
                 ).detach(),
                 "query_references_cellscale":qstate.references_cellscale.detach(),
+                "node_memory":None if node_memory is None else {
+                    "tokens":node_memory.tokens.detach(),
+                    "node_ids":node_memory.node_ids.detach() if node_memory.node_ids is not None else None,
+                    "time_offset":node_memory.time_offset.detach(),
+                    "tracklet_id":node_memory.tracklet_id.detach(),
+                    "batch_index":node_memory.batch_index.detach(),
+                    "observed_ref_um":node_memory.observed_ref_um.detach(),
+                    "projected_ref_um":node_memory.projected_ref_um.detach(),
+                    "history_valid":node_memory.history_valid.detach(),
+                },
+                "component_temporal_attention":self.query_builder.last_temporal_debug,
+                "query_temporal_attention":[
+                    layer.last_temporal_debug for layer in self.query_decoder.layers
+                ],
+                "temporal_memory_ablation":temporal_memory_ablation,
+                "detection_graph_ablation":detection_graph_ablation,
+                "candidate_detection_edge_count":torch.tensor(
+                    graph_edge_index.shape[1],device=graph_x.device
+                ),
+                "accepted_detection_edge_count":(
+                    (graph_edge_attr[:,14]>0.5).sum().detach()
+                    if graph_edge_attr.shape[-1]>14 else torch.zeros(
+                        (),device=graph_x.device,dtype=torch.long
+                    )
+                ),
             }
         return StirNetOutput(
             exist_logits=final["exist_logits"],

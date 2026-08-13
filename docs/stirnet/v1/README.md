@@ -33,8 +33,8 @@ Trackastra pass 2 is run on $S_t^*$ after refinement.
 1. **Preserve native image samples.** V1 does not globally resample all datasets to a canonical isotropic voxel grid.
 2. **Express geometry explicitly in physical coordinates.** Distances, positions, motion, EDT values, attention radii, and center losses use physical units or cell-scale-normalized physical units.
 3. **Use convolution for dense local geometry.** The spatial branch remains a CNN because boundaries, local shape, intensity structure, and surface continuity are dense local phenomena.
-4. **Use graph attention for sparse temporal evidence.** Trackastra-derived object relationships are encoded as a graph, not rasterized into the image and not treated as final truth.
-5. **Fuse before making instance decisions.** Temporal and spatial representations interact through bidirectional cross-attention and both continue reasoning after fusion.
+4. **Use graph attention for sparse temporal evidence.** Every bounded-window detection is retained. Candidate relations permit learned reasoning over all within-sample pairs, while accepted Trackastra associations remain identifiable evidence rather than topology truth.
+5. **Fuse before making instance decisions.** Fine detection-node and coarse tracklet memories are read before query creation and in every query-decoder layer; dense co-reasoning remains tracklet-level.
 6. **Predict corrected cells, not error labels.** Under-segmentation, over-segmentation, missing cells, and false positives emerge from the difference between the input and output instance sets.
 7. **Treat Trackastra as evidence, not authority.** Temporal hypotheses have learned salience and reliability and are intentionally corrupted during training.
 8. **Keep V1 implementable.** No full-volume transformer, no deformable 3D attention, no tracking loss, and no explicit merge classifier are included in V1.
@@ -55,6 +55,7 @@ Trackastra pass 2 is run on $S_t^*$ after refinement.
 | `10_configuration.md` | Frozen V1 defaults and tunable hyperparameters |
 | `11_code_architecture.md` | Proposed `learned/stirnet/` module layout and interfaces |
 | `12_validation_and_ablations.md` | Metrics, ablations, acceptance criteria, V2 triggers |
+| `13_hierarchical_temporal_memory.md` | Candidate graph, node/tracklet memory, query attention, cache/checkpoint/debug contracts |
 
 ## High-level flow
 
