@@ -237,3 +237,21 @@ V1 does not include:
 - explicit over-segmentation classifier.
 
 Each can be considered only if V1 evaluation reveals a specific failure that motivates it.
+
+## Historical-instance evidence pathway
+
+The target-frame five-channel spatial backbone remains native-resolution and
+unchanged. Each provisional detection may additionally carry a compact,
+axis-aligned `4 x 12 x 12 x 12` physical/cell-scale descriptor. A three-layer
+3-D CNN maps valid descriptors to 128-D, and a conservatively initialized
+validity gate adds that representation to the existing 32-D scalar projection
+before detection-graph message passing. Learned time-aware tracklet pooling is
+unchanged, so morphology from individual observations is combined only after
+the detection GNN has inspected it.
+
+Each final temporal hypothesis retains at most the nearest valid past and future
+occupancy/SDF support. Those compact supports contribute to hypothesis edges
+and, through implicit translational sampling, to temporal-to-spatial
+co-reasoning logits. No dense historical frame, feature pyramid, optical flow,
+or `[M,Z,Y,X]` support volume is constructed. History is provisional evidence,
+never identity or truth; Trackastra pass 2 still rebuilds final tracking.

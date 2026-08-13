@@ -19,6 +19,19 @@ GRAPH_LAYERS = 2
 GRAPH_HEADS = 4
 GRAPH_FFN_DIM = 256
 K_SPATIAL_NEIGHBORS = 6
+HYPOTHESIS_EDGE_DIM = 22
+
+# historical instances
+HISTORY_ENABLED = True
+HISTORY_GRID_SIZE = 12
+HISTORY_EXTENT_DREF = 2.5
+HISTORY_INPUT_CHANNELS = 4
+HISTORY_SUPPORT_CHANNELS = 2
+HISTORY_NODE_CHUNK_SIZE = 128
+HISTORY_GATE_INIT_BIAS = -2.0
+HISTORY_ATTENTION_BIAS_ENABLED = True
+HISTORY_ATTENTION_BIAS_HIDDEN = 32
+HISTORY_DT_NORMALIZER = 2.0
 
 # co-reasoning
 COREASONING_BLOCKS = 2
@@ -45,6 +58,7 @@ COREASONING_SPATIAL_KEY_CHUNK = 65536
 ACTIVATION_CHECKPOINTING = True
 CHECKPOINT_SPATIAL = True
 CHECKPOINT_COREASONING = True
+CHECKPOINT_HISTORY = True
 CHECKPOINT_LOSSES = True
 ```
 
@@ -199,6 +213,7 @@ Recommended:
 class StirNetConfig:
     spatial: SpatialConfig
     temporal: TemporalConfig
+    history: HistoryConfig
     coreasoning: CoReasoningConfig
     queries: QueryConfig
     decoder: DecoderConfig
@@ -209,3 +224,10 @@ class StirNetConfig:
 ```
 
 Configuration should be serializable to YAML/JSON and stored with every checkpoint.
+
+Compact grids and support may be cached/moved in float16. History nodes are
+processed in bounded chunks, and those chunks are independently checkpointed
+under `ACTIVATION_CHECKPOINTING and CHECKPOINT_HISTORY`. Physical transforms,
+component overlap, support-bias MLP inputs, attention logits, and online-softmax
+state use float32. `HISTORY_ENABLED=False` is the direct no-history ablation and
+makes node fusion and support bias behavior-neutral.

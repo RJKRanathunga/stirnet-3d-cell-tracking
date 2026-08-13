@@ -26,6 +26,16 @@ class TemporalState:
     edge_index: Tensor
     edge_attr: Tensor
     batch_index: Tensor
+    history_support: Optional[Tensor] = None
+    history_support_valid: Optional[Tensor] = None
+    history_support_dt: Optional[Tensor] = None
+    history_support_center_um: Optional[Tensor] = None
+    history_support_extent_um: Optional[Tensor] = None
+    node_history_valid: Optional[Tensor] = None
+    history_gate: Optional[Tensor] = None
+    best_current_component_id: Optional[Tensor] = None
+    best_component_overlap: Optional[Tensor] = None
+    second_best_component_overlap: Optional[Tensor] = None
 
     @property
     def is_empty(self) -> bool:

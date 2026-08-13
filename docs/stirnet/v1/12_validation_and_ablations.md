@@ -298,3 +298,36 @@ implementation update
 ```
 
 The documentation is the source of truth for the intended model behavior.
+
+## Historical-evidence validation
+
+The required ladder is:
+
+```text
+A current baseline (history disabled; new dynamics zeroed)
+B enriched hypothesis dynamics only
+C B + detection history encoder/fusion
+D C + temporal-to-spatial history support bias
+E full production configuration, when distinct from D
+```
+
+Report 2->1, 3->1, and larger-cluster recovery; clean-cell preservation; false
+split rate; instance precision/recall/F1; matched Dice; count and center error;
+pass-2 tracking when available; runtime; and CUDA peak allocated/reserved memory.
+Stratify by converging versus non-converging tracks, history absent/past-only/
+future-only/both, and strong versus weak component overlap.
+
+Unit validation covers physical-spacing invariance, invalid-history neutrality,
+chunk equivalence, translational coordinates, nearest support selection,
+support-based component assignment, 22-D reverse edges, convergence sign,
+flips/dropout/false clues, empty/no-history forward, curriculum ownership,
+finite backward, and checkpoint migration.
+
+`history_overfit.py` trains the A-D ladder on one ambiguous two-cell merge and
+reports predicted count, matched-positive proxy, existence, center error,
+coarse Dice, and native Dice rather than treating total loss as success.
+`history_memory_profile.py` resets CUDA peaks per trial and reports node,
+hypothesis, and query counts; compact tensor bytes; spatial feature shapes; and
+peak memory. Initial marginal allocated-memory target is 0.5-0.7 GB. If it is
+exceeded, optimize checkpointing, chunks, dtype, and chunk-local sampling before
+reducing support channels or the 12-cube resolution.

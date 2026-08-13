@@ -293,3 +293,24 @@ This behavior is required for:
 - spatial-only pretraining;
 - missing Trackastra data;
 - ablations.
+
+## Historical support bias
+
+Only the `temporal reads spatial` direction receives explicit support sampling.
+For the current temporal-query and spatial-key chunks, the implementation
+trilinearly samples past/future occupancy and signed distance under the
+translational projection in the coordinate contract. A zero-initialized
+`8 -> 32 -> heads` MLP consumes:
+
+```text
+past occupancy, past SDF, future occupancy, future SDF,
+past valid, future valid, |past dt|/2, |future dt|/2
+```
+
+Its per-head output is added to content and physical-position logits before the
+existing radius mask and FP32 online softmax. If neither side is valid the bias
+is exactly zero. Sampling is key-chunk local; no `[M,N_spatial,...]` tensor or
+dense projected target volume is materialized. Spatial-to-temporal attention is
+unchanged and reads the already updated, history-aware temporal tokens after the
+hypothesis GNN. Existing chunking, online-softmax equivalence, radius masking,
+and non-reentrant checkpointing remain mandatory.

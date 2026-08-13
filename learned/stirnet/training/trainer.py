@@ -41,6 +41,16 @@ def model_forward_from_batch(
         b["hypothesis_edge_attr"],b["temporal_batch"],
         b.get("spatial_padding_mask"),
         bypass_coreasoning=bypass_coreasoning,
+        node_instance_grid=b.get("node_instance_grid"),
+        node_history_valid=b.get("node_history_valid"),
+        history_support=b.get("history_support"),
+        history_support_valid=b.get("history_support_valid"),
+        history_support_dt=b.get("history_support_dt"),
+        history_support_center_um=b.get("history_support_center_um"),
+        history_support_extent_um=b.get("history_support_extent_um"),
+        best_current_component_id=b.get("best_current_component_id"),
+        best_component_overlap=b.get("best_component_overlap"),
+        second_best_component_overlap=b.get("second_best_component_overlap"),
     )
 
 

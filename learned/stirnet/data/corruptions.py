@@ -14,6 +14,14 @@ class CorruptionResult:
     metadata: dict
 
 
+@dataclass
+class SequenceCorruptionResult:
+    labels: np.ndarray
+    target_index: int
+    kind: str
+    metadata: dict
+
+
 def merge_instances(labels: np.ndarray, ids: list[int]) -> CorruptionResult:
     out=labels.copy()
     ids=[int(i) for i in ids if i>0]
@@ -21,6 +29,45 @@ def merge_instances(labels: np.ndarray, ids: list[int]) -> CorruptionResult:
     keep=ids[0]
     for i in ids[1:]: out[out==i]=keep
     return CorruptionResult(out,"merge",{"ids":ids,"kept":keep})
+
+
+def merge_sequence_at_target(
+    label_sequence: np.ndarray,
+    target_index: int,
+    ids: list[int] | None = None,
+    *,
+    require_separate_context: bool = True,
+    rng: np.random.Generator | None = None,
+) -> SequenceCorruptionResult:
+    """Merge persistent cells only at the target frame of an annotated sequence.
+
+    The surrounding frames remain provisional segmentation inputs; this helper
+    does not construct perfect tracks or inject GT identities into model tensors.
+    It is the minimal corruption primitive used before a Trackastra pass-1 cache
+    is built.
+    """
+    sequence=np.asarray(label_sequence)
+    if sequence.ndim!=4: raise ValueError("label_sequence must be [T,Z,Y,X]")
+    if not 0<=target_index<sequence.shape[0]: raise IndexError("target_index out of range")
+    rng=rng or np.random.default_rng()
+    target=sequence[target_index]
+    if ids is None:
+        candidate=merge_adjacent_instances(target,rng)
+        ids=list(candidate.metadata.get("ids",[]))
+    ids=[int(i) for i in (ids or []) if i>0]
+    if len(ids)<2:
+        return SequenceCorruptionResult(sequence.copy(),target_index,"none",{})
+    if require_separate_context:
+        context=[t for t in range(sequence.shape[0]) if t!=target_index]
+        if not any(all(np.any(sequence[t]==i) for i in ids) for t in context):
+            return SequenceCorruptionResult(sequence.copy(),target_index,"none",{"reason":"missing_separate_context"})
+    out=sequence.copy()
+    merged=merge_instances(out[target_index],ids)
+    out[target_index]=merged.labels
+    return SequenceCorruptionResult(
+        out,target_index,"sequence_merge",
+        {"ids":ids,"kept":ids[0],"past_available":target_index>0,"future_available":target_index+1<sequence.shape[0]},
+    )
 
 
 def remove_instance(labels: np.ndarray, label: int) -> CorruptionResult:

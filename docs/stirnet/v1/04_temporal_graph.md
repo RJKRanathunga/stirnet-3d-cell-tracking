@@ -311,19 +311,12 @@ Connect hypotheses if any condition holds:
 `hyp_edge_attr`:
 
 ```python
-[Eh, 8]
+[Eh, 22]
 ```
 
-Suggested schema:
-
-```text
-0-2 Δxyz/dref
-3   distance/dref
-4   same_current_component
-5   lineage_related
-6   gap_related
-7   combined_reliability
-```
+Dimensions 0-7 preserve these legacy semantics as the prefix of the required
+22-D schema in Section 16. Dimensions 8-21 add convergence, projected support,
+component overlap, volume compatibility, and explicit validity.
 
 This graph is used inside co-reasoning blocks after temporal hypotheses inspect image evidence.
 
@@ -338,9 +331,59 @@ TemporalState(
     reliability=[...,1],
     status=[...,10],
     hyp_edge_index=[2,Eh],
-    hyp_edge_attr=[Eh,8],
+    hyp_edge_attr=[Eh,22],
     batch_index=[M],
 )
 ```
 
 The spatial/query network must not depend on Trackastra-specific Python objects.
+
+## 15. Historical instance fusion
+
+The scalar node projection remains `32 -> 64 -> 128`. A compact history CNN
+maps valid `4 x 12 x 12 x 12` grids to a second 128-D vector. A learned scalar
+gate consumes the scalar embedding, history embedding, and validity, then
+applies `scalar + valid * gate * history`. Its final weights are zero and bias is
+negative at initialization. Invalid history is masked before the gate and is
+exactly behavior-neutral. Fusion occurs before the existing two detection GAT
+blocks and learned tracklet pooling.
+
+For every tracklet, preprocessing selects at most the nearest valid past and
+future observation. Hypothesis support stores only occupancy and signed distance:
+
+```text
+history_support             [M,2,2,12,12,12]
+history_support_valid       [M,2]
+history_support_dt          [M,2]
+history_support_center_um   [M,2,3]
+history_support_extent_um   [M,2]
+```
+
+## 16. Required 22-D hypothesis edge schema
+
+```text
+0-2   target-reference delta z,y,x / dref
+3     target-reference distance / dref
+4     same-current-component confidence
+5     lineage-related
+6     gap-related
+7     combined provisional reliability
+8     nearest common-past pair distance / dref
+9     older common-past pair distance / dref
+10    nearest minus older distance (negative means closing)
+11    positive-when-closing speed / dref/frame
+12-14 relative velocity z,y,x / dref/frame (j minus i)
+15    projected A/B support overlap
+16    A best-current-component overlap
+17    B best-current-component overlap
+18    combined previous physical volume / current-component volume
+19    nearest-pair-distance valid
+20    older-pair-distance valid
+21    support/component-overlap valid
+```
+
+Projected positive occupancy samples, not reference centroids, provide the
+primary current-component assignment and best/second overlap. Reference lookup
+is only the no-valid-support fallback. Reverse edges negate 0-2 and 12-14, swap
+16/17, and preserve symmetric dimensions. Missing quantities retain explicit
+validity rather than fabricated calibration.

@@ -63,6 +63,16 @@ def build_cached_sample(
         sample.update({
             "graph_x":torch.zeros((0,32)),"graph_edge_index":torch.zeros((2,0),dtype=torch.long),"graph_edge_attr":torch.zeros((0,14)),
             "tracklet_id":torch.zeros((0,),dtype=torch.long),"temporal_ref_um":torch.zeros((0,3)),"temporal_status":torch.zeros((0,10)),
-            "hypothesis_edge_index":torch.zeros((2,0),dtype=torch.long),"hypothesis_edge_attr":torch.zeros((0,8)),
+            "hypothesis_edge_index":torch.zeros((2,0),dtype=torch.long),"hypothesis_edge_attr":torch.zeros((0,22)),
+            "node_instance_grid":torch.zeros((0,4,12,12,12),dtype=torch.float16),
+            "node_history_valid":torch.zeros((0,),dtype=torch.bool),
+            "history_support":torch.zeros((0,2,2,12,12,12),dtype=torch.float16),
+            "history_support_valid":torch.zeros((0,2),dtype=torch.bool),
+            "history_support_dt":torch.zeros((0,2)),
+            "history_support_center_um":torch.zeros((0,2,3)),
+            "history_support_extent_um":torch.zeros((0,2)),
+            "best_current_component_id":torch.zeros((0,),dtype=torch.long),
+            "best_component_overlap":torch.zeros((0,)),
+            "second_best_component_overlap":torch.zeros((0,)),
         })
     return sample

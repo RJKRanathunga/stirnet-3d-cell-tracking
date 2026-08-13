@@ -19,7 +19,7 @@ class SpatialConfig:
 class TemporalConfig:
     node_dim: int = 32
     edge_dim: int = 14
-    hypothesis_edge_dim: int = 8
+    hypothesis_edge_dim: int = 22
     d_model: int = 128
     graph_layers: int = 2
     graph_heads: int = 4
@@ -28,6 +28,22 @@ class TemporalConfig:
     k_spatial_neighbors: int = 6
     spatial_neighbor_radius_dref: float = 2.5
     status_dim: int = 10
+
+
+@dataclass
+class HistoryConfig:
+    """Compact, cell-scale historical-instance evidence."""
+
+    enabled: bool = True
+    grid_size: int = 12
+    extent_dref: float = 2.5
+    input_channels: int = 4
+    support_channels: int = 2
+    node_chunk_size: int = 128
+    gate_init_bias: float = -2.0
+    attention_bias_enabled: bool = True
+    attention_bias_hidden: int = 32
+    dt_normalizer: float = 2.0
 
 
 @dataclass
@@ -120,6 +136,7 @@ class TrainingConfig:
     activation_checkpointing: bool = True
     checkpoint_spatial: bool = True
     checkpoint_coreasoning: bool = True
+    checkpoint_history: bool = True
     checkpoint_losses: bool = True
 
 
@@ -148,6 +165,7 @@ class InferenceConfig:
 class StirNetConfig:
     spatial: SpatialConfig = field(default_factory=SpatialConfig)
     temporal: TemporalConfig = field(default_factory=TemporalConfig)
+    history: HistoryConfig = field(default_factory=HistoryConfig)
     coreasoning: CoReasoningConfig = field(default_factory=CoReasoningConfig)
     queries: QueryConfig = field(default_factory=QueryConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)

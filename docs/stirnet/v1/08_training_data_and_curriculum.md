@@ -370,3 +370,35 @@ git commit if available
 ```
 
 The model code is expected under `learned/stirnet/`, but checkpoints should be stored in a dedicated learned-model/output location rather than committed to source control.
+
+## Historical evidence cache and augmentation contract
+
+History-capable caches are explicit contract version 2. In addition to existing
+graph data they store float16 `node_instance_grid`, `node_history_valid`, nearest
+past/future occupancy-SDF support and transforms, component-overlap summaries,
+and 22-D hypothesis edges. Full historical native volumes are referenced
+externally, not duplicated per patch. Unversioned/version-1 caches remain
+loadable: collation supplies invalid zero history, pads legacy 8-D edges with
+zero new columns, and retains reference-lookup fallback behavior.
+
+Axis flips reverse the corresponding spatial axis of node grids and hypothesis
+support, negate centers, node velocities, edge displacements, and hypothesis
+relative velocity dimensions 12-14, and preserve scalar/symmetric features. One
+sampled intensity transform is applied to the current raw channel and both
+historical raw channels. Hypothesis dropout removes all aligned support and
+overlap summaries; false clues receive invalid zero history and support.
+Reference jitter changes the projected center consistently but does not deform
+the stored shape.
+
+Sequence-aware corruption includes target-only 2->1 and 3->1 merges whose
+surrounding provisional frames remain separated when plausible. Variants cover
+past-only, future-only, both-sided, decreasing separation, imperfect pass-1
+association, and near-conserved combined volume. The order remains annotated
+sequence -> segmentation corruption -> Trackastra pass 1 -> history cache ->
+STIR-Net. Clean GT-derived tracks are never passed to the model.
+
+The history encoder and fusion belong to the existing `temporal` parameter
+group; support-bias MLPs live inside CR1/CR2 in that same group. There is no
+sixth curriculum stage. They are frozen/bypassed in `spatial_dense`, enabled in
+`temporal_dense`, and continue through query bootstrap, native bootstrap, and
+joint training. The parameter checker must assign every parameter exactly once.

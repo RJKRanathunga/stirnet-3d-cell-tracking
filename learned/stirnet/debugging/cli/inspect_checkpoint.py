@@ -11,6 +11,7 @@ from learned.stirnet.model.config import (
     CoReasoningConfig,
     DecoderConfig,
     InferenceConfig,
+    HistoryConfig,
     LossConfig,
     QueryConfig,
     SpatialConfig,
@@ -31,6 +32,7 @@ def config_from_dict(data: dict | None) -> StirNetConfig:
     return StirNetConfig(
         spatial=SpatialConfig(**data.get("spatial", {})),
         temporal=TemporalConfig(**data.get("temporal", {})),
+        history=HistoryConfig(**data.get("history", {})),
         coreasoning=CoReasoningConfig(**data.get("coreasoning", {})),
         queries=QueryConfig(**data.get("queries", {})),
         decoder=DecoderConfig(**data.get("decoder", {})),

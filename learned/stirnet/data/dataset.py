@@ -14,6 +14,7 @@ from .targets import (
     extract_instance_metadata,
     make_instance_boundary,
 )
+from .trackastra_cache import load_cache
 
 
 class CachedStirNetDataset(Dataset):
@@ -29,7 +30,7 @@ class CachedStirNetDataset(Dataset):
     def __len__(self): return len(self.files)
 
     def shape_key(self,index):
-        s=torch.load(self.files[index],map_location="cpu",weights_only=False)
+        s=load_cache(self.files[index],map_location="cpu")
         if "spatial_inputs" in s:
             shape=tuple(s["spatial_inputs"].shape[-3:])
         elif "raw" in s:
@@ -78,7 +79,7 @@ class CachedStirNetDataset(Dataset):
         return s
 
     def __getitem__(self,index):
-        s=torch.load(self.files[index],map_location="cpu",weights_only=False)
+        s=load_cache(self.files[index],map_location="cpu")
         s=self._materialize(s)
         if self.transform is not None:s=self.transform(s)
         return s

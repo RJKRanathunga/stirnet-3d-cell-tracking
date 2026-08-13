@@ -313,3 +313,12 @@ query decoder
 ```
 
 This is required before tuning loss weights.
+
+## Historical evidence and matching eligibility
+
+History may change existence, center, mask, and temporal representations through
+the existing segmentation losses. It adds no track identity, association,
+lineage, or Trackastra-consistency loss. Temporal-recovery eligibility remains
+defined by the immutable initial temporal reference before decoder refinement;
+projected support must not redefine which GT instance a temporal clue was
+physically eligible to recover.

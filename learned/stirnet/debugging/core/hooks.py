@@ -26,6 +26,11 @@ def _copy_temporal(state: TemporalState | None):
         "reliability": _cpu_float(state.reliability),
         "status": _cpu_float(state.status),
         "batch_index": state.batch_index.detach().long().cpu(),
+        "history_support_valid": state.history_support_valid.detach().bool().cpu() if state.history_support_valid is not None else None,
+        "history_support_dt": _cpu_float(state.history_support_dt) if state.history_support_dt is not None else None,
+        "history_gate": _cpu_float(state.history_gate) if state.history_gate is not None else None,
+        "node_history_valid": state.node_history_valid.detach().bool().cpu() if state.node_history_valid is not None else None,
+        "best_component_overlap": _cpu_float(state.best_component_overlap) if state.best_component_overlap is not None else None,
     }
 
 

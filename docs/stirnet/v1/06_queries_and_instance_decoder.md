@@ -470,3 +470,16 @@ and is used for physical matching and mask-loss supports.
 The immutable initial references are a production output, not debug-only state:
 temporal matching uses them to validate the physical meaning of a temporal
 clue even after decoder center refinement.
+
+## Historical evidence and queries
+
+Primary, dynamic split-companion, temporal-repair, and discovery query semantics
+are unchanged. Historical evidence complements rather than replaces dynamic
+split capacity. A temporal query remains the final temporal token plus its type
+embedding, so it inherits detection morphology, convergence edges, and
+history-aware spatial evidence without track-ID classes or tracking losses.
+
+The native temporal prior remains Gaussian and native masks remain streamed.
+Projected historical shapes affect final instances indirectly through temporal
+tokens and co-reasoning. A Gaussian-plus-historical-shape native prior is a
+future ablation, not part of this implementation.

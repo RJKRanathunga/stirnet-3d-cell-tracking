@@ -20,6 +20,8 @@ PARAMETER_GROUP_MODULES = {
     "dense": ("dense_heads",),
     "temporal": (
         "graph_encoder",
+        "history_encoder",
+        "history_fusion",
         "tracklet_pooler",
         "temporal_builder",
         "cr1",

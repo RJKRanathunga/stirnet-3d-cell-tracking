@@ -26,6 +26,9 @@ def build_temporal_table(hook_capture):
     sal = _np(initial, "salience")
     rel = _np(initial, "reliability")
     status = _np(initial, "status")
+    support_valid = _np(initial, "history_support_valid")
+    support_dt = _np(initial, "history_support_dt")
+    best_overlap = _np(initial, "best_component_overlap")
     t1 = _np(cr1, "tokens")
     t2 = _np(cr2, "tokens")
     n = len(t0)
@@ -54,5 +57,13 @@ def build_temporal_table(hook_capture):
         if status is not None:
             for j, value in enumerate(status[i]):
                 row[f"status_{j}"] = float(value)
+        if support_valid is not None:
+            row["past_support_valid"] = bool(support_valid[i, 0])
+            row["future_support_valid"] = bool(support_valid[i, 1])
+        if support_dt is not None:
+            row["past_support_dt"] = float(support_dt[i, 0])
+            row["future_support_dt"] = float(support_dt[i, 1])
+        if best_overlap is not None:
+            row["best_component_overlap"] = float(best_overlap[i])
         rows.append(row)
     return rows

@@ -97,11 +97,24 @@ class DetectionGraphEncoder(nn.Module):
             for _ in range(cfg.graph_layers)
         ])
 
-    def forward(self, graph_x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
-        x = self.input_proj(graph_x)
+    def project_scalars(self, graph_x: Tensor) -> Tensor:
+        return self.input_proj(graph_x)
+
+    def message_pass(self, node_embedding: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
+        x = node_embedding
         for layer in self.layers:
             x = layer(x, edge_index, edge_attr)
         return x
+
+    def forward(
+        self,
+        graph_x: Tensor,
+        edge_index: Tensor,
+        edge_attr: Tensor,
+        node_embedding: Tensor | None = None,
+    ) -> Tensor:
+        embedding = self.project_scalars(graph_x) if node_embedding is None else node_embedding
+        return self.message_pass(embedding, edge_index, edge_attr)
 
 
 class HypothesisGraphBlock(nn.Module):

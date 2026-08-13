@@ -57,6 +57,7 @@ class TemporalStateBuilder(nn.Module):
         hyp_edge_attr: Tensor,
         batch_index: Tensor,
         dref_um_per_hyp: Tensor,
+        **history_fields,
     ) -> TemporalState:
         if pooled_tokens.shape[0] == 0:
             z1 = pooled_tokens.new_zeros((0, 1))
@@ -70,6 +71,7 @@ class TemporalStateBuilder(nn.Module):
                 edge_index=hyp_edge_index,
                 edge_attr=hyp_edge_attr,
                 batch_index=batch_index,
+                **history_fields,
             )
         tokens = pooled_tokens + self.status_proj(status)
         combined = torch.cat([tokens, status], dim=-1)
@@ -87,4 +89,5 @@ class TemporalStateBuilder(nn.Module):
             edge_index=hyp_edge_index,
             edge_attr=hyp_edge_attr,
             batch_index=batch_index,
+            **history_fields,
         )

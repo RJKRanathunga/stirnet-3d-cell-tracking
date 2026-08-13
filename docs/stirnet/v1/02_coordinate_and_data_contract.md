@@ -266,7 +266,20 @@ A training sample should provide at least:
     "temporal_status": FloatTensor[M, 10],
 
     "hyp_edge_index": LongTensor[2, Eh],
-    "hyp_edge_attr": FloatTensor[Eh, 8],
+    "hyp_edge_attr": FloatTensor[Eh, 22],
+
+    "node_instance_grid": FloatTensor[N, 4, 12, 12, 12],
+    "node_history_valid": BoolTensor[N],
+
+    "history_support": FloatTensor[M, 2, 2, 12, 12, 12],
+    "history_support_valid": BoolTensor[M, 2],
+    "history_support_dt": FloatTensor[M, 2],
+    "history_support_center_um": FloatTensor[M, 2, 3],
+    "history_support_extent_um": FloatTensor[M, 2],
+
+    "best_current_component_id": LongTensor[M],
+    "best_component_overlap": FloatTensor[M],
+    "second_best_component_overlap": FloatTensor[M],
 
     "gt_label_map": IntTensor[Z, Y, X],
     "gt_instance_ids": LongTensor[K],
@@ -280,3 +293,26 @@ Variable-sized tensors are collated through index/batch vectors rather than forc
 The preferred training representation keeps one integer GT label map. Coarse
 per-instance masks are derived after downsampling, and native masks are rendered
 only for matched queries in bounded chunks.
+
+## 11. Historical descriptor coordinates
+
+Historical grids are canonical physical cubes, not native-voxel crops. The full
+grid extent is `history_extent_dref * dref_um` (default `2.5*dref_um`) on every
+zyx axis, centered on the provisional detection and aligned with the global
+acquisition z,y,x axes. Grid endpoints are at `-extent/2` and `+extent/2`;
+sampling is physically computed from `spacing_um`.
+
+The four node channels are occupancy in `[0,1]`, signed physical distance
+divided by `dref_um` and clipped to `[-1,+1]` (positive inside), masked
+robust-normalized intensity, and local robust-normalized intensity including
+nearby context. Invalid rows may be absent or zero-filled, but
+`node_history_valid=False` is authoritative and produces exactly zero history
+contribution. Cached descriptors may be float16; coordinate, distance, overlap,
+and attention-softmax arithmetic is float32.
+
+Support side 0 is past and side 1 is future. `history_support_center_um` uses
+the same target-patch-relative physical zyx convention as `temporal_ref_um`;
+`history_support_dt` is target-relative frame offset. The support cube preserves
+only occupancy and SDF. A translational projection maps the historical center
+onto the immutable target-frame temporal reference. For target point `x`, the
+historical sample point is `x - (temporal_ref_um - historical_center_um)`.

@@ -8,7 +8,7 @@ from torch import Tensor, nn
 from .attention import LocalPhysicalCrossAttention
 from .blocks import FeedForward, PhysicalAwareResBlock
 from .checkpointing import checkpoint_if_enabled
-from .config import CoReasoningConfig, SpatialConfig, TemporalConfig
+from .config import CoReasoningConfig, HistoryConfig, SpatialConfig, TemporalConfig
 from .coordinates import feature_grid_coordinates_um
 from .graph_encoder import HypothesisGraphBlock
 from .types import TemporalState
@@ -22,6 +22,7 @@ class CoReasoningBlock(nn.Module):
         temporal_cfg: TemporalConfig,
         cfg: CoReasoningConfig,
         *,
+        history_cfg: HistoryConfig | None = None,
         activation_checkpointing: bool = False,
     ):
         super().__init__()
@@ -31,7 +32,7 @@ class CoReasoningBlock(nn.Module):
         self.to_model = nn.Conv3d(in_channels, d, 1) if in_channels != d else nn.Identity()
         self.from_model = nn.Conv3d(d, in_channels, 1) if in_channels != d else nn.Identity()
         self.cross = LocalPhysicalCrossAttention(
-            cfg, activation_checkpointing=activation_checkpointing
+            cfg, history_cfg=history_cfg, activation_checkpointing=activation_checkpointing
         )
         self.t_norm1 = nn.LayerNorm(d)
         self.t_norm2 = nn.LayerNorm(d)
@@ -85,6 +86,11 @@ class CoReasoningBlock(nn.Module):
                 t_norm, temporal.ref_um, temporal.salience,
                 normalized_spatial, pos_um, temporal.batch_index,
                 dref_um, spatial_padding_mask, self.cfg.base_radius_dref,
+                temporal.history_support,
+                temporal.history_support_valid,
+                temporal.history_support_dt,
+                temporal.history_support_center_um,
+                temporal.history_support_extent_um,
             )
             gate_in = torch.cat([temporal.tokens, t_msg, temporal.salience, temporal.reliability], dim=-1)
             t = temporal.tokens + self.t_gate(gate_in) * t_msg

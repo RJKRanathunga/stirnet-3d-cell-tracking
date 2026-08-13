@@ -450,3 +450,27 @@ query references
 behind a debug flag.
 
 Do not make debugging require modifying model source.
+
+## Historical-instance module ownership
+
+The concrete layout additionally contains:
+
+```text
+model/history_encoder.py       small 3-D encoder and validity-aware gate
+model/history_support.py       implicit translation, sampling, attention bias
+data/historical_instances.py   physical extraction, selection, CPU overlaps
+debugging/acceptance/history_overfit.py
+debugging/acceptance/history_memory_profile.py
+```
+
+`TemporalState` adds optional plain-tensor history support, validity, dt, center,
+extent, node validity/gate, and component-overlap summaries. Empty and
+no-history states remain valid. Trackastra-specific objects are confined to data
+conversion.
+
+`trackastra_cache.py` writes contract version 2 atomically. `collate.py` supplies
+old-cache defaults. `training/checkpoint.py` migrates old CR1/CR2 hypothesis
+edge projections by copying columns 0-7, zero-initializing columns 8-21, and
+retaining conservative initialization for new history parameters; it does not
+discard the hypothesis GNN. `stir_net.py` orchestrates but does not own physical
+sampling or grid construction.

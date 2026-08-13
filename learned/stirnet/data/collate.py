@@ -2,6 +2,19 @@ from __future__ import annotations
 
 import torch
 
+from .graph_builder import HYPOTHESIS_EDGE_DIM
+
+
+def _hypothesis_edges_compatible(value: torch.Tensor) -> torch.Tensor:
+    """Pad legacy 8-D edges while preserving their unchanged semantic prefix."""
+    if value.shape[-1] == HYPOTHESIS_EDGE_DIM:
+        return value
+    if value.shape[-1] == 8:
+        return torch.nn.functional.pad(value, (0, HYPOTHESIS_EDGE_DIM - 8))
+    raise ValueError(
+        f"hypothesis_edge_attr has width {value.shape[-1]}; expected 8 or {HYPOTHESIS_EDGE_DIM}"
+    )
+
 
 def _cat(samples,key,shape_tail,dtype=torch.float32):
     vals=[s.get(key) for s in samples]
@@ -36,12 +49,28 @@ def stirnet_collate(samples:list[dict])->dict:
 
     # packed detection graph + hypothesis graph
     gx=[]; gei=[]; gea=[]; tid=[]; tref=[]; tstatus=[]; hei=[]; hea=[]; tb=[]
+    node_grids=[];node_valid=[]
+    supports=[];support_valid=[];support_dt=[];support_centers=[];support_extents=[]
+    best_ids=[];best_overlap=[];second_overlap=[]
     node_off=0; hyp_off=0
     for b,s in enumerate(samples):
         x=s.get("graph_x",torch.zeros((0,32))); ei=s.get("graph_edge_index",torch.zeros((2,0),dtype=torch.long)); ea=s.get("graph_edge_attr",torch.zeros((0,14)))
         tr=s.get("temporal_ref_um",torch.zeros((0,3))); st=s.get("temporal_status",torch.zeros((len(tr),10)))
         ti=s.get("tracklet_id",torch.zeros((len(x),),dtype=torch.long))
-        hi=s.get("hypothesis_edge_index",torch.zeros((2,0),dtype=torch.long)); ha=s.get("hypothesis_edge_attr",torch.zeros((0,8)))
+        hi=s.get("hypothesis_edge_index",torch.zeros((2,0),dtype=torch.long)); ha=_hypothesis_edges_compatible(s.get("hypothesis_edge_attr",torch.zeros((0,HYPOTHESIS_EDGE_DIM))))
+        grid=s.get("node_instance_grid",torch.zeros((len(x),4,12,12,12),dtype=torch.float16))
+        valid=s.get("node_history_valid",torch.zeros((len(x),),dtype=torch.bool))
+        support=s.get("history_support",torch.zeros((len(tr),2,2,12,12,12),dtype=torch.float16))
+        support_ok=s.get("history_support_valid",torch.zeros((len(tr),2),dtype=torch.bool))
+        support_delta=s.get("history_support_dt",torch.zeros((len(tr),2)))
+        support_center=s.get("history_support_center_um",torch.zeros((len(tr),2,3)))
+        support_extent=s.get("history_support_extent_um",torch.zeros((len(tr),2)))
+        node_grids.append(grid);node_valid.append(valid)
+        supports.append(support);support_valid.append(support_ok);support_dt.append(support_delta)
+        support_centers.append(support_center);support_extents.append(support_extent)
+        best_ids.append(s.get("best_current_component_id",torch.full((len(tr),),-1,dtype=torch.long)))
+        best_overlap.append(s.get("best_component_overlap",torch.zeros((len(tr),))))
+        second_overlap.append(s.get("second_best_component_overlap",torch.zeros((len(tr),))))
         gx.append(x); gea.append(ea); gei.append(ei+node_off if ei.numel() else ei)
         # local tracklet ids become global hypothesis ids
         tid.append(ti+hyp_off if ti.numel() else ti)
@@ -56,5 +85,15 @@ def stirnet_collate(samples:list[dict])->dict:
     batch["temporal_status"]=torch.cat(tstatus) if tstatus else torch.zeros((0,10))
     batch["temporal_batch"]=torch.cat(tb) if tb else torch.zeros((0,),dtype=torch.long)
     batch["hypothesis_edge_index"]=torch.cat(hei,dim=1) if hei else torch.zeros((2,0),dtype=torch.long)
-    batch["hypothesis_edge_attr"]=torch.cat(hea) if hea else torch.zeros((0,8))
+    batch["hypothesis_edge_attr"]=torch.cat(hea) if hea else torch.zeros((0,HYPOTHESIS_EDGE_DIM))
+    batch["node_instance_grid"]=torch.cat(node_grids) if node_grids else torch.zeros((0,4,12,12,12),dtype=torch.float16)
+    batch["node_history_valid"]=torch.cat(node_valid) if node_valid else torch.zeros((0,),dtype=torch.bool)
+    batch["history_support"]=torch.cat(supports) if supports else torch.zeros((0,2,2,12,12,12),dtype=torch.float16)
+    batch["history_support_valid"]=torch.cat(support_valid) if support_valid else torch.zeros((0,2),dtype=torch.bool)
+    batch["history_support_dt"]=torch.cat(support_dt) if support_dt else torch.zeros((0,2))
+    batch["history_support_center_um"]=torch.cat(support_centers) if support_centers else torch.zeros((0,2,3))
+    batch["history_support_extent_um"]=torch.cat(support_extents) if support_extents else torch.zeros((0,2))
+    batch["best_current_component_id"]=torch.cat(best_ids) if best_ids else torch.zeros((0,),dtype=torch.long)
+    batch["best_component_overlap"]=torch.cat(best_overlap) if best_overlap else torch.zeros((0,))
+    batch["second_best_component_overlap"]=torch.cat(second_overlap) if second_overlap else torch.zeros((0,))
     return batch

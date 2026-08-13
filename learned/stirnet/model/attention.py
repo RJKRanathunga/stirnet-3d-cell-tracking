@@ -7,7 +7,8 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from .checkpointing import checkpoint_if_enabled
-from .config import CoReasoningConfig
+from .config import CoReasoningConfig, HistoryConfig
+from .history_support import HistorySupportBias, sample_projected_history_support
 
 
 class PhysicalPositionBias(nn.Module):
@@ -36,6 +37,7 @@ class LocalPhysicalCrossAttention(nn.Module):
         self,
         cfg: CoReasoningConfig,
         *,
+        history_cfg: HistoryConfig | None = None,
         activation_checkpointing: bool = False,
     ):
         super().__init__()
@@ -56,6 +58,16 @@ class LocalPhysicalCrossAttention(nn.Module):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
         self.pos_bias = PhysicalPositionBias(h, cfg.position_bias_hidden)
+        self.history_bias = (
+            HistorySupportBias(
+                h, history_cfg.attention_bias_hidden, history_cfg.dt_normalizer
+            )
+            if history_cfg is not None
+            and history_cfg.enabled
+            and history_cfg.attention_bias_enabled
+            else None
+        )
+        self.last_history_bias_stats: dict[str, Tensor] = {}
 
         self.t_q = nn.Linear(d, d, bias=False)
         self.s_k = nn.Linear(d, d, bias=False)
@@ -85,6 +97,11 @@ class LocalPhysicalCrossAttention(nn.Module):
         spatial_pos_chunk_um: Tensor,
         dref_um: Tensor,
         padding_chunk: Tensor,
+        history_support: Tensor,
+        history_valid: Tensor,
+        history_dt: Tensor,
+        history_center_um: Tensor,
+        history_extent_um: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Apply one online-softmax spatial key chunk."""
         key = self._split(self.s_k(spatial_chunk)).permute(1, 0, 2)
@@ -93,6 +110,23 @@ class LocalPhysicalCrossAttention(nn.Module):
         delta = spatial_pos_chunk_um[None, :, :] - query_ref_um[:, None, :]
         bias = self.pos_bias(delta, dref_um).permute(2, 0, 1)
         logits = (logits + bias).float()
+        if self.history_bias is not None and history_support.numel():
+            samples = sample_projected_history_support(
+                history_support,
+                history_valid,
+                history_center_um,
+                query_ref_um,
+                history_extent_um,
+                spatial_pos_chunk_um,
+            )
+            support_bias = self.history_bias(samples, history_valid, history_dt)
+            logits = logits + support_bias.permute(2, 0, 1).float()
+            self.last_history_bias_stats = {
+                "mean": support_bias.detach().mean(),
+                "mean_abs": support_bias.detach().abs().mean(),
+                "max_abs": support_bias.detach().abs().amax(),
+                "valid_fraction": history_valid.detach().float().mean(),
+            }
         valid = torch.linalg.vector_norm(delta, dim=-1) <= query_radius_um[:, None]
         valid = valid & (~padding_chunk[None, :])
         logits = logits.masked_fill(~valid[None], -torch.inf)
@@ -175,8 +209,14 @@ class LocalPhysicalCrossAttention(nn.Module):
         dref_um: Tensor,
         spatial_padding_mask: Tensor | None = None,
         base_radius_dref: float = 1.5,
+        history_support: Tensor | None = None,
+        history_support_valid: Tensor | None = None,
+        history_support_dt: Tensor | None = None,
+        history_support_center_um: Tensor | None = None,
+        history_support_extent_um: Tensor | None = None,
     ) -> Tensor:
         out = torch.zeros_like(temporal)
+        self.last_history_bias_stats = {}
         B = spatial.shape[0]
         for b in range(B):
             ids = torch.nonzero(temporal_batch == b, as_tuple=False).flatten()
@@ -208,6 +248,13 @@ class LocalPhysicalCrossAttention(nn.Module):
                 )
                 qref = tref[q_start:q_end]
                 qradius = radius[q_start:q_end]
+                local_ids = ids[q_start:q_end]
+                empty = s.new_zeros((q_count, 0))
+                q_support = history_support[local_ids] if history_support is not None else empty
+                q_valid = history_support_valid[local_ids] if history_support_valid is not None else empty.bool()
+                q_dt = history_support_dt[local_ids] if history_support_dt is not None else empty
+                q_center = history_support_center_um[local_ids] if history_support_center_um is not None else empty
+                q_extent = history_support_extent_um[local_ids] if history_support_extent_um is not None else empty
 
                 for k_start in range(0, s.shape[0], self.spatial_key_chunk_size):
                     k_end = min(k_start + self.spatial_key_chunk_size, s.shape[0])
@@ -231,6 +278,11 @@ class LocalPhysicalCrossAttention(nn.Module):
                         spos[k_start:k_end],
                         dref_um[b],
                         padding_chunk,
+                        q_support,
+                        q_valid,
+                        q_dt,
+                        q_center,
+                        q_extent,
                         enabled=self.activation_checkpointing and self.training,
                     )
 
