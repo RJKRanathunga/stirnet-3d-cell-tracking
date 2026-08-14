@@ -91,6 +91,41 @@ class QueryConfig:
 
 
 @dataclass
+class ProposalConfig:
+    enabled: bool = True
+    query_mode: str = "spatial_proposals"
+
+    # Candidate generation.
+    max_proposals: int = 128
+    candidate_pool_size: int = 512
+    nms_radius_dref: float = 0.35
+    inference_score_threshold: float = 0.05
+
+    # Proposal-local representation.
+    local_grid_size: int = 3
+    local_extent_dref: float = 0.50
+    local_dim: int = 128
+
+    # Safe coverage for existing components.
+    ensure_source_fallback: bool = True
+    source_fallback_match_radius_dref: float = 0.50
+
+    # Structured matching.
+    match_radius_dref: float = 1.0
+
+    # Query-decoder spatial support.
+    attention_radius_layer0_dref: float = 1.0
+    attention_radius_layer1_dref: float = 1.5
+    attention_radius_layer2_dref: float = 2.0
+
+    # Native rendering support.
+    native_support_radius_dref: float = 2.5
+
+    # Component context must remain secondary to local proposal identity.
+    component_context_gate_init_bias: float = -1.5
+
+
+@dataclass
 class DecoderConfig:
     d_model: int = 128
     heads: int = 4
@@ -105,6 +140,7 @@ class DecoderConfig:
     split_center_step_dref: float = 0.75
     temporal_center_step_dref: float = 0.25
     discovery_center_step_dref: float = 1.00
+    proposal_center_step_dref: float = 0.50
 
 
 @dataclass
@@ -120,6 +156,8 @@ class LossConfig:
     foreground: float = 0.50
     center_heatmap: float = 1.00
     boundary: float = 0.50
+    internal_boundary: float = 0.25
+    proposal_center: float = 0.75
     aux_layer: float = 0.50
     exist_focal_gamma: float = 2.0
     exist_focal_alpha_pos: float = 0.75
@@ -179,6 +217,7 @@ class StirNetConfig:
     history: HistoryConfig = field(default_factory=HistoryConfig)
     coreasoning: CoReasoningConfig = field(default_factory=CoReasoningConfig)
     queries: QueryConfig = field(default_factory=QueryConfig)
+    proposals: ProposalConfig = field(default_factory=ProposalConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     losses: LossConfig = field(default_factory=LossConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)

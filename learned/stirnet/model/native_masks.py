@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from .query_builder import (
     QUERY_DISCOVERY,
     QUERY_PRIMARY,
+    QUERY_SPATIAL_PROPOSAL,
     QUERY_SPLIT,
     QUERY_TEMPORAL,
 )
@@ -161,6 +162,7 @@ def native_query_prior_and_support(
     temporal_sigma_dref: float,
     prior_inside_logit: float,
     prior_outside_logit: float,
+    proposal_support_radius_dref: float | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Shared native prior/support semantics for training and inference."""
     device = coords_um.device
@@ -170,16 +172,24 @@ def native_query_prior_and_support(
     distance_squared = (coords_um.float()[None] - refs_um[:, None]).square().sum(-1)
     radius_um = float(support_radius_dref) * dref_um.float()
     radial_support = distance_squared <= radius_um.square()
+    proposal_radius_um = float(
+        support_radius_dref
+        if proposal_support_radius_dref is None
+        else proposal_support_radius_dref
+    ) * dref_um.float()
+    proposal_radial_support = distance_squared <= proposal_radius_um.square()
     source_support = source_dilated_support.to(device=device, dtype=torch.bool)
 
     primary = query_types == QUERY_PRIMARY
     split = query_types == QUERY_SPLIT
     temporal = query_types == QUERY_TEMPORAL
     discovery = query_types == QUERY_DISCOVERY
+    proposal = query_types == QUERY_SPATIAL_PROPOSAL
     support = torch.zeros_like(radial_support)
     support[primary] = radial_support[primary] | source_support[primary]
     support[split] = source_support[split]
     support[temporal | discovery] = radial_support[temporal | discovery]
+    support[proposal] = proposal_radial_support[proposal]
 
     prior = torch.zeros_like(distance_squared, dtype=torch.float32)
     if primary.any():
@@ -221,6 +231,7 @@ def compose_native_query_logits(
     prior_inside_logit: float,
     prior_outside_logit: float,
     background_logit: float,
+    proposal_support_radius_dref: float | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     prior, support = native_query_prior_and_support(
         query_types,
@@ -234,6 +245,7 @@ def compose_native_query_logits(
         temporal_sigma_dref=temporal_sigma_dref,
         prior_inside_logit=prior_inside_logit,
         prior_outside_logit=prior_outside_logit,
+        proposal_support_radius_dref=proposal_support_radius_dref,
     )
     combined = (learned_logits.float() + prior).masked_fill(
         ~support, float(background_logit)

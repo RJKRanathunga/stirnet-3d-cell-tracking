@@ -39,7 +39,9 @@ def run(
     batch, sample = build_real_batch(data_dir)
     cfg = _reduced_config(); device = torch.device("cuda")
     model = StirNet(cfg).to(device).train()
-    criterion = RefinementCriterion(cfg.losses, cfg.queries, cfg.training).to(device).train()
+    criterion = RefinementCriterion(
+        cfg.losses, cfg.queries, cfg.training, cfg.proposals
+    ).to(device).train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
     scaler = torch.amp.GradScaler("cuda", init_scale=1024.0)
     b = {}

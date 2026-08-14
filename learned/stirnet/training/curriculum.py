@@ -18,6 +18,7 @@ CURRICULUM_STAGES = (
 PARAMETER_GROUP_MODULES = {
     "spatial": ("acquisition", "encoder", "decoder"),
     "dense": ("dense_heads",),
+    "proposal": ("spatial_proposal_generator",),
     "temporal": (
         "graph_encoder",
         "history_encoder",
@@ -92,7 +93,7 @@ def curriculum_stage(config: CurriculumConfig, step: int) -> CurriculumStage:
     }
     native_overrides = {"count": 0.0, "overlap": 0.0}
     if name == "spatial_dense":
-        trainable = frozenset({"spatial", "dense"})
+        trainable = frozenset({"spatial", "dense", "proposal"})
         return CurriculumStage(
             name,
             trainable,
@@ -101,7 +102,7 @@ def curriculum_stage(config: CurriculumConfig, step: int) -> CurriculumStage:
             bypass_coreasoning=True,
         )
     if name == "temporal_dense":
-        trainable = frozenset({"spatial", "dense", "temporal"})
+        trainable = frozenset({"spatial", "dense", "proposal", "temporal"})
         return CurriculumStage(
             name,
             trainable,
@@ -109,19 +110,26 @@ def curriculum_stage(config: CurriculumConfig, step: int) -> CurriculumStage:
             dense_only_overrides,
         )
     if name == "query_bootstrap":
-        trainable = frozenset({"dense", "temporal", "query"})
+        trainable = frozenset({"spatial", "dense", "proposal", "temporal", "query"})
+        lr_scales = {group: float(group in trainable) for group in PARAMETER_GROUP_MODULES}
+        lr_scales["spatial"] = 0.25
+        lr_scales["dense"] = 0.50
         return CurriculumStage(
             name,
             trainable,
-            {group: float(group in trainable) for group in PARAMETER_GROUP_MODULES},
+            lr_scales,
             query_overrides,
         )
     if name == "native_bootstrap":
-        trainable = frozenset({"dense", "temporal", "query", "native"})
+        trainable = all_groups
+        lr_scales = dict(unit_lr)
+        lr_scales["spatial"] = 0.10
+        lr_scales["dense"] = 0.50
+        lr_scales["proposal"] = 0.50
         return CurriculumStage(
             name,
             trainable,
-            {group: float(group in trainable) for group in PARAMETER_GROUP_MODULES},
+            lr_scales,
             native_overrides,
         )
     if name != "joint":
@@ -129,6 +137,7 @@ def curriculum_stage(config: CurriculumConfig, step: int) -> CurriculumStage:
     joint_lr = dict(unit_lr)
     joint_lr["spatial"] = float(config.joint_spatial_lr_scale)
     joint_lr["dense"] = float(config.joint_dense_lr_scale)
+    joint_lr["proposal"] = 0.50
     if any(scale < 0 for scale in joint_lr.values()):
         raise ValueError("curriculum LR scales must be non-negative")
     return CurriculumStage(name, all_groups, joint_lr, {"overlap": 0.0})

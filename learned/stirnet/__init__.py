@@ -1,3 +1,3 @@
-from .model import StirNet, StirNetConfig, RefinementCriterion
+from .model import ProposalConfig, RefinementCriterion, StirNet, StirNetConfig
 
-__all__ = ["StirNet", "StirNetConfig", "RefinementCriterion"]
+__all__ = ["StirNet", "StirNetConfig", "ProposalConfig", "RefinementCriterion"]

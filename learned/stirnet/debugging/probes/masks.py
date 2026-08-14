@@ -11,6 +11,7 @@ from ...model.native_masks import (
     native_chunk_coordinates_um,
     source_dilation_support_chunk,
 )
+from ...model.query_builder import QUERY_SPATIAL_PROPOSAL
 
 
 @dataclass
@@ -70,6 +71,7 @@ def _composed_logits_chunk(
     prior_outside_logit,
     temporal_sigma_dref,
     native_support_radius_dref,
+    proposal_native_support_radius_dref,
     native_source_dilation_dref,
     native_background_logit,
 ):
@@ -78,12 +80,17 @@ def _composed_logits_chunk(
     dref = outputs.dref_um[b]
     query_types = outputs.query_types[b, q : q + 1]
     source_ids = outputs.source_instance_ids[b, q : q + 1]
+    support_source_ids = torch.where(
+        query_types == QUERY_SPATIAL_PROPOSAL,
+        torch.full_like(source_ids, -1),
+        source_ids,
+    )
     coords_um = native_chunk_coordinates_um(
         (z_size, y_size, x_size), spacing, start, end
     )
     source_support = source_dilation_support_chunk(
         outputs.instance_labels[b],
-        source_ids,
+        support_source_ids,
         spacing,
         dref,
         native_source_dilation_dref,
@@ -104,6 +111,7 @@ def _composed_logits_chunk(
         prior_inside_logit=prior_inside_logit,
         prior_outside_logit=prior_outside_logit,
         background_logit=native_background_logit,
+        proposal_support_radius_dref=proposal_native_support_radius_dref,
     )
     return prior[0], combined[0]
 
@@ -150,7 +158,7 @@ def _crop_bounds(outputs, target, target_index, q, *, margin_dref, unmatched_rad
 
 
 @torch.no_grad()
-def _render_crop(outputs, target, target_index, q, low, high, *, prior_inside_logit, prior_outside_logit, temporal_sigma_dref, native_support_radius_dref, native_source_dilation_dref, native_background_logit, mask_threshold, out_dtype):
+def _render_crop(outputs, target, target_index, q, low, high, *, prior_inside_logit, prior_outside_logit, temporal_sigma_dref, native_support_radius_dref, proposal_native_support_radius_dref, native_source_dilation_dref, native_background_logit, mask_threshold, out_dtype):
     b = 0
     z0, y0, x0 = map(int, low)
     z1, y1, x1 = map(int, high)
@@ -179,6 +187,7 @@ def _render_crop(outputs, target, target_index, q, low, high, *, prior_inside_lo
             prior_outside_logit=prior_outside_logit,
             temporal_sigma_dref=temporal_sigma_dref,
             native_support_radius_dref=native_support_radius_dref,
+            proposal_native_support_radius_dref=proposal_native_support_radius_dref,
             native_source_dilation_dref=native_source_dilation_dref,
             native_background_logit=native_background_logit,
         )
@@ -210,7 +219,7 @@ def _render_crop(outputs, target, target_index, q, low, high, *, prior_inside_lo
 
 
 @torch.no_grad()
-def probe_native_masks(outputs, target, selected_queries, query_to_target, *, mask_threshold, chunk_voxels, prior_inside_logit, prior_outside_logit, temporal_sigma_dref, native_support_radius_dref, native_source_dilation_dref, native_background_logit, crop_margin_dref, unmatched_crop_radius_dref, out_dtype):
+def probe_native_masks(outputs, target, selected_queries, query_to_target, *, mask_threshold, chunk_voxels, prior_inside_logit, prior_outside_logit, temporal_sigma_dref, native_support_radius_dref, proposal_native_support_radius_dref, native_source_dilation_dref, native_background_logit, crop_margin_dref, unmatched_crop_radius_dref, out_dtype):
     """Stream full-scene mask metrics; store only compact query-centric crops."""
 
     b = 0
@@ -234,6 +243,7 @@ def probe_native_masks(outputs, target, selected_queries, query_to_target, *, ma
                 prior_outside_logit=prior_outside_logit,
                 temporal_sigma_dref=temporal_sigma_dref,
                 native_support_radius_dref=native_support_radius_dref,
+                proposal_native_support_radius_dref=proposal_native_support_radius_dref,
                 native_source_dilation_dref=native_source_dilation_dref,
                 native_background_logit=native_background_logit,
             )
@@ -255,6 +265,7 @@ def probe_native_masks(outputs, target, selected_queries, query_to_target, *, ma
             prior_outside_logit=prior_outside_logit,
             temporal_sigma_dref=temporal_sigma_dref,
             native_support_radius_dref=native_support_radius_dref,
+            proposal_native_support_radius_dref=proposal_native_support_radius_dref,
             native_source_dilation_dref=native_source_dilation_dref,
             native_background_logit=native_background_logit,
             mask_threshold=mask_threshold,

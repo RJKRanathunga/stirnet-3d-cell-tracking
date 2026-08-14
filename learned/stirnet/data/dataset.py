@@ -12,6 +12,7 @@ from .targets import (
     build_gt_targets,
     estimate_dref_um,
     extract_instance_metadata,
+    make_internal_boundary_target,
     make_instance_boundary,
 )
 from .trackastra_cache import load_cache
@@ -44,9 +45,18 @@ class CachedStirNetDataset(Dataset):
         if "spatial_inputs" in s:
             if "target" in s and "instance_labels" in s:
                 s = dict(s)
-                s["target"] = add_source_gt_compatibility(
+                target = add_source_gt_compatibility(
                     s["target"], s["instance_labels"]
                 )
+                if "internal_boundary" not in target and "label_map" in target:
+                    target = dict(target)
+                    target["internal_boundary"] = torch.as_tensor(
+                        make_internal_boundary_target(
+                            torch.as_tensor(target["label_map"]).cpu().numpy(),
+                            tuple(float(value) for value in s["spacing_um"]),
+                        )
+                    )
+                s["target"] = target
             return s
         raw=np.asarray(s["raw"],np.float32)
         labels=np.asarray(s["instance_labels"],np.int64)

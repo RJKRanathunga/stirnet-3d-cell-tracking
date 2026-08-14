@@ -5,7 +5,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from .checkpointing import checkpoint_if_enabled
-from .config import LossConfig, QueryConfig, TrainingConfig
+from .config import LossConfig, ProposalConfig, QueryConfig, TrainingConfig
 from .matcher import (
     HungarianMatcher3D,
     MatchResult,
@@ -20,6 +20,7 @@ from .native_masks import (
     source_dilation_support_chunk,
 )
 from .types import StirNetOutput
+from .query_builder import QUERY_SPATIAL_PROPOSAL
 
 
 def binary_focal_loss_with_logits(
@@ -102,10 +103,12 @@ class RefinementCriterion(nn.Module):
         loss_cfg: LossConfig,
         query_cfg: QueryConfig,
         training_cfg: TrainingConfig | None = None,
+        proposal_cfg: ProposalConfig | None = None,
     ):
         super().__init__()
         self.cfg = loss_cfg
         self.query_cfg = query_cfg
+        self.proposal_cfg = proposal_cfg or ProposalConfig()
         training_cfg = training_cfg or TrainingConfig()
         self.activation_checkpointing = (
             training_cfg.activation_checkpointing and training_cfg.checkpoint_losses
@@ -116,6 +119,7 @@ class RefinementCriterion(nn.Module):
             mask_focal_gamma=self.cfg.mask_focal_gamma,
             temporal_match_radius_dref=self.query_cfg.temporal_match_radius_dref,
             discovery_match_radius_dref=self.query_cfg.discovery_match_radius_dref,
+            proposal_match_radius_dref=self.proposal_cfg.match_radius_dref,
         )
         self.loss_weight_overrides: dict[str, float] = {}
 
@@ -125,7 +129,7 @@ class RefinementCriterion(nn.Module):
         valid = {
             "exist", "dice_hi", "focal_hi", "dice_coarse", "focal_coarse",
             "center", "count", "overlap", "foreground", "center_heatmap",
-            "boundary", "aux_layer",
+            "boundary", "internal_boundary", "proposal_center", "aux_layer",
         }
         overrides = {} if overrides is None else dict(overrides)
         unknown = set(overrides) - valid
@@ -139,7 +143,7 @@ class RefinementCriterion(nn.Module):
         names = (
             "exist", "dice_hi", "focal_hi", "dice_coarse", "focal_coarse",
             "center", "count", "overlap", "foreground", "center_heatmap",
-            "boundary", "aux_layer",
+            "boundary", "internal_boundary", "proposal_center", "aux_layer",
         )
         weights = {name: float(getattr(self.cfg, name)) for name in names}
         weights.update(self.loss_weight_overrides)
@@ -361,7 +365,11 @@ class RefinementCriterion(nn.Module):
                         )
                         source_support = source_dilation_support_chunk(
                             current_label_volume,
-                            chunk_source_ids,
+                            torch.where(
+                                chunk_query_types == QUERY_SPATIAL_PROPOSAL,
+                                torch.full_like(chunk_source_ids, -1),
+                                chunk_source_ids,
+                            ),
                             chunk_spacing,
                             dref,
                             self.query_cfg.native_source_dilation_dref,
@@ -385,6 +393,9 @@ class RefinementCriterion(nn.Module):
                             prior_inside_logit=self.query_cfg.prior_inside_logit,
                             prior_outside_logit=self.query_cfg.prior_outside_logit,
                             background_logit=self.query_cfg.native_background_logit,
+                            proposal_support_radius_dref=(
+                                self.proposal_cfg.native_support_radius_dref
+                            ),
                         )
                         target_chunk = self._native_target_chunk(
                             target,
@@ -582,6 +593,57 @@ class RefinementCriterion(nn.Module):
         )
         return foreground, center, boundary
 
+    def _internal_boundary_loss(
+        self, boundary_logits: Tensor, targets: list[dict]
+    ) -> Tensor:
+        """Class-normalized internal-interface BCE with outer boundaries ignored."""
+        flat_logits = boundary_logits[:, 0].reshape(boundary_logits.shape[0], -1)
+        chunk_size = max(1, int(self.cfg.dense_chunk_voxels))
+        positive_sum = boundary_logits.sum() * 0
+        negative_sum = boundary_logits.sum() * 0
+        positive_count = 0
+        negative_count = 0
+        for batch_index, target in enumerate(targets):
+            if "internal_boundary" not in target or "boundary" not in target:
+                continue
+            foreground = target.get("foreground")
+            if foreground is None and "label_map" in target:
+                foreground = torch.as_tensor(target["label_map"]) > 0
+            if foreground is None:
+                continue
+            voxel_count = flat_logits.shape[1]
+            for start in range(0, voxel_count, chunk_size):
+                end = min(start + chunk_size, voxel_count)
+                prediction = flat_logits[batch_index, start:end].float()
+                internal = _tensor_chunk(
+                    torch.as_tensor(target["internal_boundary"]),
+                    start,
+                    end,
+                    prediction.device,
+                ).float() > 0.5
+                all_boundary = _tensor_chunk(
+                    torch.as_tensor(target["boundary"]),
+                    start,
+                    end,
+                    prediction.device,
+                ).float() > 0.5
+                cell = _tensor_chunk(
+                    torch.as_tensor(foreground), start, end, prediction.device
+                ).bool()
+                negative = cell & ~all_boundary
+                if internal.any():
+                    positive_sum = positive_sum + F.softplus(-prediction[internal]).sum()
+                    positive_count += int(internal.sum())
+                if negative.any():
+                    negative_sum = negative_sum + F.softplus(prediction[negative]).sum()
+                    negative_count += int(negative.sum())
+        terms = []
+        if positive_count:
+            terms.append(positive_sum / positive_count)
+        if negative_count:
+            terms.append(negative_sum / negative_count)
+        return torch.stack(terms).mean() if terms else boundary_logits.sum() * 0
+
     def forward(self, outputs: StirNetOutput, targets: list[dict]) -> dict[str, Tensor]:
         weights = self._effective_loss_weights()
         final = {
@@ -651,6 +713,25 @@ class RefinementCriterion(nn.Module):
             )
         else:
             loss_foreground = loss_heatmap = loss_boundary = zero
+        loss_internal_boundary = (
+            self._internal_boundary_loss(
+                outputs.dense_outputs["boundary_logits"], targets
+            )
+            if weights["internal_boundary"] > 0
+            and "boundary_logits" in outputs.dense_outputs
+            else zero
+        )
+        loss_proposal_center = (
+            self._stream_dense_loss(
+                outputs.dense_outputs["proposal_score_logits"],
+                targets,
+                "center_heatmap",
+                focal=True,
+            )
+            if weights["proposal_center"] > 0
+            and "proposal_score_logits" in outputs.dense_outputs
+            else zero
+        )
 
         total = (
             weights["exist"] * loss_exist
@@ -664,6 +745,8 @@ class RefinementCriterion(nn.Module):
             + weights["foreground"] * loss_foreground
             + weights["center_heatmap"] * loss_heatmap
             + weights["boundary"] * loss_boundary
+            + weights["internal_boundary"] * loss_internal_boundary
+            + weights["proposal_center"] * loss_proposal_center
         )
 
         aux_total = zero
@@ -699,6 +782,8 @@ class RefinementCriterion(nn.Module):
             "foreground": loss_foreground,
             "center_heatmap": loss_heatmap,
             "boundary": loss_boundary,
+            "internal_boundary": loss_internal_boundary,
+            "proposal_center": loss_proposal_center,
             "aux": aux_total,
             "raw_gt_count": outputs.exist_logits.new_tensor(
                 [_target_count(target) for target in targets]

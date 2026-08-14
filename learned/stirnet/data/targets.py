@@ -148,14 +148,55 @@ def make_instance_boundary(labels: np.ndarray) -> np.ndarray:
     return boundary
 
 
-def make_boundary_target(labels: np.ndarray, spacing_um, width_um: float = 1.0) -> np.ndarray:
-    boundary = make_instance_boundary(labels)
-    spacing=np.asarray(spacing_um,float)
-    rv=np.ceil(width_um/spacing).astype(int)
-    if rv.max() == 0: return boundary.astype(np.float32)
-    zz,yy,xx=np.ogrid[-rv[0]:rv[0]+1,-rv[1]:rv[1]+1,-rv[2]:rv[2]+1]
-    structure=(zz*spacing[0])**2+(yy*spacing[1])**2+(xx*spacing[2])**2 <= width_um**2
+def make_internal_instance_boundary(labels: np.ndarray) -> np.ndarray:
+    """Cell-cell interfaces only; cell-background interfaces are excluded."""
+    boundary = np.zeros_like(labels, dtype=bool)
+    for axis in range(3):
+        sl1 = [slice(None)] * 3
+        sl2 = [slice(None)] * 3
+        sl1[axis] = slice(1, None)
+        sl2[axis] = slice(None, -1)
+        a = labels[tuple(sl1)]
+        b = labels[tuple(sl2)]
+        different_cells = (a > 0) & (b > 0) & (a != b)
+        boundary[tuple(sl1)] |= different_cells
+        boundary[tuple(sl2)] |= different_cells
+    return boundary
+
+
+def _physically_dilate_boundary(
+    boundary: np.ndarray, spacing_um, width_um: float
+) -> np.ndarray:
+    spacing = np.asarray(spacing_um, float)
+    rv = np.ceil(width_um / spacing).astype(int)
+    if rv.max() == 0:
+        return boundary.astype(np.float32)
+    zz, yy, xx = np.ogrid[
+        -rv[0] : rv[0] + 1,
+        -rv[1] : rv[1] + 1,
+        -rv[2] : rv[2] + 1,
+    ]
+    structure = (
+        (zz * spacing[0]) ** 2
+        + (yy * spacing[1]) ** 2
+        + (xx * spacing[2]) ** 2
+        <= width_um**2
+    )
     return ndi.binary_dilation(boundary, structure=structure).astype(np.float32)
+
+
+def make_boundary_target(labels: np.ndarray, spacing_um, width_um: float = 1.0) -> np.ndarray:
+    return _physically_dilate_boundary(
+        make_instance_boundary(labels), spacing_um, width_um
+    )
+
+
+def make_internal_boundary_target(
+    labels: np.ndarray, spacing_um, width_um: float = 1.0
+) -> np.ndarray:
+    return _physically_dilate_boundary(
+        make_internal_instance_boundary(labels), spacing_um, width_um
+    )
 
 
 def build_source_gt_compatibility(
@@ -261,6 +302,11 @@ def build_gt_targets(
         "foreground": torch.as_tensor((gt_labels>0).astype(np.float32)),
         "center_heatmap": torch.as_tensor(make_center_heatmap(gt_labels.shape,centers,spacing_um,center_sigma_um)),
         "boundary": torch.as_tensor(make_boundary_target(gt_labels,spacing_um,boundary_width_um)),
+        "internal_boundary": torch.as_tensor(
+            make_internal_boundary_target(
+                gt_labels, spacing_um, boundary_width_um
+            )
+        ),
     }
     if include_dense_masks:
         masks=np.stack([(gt_labels==i) for i in ids],axis=0) if len(ids) else np.zeros((0,*gt_labels.shape),bool)

@@ -6,17 +6,18 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from .config import QueryConfig, TemporalConfig
+from .config import ProposalConfig, QueryConfig, TemporalConfig
 from .coordinates import resize_label_map_nearest
 from .temporal_memory import HierarchicalTemporalFusion
-from .types import QueryState, TemporalState
+from .types import QueryState, SpatialProposalState, TemporalState
 
 
 QUERY_PRIMARY = 0
 QUERY_SPLIT = 1
 QUERY_TEMPORAL = 2
 QUERY_DISCOVERY = 3
-NUM_QUERY_TYPES = 4
+QUERY_SPATIAL_PROPOSAL = 4
+NUM_QUERY_TYPES = 5
 
 
 class InstanceQueryBuilder(nn.Module):
@@ -25,6 +26,7 @@ class InstanceQueryBuilder(nn.Module):
         cfg: QueryConfig,
         feature_channels: int = 64,
         temporal_cfg: TemporalConfig | None = None,
+        proposal_cfg: ProposalConfig | None = None,
     ):
         super().__init__()
         self.cfg = cfg
@@ -33,6 +35,17 @@ class InstanceQueryBuilder(nn.Module):
             nn.Linear(cfg.instance_feature_dim, 64), nn.SiLU(), nn.Linear(64, cfg.d_model)
         )
         self.type_embedding = nn.Embedding(NUM_QUERY_TYPES, cfg.d_model)
+        self.proposal_cfg = proposal_cfg or ProposalConfig()
+        self.proposal_proj = nn.Linear(self.proposal_cfg.local_dim, cfg.d_model)
+        self.proposal_score_proj = nn.Sequential(
+            nn.Linear(1, cfg.d_model), nn.SiLU(), nn.Linear(cfg.d_model, cfg.d_model)
+        )
+        self.component_context_gate = nn.Linear(cfg.d_model, 1)
+        nn.init.zeros_(self.component_context_gate.weight)
+        nn.init.constant_(
+            self.component_context_gate.bias,
+            self.proposal_cfg.component_context_gate_init_bias,
+        )
         if cfg.split_companions_per_instance < 0:
             raise ValueError("split_companions_per_instance must be non-negative")
         if cfg.max_split_companions_per_instance < cfg.split_companions_per_instance:
@@ -163,7 +176,16 @@ class InstanceQueryBuilder(nn.Module):
         memory_ablation: str = "full",
         return_debug: bool = False,
         full_attention: bool = False,
+        proposal_state: SpatialProposalState | None = None,
+        query_mode: str = "legacy",
     ) -> QueryState:
+        if query_mode not in {"legacy", "spatial_proposals"}:
+            raise ValueError(
+                "query_mode must be 'legacy' or 'spatial_proposals'; "
+                f"got {query_mode!r}"
+            )
+        if query_mode == "spatial_proposals" and proposal_state is None:
+            raise ValueError("spatial_proposals query mode requires proposal_state")
         B = feature.shape[0]
         pooled = self._pool_instances(
             feature, feature_spacing_um, instance_labels, instance_ids, instance_batch, instance_centroids_um
@@ -188,15 +210,17 @@ class InstanceQueryBuilder(nn.Module):
                 self.last_temporal_debug["component_batch_index"] = (
                     instance_batch.detach()
                 )
-        split_counts = self.split_companion_counts(
-            instance_labels, instance_ids, instance_batch
+        split_counts = (
+            self.split_companion_counts(instance_labels, instance_ids, instance_batch)
+            if query_mode == "legacy"
+            else torch.zeros_like(instance_ids)
         )
 
         per_batch = []
         for b in range(B):
             parts, refs, types, srcids, sal, rel = [], [], [], [], [], []
             inst_idx = torch.nonzero(instance_batch == b, as_tuple=False).flatten()
-            if inst_idx.numel():
+            if query_mode == "legacy" and inst_idx.numel():
                 p = inst_emb[inst_idx]
                 pref = instance_centroids_um[inst_idx] / dref_um[b].clamp_min(1e-8)
                 primary = p + self.type_embedding.weight[QUERY_PRIMARY].to(p.dtype)
@@ -224,6 +248,50 @@ class InstanceQueryBuilder(nn.Module):
                     srcids.append(instance_ids[inst_idx][eligible])
                     sal.append(feature.new_zeros((split_count, 1)))
                     rel.append(feature.new_zeros((split_count, 1)))
+
+            if query_mode == "spatial_proposals":
+                assert proposal_state is not None
+                proposal_rows = torch.nonzero(
+                    ~proposal_state.padding_mask[b], as_tuple=False
+                ).flatten()
+                if proposal_rows.numel():
+                    local = self.proposal_proj(
+                        proposal_state.embeddings[b, proposal_rows]
+                    )
+                    score = self.proposal_score_proj(
+                        proposal_state.scores[b, proposal_rows, None].to(local.dtype)
+                    )
+                    context = torch.zeros_like(local)
+                    proposal_sources = proposal_state.source_instance_ids[b, proposal_rows]
+                    for row, source_id in enumerate(proposal_sources.tolist()):
+                        if source_id < 0:
+                            continue
+                        match = inst_idx[instance_ids[inst_idx] == int(source_id)]
+                        if match.numel():
+                            context[row] = inst_emb[match[0]]
+                    gate = torch.sigmoid(self.component_context_gate(local))
+                    proposal_queries = (
+                        local
+                        + score
+                        + self.type_embedding.weight[QUERY_SPATIAL_PROPOSAL].to(local.dtype)
+                        + gate * context
+                    )
+                    proposal_count = len(proposal_rows)
+                    parts.append(proposal_queries)
+                    refs.append(
+                        proposal_state.references_cellscale[b, proposal_rows]
+                    )
+                    types.append(
+                        torch.full(
+                            (proposal_count,),
+                            QUERY_SPATIAL_PROPOSAL,
+                            device=feature.device,
+                            dtype=torch.long,
+                        )
+                    )
+                    srcids.append(proposal_sources)
+                    sal.append(feature.new_zeros((proposal_count, 1)))
+                    rel.append(feature.new_zeros((proposal_count, 1)))
 
             tidx = torch.nonzero(temporal.batch_index == b, as_tuple=False).flatten() if not temporal.is_empty else torch.empty(0, dtype=torch.long, device=feature.device)
             if tidx.numel():
@@ -272,4 +340,13 @@ class InstanceQueryBuilder(nn.Module):
             salience[b, :n] = sa.to(salience.dtype)
             reliability[b, :n] = re.to(reliability.dtype)
             padding[b, :n] = False
-        return QueryState(embeddings, references, query_types, padding, source_ids, salience, reliability)
+        return QueryState(
+            embeddings,
+            references,
+            query_types,
+            padding,
+            source_ids,
+            salience,
+            reliability,
+            references.clone(),
+        )

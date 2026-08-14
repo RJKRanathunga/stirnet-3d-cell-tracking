@@ -122,7 +122,9 @@ def run(steps: int=200,device: str|None=None,selected: set[str]|None=None) -> di
             model.cfg.history.enabled=False
         if not options["bias"]:
             model.cr1.cross.history_bias=None;model.cr2.cross.history_bias=None
-        criterion=RefinementCriterion(cfg.losses,cfg.queries,cfg.training).to(device)
+        criterion=RefinementCriterion(
+            cfg.losses,cfg.queries,cfg.training,cfg.proposals
+        ).to(device)
         optimizer=torch.optim.AdamW(model.parameters(),lr=2e-3)
         first_loss=None
         for _ in range(steps):

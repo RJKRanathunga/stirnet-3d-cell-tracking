@@ -207,6 +207,7 @@ class StirNetInspector:
                 prior_outside_logit=self.model.cfg.queries.prior_outside_logit,
                 temporal_sigma_dref=self.model.cfg.queries.temporal_gaussian_sigma_dref,
                 native_support_radius_dref=self.model.cfg.queries.native_support_radius_dref,
+                proposal_native_support_radius_dref=self.model.cfg.proposals.native_support_radius_dref,
                 native_source_dilation_dref=self.model.cfg.queries.native_source_dilation_dref,
                 native_background_logit=self.model.cfg.queries.native_background_logit,
                 crop_margin_dref=self.config.mask_crop_margin_dref,

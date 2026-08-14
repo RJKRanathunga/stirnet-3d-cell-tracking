@@ -9,11 +9,13 @@ import torch
 from learned.stirnet import StirNet
 from learned.stirnet.model.config import (
     CoReasoningConfig,
+    CurriculumConfig,
     DecoderConfig,
     InferenceConfig,
     HistoryConfig,
     LossConfig,
     QueryConfig,
+    ProposalConfig,
     SpatialConfig,
     StirNetConfig,
     TemporalConfig,
@@ -35,9 +37,11 @@ def config_from_dict(data: dict | None) -> StirNetConfig:
         history=HistoryConfig(**data.get("history", {})),
         coreasoning=CoReasoningConfig(**data.get("coreasoning", {})),
         queries=QueryConfig(**data.get("queries", {})),
+        proposals=ProposalConfig(**data.get("proposals", {})),
         decoder=DecoderConfig(**data.get("decoder", {})),
         losses=LossConfig(**data.get("losses", {})),
         training=TrainingConfig(**data.get("training", {})),
+        curriculum=CurriculumConfig(**data.get("curriculum", {})),
         inference=InferenceConfig(**data.get("inference", {})),
     )
 

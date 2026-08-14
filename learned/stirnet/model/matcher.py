@@ -11,6 +11,7 @@ from .coordinates import feature_grid_coordinates_um, resize_label_map_nearest
 from .query_builder import (
     QUERY_DISCOVERY,
     QUERY_PRIMARY,
+    QUERY_SPATIAL_PROPOSAL,
     QUERY_SPLIT,
     QUERY_TEMPORAL,
 )
@@ -194,6 +195,7 @@ class HungarianMatcher3D(nn.Module):
         mask_focal_gamma: float = 2.0,
         temporal_match_radius_dref: float = 1.0,
         discovery_match_radius_dref: float = 1.5,
+        proposal_match_radius_dref: float = 1.0,
     ):
         super().__init__()
         self.w_exist = w_exist
@@ -205,6 +207,7 @@ class HungarianMatcher3D(nn.Module):
         self.mask_focal_gamma = mask_focal_gamma
         self.temporal_match_radius_dref = temporal_match_radius_dref
         self.discovery_match_radius_dref = discovery_match_radius_dref
+        self.proposal_match_radius_dref = proposal_match_radius_dref
 
     @staticmethod
     def _assignment(cost: Tensor) -> tuple[Tensor, Tensor]:
@@ -272,11 +275,18 @@ class HungarianMatcher3D(nn.Module):
         gt_centers_cellscale: Tensor,
         target: dict,
     ) -> tuple[Tensor, Tensor] | None:
-        """Two-stage source-aware assignment in valid-query/valid-GT space."""
+        """Role-ordered source/anchor-aware assignment in valid spaces."""
+        qtypes = query_types[valid_q].detach().cpu().long()
+        query_sources = source_instance_ids[valid_q].detach().cpu().long()
+        has_proposals = bool((qtypes == QUERY_SPATIAL_PROPOSAL).any())
         if "source_ids" not in target or "source_gt_overlap" not in target:
-            return None
-        source_ids = torch.as_tensor(target["source_ids"], dtype=torch.long).cpu()
-        overlap = torch.as_tensor(target["source_gt_overlap"], dtype=torch.long).cpu()
+            if not has_proposals:
+                return None
+            source_ids = torch.empty(0, dtype=torch.long)
+            overlap = torch.zeros((0, len(target_ids(target))), dtype=torch.long)
+        else:
+            source_ids = torch.as_tensor(target["source_ids"], dtype=torch.long).cpu()
+            overlap = torch.as_tensor(target["source_gt_overlap"], dtype=torch.long).cpu()
         all_gt_count = len(target_ids(target))
         if overlap.shape != (len(source_ids), all_gt_count):
             raise ValueError(
@@ -285,8 +295,6 @@ class HungarianMatcher3D(nn.Module):
             )
         overlap = overlap[:, valid_gt.detach().cpu().long()] > 0
         source_row = {int(source_id): row for row, source_id in enumerate(source_ids.tolist())}
-        qtypes = query_types[valid_q].detach().cpu().long()
-        query_sources = source_instance_ids[valid_q].detach().cpu().long()
         eligible = torch.zeros((len(valid_q), len(valid_gt)), dtype=torch.bool)
         for row, (query_type, source_id) in enumerate(
             zip(qtypes.tolist(), query_sources.tolist())
@@ -300,9 +308,31 @@ class HungarianMatcher3D(nn.Module):
                 eligible[row] = compatible
             elif query_type == QUERY_SPLIT and compatible_count >= 2:
                 eligible[row] = compatible
+            elif query_type == QUERY_SPATIAL_PROPOSAL and compatible_count >= 1:
+                eligible[row] = compatible
 
-        # Stage A: compatible primary/split candidates only.
-        seeded_rows = torch.nonzero(eligible.any(dim=1), as_tuple=False).flatten()
+        proposal_rows = torch.nonzero(
+            qtypes == QUERY_SPATIAL_PROPOSAL, as_tuple=False
+        ).flatten()
+        off_mask_rows = proposal_rows[query_sources[proposal_rows] < 0]
+        if off_mask_rows.numel():
+            proposal_refs = initial_references_cellscale[valid_q][
+                off_mask_rows.to(valid_q.device)
+            ].float()
+            proposal_eligible = torch.cdist(
+                proposal_refs, gt_centers_cellscale.float(), p=2
+            ) <= float(self.proposal_match_radius_dref)
+            eligible[off_mask_rows] = proposal_eligible.detach().cpu()
+
+        # Stage A: learned proposals. Legacy mode retains primary/split Stage A.
+        stage_a_types = (
+            qtypes == QUERY_SPATIAL_PROPOSAL
+            if has_proposals
+            else ((qtypes == QUERY_PRIMARY) | (qtypes == QUERY_SPLIT))
+        )
+        seeded_rows = torch.nonzero(
+            eligible.any(dim=1) & stage_a_types, as_tuple=False
+        ).flatten()
         seeded_cols = torch.nonzero(eligible.any(dim=0), as_tuple=False).flatten()
         matched_rows: list[Tensor] = []
         matched_cols: list[Tensor] = []
@@ -371,11 +401,31 @@ class HungarianMatcher3D(nn.Module):
         rows, cols = rows[order], cols[order]
         if rows.unique().numel() != rows.numel() or cols.unique().numel() != cols.numel():
             raise AssertionError("Structured Hungarian assignment is not one-to-one")
-        seeded = (qtypes[rows.cpu()] == QUERY_PRIMARY) | (
-            qtypes[rows.cpu()] == QUERY_SPLIT
+        seeded = (
+            (qtypes[rows.cpu()] == QUERY_PRIMARY)
+            | (qtypes[rows.cpu()] == QUERY_SPLIT)
+            | (qtypes[rows.cpu()] == QUERY_SPATIAL_PROPOSAL)
         )
         if seeded.any() and not eligible[rows.cpu()[seeded], cols.cpu()[seeded]].all():
             raise AssertionError("Structured Hungarian produced a source-incompatible seeded match")
+        off_mask_proposal = (
+            (qtypes[rows.cpu()] == QUERY_SPATIAL_PROPOSAL)
+            & (query_sources[rows.cpu()] < 0)
+        )
+        if off_mask_proposal.any():
+            rows_cpu = rows.detach().cpu()
+            cols_cpu = cols.detach().cpu()
+            distance = torch.linalg.vector_norm(
+                initial_references_cellscale.detach().float().cpu()[
+                    valid_q.detach().cpu()
+                ][rows_cpu[off_mask_proposal]]
+                - gt_centers_cellscale.detach().float().cpu()[
+                    cols_cpu[off_mask_proposal]
+                ],
+                dim=-1,
+            )
+            if bool((distance > self.proposal_match_radius_dref + 1e-6).any()):
+                raise AssertionError("Spatial proposal match violates initial-anchor radius")
         temporal = qtypes[rows.cpu()] == QUERY_TEMPORAL
         if temporal.any():
             rows_cpu = rows.detach().cpu()

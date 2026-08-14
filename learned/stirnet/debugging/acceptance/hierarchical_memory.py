@@ -87,8 +87,11 @@ def run(steps: int = 100, device: str | None = None) -> dict:
     # Two unconstrained split slots make specialization directly observable;
     # neither slot is assigned to a historical branch by the architecture.
     cfg.queries.split_companions_per_instance = 2
+    cfg.proposals.query_mode = "legacy"
     model = StirNet(cfg).to(selected_device)
-    criterion = RefinementCriterion(cfg.losses, cfg.queries, cfg.training).to(
+    criterion = RefinementCriterion(
+        cfg.losses, cfg.queries, cfg.training, cfg.proposals
+    ).to(
         selected_device
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3)

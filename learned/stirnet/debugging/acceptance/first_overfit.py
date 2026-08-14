@@ -25,6 +25,7 @@ from learned.stirnet.model.query_builder import (
     InstanceQueryBuilder,
     QUERY_DISCOVERY,
     QUERY_PRIMARY,
+    QUERY_SPATIAL_PROPOSAL,
     QUERY_SPLIT,
     QUERY_TEMPORAL,
 )
@@ -314,7 +315,9 @@ def run(data_dir: Path) -> None:
     cfg = _reduced_config()
     device = torch.device("cuda")
     model = StirNet(cfg).to(device).eval()
-    criterion = RefinementCriterion(cfg.losses, cfg.queries, cfg.training).to(device).eval()
+    criterion = RefinementCriterion(
+        cfg.losses, cfg.queries, cfg.training, cfg.proposals
+    ).to(device).eval()
     b = {}
     for key, value in batch.items():
         if key == "targets":
@@ -347,6 +350,7 @@ def run(data_dir: Path) -> None:
         QUERY_SPLIT: 0,
         QUERY_TEMPORAL: 0,
         QUERY_DISCOVERY: 0,
+        QUERY_SPATIAL_PROPOSAL: 0,
     }
     temporal_distances_dref = []
     discovery_distances_dref = []
@@ -369,9 +373,15 @@ def run(data_dir: Path) -> None:
             discovery_distances_dref.append(
                 float(torch.linalg.vector_norm(center - target_centers[target_index]))
             )
-        if query_type not in (QUERY_PRIMARY, QUERY_SPLIT):
+        if query_type not in (
+            QUERY_PRIMARY,
+            QUERY_SPLIT,
+            QUERY_SPATIAL_PROPOSAL,
+        ):
             continue
         source_id = int(outputs.source_instance_ids[0, pred_index].detach().cpu())
+        if query_type == QUERY_SPATIAL_PROPOSAL and source_id < 0:
+            continue
         source_row = source_rows.get(source_id)
         if source_row is None or int(target["source_gt_overlap"][source_row, target_index]) <= 0:
             incompatible_seeded += 1
@@ -391,6 +401,7 @@ def run(data_dir: Path) -> None:
         "split": int((query_types == QUERY_SPLIT).sum()),
         "temporal": int((query_types == QUERY_TEMPORAL).sum()),
         "discovery": int((query_types == QUERY_DISCOVERY).sum()),
+        "spatial_proposal": int((query_types == QUERY_SPATIAL_PROPOSAL).sum()),
     }
     split_companions_by_source = {
         int(source_id): int(
@@ -400,7 +411,11 @@ def run(data_dir: Path) -> None:
     }
     source_nine_seeded = int(
         (
-            ((query_types == QUERY_PRIMARY) | (query_types == QUERY_SPLIT))
+            (
+                (query_types == QUERY_PRIMARY)
+                | (query_types == QUERY_SPLIT)
+                | (query_types == QUERY_SPATIAL_PROPOSAL)
+            )
             & (query_sources == 9)
         ).sum()
     )
@@ -419,6 +434,7 @@ def run(data_dir: Path) -> None:
             seeded_mask = (
                 (layer_debug["query_type"] == QUERY_PRIMARY)
                 | (layer_debug["query_type"] == QUERY_SPLIT)
+                | (layer_debug["query_type"] == QUERY_SPATIAL_PROPOSAL)
             )
             for row in torch.nonzero(
                 source_mask & seeded_mask, as_tuple=False
@@ -439,6 +455,7 @@ def run(data_dir: Path) -> None:
             (
                 (outputs.query_types[0] == QUERY_PRIMARY)
                 | (outputs.query_types[0] == QUERY_SPLIT)
+                | (outputs.query_types[0] == QUERY_SPATIAL_PROPOSAL)
             )
             & (outputs.source_instance_ids[0] == 9),
             as_tuple=False,
@@ -464,9 +481,20 @@ def run(data_dir: Path) -> None:
     assert max_temporal_dref <= cfg.queries.temporal_match_radius_dref + 1e-6
     assert max_discovery_dref <= cfg.queries.discovery_match_radius_dref + 1e-6
     assert float(losses["overlap"]) == 0.0
-    assert valid_query_count == sample["required_queries"]
-    assert split_companions_by_source == sample["split_companions_by_source"]
-    assert source_nine_seeded >= 9
+    if cfg.proposals.query_mode == "legacy" or not cfg.proposals.enabled:
+        assert valid_query_count == sample["required_queries"]
+        assert split_companions_by_source == sample["split_companions_by_source"]
+        assert source_nine_seeded >= 9
+    else:
+        assert outputs.proposals is not None
+        expected_queries = (
+            query_type_counts["spatial_proposal"]
+            + sample["temporal_tracklets"]
+            + cfg.queries.discovery_queries
+        )
+        assert valid_query_count == expected_queries
+        assert all(count == 0 for count in split_companions_by_source.values())
+        assert cfg.proposals.max_proposals >= 9
     assert int(losses["raw_gt_count"]) == sample["target_count"]
     assert int(losses["matched_count"]) == matched_count
     torch.cuda.synchronize()
@@ -487,7 +515,7 @@ def run(data_dir: Path) -> None:
     print("auxiliary_identity_switching=0 (final assignment reused by criterion)")
     print(
         "matches: "
-        f"stage_a={matched_by_type[QUERY_PRIMARY] + matched_by_type[QUERY_SPLIT]}; "
+        f"stage_a={matched_by_type[QUERY_PRIMARY] + matched_by_type[QUERY_SPLIT] + matched_by_type[QUERY_SPATIAL_PROPOSAL]}; "
         f"temporal={matched_by_type[QUERY_TEMPORAL]}; "
         f"discovery={matched_by_type[QUERY_DISCOVERY]}; "
         f"unmatched_gt={sample['target_count'] - matched_count}"

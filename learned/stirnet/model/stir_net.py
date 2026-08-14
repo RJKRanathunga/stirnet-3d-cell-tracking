@@ -13,6 +13,7 @@ from .query_decoder import InstanceQueryDecoder
 from .spacing import AcquisitionEmbedding
 from .spatial_decoder import SpatialDecoder
 from .spatial_encoder import SpatialEncoder
+from .spatial_proposals import SpatialProposalGenerator
 from .temporal_hypotheses import TemporalStateBuilder, TrackletPooler
 from .types import StirNetOutput, TemporalNodeMemory, TemporalState
 
@@ -67,13 +68,26 @@ class StirNet(nn.Module):
             activation_checkpointing=checkpoint_coreasoning,
         )
         self.query_builder = InstanceQueryBuilder(
-            self.cfg.queries, feature_channels=c2, temporal_cfg=self.cfg.temporal
+            self.cfg.queries,
+            feature_channels=c2,
+            temporal_cfg=self.cfg.temporal,
+            proposal_cfg=self.cfg.proposals,
         )
         self.query_decoder = InstanceQueryDecoder(
-            (c3,c2,c1),self.cfg.decoder,self.cfg.queries,self.cfg.temporal
+            (c3,c2,c1),
+            self.cfg.decoder,
+            self.cfg.queries,
+            self.cfg.temporal,
+            self.cfg.proposals,
         )
         self.native_mask_head = MaskEmbeddingHead(self.cfg.decoder.d_model,self.cfg.spatial.mask_dim)
         self.dense_heads = DenseAuxiliaryHeads(c0)
+        self.spatial_proposal_generator = SpatialProposalGenerator(
+            self.cfg.proposals,
+            d0_channels=c0,
+            e2_channels=c2,
+            spatial_input_channels=self.cfg.spatial.in_channels,
+        )
 
     def _validate_config(self) -> None:
         channels = self.cfg.spatial.channels
@@ -119,6 +133,41 @@ class StirNet(nn.Module):
             and self.cfg.temporal.max_candidate_edges < 0
         ):
             raise ValueError("max_candidate_edges must be non-negative or None")
+        proposal = self.cfg.proposals
+        if proposal.query_mode not in {"legacy", "spatial_proposals"}:
+            raise ValueError(
+                "proposals.query_mode must be 'legacy' or 'spatial_proposals'"
+            )
+        if proposal.max_proposals <= 0 or proposal.candidate_pool_size <= 0:
+            raise ValueError("proposal candidate limits must be positive")
+        if proposal.candidate_pool_size < proposal.max_proposals:
+            raise ValueError(
+                "proposals.candidate_pool_size must be at least max_proposals"
+            )
+        if proposal.local_grid_size <= 0 or proposal.local_grid_size % 2 == 0:
+            raise ValueError("proposals.local_grid_size must be a positive odd integer")
+        if proposal.local_dim <= 0:
+            raise ValueError("proposals.local_dim must be positive")
+        positive_proposal_values = {
+            "nms_radius_dref": proposal.nms_radius_dref,
+            "local_extent_dref": proposal.local_extent_dref,
+            "source_fallback_match_radius_dref": proposal.source_fallback_match_radius_dref,
+            "match_radius_dref": proposal.match_radius_dref,
+            "attention_radius_layer0_dref": proposal.attention_radius_layer0_dref,
+            "attention_radius_layer1_dref": proposal.attention_radius_layer1_dref,
+            "attention_radius_layer2_dref": proposal.attention_radius_layer2_dref,
+            "native_support_radius_dref": proposal.native_support_radius_dref,
+        }
+        invalid_proposal_values = [
+            name for name, value in positive_proposal_values.items() if value <= 0
+        ]
+        if invalid_proposal_values:
+            raise ValueError(
+                "proposal physical radii/extents must be positive: "
+                + ", ".join(invalid_proposal_values)
+            )
+        if not 0 <= proposal.inference_score_threshold <= 1:
+            raise ValueError("proposal inference score threshold must be in [0, 1]")
 
     def _build_temporal(
         self, graph_x: Tensor, graph_edge_index: Tensor, graph_edge_attr: Tensor,
@@ -336,12 +385,43 @@ class StirNet(nn.Module):
         d1,d0,mask_features=self.decoder.decode_from_e2(e2,pyramid,acq)
         dense=self.dense_heads(d0)
 
+        query_mode = (
+            self.cfg.proposals.query_mode
+            if self.cfg.proposals.enabled
+            else "legacy"
+        )
+        proposal_state = None
+        if query_mode == "spatial_proposals":
+            proposal_state, proposal_score_logits = self.spatial_proposal_generator(
+                d0,
+                e2,
+                spatial_inputs,
+                dense,
+                instance_labels,
+                spacing_um,
+                pyramid.spacings_um[2],
+                dref_um,
+                instance_ids,
+                instance_batch,
+                instance_centroids_um,
+                spatial_padding_mask,
+            )
+        else:
+            proposal_score_logits = (
+                self.spatial_proposal_generator.proposal_score_logits(
+                    d0, spatial_inputs, dense
+                )
+            )
+        dense["proposal_score_logits"] = proposal_score_logits
+
         qstate=self.query_builder(
             e2,pyramid.spacings_um[2],instance_labels,instance_features,
             instance_ids,instance_batch,instance_centroids_um,dref_um,temporal,
             memory_ablation=temporal_memory_ablation,
             return_debug=return_debug,
             full_attention=return_full_temporal_attention,
+            proposal_state=proposal_state,
+            query_mode=query_mode,
         )
         initial_query_references=qstate.references_cellscale
         qstate,dec_outputs=self.query_decoder(
@@ -425,6 +505,44 @@ class StirNet(nn.Module):
                         (),device=graph_x.device,dtype=torch.long
                     )
                 ),
+                "proposal_score_logits":proposal_score_logits.detach(),
+                "proposal_references_cellscale":(
+                    proposal_state.references_cellscale.detach()
+                    if proposal_state is not None else None
+                ),
+                "proposal_scores":(
+                    proposal_state.scores.detach()
+                    if proposal_state is not None else None
+                ),
+                "proposal_source_instance_ids":(
+                    proposal_state.source_instance_ids.detach()
+                    if proposal_state is not None else None
+                ),
+                "proposal_fallback_mask":(
+                    proposal_state.fallback_mask.detach()
+                    if proposal_state is not None else None
+                ),
+                "proposal_padding_mask":(
+                    proposal_state.padding_mask.detach()
+                    if proposal_state is not None else None
+                ),
+                "proposal_embeddings":(
+                    proposal_state.embeddings.detach()
+                    if proposal_state is not None else None
+                ),
+                "learned_proposal_count":(
+                    ((~proposal_state.padding_mask) & ~proposal_state.fallback_mask)
+                    .sum(dim=1)
+                    .detach()
+                    if proposal_state is not None else None
+                ),
+                "fallback_proposal_count":(
+                    (proposal_state.fallback_mask & ~proposal_state.padding_mask)
+                    .sum(dim=1)
+                    .detach()
+                    if proposal_state is not None else None
+                ),
+                "query_mode":query_mode,
             }
         return StirNetOutput(
             exist_logits=final["exist_logits"],
@@ -446,6 +564,7 @@ class StirNet(nn.Module):
             dref_um=dref_um,
             instance_labels=instance_labels,
             debug=debug,
+            proposals=proposal_state,
         )
 
     def render_masks(self, outputs: StirNetOutput, selected_indices: list[Tensor]) -> list[Tensor]:
@@ -459,4 +578,7 @@ class StirNet(nn.Module):
             native_support_radius_dref=self.cfg.queries.native_support_radius_dref,
             native_source_dilation_dref=self.cfg.queries.native_source_dilation_dref,
             native_background_logit=self.cfg.queries.native_background_logit,
+            proposal_native_support_radius_dref=(
+                self.cfg.proposals.native_support_radius_dref
+            ),
         )

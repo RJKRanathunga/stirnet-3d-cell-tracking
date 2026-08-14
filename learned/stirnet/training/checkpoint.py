@@ -5,13 +5,13 @@ import torch
 
 
 def migrate_history_checkpoint_state_dict(model, state_dict: dict) -> tuple[dict, list[str]]:
-    """Migrate earlier V1 weights into hierarchical temporal-memory V1.
+    """Migrate earlier V1 weights into the current additive V1 architecture.
 
     The legacy eight hypothesis-edge semantics are the unchanged prefix of the
     22-D schema. The legacy 14 detection-edge semantics are likewise the exact
     prefix of the 15-D candidate-edge schema. New columns are initialized to
-    zero; newly introduced history/memory modules retain the receiving model's
-    conservative initialization.
+    zero; newly introduced history/memory and spatial-proposal modules retain
+    the receiving model's conservative initialization.
     """
     current=model.state_dict()
     migrated=dict(state_dict)
@@ -19,6 +19,21 @@ def migrate_history_checkpoint_state_dict(model, state_dict: dict) -> tuple[dict
     edge_suffix="hyp_graph.block.attn.edge.weight"
     for key,target in current.items():
         source=migrated.get(key)
+        if (
+            key == "query_builder.type_embedding.weight"
+            and source is not None
+            and source.ndim == 2
+            and source.shape[0] == 4
+            and target.shape == (5, source.shape[1])
+        ):
+            value = target.clone()
+            value[:4] = source.to(value.dtype)
+            value[4] = 0.5 * (
+                source[0].to(value.dtype) + source[1].to(value.dtype)
+            )
+            migrated[key] = value
+            notes.append(f"expanded {key}: 4 -> 5 query types")
+            continue
         if (
             source is not None
             and source.shape != target.shape
@@ -46,6 +61,10 @@ def migrate_history_checkpoint_state_dict(model, state_dict: dict) -> tuple[dict
             or key.startswith("history_fusion.")
             or ".cross.history_bias." in key
             or ".temporal_fusion." in key
+            or key.startswith("spatial_proposal_generator.")
+            or key.startswith("query_builder.proposal_proj.")
+            or key.startswith("query_builder.proposal_score_proj.")
+            or key.startswith("query_builder.component_context_gate.")
         ):
             migrated[key]=target.clone()
             notes.append(f"initialized new history parameter {key}")
@@ -83,13 +102,15 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, ma
         if notes:
             ckpt["history_migration"]=notes
             ckpt["temporal_migration"]=notes
+            ckpt["model_migration"]=notes
     model.load_state_dict(state,strict=strict)
     if optimizer is not None and "optimizer" in ckpt:
         if not _optimizer_structure_matches(optimizer,ckpt["optimizer"]):
             raise ValueError(
-                "Checkpoint optimizer state is incompatible with the current hierarchical "
-                "temporal-memory parameter groups. The model state was migrated, but optimizer "
-                "state cannot be mapped safely; load without an optimizer and start a new one."
+                "Checkpoint optimizer state is incompatible with the current STIR-Net "
+                "parameter groups (including the spatial-proposal group). The model state "
+                "was migrated, but optimizer state cannot be mapped safely; load without an "
+                "optimizer and start a new one."
             )
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and "scheduler" in ckpt: scheduler.load_state_dict(ckpt["scheduler"])

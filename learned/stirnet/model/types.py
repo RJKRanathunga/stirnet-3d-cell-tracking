@@ -70,6 +70,17 @@ class QueryState:
     source_instance_ids: Tensor
     temporal_salience: Tensor
     temporal_reliability: Tensor
+    initial_references_cellscale: Optional[Tensor] = None
+
+
+@dataclass
+class SpatialProposalState:
+    embeddings: Tensor
+    references_cellscale: Tensor
+    scores: Tensor
+    padding_mask: Tensor
+    source_instance_ids: Tensor
+    fallback_mask: Tensor
 
 
 @dataclass
@@ -93,3 +104,4 @@ class StirNetOutput:
     dref_um: Tensor
     instance_labels: Tensor
     debug: Optional[Dict[str, Any]] = None
+    proposals: Optional[SpatialProposalState] = None

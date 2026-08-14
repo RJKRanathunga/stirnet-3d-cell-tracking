@@ -75,7 +75,7 @@ class Trainer:
         self.device=torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model.to(self.device)
         self.criterion=RefinementCriterion(
-            cfg.losses, cfg.queries, cfg.training
+            cfg.losses, cfg.queries, cfg.training, cfg.proposals
         ).to(self.device)
         self.optimizer=torch.optim.AdamW(
             optimizer_parameter_groups(model, cfg.training.lr),

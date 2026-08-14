@@ -5,7 +5,13 @@ from typing import Any
 import numpy as np
 import torch
 
-from ...model.query_builder import QUERY_DISCOVERY, QUERY_PRIMARY, QUERY_SPLIT, QUERY_TEMPORAL
+from ...model.query_builder import (
+    QUERY_DISCOVERY,
+    QUERY_PRIMARY,
+    QUERY_SPATIAL_PROPOSAL,
+    QUERY_SPLIT,
+    QUERY_TEMPORAL,
+)
 from .matching import MatchingProbeResult, coarse_dice_for_matches
 
 
@@ -14,6 +20,7 @@ QUERY_TYPE_NAMES = {
     int(QUERY_SPLIT): "split",
     int(QUERY_TEMPORAL): "temporal",
     int(QUERY_DISCOVERY): "discovery",
+    int(QUERY_SPATIAL_PROPOSAL): "spatial_proposal",
 }
 
 

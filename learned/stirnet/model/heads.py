@@ -8,6 +8,7 @@ from .native_masks import (
     native_chunk_coordinates_um,
     source_dilation_support_chunk,
 )
+from .query_builder import QUERY_SPATIAL_PROPOSAL
 
 
 class ExistenceHead(nn.Module):
@@ -76,6 +77,7 @@ def render_native_masks(
     native_support_radius_dref: float = 1.5,
     native_source_dilation_dref: float = 0.5,
     native_background_logit: float = -20.0,
+    proposal_native_support_radius_dref: float | None = None,
 ) -> list[Tensor]:
     """Render only selected native-resolution masks; returns one tensor per batch item."""
     B, C, Z, Y, X = mask_features.shape
@@ -90,12 +92,17 @@ def render_native_masks(
         learned = torch.einsum("qc,cv->qv", emb, mask_features[b].flatten(1))
         selected_types = query_types[b, idx]
         selected_sources = source_instance_ids[b, idx]
+        support_sources = torch.where(
+            selected_types == QUERY_SPATIAL_PROPOSAL,
+            torch.full_like(selected_sources, -1),
+            selected_sources,
+        )
         coords_um = native_chunk_coordinates_um(
             (Z, Y, X), spacing_um[b], 0, voxel_count
         )
         source_support = source_dilation_support_chunk(
             instance_labels[b],
-            selected_sources,
+            support_sources,
             spacing_um[b],
             dref_um[b],
             native_source_dilation_dref,
@@ -116,6 +123,7 @@ def render_native_masks(
             prior_inside_logit=prior_inside_logit,
             prior_outside_logit=prior_outside_logit,
             background_logit=native_background_logit,
+            proposal_support_radius_dref=proposal_native_support_radius_dref,
         )
         results.append(logits.reshape(len(idx), Z, Y, X))
     return results

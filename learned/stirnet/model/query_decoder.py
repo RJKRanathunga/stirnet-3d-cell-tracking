@@ -9,10 +9,16 @@ import torch.nn.functional as F
 
 from .attention import PhysicalPositionBias
 from .blocks import FeedForward
-from .config import DecoderConfig, QueryConfig, TemporalConfig
+from .config import DecoderConfig, ProposalConfig, QueryConfig, TemporalConfig
 from .coordinates import feature_grid_coordinates_um, resize_label_map_nearest
 from .heads import CenterHead, ExistenceHead, MaskEmbeddingHead, dot_mask_logits
-from .query_builder import QUERY_DISCOVERY, QUERY_PRIMARY, QUERY_SPLIT, QUERY_TEMPORAL
+from .query_builder import (
+    QUERY_DISCOVERY,
+    QUERY_PRIMARY,
+    QUERY_SPATIAL_PROPOSAL,
+    QUERY_SPLIT,
+    QUERY_TEMPORAL,
+)
 from .temporal_memory import HierarchicalTemporalFusion
 from .types import QueryState, TemporalState
 
@@ -115,6 +121,7 @@ class QueryDecoderLayer(nn.Module):
             cfg.split_center_step_dref,
             cfg.temporal_center_step_dref,
             cfg.discovery_center_step_dref,
+            cfg.proposal_center_step_dref,
         )
 
     def _bounded_center_delta(self, raw_delta: Tensor, q: QueryState) -> Tensor:
@@ -199,10 +206,12 @@ class InstanceQueryDecoder(nn.Module):
         cfg: DecoderConfig,
         query_cfg: QueryConfig,
         temporal_cfg: TemporalConfig | None = None,
+        proposal_cfg: ProposalConfig | None = None,
     ):
         super().__init__()
         self.cfg = cfg
         self.query_cfg = query_cfg
+        self.proposal_cfg = proposal_cfg or ProposalConfig()
         self.feature_proj = nn.ModuleList([nn.Conv3d(c, cfg.d_model, 1) for c in input_channels])
         self.mask_feature_proj = nn.ModuleList([nn.Conv3d(c, cfg.mask_dim, 1) for c in input_channels])
         self.layers = nn.ModuleList([
@@ -211,7 +220,16 @@ class InstanceQueryDecoder(nn.Module):
 
     def _reference_support(self, q: QueryState, pos_um: Tensor, dref_um: Tensor, layer_idx: int) -> Tensor:
         B, Q = q.query_types.shape
-        refs_um = q.references_cellscale * dref_um[:, None, None]
+        proposal = q.query_types == QUERY_SPATIAL_PROPOSAL
+        anchor_references = (
+            q.initial_references_cellscale
+            if q.initial_references_cellscale is not None
+            else q.references_cellscale
+        )
+        support_references = torch.where(
+            proposal[..., None], anchor_references, q.references_cellscale
+        )
+        refs_um = support_references * dref_um[:, None, None]
         dist = torch.linalg.vector_norm(pos_um[:, None] - refs_um[:, :, None], dim=-1)
         base = self.query_cfg.temporal_gaussian_sigma_dref * 2.0
         radius = torch.full((B,Q), base, device=dist.device, dtype=dist.dtype)
@@ -222,6 +240,16 @@ class InstanceQueryDecoder(nn.Module):
             radius = torch.where(discovery, torch.full_like(radius, 1e6), radius)
         else:
             radius = torch.where(discovery, torch.full_like(radius, 2.5), radius)
+        proposal_radii = (
+            self.proposal_cfg.attention_radius_layer0_dref,
+            self.proposal_cfg.attention_radius_layer1_dref,
+            self.proposal_cfg.attention_radius_layer2_dref,
+        )
+        radius = torch.where(
+            proposal,
+            torch.full_like(radius, float(proposal_radii[layer_idx])),
+            radius,
+        )
         support = dist <= radius[...,None] * dref_um[:,None,None]
         support = support & (~q.padding_mask[...,None])
         return support
@@ -232,7 +260,10 @@ class InstanceQueryDecoder(nn.Module):
         support = torch.zeros((B,Q,*spatial_shape), device=instance_labels.device, dtype=torch.bool)
         for b in range(B):
             ids = q.source_instance_ids[b]
-            seeded = ids >= 0
+            seeded = (ids >= 0) & (
+                (q.query_types[b] == QUERY_PRIMARY)
+                | (q.query_types[b] == QUERY_SPLIT)
+            )
             if seeded.any():
                 support[b,seeded] = labels[b][None] == ids[seeded,None,None,None]
         return support
@@ -282,6 +313,16 @@ class InstanceQueryDecoder(nn.Module):
                 prev = F.interpolate(previous_mask.sigmoid(), size=(Z,Y,X), mode="trilinear", align_corners=False)
                 prev_support = prev > self.cfg.mask_attention_threshold
                 prev_support = self._dilate(prev_support, spacing, dref_um)
+                proposal = q.query_types == QUERY_SPATIAL_PROPOSAL
+                if proposal.any():
+                    proposal_cap = self._reference_support(
+                        q, pos_um, dref_um, li
+                    ).reshape(B, q.embeddings.shape[1], Z, Y, X)
+                    prev_support = torch.where(
+                        proposal[..., None, None, None],
+                        prev_support & proposal_cap,
+                        prev_support,
+                    )
                 support = support | prev_support
             support_flat = support.flatten(2)
             q, out = layer(

@@ -310,11 +310,11 @@ def test_curriculum_transitions_preserve_model_optimizer_and_named_state() -> No
         "joint",
     ]
     expected_trainable = [
-        {"spatial", "dense"},
-        {"spatial", "dense", "temporal"},
-        {"dense", "temporal", "query"},
-        {"dense", "temporal", "query", "native"},
-        {"spatial", "dense", "temporal", "query", "native"},
+        {"spatial", "dense", "proposal"},
+        {"spatial", "dense", "proposal", "temporal"},
+        {"spatial", "dense", "proposal", "temporal", "query"},
+        {"spatial", "dense", "proposal", "temporal", "query", "native"},
+        {"spatial", "dense", "proposal", "temporal", "query", "native"},
     ]
     parameter_groups = model_parameter_groups(model)
     for step, (name, trainable) in enumerate(
@@ -342,6 +342,7 @@ def test_curriculum_transitions_preserve_model_optimizer_and_named_state() -> No
     assert final_stage is not None
     assert final_stage.lr_scales["spatial"] == 0.1
     assert final_stage.lr_scales["dense"] == 0.5
+    assert final_stage.lr_scales["proposal"] == 0.5
 
 
 def test_curriculum_loss_gates_and_disabled_mode_preserve_legacy_behavior() -> None:
