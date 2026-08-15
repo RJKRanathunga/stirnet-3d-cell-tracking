@@ -121,7 +121,14 @@ class QueryDecoderLayer(nn.Module):
             cfg.split_center_step_dref,
             cfg.temporal_center_step_dref,
             cfg.discovery_center_step_dref,
-            cfg.proposal_center_step_dref,
+            (
+                cfg.proposal_center_max_offset_dref
+                if cfg.proposal_center_step_dref is None
+                else cfg.proposal_center_step_dref
+            ),
+        )
+        self.proposal_center_max_offset_dref = float(
+            self.center_step_by_type[QUERY_SPATIAL_PROPOSAL]
         )
 
     def _bounded_center_delta(self, raw_delta: Tensor, q: QueryState) -> Tensor:
@@ -129,6 +136,16 @@ class QueryDecoderLayer(nn.Module):
         safe_types = q.query_types.clamp(0, len(self.center_step_by_type) - 1)
         max_step = limits[safe_types]
         delta = torch.tanh(raw_delta) * max_step[..., None]
+        proposal = q.query_types == QUERY_SPATIAL_PROPOSAL
+        if proposal.any():
+            proposal_direction = torch.tanh(raw_delta[proposal])
+            proposal_direction = proposal_direction / torch.linalg.vector_norm(
+                proposal_direction, dim=-1, keepdim=True
+            ).clamp_min(1.0)
+            delta[proposal] = (
+                proposal_direction
+                * max_step[proposal][..., None]
+            )
         return delta.masked_fill(q.padding_mask[..., None], 0)
 
     def forward(
@@ -185,7 +202,16 @@ class QueryDecoderLayer(nn.Module):
         reference_before_update = q.references_cellscale
         raw_delta = self.center(x)
         delta = self._bounded_center_delta(raw_delta, q)
-        refs = reference_before_update + delta
+        proposal = q.query_types == QUERY_SPATIAL_PROPOSAL
+        initial_references = (
+            q.initial_references_cellscale
+            if q.initial_references_cellscale is not None
+            else reference_before_update
+        )
+        refinement_origin = torch.where(
+            proposal[..., None], initial_references, reference_before_update
+        )
+        refs = refinement_origin + delta
         emb = self.mask_embed(x)
         masks = dot_mask_logits(emb, spatial_mask_features)
         masks = masks.masked_fill(q.padding_mask[..., None, None, None], -20.0)

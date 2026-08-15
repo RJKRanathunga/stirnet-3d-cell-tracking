@@ -29,12 +29,12 @@ Build a compact CPU-resident current-source by GT overlap-count matrix while
 constructing the target. A positive overlap defines compatibility; no
 source-by-GT-by-volume tensor is created.
 
-Stage A assigns primary/split queries only to GT cells overlapping their own
-source. A source overlapping zero GTs contributes no positive seeded query. For
-a one-GT source only the primary is eligible. For a source overlapping two or
-more GTs, primary and split compete for compatible GTs. The global seeded
-assignment also resolves oversegmentation: when multiple source fragments
-overlap one GT, at most one primary owns it.
+In spatial-proposal mode, Stage A retains source-overlap eligibility for
+source-linked proposals and initial-anchor proximity eligibility for off-mask
+proposals. Its assignment cost is immutable-initial-anchor distance to the GT
+center, so evolving centers or coarse masks cannot exchange biological target
+ownership between nearby proposal queries. Excess proposals remain unmatched.
+Legacy mode retains the source-compatible primary/split Stage A behavior.
 
 Stage B1 considers temporal queries against GTs left by Stage A. An edge is
 eligible only when the immutable temporal initial reference is within
@@ -68,10 +68,14 @@ $$C_{dice} = 1- \frac{ 2\sum_{v\in S_j}p_i(v)g_j(v)+\epsilon }{ \sum_{v\in S_j}p
 
 Use a coarse feature grid for matching efficiency.
 
-The standard target representation may retain one integer native label map
-plus target IDs and centers. Downsample that label map once per required coarse
-resolution, then construct instance masks on the coarse grid. Do not eagerly
-materialize `K x Z x Y x X` native target masks.
+The standard target representation retains one integer native label map plus
+target IDs and centers. For every required decoder shape, selected foreground
+label voxels scatter directly to `[target_index, coarse_linear_index]`; a coarse
+bin is positive when any native voxel from that instance maps to it. Different
+instances may overlap at coarse resolution. This occupancy-preserving path is
+used by final matching, final coarse losses, and auxiliary-layer losses and
+never constructs `K x Z x Y x X` native targets. Nearest multiclass-label
+sampling remains debug-only because it can erase small instances.
 
 ## 6. Focal mask matching cost
 
@@ -122,11 +126,18 @@ $$L_{exist}.$$
 
 ## 9. High-resolution mask loss
 
-Matched positive queries only. Dice and focal reductions use the same physical
-GT-local support $S_j$; every positive GT voxel is included even when an
-elongated cell extends beyond the nominal radius. Native reduction remains
-spatially streamed, and focal normalizes by supported voxels rather than the
-complete scene volume.
+Matched positive queries only. Spatial proposals are decoded after matching on
+native crops around their immutable anchors. Their target crop is derived
+directly from the CPU integer label map and the complete physical `1.5*dref`
+sphere is supervised: every allowed voxel is either matched-GT positive or
+explicit negative. GT voxels outside the allowed sphere are not unioned into
+support. Dense probability side evidence is detached, while D0 remains attached
+so joint local-mask loss can train the spatial decoder/backbone.
+
+Non-spatial queries retain the legacy streamed native objective and its
+role-specific support/prior semantics. Proposal-local and legacy results are
+combined by matched-query count while preserving the public `dice_hi` and
+`focal_hi` metrics.
 
 $$L_{mask}^{hi} = 5L_{Dice}^{hi} + 2L_{Focal}^{hi}.$$
 

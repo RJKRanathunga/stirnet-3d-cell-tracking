@@ -85,7 +85,7 @@ Tune on validation data.
 
 ## 6. Native mask rendering
 
-For each surviving query:
+For each surviving non-spatial-proposal query, retain the legacy renderer:
 
 $$L_i(v)=m_i^TF_{mask}(v)+L_i^{prior}(v).$$
 
@@ -94,6 +94,13 @@ Probability:
 $$P_i(v)=\sigma(L_i(v)).$$
 
 Do not render masks for discarded low-existence queries.
+
+For each surviving spatial proposal, run the local native mask decoder only on
+the clipped anisotropic bounding box around its immutable initial anchor. The
+decoder may predict throughout the box, but only voxels inside the exact
+physical `1.5*dref` sphere retain learned logits; the rest receive the fixed
+background logit. Mixed query types are split internally and restored to the
+caller's selected-query order.
 
 Native rendering is physically bounded and shares its implementation with the
 streamed training loss:
@@ -118,10 +125,14 @@ Then:
 ```text
 connected components
  |
-select component containing predicted center
+select component containing seed
 ```
 
-If center voxel is not inside any positive component, select the component with minimum physical distance to the predicted center.
+The seed is the immutable initial proposal anchor for spatial proposals and the
+final predicted center for every other query type. If the seed voxel is not
+inside a positive component, select the component with minimum physical
+distance to that same seed. The final center remains the reported center and is
+still used for valid-window checks.
 
 Reject tiny disconnected components.
 

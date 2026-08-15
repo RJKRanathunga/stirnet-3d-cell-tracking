@@ -112,7 +112,15 @@ class Trainer:
                 b,
                 bypass_coreasoning=self.curriculum_stage.bypass_coreasoning,
             )
-            losses=self.criterion(out,b["targets"])
+            losses=self.criterion(
+                out,
+                b["targets"],
+                local_mask_decoder=(
+                    self.model.local_mask_decoder
+                    if self.cfg.local_masks.enabled
+                    else None
+                ),
+            )
             loss=losses["loss"]
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
@@ -130,7 +138,15 @@ class Trainer:
                 self.model,
                 b,
                 bypass_coreasoning=self.curriculum_stage.bypass_coreasoning,
-            );losses=self.criterion(out,b["targets"])
+            );losses=self.criterion(
+                out,
+                b["targets"],
+                local_mask_decoder=(
+                    self.model.local_mask_decoder
+                    if self.cfg.local_masks.enabled
+                    else None
+                ),
+            )
         return {k:float(v.detach().cpu()) for k,v in losses.items()}
 
     def fit(self,train_loader,val_loader=None,epochs=1,out_dir="runs/stirnet",checkpoint_every=1):

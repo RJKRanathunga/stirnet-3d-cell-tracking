@@ -119,7 +119,7 @@ class ProposalConfig:
     attention_radius_layer2_dref: float = 2.0
 
     # Native rendering support.
-    native_support_radius_dref: float = 2.5
+    native_support_radius_dref: float = 1.5
 
     # Component context must remain secondary to local proposal identity.
     component_context_gate_init_bias: float = -1.5
@@ -140,7 +140,20 @@ class DecoderConfig:
     split_center_step_dref: float = 0.75
     temporal_center_step_dref: float = 0.25
     discovery_center_step_dref: float = 1.00
-    proposal_center_step_dref: float = 0.50
+    proposal_center_max_offset_dref: float = 0.50
+    # Deprecated compatibility override.  New configurations should leave
+    # this unset so proposal corrections are clearly total anchor offsets.
+    proposal_center_step_dref: float | None = None
+
+
+@dataclass
+class LocalMaskConfig:
+    enabled: bool = True
+    support_radius_dref: float = 1.5
+    hidden_channels: int = 32
+    query_channels: int = 32
+    query_chunk_size: int = 1
+    detach_dense_evidence: bool = True
 
 
 @dataclass
@@ -219,6 +232,7 @@ class StirNetConfig:
     queries: QueryConfig = field(default_factory=QueryConfig)
     proposals: ProposalConfig = field(default_factory=ProposalConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
+    local_masks: LocalMaskConfig = field(default_factory=LocalMaskConfig)
     losses: LossConfig = field(default_factory=LossConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)

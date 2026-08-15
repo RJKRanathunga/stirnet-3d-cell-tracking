@@ -129,11 +129,15 @@ def run(steps: int=200,device: str|None=None,selected: set[str]|None=None) -> di
         first_loss=None
         for _ in range(steps):
             optimizer.zero_grad(set_to_none=True);output=model_forward_from_batch(model,batch)
-            losses=criterion(output,batch["targets"]);losses["loss"].backward();optimizer.step()
+            losses=criterion(
+                output,batch["targets"],local_mask_decoder=model.local_mask_decoder
+            );losses["loss"].backward();optimizer.step()
             first_loss=float(losses["loss"].detach()) if first_loss is None else first_loss
         model.eval()
         with torch.no_grad(): output=model_forward_from_batch(model,batch)
-        metrics=_task_metrics(model,output,batch["targets"][0]);metrics["initial_loss"]=first_loss;metrics["final_loss"]=float(criterion(output,batch["targets"])["loss"])
+        metrics=_task_metrics(model,output,batch["targets"][0]);metrics["initial_loss"]=first_loss;metrics["final_loss"]=float(criterion(
+            output,batch["targets"],local_mask_decoder=model.local_mask_decoder
+        )["loss"])
         results[name]=metrics
     return results
 

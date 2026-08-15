@@ -14,6 +14,7 @@ from .matcher import (
     target_masks_at_shape,
     valid_target_indices,
 )
+from .local_masks import LocalNativeMaskDecoder, PhysicalLocalCrop
 from .native_masks import (
     compose_native_query_logits,
     native_chunk_coordinates_um,
@@ -292,7 +293,7 @@ class RefinementCriterion(nn.Module):
         selected = masks[indices_cpu.to(masks.device)].reshape(len(indices_cpu), -1)
         return selected[:, start:end].to(device=device, dtype=torch.float32, non_blocking=True)
 
-    def _native_mask_losses(
+    def _legacy_native_mask_losses(
         self,
         outputs: StirNetOutput,
         targets: list[dict],
@@ -459,6 +460,162 @@ class RefinementCriterion(nn.Module):
         if not dice_values:
             return zero, zero
         return torch.cat(dice_values).mean(), torch.cat(focal_values).mean()
+
+    @staticmethod
+    def _filter_matches_by_proposal_type(
+        outputs: StirNetOutput,
+        matches: list[MatchResult],
+        *,
+        proposal: bool,
+    ) -> list[MatchResult]:
+        filtered = []
+        for batch_index, match in enumerate(matches):
+            is_proposal = (
+                outputs.query_types[batch_index, match.pred_indices]
+                == QUERY_SPATIAL_PROPOSAL
+            )
+            keep = is_proposal if proposal else ~is_proposal
+            filtered.append(
+                MatchResult(match.pred_indices[keep], match.target_indices[keep])
+            )
+        return filtered
+
+    @staticmethod
+    def _local_native_target(
+        target: dict,
+        target_index: int,
+        crop: PhysicalLocalCrop,
+        device: torch.device,
+    ) -> Tensor:
+        if "label_map" in target:
+            labels = torch.as_tensor(target["label_map"])[crop.slices]
+            ids = target_ids(target)
+            target_id = ids[target_index].to(labels.device)
+            native_target = labels == target_id
+        elif "masks" in target:
+            native_target = torch.as_tensor(target["masks"])[target_index][
+                crop.slices
+            ].bool()
+        else:
+            raise KeyError("Target needs either 'label_map' plus 'ids', or legacy 'masks'")
+        return native_target.to(
+            device=device, dtype=torch.float32, non_blocking=True
+        )
+
+    def _proposal_local_mask_losses(
+        self,
+        outputs: StirNetOutput,
+        targets: list[dict],
+        matches: list[MatchResult],
+        local_mask_decoder: LocalNativeMaskDecoder,
+    ) -> tuple[Tensor, Tensor]:
+        if outputs.d0_features is None or outputs.spatial_inputs is None:
+            raise ValueError(
+                "proposal-local training requires d0_features and spatial_inputs"
+            )
+        requests: list[tuple[int, int]] = []
+        target_requests: list[tuple[int, int]] = []
+        for batch_index, match in enumerate(matches):
+            for query_index, target_index in zip(
+                match.pred_indices.tolist(), match.target_indices.tolist()
+            ):
+                requests.append((batch_index, int(query_index)))
+                target_requests.append((batch_index, int(target_index)))
+        zero = outputs.exist_logits.sum() * 0
+        if not requests:
+            return zero, zero
+        predictions = local_mask_decoder.decode_requests(
+            outputs.d0_features,
+            outputs.spatial_inputs,
+            outputs.dense_outputs,
+            outputs.query_embeddings,
+            outputs.query_initial_references_cellscale,
+            outputs.spacing_um,
+            outputs.dref_um,
+            requests,
+        )
+        dice_values = []
+        focal_values = []
+        for prediction, (batch_index, target_index) in zip(
+            predictions, target_requests
+        ):
+            if prediction.logits is None:
+                raise RuntimeError("local mask decoder returned no logits")
+            target_crop = self._local_native_target(
+                targets[batch_index],
+                target_index,
+                prediction,
+                prediction.logits.device,
+            )
+            support = prediction.support.to(device=prediction.logits.device)
+            # The whole allowed sphere is supervised.  GT outside it is not
+            # unioned into support; anchor/center objectives own localization.
+            target_crop = target_crop * support.float()
+            dice, focal = local_matched_mask_losses(
+                prediction.logits[None],
+                target_crop[None],
+                support[None],
+                alpha=self.cfg.mask_focal_alpha_pos,
+                gamma=self.cfg.mask_focal_gamma,
+            )
+            dice_values.append(dice)
+            focal_values.append(focal)
+        return torch.stack(dice_values).mean(), torch.stack(focal_values).mean()
+
+    def _native_mask_losses(
+        self,
+        outputs: StirNetOutput,
+        targets: list[dict],
+        matches: list[MatchResult],
+        local_mask_decoder: LocalNativeMaskDecoder | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Query-count-weighted hybrid high-resolution mask objective."""
+        if local_mask_decoder is None:
+            proposal_count = sum(
+                int(
+                    (
+                        outputs.query_types[batch_index, match.pred_indices]
+                        == QUERY_SPATIAL_PROPOSAL
+                    ).sum()
+                )
+                for batch_index, match in enumerate(matches)
+            )
+            if proposal_count:
+                raise ValueError(
+                    "matched spatial proposals require the model-owned "
+                    "local_mask_decoder"
+                )
+            return self._legacy_native_mask_losses(outputs, targets, matches)
+        proposal_matches = self._filter_matches_by_proposal_type(
+            outputs, matches, proposal=True
+        )
+        legacy_matches = self._filter_matches_by_proposal_type(
+            outputs, matches, proposal=False
+        )
+        proposal_count = sum(
+            int(match.pred_indices.numel()) for match in proposal_matches
+        )
+        legacy_count = sum(int(match.pred_indices.numel()) for match in legacy_matches)
+        zero = outputs.exist_logits.sum() * 0
+        local_dice, local_focal = (
+            self._proposal_local_mask_losses(
+                outputs, targets, proposal_matches, local_mask_decoder
+            )
+            if proposal_count
+            else (zero, zero)
+        )
+        legacy_dice, legacy_focal = (
+            self._legacy_native_mask_losses(outputs, targets, legacy_matches)
+            if legacy_count
+            else (zero, zero)
+        )
+        total_count = proposal_count + legacy_count
+        if total_count == 0:
+            return zero, zero
+        return (
+            (proposal_count * local_dice + legacy_count * legacy_dice) / total_count,
+            (proposal_count * local_focal + legacy_count * legacy_focal) / total_count,
+        )
 
     def _dense_target_chunk(
         self,
@@ -644,7 +801,12 @@ class RefinementCriterion(nn.Module):
             terms.append(negative_sum / negative_count)
         return torch.stack(terms).mean() if terms else boundary_logits.sum() * 0
 
-    def forward(self, outputs: StirNetOutput, targets: list[dict]) -> dict[str, Tensor]:
+    def forward(
+        self,
+        outputs: StirNetOutput,
+        targets: list[dict],
+        local_mask_decoder: LocalNativeMaskDecoder | None = None,
+    ) -> dict[str, Tensor]:
         weights = self._effective_loss_weights()
         final = {
             "exist_logits": outputs.exist_logits,
@@ -702,9 +864,14 @@ class RefinementCriterion(nn.Module):
             else zero
         )
         if weights["dice_hi"] > 0 or weights["focal_hi"] > 0:
-            loss_high_dice, loss_high_focal = self._native_mask_losses(
-                outputs, targets, matches
-            )
+            if local_mask_decoder is None:
+                loss_high_dice, loss_high_focal = self._native_mask_losses(
+                    outputs, targets, matches
+                )
+            else:
+                loss_high_dice, loss_high_focal = self._native_mask_losses(
+                    outputs, targets, matches, local_mask_decoder
+                )
         else:
             loss_high_dice = loss_high_focal = zero
         if any(weights[name] > 0 for name in ("foreground", "center_heatmap", "boundary")):

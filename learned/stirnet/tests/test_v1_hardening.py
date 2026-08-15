@@ -464,7 +464,9 @@ def test_reduced_width_full_forward_matching_and_label_map_loss_are_finite() -> 
         output.query_embeddings,
     ):
         assert torch.isfinite(tensor.float()).all()
-    losses = RefinementCriterion(cfg.losses, cfg.queries)(output, [target])
+    losses = RefinementCriterion(cfg.losses, cfg.queries)(
+        output, [target], local_mask_decoder=model.local_mask_decoder
+    )
     assert losses and all(torch.isfinite(value.float()) for value in losses.values())
 
 

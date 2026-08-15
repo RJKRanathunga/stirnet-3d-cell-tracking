@@ -379,6 +379,17 @@ Update:
 
 $$\tilde r_i^{(l)} = \tilde r_i^{(l-1)} + \Delta_i^{(l)}.$$
 
+This cumulative update applies to primary, split, temporal, and discovery
+queries. A spatial-proposal query instead retains its immutable initial anchor
+$a_i$ and predicts a total correction at every layer:
+
+$$\tilde r_i^{(l)} = a_i + \Delta_i^{(l)},\qquad
+\|\Delta_i^{(l)}\|_2\le0.5.$$
+
+Three decoder layers therefore cannot move a proposal by three times the
+configured limit. The initial anchor also defines proposal attention/crop
+identity even while the decoded center changes.
+
 The final center-head projection is zero initialized, so a fresh decoder starts
 with zero correction. Per-layer, per-coordinate limits in cell-scale units are:
 
@@ -387,6 +398,7 @@ primary   0.50 dref
 split     0.75 dref
 temporal  0.25 dref
 discovery 1.00 dref
+proposal  0.50 dref total from immutable anchor
 ```
 
 Padding queries receive no update. Refinement remains iterative and cumulative
@@ -427,13 +439,21 @@ produces:
 
 $$m_i\in\mathbb R^{32}.$$
 
-Native mask features:
+For temporal, discovery, and legacy query modes, native mask features are:
 
 $$F_{mask} \in \mathbb R^{B\times32\times Z\times Y\times X}.$$
 
 Final mask logit:
 
 $$L_i(v) = m_i^TF_{mask}(v)+L_i^{prior}(v).$$
+
+Spatial proposals use a separate exact-mask branch. A native anisotropic crop
+within `1.5*dref` of the immutable proposal anchor contains D0, all five spatial
+inputs, sigmoid foreground/center/boundary evidence, and relative XYZ in dref
+units. Two small 3-D convolution blocks produce 32 spatial channels; a projected
+final query is broadcast and fused through 1x1x1 convolutions to one native
+logit channel. Voxels outside the exact physical support sphere receive the
+fixed native-background logit.
 
 ## 19. Memory-aware rendering
 
@@ -492,6 +512,10 @@ and is used for physical matching and mask-loss supports.
 The immutable initial references are a production output, not debug-only state:
 temporal matching uses them to validate the physical meaning of a temporal
 clue even after decoder center refinement.
+
+`StirNetOutput` also retains references to D0 and the original spatial inputs
+for post-match/post-selection local decoding. These are references to existing
+forward tensors, not duplicated native volumes.
 
 ## Historical evidence and queries
 

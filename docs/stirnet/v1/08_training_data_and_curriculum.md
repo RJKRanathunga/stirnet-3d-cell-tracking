@@ -287,42 +287,49 @@ Persistent parameter groups are:
 ```text
 spatial  = acquisition + encoder + decoder
 dense    = dense_heads
+proposal = spatial_proposal_generator
 temporal = graph_encoder + tracklet_pooler + temporal_builder + CR1 + CR2
 query    = query_builder + query_decoder
 native   = native_mask_head
+local_mask = local_mask_decoder
 ```
 
 ### Stage 1 — `spatial_dense`
 
-Train only `spatial` and `dense`. CR1/CR2 are genuinely bypassed so frozen
-random co-reasoning cannot transform spatial features. Only foreground,
-boundary, and center-heatmap losses are active; all query, native, count, and
-auxiliary-layer weights are effectively zero.
+Train `spatial`, `dense`, and `proposal`. CR1/CR2 are genuinely bypassed so
+frozen random co-reasoning cannot transform spatial features. Only foreground,
+boundary, center-heatmap, internal-boundary, and proposal-center losses are
+active; all query, native, count, and auxiliary-layer weights are effectively
+zero.
 
 ### Stage 2 — `temporal_dense`
 
-Train `spatial`, `dense`, and `temporal`, including both co-reasoning blocks.
-Query and native groups remain frozen, and only the three dense losses are
-active.
+Train `spatial`, `dense`, `proposal`, and `temporal`, including both
+co-reasoning blocks. Query and both native groups remain frozen, and only dense
+and proposal-center losses are active.
 
 ### Stage 3 — `query_bootstrap`
 
-Train `dense`, `temporal`, and `query`; protect the spatial backbone with LR
-scale zero and keep `native` frozen. Existence, center, coarse Dice/focal,
-dense, and auxiliary-layer losses are active. Native Dice/focal, count, and
-overlap are zero.
+Train `spatial`, `dense`, `proposal`, `temporal`, and `query`; use reduced
+spatial/dense LR scales and keep `native` and `local_mask` frozen. Existence,
+center, coarse Dice/focal, dense, proposal-center, and auxiliary-layer losses
+are active. Native Dice/focal, count, and overlap are zero.
 
 ### Stage 4 — `native_bootstrap`
 
-Enable `native` while retaining the Stage-3 trainable groups and protected
-spatial backbone. Add native Dice/focal. Count and overlap remain zero.
+Train only `local_mask`. Spatial, dense, proposal, temporal, query, and legacy
+native groups are frozen; only native Dice/focal remain active. This reproduces
+the causal experiment in which a small local decoder is bootstrapped on top of
+a frozen STIR-Net.
 
 ### Stage 5 — `joint`
 
 Unfreeze every group and enable the complete corrected V1 objective, including
 matched-positive count. Overlap stays disabled. Defaults scale the learned
 spatial path to `0.1 * base_lr`, dense heads to `0.5 * base_lr`, and temporal,
-query, and native groups to the base LR. These scales and all stage durations
+query, native, and local-mask groups to the base LR; proposal defaults to
+`0.5 * base_lr`. Local-mask gradients through D0 are enabled in this stage.
+These scales and all stage durations
 are configuration, not architectural constants. Trackastra remains frozen and
 external.
 

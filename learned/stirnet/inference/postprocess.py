@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from scipy import ndimage as ndi
 
+from ..model.query_builder import QUERY_SPATIAL_PROPOSAL
 from ..model.types import StirNetOutput
 
 
@@ -44,8 +45,14 @@ def postprocess_batch(model,outputs:StirNetOutput,render_threshold=0.30,final_ex
                     continue
             mp=torch.sigmoid(rendered[b][local]).detach().cpu().numpy()
             mask=mp>mask_threshold
-            center_vox=(center_rel+0.5*extent)/spacing
-            mask=_component_near_center(mask,center_vox,min_mask_voxels)
+            seed_rel = (
+                outputs.query_initial_references_cellscale[b, qi]
+                * outputs.dref_um[b]
+                if int(outputs.query_types[b, qi]) == QUERY_SPATIAL_PROPOSAL
+                else outputs.centers_cellscale[b, qi] * outputs.dref_um[b]
+            ).detach().cpu().numpy()
+            seed_vox=(seed_rel+0.5*extent)/spacing
+            mask=_component_near_center(mask,seed_vox,min_mask_voxels)
             if mask.sum()<min_mask_voxels:continue
             accepted.append((qi,ep,mp,mask))
         labels=np.zeros(shape,np.int32)

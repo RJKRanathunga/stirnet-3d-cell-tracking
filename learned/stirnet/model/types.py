@@ -105,3 +105,5 @@ class StirNetOutput:
     instance_labels: Tensor
     debug: Optional[Dict[str, Any]] = None
     proposals: Optional[SpatialProposalState] = None
+    d0_features: Optional[Tensor] = None
+    spatial_inputs: Optional[Tensor] = None

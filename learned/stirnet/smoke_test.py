@@ -46,7 +46,9 @@ def run():
     criterion=RefinementCriterion(
         cfg.losses,cfg.queries,cfg.training,cfg.proposals
     )
-    loss=criterion(outputs,targets)["loss"]
+    loss=criterion(
+        outputs,targets,local_mask_decoder=model.local_mask_decoder
+    )["loss"]
     loss.backward()
     print("STIR-Net smoke test OK",float(loss.detach()))
 

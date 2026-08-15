@@ -302,7 +302,21 @@ for feature maps.
 
 This interpolation occurs only on learned internal features, not on the original input data or labels.
 
-## 10. Final native mask features
+## 10. Final native spatial features
+
+The final decoder feature remains available directly as:
+
+```python
+D0: [B, 16, Z_native_patch, Y_native_patch, X_native_patch]
+```
+
+For matched/selected spatial-proposal queries, sparse native crops from D0 are
+fed to the local native mask decoder together with the five spatial inputs,
+three detached dense probabilities, relative physical XYZ, and the final query
+embedding. D0 is not duplicated or globally resampled, and local-mask gradients
+may flow through it into the spatial decoder/backbone during joint training.
+
+The legacy projection is retained:
 
 Decoder output:
 
@@ -316,7 +330,8 @@ Projection:
 Conv3d(last_decoder_channels, 32, kernel_size=1)
 ```
 
-This tensor is used for native-resolution query mask rendering.
+This tensor is used for temporal, discovery, and legacy-query native mask
+rendering. It remains available while the proposal-local path is validated.
 
 ## 11. Dense auxiliary heads
 

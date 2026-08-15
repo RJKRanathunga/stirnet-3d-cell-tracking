@@ -99,7 +99,11 @@ def run(steps: int = 100, device: str | None = None) -> dict:
     for _ in range(steps):
         optimizer.zero_grad(set_to_none=True)
         output = model_forward_from_batch(model, batch)
-        losses = criterion(output, batch["targets"])
+        losses = criterion(
+            output,
+            batch["targets"],
+            local_mask_decoder=model.local_mask_decoder,
+        )
         losses["loss"].backward()
         optimizer.step()
         if initial_loss is None:
@@ -131,7 +135,11 @@ def run(steps: int = 100, device: str | None = None) -> dict:
                 temporal_memory_ablation=memory_ablation,
                 detection_graph_ablation=graph_ablation,
             )
-            losses = criterion(output, batch["targets"])
+            losses = criterion(
+                output,
+                batch["targets"],
+                local_mask_decoder=model.local_mask_decoder,
+            )
         metrics = _task_metrics(model, output, batch["targets"][0])
         metrics.update(
             {

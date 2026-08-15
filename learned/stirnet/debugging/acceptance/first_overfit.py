@@ -335,7 +335,11 @@ def run(data_dir: Path) -> None:
         outputs = model_forward_from_batch(model, b, return_debug=True)
     print("acceptance: forward complete; starting matching and streamed losses", flush=True)
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
-        losses = criterion(outputs, b["targets"])
+        losses = criterion(
+            outputs,
+            b["targets"],
+            local_mask_decoder=model.local_mask_decoder,
+        )
     print("acceptance: losses complete; validating structured matches", flush=True)
     matching = run_matching_probe(outputs, b["targets"])
     target = b["targets"][0]

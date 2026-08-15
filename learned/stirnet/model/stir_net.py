@@ -8,6 +8,8 @@ from .coreasoning import CoReasoningBlock
 from .graph_encoder import DetectionGraphEncoder
 from .history_encoder import HistoricalInstanceEncoder, HistoryFusion
 from .heads import DenseAuxiliaryHeads, MaskEmbeddingHead, render_native_masks
+from .local_masks import LocalNativeMaskDecoder
+from .query_builder import QUERY_SPATIAL_PROPOSAL
 from .query_builder import InstanceQueryBuilder
 from .query_decoder import InstanceQueryDecoder
 from .spacing import AcquisitionEmbedding
@@ -81,6 +83,13 @@ class StirNet(nn.Module):
             self.cfg.proposals,
         )
         self.native_mask_head = MaskEmbeddingHead(self.cfg.decoder.d_model,self.cfg.spatial.mask_dim)
+        self.local_mask_decoder = LocalNativeMaskDecoder(
+            self.cfg.local_masks,
+            d0_channels=c0,
+            spatial_input_channels=self.cfg.spatial.in_channels,
+            query_dim=self.cfg.decoder.d_model,
+            background_logit=self.cfg.queries.native_background_logit,
+        )
         self.dense_heads = DenseAuxiliaryHeads(c0)
         self.spatial_proposal_generator = SpatialProposalGenerator(
             self.cfg.proposals,
@@ -168,6 +177,20 @@ class StirNet(nn.Module):
             )
         if not 0 <= proposal.inference_score_threshold <= 1:
             raise ValueError("proposal inference score threshold must be in [0, 1]")
+        proposal_center_limit = (
+            self.cfg.decoder.proposal_center_max_offset_dref
+            if self.cfg.decoder.proposal_center_step_dref is None
+            else self.cfg.decoder.proposal_center_step_dref
+        )
+        if proposal_center_limit <= 0:
+            raise ValueError("proposal center maximum offset must be positive")
+        local = self.cfg.local_masks
+        if local.support_radius_dref <= 0:
+            raise ValueError("local mask support radius must be positive")
+        if local.hidden_channels <= 0 or local.query_channels <= 0:
+            raise ValueError("local mask channel widths must be positive")
+        if local.query_chunk_size <= 0:
+            raise ValueError("local mask query chunk size must be positive")
 
     def _build_temporal(
         self, graph_x: Tensor, graph_edge_index: Tensor, graph_edge_attr: Tensor,
@@ -423,7 +446,11 @@ class StirNet(nn.Module):
             proposal_state=proposal_state,
             query_mode=query_mode,
         )
-        initial_query_references=qstate.references_cellscale
+        initial_query_references=(
+            qstate.initial_references_cellscale
+            if qstate.initial_references_cellscale is not None
+            else qstate.references_cellscale.clone()
+        )
         qstate,dec_outputs=self.query_decoder(
             qstate,[e3,e2,d1],
             [pyramid.spacings_um[3],pyramid.spacings_um[2],pyramid.spacings_um[1]],
@@ -565,11 +592,47 @@ class StirNet(nn.Module):
             instance_labels=instance_labels,
             debug=debug,
             proposals=proposal_state,
+            d0_features=d0,
+            spatial_inputs=spatial_inputs,
         )
 
     def render_masks(self, outputs: StirNetOutput, selected_indices: list[Tensor]) -> list[Tensor]:
-        return render_native_masks(
-            outputs.mask_features,outputs.native_mask_embeddings,selected_indices,
+        """Render selected queries through proposal-local and legacy branches."""
+        if len(selected_indices) != outputs.exist_logits.shape[0]:
+            raise ValueError("selected_indices must contain one tensor per batch item")
+        use_local = self.cfg.local_masks.enabled
+        legacy_indices: list[Tensor] = []
+        legacy_destinations: list[Tensor] = []
+        local_requests: list[tuple[int, int]] = []
+        local_destinations: list[tuple[int, int]] = []
+        shape = tuple(int(value) for value in outputs.instance_labels.shape[-3:])
+        rendered = [
+            outputs.mask_features.new_full(
+                (len(indices), *shape),
+                float(self.cfg.queries.native_background_logit),
+            )
+            for indices in selected_indices
+        ]
+        for batch_index, indices in enumerate(selected_indices):
+            selected_types = outputs.query_types[batch_index, indices]
+            local = (
+                selected_types == QUERY_SPATIAL_PROPOSAL
+                if use_local
+                else torch.zeros_like(selected_types, dtype=torch.bool)
+            )
+            legacy_indices.append(indices[~local])
+            legacy_destinations.append(
+                torch.nonzero(~local, as_tuple=False).flatten()
+            )
+            for destination, query_index in zip(
+                torch.nonzero(local, as_tuple=False).flatten().tolist(),
+                indices[local].tolist(),
+            ):
+                local_requests.append((batch_index, int(query_index)))
+                local_destinations.append((batch_index, int(destination)))
+
+        legacy = render_native_masks(
+            outputs.mask_features,outputs.native_mask_embeddings,legacy_indices,
             outputs.query_types,outputs.source_instance_ids,outputs.centers_cellscale,
             outputs.instance_labels,outputs.spacing_um,outputs.dref_um,
             prior_inside_logit=self.cfg.queries.prior_inside_logit,
@@ -582,3 +645,31 @@ class StirNet(nn.Module):
                 self.cfg.proposals.native_support_radius_dref
             ),
         )
+        for batch_index, destinations in enumerate(legacy_destinations):
+            if destinations.numel():
+                rendered[batch_index][destinations] = legacy[batch_index]
+
+        if local_requests:
+            if outputs.d0_features is None or outputs.spatial_inputs is None:
+                raise ValueError(
+                    "spatial-proposal rendering requires d0_features and spatial_inputs"
+                )
+            local_predictions = self.local_mask_decoder.decode_requests(
+                outputs.d0_features,
+                outputs.spatial_inputs,
+                outputs.dense_outputs,
+                outputs.query_embeddings,
+                outputs.query_initial_references_cellscale,
+                outputs.spacing_um,
+                outputs.dref_um,
+                local_requests,
+            )
+            for (batch_index, destination), prediction in zip(
+                local_destinations, local_predictions
+            ):
+                if prediction.logits is None:
+                    raise RuntimeError("local mask decoder returned no logits")
+                rendered[batch_index][destination][prediction.slices] = (
+                    prediction.logits.to(rendered[batch_index].dtype)
+                )
+        return rendered

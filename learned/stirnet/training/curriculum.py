@@ -30,6 +30,7 @@ PARAMETER_GROUP_MODULES = {
     ),
     "query": ("query_builder", "query_decoder"),
     "native": ("native_mask_head",),
+    "local_mask": ("local_mask_decoder",),
 }
 
 
@@ -91,7 +92,20 @@ def curriculum_stage(config: CurriculumConfig, step: int) -> CurriculumStage:
         "count": 0.0,
         "overlap": 0.0,
     }
-    native_overrides = {"count": 0.0, "overlap": 0.0}
+    native_overrides = {
+        "exist": 0.0,
+        "dice_coarse": 0.0,
+        "focal_coarse": 0.0,
+        "center": 0.0,
+        "count": 0.0,
+        "overlap": 0.0,
+        "foreground": 0.0,
+        "center_heatmap": 0.0,
+        "boundary": 0.0,
+        "internal_boundary": 0.0,
+        "proposal_center": 0.0,
+        "aux_layer": 0.0,
+    }
     if name == "spatial_dense":
         trainable = frozenset({"spatial", "dense", "proposal"})
         return CurriculumStage(
@@ -121,11 +135,10 @@ def curriculum_stage(config: CurriculumConfig, step: int) -> CurriculumStage:
             query_overrides,
         )
     if name == "native_bootstrap":
-        trainable = all_groups
-        lr_scales = dict(unit_lr)
-        lr_scales["spatial"] = 0.10
-        lr_scales["dense"] = 0.50
-        lr_scales["proposal"] = 0.50
+        trainable = frozenset({"local_mask"})
+        lr_scales = {
+            group: float(group in trainable) for group in PARAMETER_GROUP_MODULES
+        }
         return CurriculumStage(
             name,
             trainable,
@@ -138,6 +151,7 @@ def curriculum_stage(config: CurriculumConfig, step: int) -> CurriculumStage:
     joint_lr["spatial"] = float(config.joint_spatial_lr_scale)
     joint_lr["dense"] = float(config.joint_dense_lr_scale)
     joint_lr["proposal"] = 0.50
+    joint_lr["local_mask"] = 1.0
     if any(scale < 0 for scale in joint_lr.values()):
         raise ValueError("curriculum LR scales must be non-negative")
     return CurriculumStage(name, all_groups, joint_lr, {"overlap": 0.0})

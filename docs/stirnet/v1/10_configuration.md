@@ -60,6 +60,15 @@ MAX_QUERIES = None
 QUERY_LAYERS = 3
 QUERY_HEADS = 4
 QUERY_FFN_DIM = 512
+PROPOSAL_CENTER_MAX_OFFSET_DREF = 0.50
+
+# proposal-local native masks
+LOCAL_MASK_ENABLED = True
+LOCAL_MASK_SUPPORT_RADIUS_DREF = 1.5
+LOCAL_MASK_HIDDEN_CHANNELS = 32
+LOCAL_MASK_QUERY_CHANNELS = 32
+LOCAL_MASK_QUERY_CHUNK_SIZE = 1
+LOCAL_MASK_DETACH_DENSE_EVIDENCE = True
 
 # bounded-memory execution defaults
 COREASONING_TEMPORAL_QUERY_CHUNK = 8
@@ -96,6 +105,7 @@ NATIVE_SUPPORT_RADIUS_DREF = 1.5
 NATIVE_SOURCE_DILATION_DREF = 0.5
 TEMPORAL_MATCH_RADIUS_DREF = 1.0
 DISCOVERY_MATCH_RADIUS_DREF = 1.5
+PROPOSAL_NATIVE_SUPPORT_RADIUS_DREF = 1.5
 ```
 
 These values are expressed relative to $d_\text{ref}$, not voxel counts.
@@ -117,7 +127,12 @@ PRIMARY_CENTER_STEP_DREF = 0.50
 SPLIT_CENTER_STEP_DREF = 0.75
 TEMPORAL_CENTER_STEP_DREF = 0.25
 DISCOVERY_CENTER_STEP_DREF = 1.00
+PROPOSAL_CENTER_MAX_OFFSET_DREF = 0.50
 ```
+
+The proposal value is a total Euclidean offset from the immutable initial
+anchor, not a per-layer step. Older serialized V1 configuration dictionaries
+using `proposal_center_step_dref` are migrated explicitly on checkpoint load.
 
 Physical dilation widths should be specified in multiples of $d_\text{ref}$ and converted to each feature grid using current effective spacing.
 

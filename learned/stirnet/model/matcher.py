@@ -40,24 +40,135 @@ def target_masks_at_shape(
     device: torch.device,
     *,
     target_indices: Tensor | None = None,
+    mode: str = "occupancy",
 ) -> Tensor:
-    """Materialize only coarse target masks, preferably from one label map."""
+    """Materialize selected coarse instance masks without dense native expansion.
+
+    ``occupancy`` maps every selected foreground voxel to one coarse bin and
+    scatters into ``[target, coarse_linear_index]``.  In particular, it never
+    constructs the prohibitive ``[targets, native_z, native_y, native_x]``
+    intermediate when the compact integer ``label_map`` representation is
+    available.  Different instances may occupy the same coarse bin.
+
+    ``nearest`` retains the superseded multiclass-label behavior for focused
+    diagnostics and checkpoint-era regression tests only.
+    """
+    if mode not in {"occupancy", "nearest"}:
+        raise ValueError("target mask mode must be 'occupancy' or 'nearest'")
     if target_indices is None:
         target_indices = valid_target_indices(target)
     target_indices_cpu = target_indices.detach().cpu().long()
     if "label_map" in target:
         labels = torch.as_tensor(target["label_map"])
-        labels = resize_label_map_nearest(labels, spatial_shape)
         all_ids = target_ids(target)
         ids = all_ids[target_indices_cpu.to(all_ids.device)].to(labels.device)
-        masks = labels.unsqueeze(0) == ids[:, None, None, None]
+        if mode == "nearest":
+            resized = resize_label_map_nearest(labels, spatial_shape)
+            masks = resized.unsqueeze(0) == ids[:, None, None, None]
+        else:
+            masks = _occupancy_masks_from_label_map(labels, ids, spatial_shape)
     elif "masks" in target:
         masks = torch.as_tensor(target["masks"])
         masks = masks[target_indices_cpu.to(masks.device)]
-        masks = resize_label_map_nearest(masks, spatial_shape)
+        if mode == "nearest":
+            masks = resize_label_map_nearest(masks, spatial_shape)
+        else:
+            masks = _occupancy_masks_from_binary_masks(masks, spatial_shape)
     else:
         raise KeyError("Target needs either 'label_map' plus 'ids', or legacy 'masks'")
     return masks.to(device=device, dtype=torch.float32, non_blocking=True)
+
+
+def _native_to_coarse_linear_indices(
+    native_linear: Tensor,
+    native_shape: tuple[int, int, int],
+    coarse_shape: tuple[int, int, int],
+) -> Tensor:
+    """Map flat native voxel indices to non-overlapping coarse occupancy bins."""
+    native_z, native_y, native_x = native_shape
+    coarse_z, coarse_y, coarse_x = coarse_shape
+    z = torch.div(native_linear, native_y * native_x, rounding_mode="floor")
+    remainder = native_linear.remainder(native_y * native_x)
+    y = torch.div(remainder, native_x, rounding_mode="floor")
+    x = remainder.remainder(native_x)
+    z = torch.div(z * coarse_z, native_z, rounding_mode="floor").clamp_max(
+        coarse_z - 1
+    )
+    y = torch.div(y * coarse_y, native_y, rounding_mode="floor").clamp_max(
+        coarse_y - 1
+    )
+    x = torch.div(x * coarse_x, native_x, rounding_mode="floor").clamp_max(
+        coarse_x - 1
+    )
+    return (z * coarse_y + y) * coarse_x + x
+
+
+def _selected_id_rows(values: Tensor, selected_ids: Tensor) -> tuple[Tensor, Tensor]:
+    """Return positions and selected-target rows for matching integer IDs."""
+    if values.numel() == 0 or selected_ids.numel() == 0:
+        empty = torch.empty(0, device=values.device, dtype=torch.long)
+        return empty, empty
+    ordered_ids, order = torch.sort(selected_ids.long())
+    positions = torch.searchsorted(ordered_ids, values.long())
+    safe = positions.clamp_max(len(ordered_ids) - 1)
+    keep = (positions < len(ordered_ids)) & (ordered_ids[safe] == values.long())
+    return torch.nonzero(keep, as_tuple=False).flatten(), order[safe[keep]]
+
+
+def _occupancy_masks_from_label_map(
+    labels: Tensor,
+    selected_ids: Tensor,
+    coarse_shape: tuple[int, int, int],
+) -> Tensor:
+    if labels.ndim != 3:
+        raise ValueError(
+            "occupancy label_map must have shape [Z,Y,X], got "
+            f"{tuple(labels.shape)}"
+        )
+    coarse_voxels = int(coarse_shape[0] * coarse_shape[1] * coarse_shape[2])
+    result = torch.zeros(
+        (len(selected_ids), coarse_voxels), device=labels.device, dtype=torch.bool
+    )
+    foreground_linear = torch.nonzero(
+        labels.reshape(-1) > 0, as_tuple=False
+    ).flatten()
+    if foreground_linear.numel() == 0 or selected_ids.numel() == 0:
+        return result.reshape(len(selected_ids), *coarse_shape)
+    values = labels.reshape(-1)[foreground_linear]
+    selected_positions, target_rows = _selected_id_rows(values, selected_ids)
+    if selected_positions.numel():
+        coarse_linear = _native_to_coarse_linear_indices(
+            foreground_linear[selected_positions], tuple(labels.shape), coarse_shape
+        )
+        result[target_rows, coarse_linear] = True
+    return result.reshape(len(selected_ids), *coarse_shape)
+
+
+def _occupancy_masks_from_binary_masks(
+    masks: Tensor, coarse_shape: tuple[int, int, int]
+) -> Tensor:
+    if masks.ndim != 4:
+        raise ValueError(
+            "legacy occupancy masks must have shape [K,Z,Y,X], got "
+            f"{tuple(masks.shape)}"
+        )
+    coarse_voxels = int(coarse_shape[0] * coarse_shape[1] * coarse_shape[2])
+    result = torch.zeros(
+        (masks.shape[0], coarse_voxels), device=masks.device, dtype=torch.bool
+    )
+    positive = torch.nonzero(masks.bool(), as_tuple=False)
+    if positive.numel():
+        native_shape = tuple(int(v) for v in masks.shape[-3:])
+        native_linear = (
+            (positive[:, 1] * native_shape[1] + positive[:, 2])
+            * native_shape[2]
+            + positive[:, 3]
+        )
+        coarse_linear = _native_to_coarse_linear_indices(
+            native_linear, native_shape, coarse_shape
+        )
+        result[positive[:, 0], coarse_linear] = True
+    return result.reshape(masks.shape[0], *coarse_shape)
 
 
 def build_local_support_masks(
@@ -339,7 +450,20 @@ class HungarianMatcher3D(nn.Module):
         used_cols = torch.zeros(len(valid_gt), dtype=torch.bool)
         if seeded_rows.numel() and seeded_cols.numel():
             eligible_sub = eligible[seeded_rows][:, seeded_cols].to(cost.device)
-            seeded_cost = cost[seeded_rows.to(cost.device)][:, seeded_cols.to(cost.device)]
+            if has_proposals:
+                proposal_anchors = initial_references_cellscale[valid_q][
+                    seeded_rows.to(valid_q.device)
+                ].float()
+                proposal_targets = gt_centers_cellscale[
+                    seeded_cols.to(gt_centers_cellscale.device)
+                ].float()
+                seeded_cost = torch.cdist(
+                    proposal_anchors, proposal_targets, p=2
+                ).to(cost.device)
+            else:
+                seeded_cost = cost[seeded_rows.to(cost.device)][
+                    :, seeded_cols.to(cost.device)
+                ]
             row, col = self._eligible_assignment(seeded_cost, eligible_sub)
             row = seeded_rows.to(cost.device)[row]
             col = seeded_cols.to(cost.device)[col]

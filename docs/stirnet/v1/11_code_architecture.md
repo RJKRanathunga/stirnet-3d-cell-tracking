@@ -34,6 +34,7 @@ learned/stirnet/
 │   │
 │   ├── query_builder.py
 │   ├── query_decoder.py
+│   ├── local_masks.py
 │   ├── heads.py
 │   │
 │   ├── matcher.py
@@ -115,6 +116,7 @@ class QueryState:
     query_types: Tensor
     padding_mask: Tensor
     source_instance_ids: Tensor
+    initial_references_cellscale: Tensor
 
 @dataclass
 class StirNetOutput:
@@ -129,6 +131,8 @@ class StirNetOutput:
     aux_outputs: list
     dense_outputs: dict
     mask_features: Tensor
+    d0_features: Tensor
+    spatial_inputs: Tensor
 ```
 
 ## 4. `model/spacing.py`
@@ -310,6 +314,10 @@ DenseCenterHead
 DenseBoundaryHead
 ```
 
+`model/local_masks.py` owns the physical crop/support utility and the single
+model-owned `LocalNativeMaskDecoder`. It consumes sparse matched/selected
+proposal crops and never allocates query-by-whole-native-volume features.
+
 ## 16. `model/matcher.py`
 
 Implement `HungarianMatcher3D`.
@@ -349,7 +357,11 @@ Implement one criterion object:
 
 ```python
 criterion = RefinementCriterion(config.losses)
-loss_dict = criterion(outputs, targets)
+loss_dict = criterion(
+    outputs,
+    targets,
+    local_mask_decoder=model.local_mask_decoder,
+)
 ```
 
 Return a dict of named losses before weighted reduction.
@@ -402,18 +414,15 @@ outputs = model(
 
 ## 20. High-resolution mask renderer
 
-Expose separately:
+Expose separately while preserving one public hybrid API:
 
 ```python
-mask_logits = model.render_masks(
-    mask_features,
-    query_embeddings,
-    query_indices,
-    query_priors,
-)
+mask_logits = model.render_masks(outputs, selected_indices)
 ```
 
-This supports memory-efficient training and inference.
+Spatial proposals use the new anchor-local decoder. Temporal, discovery, and
+legacy queries use the retained dot-product renderer. Results preserve selected
+query order. Training calls the local decoder only after Hungarian matching.
 
 ## 21. Data layer responsibilities
 

@@ -74,7 +74,11 @@ def run(
 
         phase = "matching and loss forward"; started = _begin_phase()
         with torch.autocast(device_type="cuda", dtype=torch.float16):
-            losses = criterion(outputs, b["targets"]); loss = losses["loss"]
+            losses = criterion(
+                outputs,
+                b["targets"],
+                local_mask_decoder=model.local_mask_decoder,
+            ); loss = losses["loss"]
         _end_phase(phase, started)
         if not bool(torch.isfinite(loss)):
             raise RuntimeError(f"Non-finite total loss: {float(loss)}")

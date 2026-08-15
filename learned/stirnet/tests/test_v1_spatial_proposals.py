@@ -177,12 +177,12 @@ def test_off_mask_proposal_can_render_without_current_foreground() -> None:
         coords,
         torch.tensor(1.0),
         support_radius_dref=1.0,
-        proposal_support_radius_dref=2.5,
+        proposal_support_radius_dref=1.5,
         temporal_sigma_dref=0.75,
         prior_inside_logit=1.5,
         prior_outside_logit=-1.5,
     )
-    assert support.all()
+    assert support.tolist() == [[False, True, False]]
     torch.testing.assert_close(prior, torch.zeros_like(prior))
 
 
@@ -382,12 +382,15 @@ def test_forward_criterion_backward_gives_new_modules_finite_gradients() -> None
     criterion = RefinementCriterion(
         cfg.losses, cfg.queries, cfg.training, cfg.proposals
     )
-    losses = criterion(output, [target])
+    losses = criterion(
+        output, [target], local_mask_decoder=model.local_mask_decoder
+    )
     losses["loss"].backward()
     for parameter in (
         model.spatial_proposal_generator.from_d0.weight,
         model.spatial_proposal_generator.local_encoder[0].weight,
         model.query_builder.proposal_proj.weight,
+        model.local_mask_decoder.spatial[0].weight,
     ):
         assert parameter.grad is not None
         assert torch.isfinite(parameter.grad).all()

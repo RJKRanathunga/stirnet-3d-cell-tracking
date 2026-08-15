@@ -1,3 +1,17 @@
-from .model import ProposalConfig, RefinementCriterion, StirNet, StirNetConfig
+from .model import (
+    LocalMaskConfig,
+    LocalNativeMaskDecoder,
+    ProposalConfig,
+    RefinementCriterion,
+    StirNet,
+    StirNetConfig,
+)
 
-__all__ = ["StirNet", "StirNetConfig", "ProposalConfig", "RefinementCriterion"]
+__all__ = [
+    "StirNet",
+    "StirNetConfig",
+    "ProposalConfig",
+    "LocalMaskConfig",
+    "LocalNativeMaskDecoder",
+    "RefinementCriterion",
+]

@@ -94,7 +94,11 @@ def run_total_backward_probe(model, criterion, batch, *, device=None, amp_dtype=
         autocast = torch.autocast(device_type="cuda", dtype=torch.float16 if amp_dtype == "fp16" else torch.bfloat16)
     with autocast:
         outputs = model_forward_from_batch(model, b)
-        losses = criterion(outputs, b["targets"])
+        losses = criterion(
+            outputs,
+            b["targets"],
+            local_mask_decoder=model.local_mask_decoder,
+        )
         loss = losses["loss"]
     # Mirror the training-time protection against FP16 gradient underflow
     # without taking an optimizer step. The probe does not own an optimizer,
