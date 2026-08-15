@@ -6,6 +6,10 @@ from typing import Iterable, Literal
 import numpy as np
 import torch
 
+from ..temporal_events import (
+    TEMPORAL_NODE_EVENT_FEATURE_DIM,
+)
+
 from .historical_instances import (
     component_overlap_from_projected_support,
     pairwise_convergence_statistics,
@@ -130,6 +134,9 @@ def build_temporal_graph(
     if not records:
         return {
             "graph_x":torch.zeros((0,32),dtype=torch.float32),
+            "node_event_features":torch.zeros(
+                (0,TEMPORAL_NODE_EVENT_FEATURE_DIM),dtype=torch.float32
+            ),
             "graph_edge_index":torch.zeros((2,0),dtype=torch.long),
             "graph_edge_attr":torch.zeros((0,DETECTION_EDGE_DIM),dtype=torch.float32),
             "accepted_association_edge_index":torch.zeros((2,0),dtype=torch.long),
@@ -202,13 +209,30 @@ def build_temporal_graph(
     for a in associations:
         if a.relation=="division": division_nodes.update([a.src_node_id,a.dst_node_id])
     # Interior start/end from tracklet extent, excluding explicitly boundary-related records.
-    gx=[]
+    gx=[]; node_event_features=[]
+    temporal_window=float(2*max(int(temporal_radius),0)+1)
     for i,r in enumerate(records):
         group=track_groups[tracklet_id[i]]; ts=[g.time_offset for g in group]
         interior_start=(r.time_offset==min(ts) and min(ts)>-temporal_radius and not r.boundary_related)
         interior_end=(r.time_offset==max(ts) and max(ts)<temporal_radius and not r.boundary_related)
+        normalized_time=r.time_offset/max(temporal_radius,1)
+        is_current=float(r.time_offset==0)
+        is_interior_start=float(interior_start)
+        is_interior_end=float(interior_end)
+        is_division=float(r.node_id in division_nodes)
+        is_boundary=float(r.boundary_related)
+        node_event_features.append([
+            normalized_time,
+            lengths_before[i]/temporal_window,
+            lengths_after[i]/temporal_window,
+            is_current,
+            is_interior_start,
+            is_interior_end,
+            is_division,
+            is_boundary,
+        ])
         gx.append([
-            r.time_offset/max(temporal_radius,1),
+            normalized_time,
             *(np.asarray(r.position_um)/dref_um),
             np.log(max(r.physical_volume_um3,1e-6)/max(med_vol,1e-6)),
             *(np.asarray(r.bbox_um)/dref_um),
@@ -220,11 +244,12 @@ def build_temporal_graph(
             lengths_before[i],lengths_after[i],
             r.distance_to_volume_boundary_um/dref_um,
             r.distance_to_patch_boundary_um/dref_um,
-            float(r.time_offset==0),float(interior_start),float(interior_end),
-            float(r.node_id in division_nodes),float(r.boundary_related),
+            is_current,is_interior_start,is_interior_end,is_division,is_boundary,
         ])
     gx=np.asarray(gx,np.float32)
+    node_event_features=np.asarray(node_event_features,np.float32)
     assert gx.shape[1]==32
+    assert node_event_features.shape[1]==TEMPORAL_NODE_EVENT_FEATURE_DIM
 
     edges=[]; attrs=[]
     accepted_edges=[]; accepted_attrs=[]
@@ -423,6 +448,7 @@ def build_temporal_graph(
     hattr=np.asarray(hattrs,np.float32).reshape(-1,HYPOTHESIS_EDGE_DIM)
     return {
         "graph_x":torch.as_tensor(gx),
+        "node_event_features":torch.as_tensor(node_event_features),
         "graph_edge_index":torch.as_tensor(edge_index,dtype=torch.long),
         "graph_edge_attr":torch.as_tensor(edge_attr),
         "accepted_association_edge_index":torch.as_tensor(accepted_edge_index,dtype=torch.long),

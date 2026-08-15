@@ -38,6 +38,7 @@ def model_forward_from_batch(
     return_debug: bool = False,
     return_full_temporal_attention: bool = False,
     temporal_memory_ablation: str = "full",
+    temporal_routing_ablation: str = "full",
     detection_graph_ablation: str = "full",
 ):
     return model(
@@ -62,7 +63,9 @@ def model_forward_from_batch(
         node_observed_ref_um=b.get("node_observed_ref_um"),
         node_time_offset=b.get("node_time_offset"),
         node_ids=b.get("node_ids"),
+        node_event_features=b.get("node_event_features"),
         temporal_memory_ablation=temporal_memory_ablation,
+        temporal_routing_ablation=temporal_routing_ablation,
         detection_graph_ablation=detection_graph_ablation,
         return_full_temporal_attention=return_full_temporal_attention,
     )

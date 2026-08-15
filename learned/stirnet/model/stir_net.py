@@ -18,6 +18,10 @@ from .spatial_encoder import SpatialEncoder
 from .spatial_proposals import SpatialProposalGenerator
 from .temporal_hypotheses import TemporalStateBuilder, TrackletPooler
 from .types import StirNetOutput, TemporalNodeMemory, TemporalState
+from ..temporal_events import (
+    TEMPORAL_NODE_EVENT_FEATURE_DIM,
+    event_features_from_legacy_graph_x,
+)
 
 
 class StirNet(nn.Module):
@@ -138,6 +142,26 @@ class StirNet(nn.Module):
         if self.cfg.temporal.memory_debug_topk < 0:
             raise ValueError("memory_debug_topk must be non-negative")
         if (
+            self.cfg.temporal.event_feature_dim
+            != TEMPORAL_NODE_EVENT_FEATURE_DIM
+        ):
+            raise ValueError(
+                "STIR-Net temporal event metadata requires event_feature_dim=8"
+            )
+        if self.cfg.temporal.event_hidden_dim <= 0:
+            raise ValueError("event_hidden_dim must be positive")
+        if self.cfg.temporal.event_logit_clip <= 0:
+            raise ValueError("event_logit_clip must be positive")
+        if self.cfg.temporal.event_strength_max <= 0:
+            raise ValueError("event_strength_max must be positive")
+        temperature_min = self.cfg.temporal.competition_temperature_min
+        temperature_init = self.cfg.temporal.competition_temperature_init
+        temperature_max = self.cfg.temporal.competition_temperature_max
+        if not 0 < temperature_min <= temperature_init <= temperature_max:
+            raise ValueError(
+                "competition temperatures must satisfy 0 < min <= init <= max"
+            )
+        if (
             self.cfg.temporal.max_candidate_edges is not None
             and self.cfg.temporal.max_candidate_edges < 0
         ):
@@ -210,6 +234,7 @@ class StirNet(nn.Module):
         node_observed_ref_um: Tensor | None = None,
         node_time_offset: Tensor | None = None,
         node_ids: Tensor | None = None,
+        node_event_features: Tensor | None = None,
         detection_graph_ablation: str = "full",
     ) -> TemporalState:
         M=temporal_ref_um.shape[0]
@@ -245,6 +270,19 @@ class StirNet(nn.Module):
                     f"({self.cfg.temporal.hypothesis_edge_dim}); got {hypothesis_edge_attr.shape[-1]}"
                 )
         node_count=graph_x.shape[0]
+        if node_event_features is None:
+            node_event_features=event_features_from_legacy_graph_x(
+                graph_x,temporal_radius=self.cfg.temporal.temporal_radius
+            )
+        if node_event_features.shape != (
+            node_count,self.cfg.temporal.event_feature_dim
+        ):
+            raise ValueError(
+                "node_event_features must align one-to-one with graph_x and have shape [N,8]"
+            )
+        node_event_features=node_event_features.to(
+            device=graph_x.device,dtype=torch.float32
+        )
         if node_count:
             if tracklet_id.shape != (node_count,):
                 raise ValueError("tracklet_id must align one-to-one with graph_x")
@@ -281,6 +319,7 @@ class StirNet(nn.Module):
                 batch_index=node_batch,
                 history_valid=node_history_valid,
                 node_ids=node_ids,
+                event_features=node_event_features,
             )
             return TemporalState(
                 tokens,temporal_ref_um,temporal_ref_um,z1,z1,temporal_status,
@@ -328,6 +367,7 @@ class StirNet(nn.Module):
             batch_index=node_batch,
             history_valid=node_history_valid,
             node_ids=node_ids,
+            event_features=node_event_features,
         )
         dref_h=dref_um[temporal_batch]
         return self.temporal_builder(pooled,temporal_ref_um,temporal_status,hypothesis_edge_index,
@@ -379,7 +419,9 @@ class StirNet(nn.Module):
         node_observed_ref_um: Tensor | None = None,
         node_time_offset: Tensor | None = None,
         node_ids: Tensor | None = None,
+        node_event_features: Tensor | None = None,
         temporal_memory_ablation: str = "full",
+        temporal_routing_ablation: str = "full",
         detection_graph_ablation: str = "full",
         return_full_temporal_attention: bool = False,
     ) -> StirNetOutput:
@@ -394,6 +436,7 @@ class StirNet(nn.Module):
                                       best_current_component_id,best_component_overlap,
                                       second_best_component_overlap,
                                       node_observed_ref_um,node_time_offset,node_ids,
+                                      node_event_features,
                                       detection_graph_ablation)
 
         if bypass_coreasoning:
@@ -441,6 +484,7 @@ class StirNet(nn.Module):
             e2,pyramid.spacings_um[2],instance_labels,instance_features,
             instance_ids,instance_batch,instance_centroids_um,dref_um,temporal,
             memory_ablation=temporal_memory_ablation,
+            routing_ablation=temporal_routing_ablation,
             return_debug=return_debug,
             full_attention=return_full_temporal_attention,
             proposal_state=proposal_state,
@@ -456,6 +500,7 @@ class StirNet(nn.Module):
             [pyramid.spacings_um[3],pyramid.spacings_um[2],pyramid.spacings_um[1]],
             instance_labels,dref_um,temporal,
             memory_ablation=temporal_memory_ablation,
+            routing_ablation=temporal_routing_ablation,
             return_debug=return_debug,
             full_attention=return_full_temporal_attention,
         )
@@ -516,12 +561,14 @@ class StirNet(nn.Module):
                     "observed_ref_um":node_memory.observed_ref_um.detach(),
                     "projected_ref_um":node_memory.projected_ref_um.detach(),
                     "history_valid":node_memory.history_valid.detach(),
+                    "event_features":node_memory.event_features.detach() if node_memory.event_features is not None else None,
                 },
                 "component_temporal_attention":self.query_builder.last_temporal_debug,
                 "query_temporal_attention":[
                     layer.last_temporal_debug for layer in self.query_decoder.layers
                 ],
                 "temporal_memory_ablation":temporal_memory_ablation,
+                "temporal_routing_ablation":temporal_routing_ablation,
                 "detection_graph_ablation":detection_graph_ablation,
                 "candidate_detection_edge_count":torch.tensor(
                     graph_edge_index.shape[1],device=graph_x.device

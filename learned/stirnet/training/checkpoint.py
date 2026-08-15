@@ -33,8 +33,9 @@ def migrate_history_checkpoint_state_dict(model, state_dict: dict) -> tuple[dict
     The legacy eight hypothesis-edge semantics are the unchanged prefix of the
     22-D schema. The legacy 14 detection-edge semantics are likewise the exact
     prefix of the 15-D candidate-edge schema. New columns are initialized to
-    zero; newly introduced history/memory and spatial-proposal modules retain
-    the receiving model's conservative initialization.
+    zero; newly introduced history/memory, event-routing, competition, and
+    spatial-proposal modules retain the receiving model's principled
+    initialization.
     """
     current=model.state_dict()
     migrated=dict(state_dict)

@@ -92,6 +92,7 @@ def corrupt_temporal_clues(sample: dict, *, hypothesis_dropout=0.10, edge_dropou
         out["graph_x"]=out["graph_x"][node_keep]
         if "node_instance_grid" in out: out["node_instance_grid"]=out["node_instance_grid"][node_keep]
         if "node_history_valid" in out: out["node_history_valid"]=out["node_history_valid"][node_keep]
+        if "node_event_features" in out: out["node_event_features"]=out["node_event_features"][node_keep]
         if "node_ids" in out: out["node_ids"]=out["node_ids"][node_keep]
         if "node_observed_ref_um" in out: out["node_observed_ref_um"]=out["node_observed_ref_um"][node_keep]
         if "node_time_offset" in out: out["node_time_offset"]=out["node_time_offset"][node_keep]

@@ -18,6 +18,7 @@ from .query_builder import (
     QUERY_SPATIAL_PROPOSAL,
     QUERY_SPLIT,
     QUERY_TEMPORAL,
+    build_competition_group_ids,
 )
 from .temporal_memory import HierarchicalTemporalFusion
 from .types import QueryState, TemporalState
@@ -159,6 +160,7 @@ class QueryDecoderLayer(nn.Module):
         temporal: TemporalState | None = None,
         *,
         memory_ablation: str = "full",
+        routing_ablation: str = "full",
         return_debug: bool = False,
         full_attention: bool = False,
     ):
@@ -172,6 +174,13 @@ class QueryDecoderLayer(nn.Module):
             flat_batch = torch.arange(
                 x.shape[0], device=x.device, dtype=torch.long
             )[:, None].expand_as(valid)
+            competition_group_ids = (
+                q.competition_group_ids
+                if q.competition_group_ids is not None
+                else build_competition_group_ids(
+                    q.query_types, q.source_instance_ids
+                )
+            )
             temporal_message, self.last_temporal_debug = self.temporal_fusion(
                 x[valid],
                 (q.references_cellscale * dref_um[:, None, None])[valid],
@@ -179,6 +188,8 @@ class QueryDecoderLayer(nn.Module):
                 temporal,
                 dref_um,
                 memory_ablation=memory_ablation,
+                routing_ablation=routing_ablation,
+                competition_group_ids=competition_group_ids[valid],
                 return_debug=return_debug,
                 full_attention=full_attention,
             )
@@ -190,6 +201,9 @@ class QueryDecoderLayer(nn.Module):
                 self.last_temporal_debug["query_type"] = q.query_types[valid].detach()
                 self.last_temporal_debug["source_instance_id"] = (
                     q.source_instance_ids[valid].detach()
+                )
+                self.last_temporal_debug["competition_group_id"] = (
+                    competition_group_ids[valid].detach()
                 )
             updated = x.clone()
             updated[valid] = temporal_message
@@ -318,6 +332,7 @@ class InstanceQueryDecoder(nn.Module):
         temporal: TemporalState | None = None,
         *,
         memory_ablation: str = "full",
+        routing_ablation: str = "full",
         return_debug: bool = False,
         full_attention: bool = False,
     ) -> tuple[QueryState, list[dict[str,Tensor]]]:
@@ -360,6 +375,7 @@ class InstanceQueryDecoder(nn.Module):
                 mask_feat,
                 temporal,
                 memory_ablation=memory_ablation,
+                routing_ablation=routing_ablation,
                 return_debug=return_debug,
                 full_attention=full_attention,
             )

@@ -19,6 +19,7 @@ from learned.stirnet.data.trackastra_cache import (
 )
 from learned.stirnet.model.config import StirNetConfig, TemporalConfig
 from learned.stirnet.model.graph_encoder import DetectionGraphEncoder
+from learned.stirnet.model.query_builder import build_competition_group_ids
 from learned.stirnet.model.stir_net import StirNet
 from learned.stirnet.model.temporal_memory import TemporalMemoryAttention
 from learned.stirnet.model.types import TemporalNodeMemory, TemporalState
@@ -154,6 +155,12 @@ def test_candidate_graph_has_no_cross_batch_edges_after_collation() -> None:
     source, destination = batch["graph_edge_index"]
     assert torch.equal(node_batch[source], node_batch[destination])
     assert batch["graph_edge_index"].shape[1] == 4
+    torch.testing.assert_close(
+        batch["node_event_features"],
+        torch.cat(
+            [graph_a["node_event_features"], graph_b["node_event_features"]]
+        ),
+    )
 
 
 def test_candidate_graph_safety_limit_raises_without_truncation() -> None:
@@ -190,6 +197,10 @@ def test_fine_node_memory_survives_tracklet_pooling() -> None:
     torch.testing.assert_close(
         temporal.node_memory.projected_ref_um,
         temporal.ref_um[temporal.node_memory.tracklet_id],
+    )
+    torch.testing.assert_close(
+        temporal.node_memory.event_features,
+        graph["node_event_features"],
     )
 
 
@@ -459,7 +470,15 @@ def test_missing_history_full_forward_debugs_every_memory_read() -> None:
     assert output.debug["node_memory"]["tokens"].shape[0] == 4
     component = output.debug["component_temporal_attention"]["node"]
     assert component["full_weights"].shape == (1, 4)
+    assert component["competition_group_id"].tolist() == [-1]
     layers = output.debug["query_temporal_attention"]
     assert len(layers) == cfg.decoder.layers
     assert all(layer["node"]["full_weights"].shape[1] == 4 for layer in layers)
     assert all(torch.isfinite(layer["node"]["entropy"]).all() for layer in layers)
+    for layer in layers:
+        expected_groups = build_competition_group_ids(
+            layer["query_type"], layer["source_instance_id"]
+        )
+        torch.testing.assert_close(
+            layer["node"]["competition_group_id"], expected_groups
+        )

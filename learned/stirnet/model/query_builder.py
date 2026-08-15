@@ -20,6 +20,33 @@ QUERY_SPATIAL_PROPOSAL = 4
 NUM_QUERY_TYPES = 5
 
 
+def build_competition_group_ids(
+    query_types: Tensor,
+    source_instance_ids: Tensor,
+) -> Tensor:
+    """Map high-level query metadata to reader-agnostic competition groups.
+
+    Source-linked spatial proposals compete with sibling proposals from the
+    same source. Legacy primary/split queries retain the same behavior. All
+    off-mask, temporal, discovery, padding, and unknown query kinds use -1.
+    Batch isolation is supplied separately to the temporal reader.
+    """
+
+    if query_types.shape != source_instance_ids.shape:
+        raise ValueError("query types and source IDs must have matching shapes")
+    source_linked_type = (
+        (query_types == QUERY_PRIMARY)
+        | (query_types == QUERY_SPLIT)
+        | (query_types == QUERY_SPATIAL_PROPOSAL)
+    )
+    eligible = source_linked_type & (source_instance_ids >= 0)
+    return torch.where(
+        eligible,
+        source_instance_ids,
+        torch.full_like(source_instance_ids, -1),
+    )
+
+
 class InstanceQueryBuilder(nn.Module):
     def __init__(
         self,
@@ -174,6 +201,7 @@ class InstanceQueryBuilder(nn.Module):
         temporal: TemporalState,
         *,
         memory_ablation: str = "full",
+        routing_ablation: str = "full",
         return_debug: bool = False,
         full_attention: bool = False,
         proposal_state: SpatialProposalState | None = None,
@@ -200,6 +228,7 @@ class InstanceQueryBuilder(nn.Module):
                 temporal,
                 dref_um,
                 memory_ablation=memory_ablation,
+                routing_ablation=routing_ablation,
                 return_debug=return_debug,
                 full_attention=full_attention,
             )
@@ -340,13 +369,17 @@ class InstanceQueryBuilder(nn.Module):
             salience[b, :n] = sa.to(salience.dtype)
             reliability[b, :n] = re.to(reliability.dtype)
             padding[b, :n] = False
+        competition_group_ids = build_competition_group_ids(
+            query_types, source_ids
+        )
         return QueryState(
-            embeddings,
-            references,
-            query_types,
-            padding,
-            source_ids,
-            salience,
-            reliability,
-            references.clone(),
+            embeddings=embeddings,
+            references_cellscale=references,
+            query_types=query_types,
+            padding_mask=padding,
+            source_instance_ids=source_ids,
+            temporal_salience=salience,
+            temporal_reliability=reliability,
+            initial_references_cellscale=references.clone(),
+            competition_group_ids=competition_group_ids,
         )

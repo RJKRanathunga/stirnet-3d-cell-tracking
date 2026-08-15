@@ -6,6 +6,7 @@ from scipy import ndimage as ndi
 
 from .targets import build_gt_targets, estimate_dref_um, extract_instance_metadata, make_instance_boundary
 from .graph_builder import DETECTION_EDGE_DIM
+from ..temporal_events import TEMPORAL_NODE_EVENT_FEATURE_DIM
 
 
 def robust_normalize(raw: np.ndarray, low_pct: float = 1.0, high_pct: float = 99.8) -> np.ndarray:
@@ -63,6 +64,7 @@ def build_cached_sample(
     else:
         sample.update({
             "graph_x":torch.zeros((0,32)),"graph_edge_index":torch.zeros((2,0),dtype=torch.long),"graph_edge_attr":torch.zeros((0,DETECTION_EDGE_DIM)),
+            "node_event_features":torch.zeros((0,TEMPORAL_NODE_EVENT_FEATURE_DIM)),
             "accepted_association_edge_index":torch.zeros((2,0),dtype=torch.long),
             "accepted_association_edge_attr":torch.zeros((0,3)),
             "tracklet_id":torch.zeros((0,),dtype=torch.long),"temporal_ref_um":torch.zeros((0,3)),"temporal_status":torch.zeros((0,10)),

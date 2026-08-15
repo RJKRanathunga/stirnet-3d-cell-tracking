@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from .graph_builder import DETECTION_EDGE_DIM, HYPOTHESIS_EDGE_DIM
+from ..temporal_events import TEMPORAL_NODE_EVENT_FEATURE_DIM
 
 
 def _hypothesis_edges_compatible(value: torch.Tensor) -> torch.Tensor:
@@ -49,6 +50,7 @@ def stirnet_collate(samples:list[dict])->dict:
 
     # packed detection graph + hypothesis graph
     gx=[]; gei=[]; gea=[]; aei=[]; aea=[]; tid=[]; node_ids=[]; node_refs=[]; node_dt=[]
+    node_events=[]; complete_event_contract=True
     tref=[]; tstatus=[]; hei=[]; hea=[]; tb=[]
     node_grids=[];node_valid=[]
     supports=[];support_valid=[];support_dt=[];support_centers=[];support_extents=[]
@@ -88,6 +90,20 @@ def stirnet_collate(samples:list[dict])->dict:
         node_ids.append(s.get("node_ids",torch.arange(len(x),dtype=torch.long)))
         node_refs.append(s.get("node_observed_ref_um",x[:,1:4]*torch.as_tensor(s["dref_um"])))
         node_dt.append(s.get("node_time_offset",x[:,0]*2.0))
+        event_features=s.get("node_event_features")
+        if event_features is None:
+            # Leave reconstruction to StirNet, which knows the configured
+            # temporal radius. This keeps old cache migration exact even when
+            # a non-default radius was used.
+            complete_event_contract=False
+        else:
+            if event_features.shape != (
+                len(x),TEMPORAL_NODE_EVENT_FEATURE_DIM
+            ):
+                raise ValueError(
+                    "node_event_features must align with graph_x and have shape [N,8]"
+                )
+            node_events.append(event_features)
         # local tracklet ids become global hypothesis ids
         tid.append(ti+hyp_off if ti.numel() else ti)
         tref.append(tr);tstatus.append(st);tb.append(torch.full((len(tr),),b,dtype=torch.long))
@@ -102,6 +118,12 @@ def stirnet_collate(samples:list[dict])->dict:
     batch["node_ids"]=torch.cat(node_ids) if node_ids else torch.zeros((0,),dtype=torch.long)
     batch["node_observed_ref_um"]=torch.cat(node_refs) if node_refs else torch.zeros((0,3))
     batch["node_time_offset"]=torch.cat(node_dt) if node_dt else torch.zeros((0,))
+    if complete_event_contract:
+        batch["node_event_features"]=(
+            torch.cat(node_events)
+            if node_events
+            else torch.zeros((0,TEMPORAL_NODE_EVENT_FEATURE_DIM))
+        )
     batch["temporal_ref_um"]=torch.cat(tref) if tref else torch.zeros((0,3))
     batch["temporal_status"]=torch.cat(tstatus) if tstatus else torch.zeros((0,10))
     batch["temporal_batch"]=torch.cat(tb) if tb else torch.zeros((0,),dtype=torch.long)

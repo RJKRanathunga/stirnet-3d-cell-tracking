@@ -27,6 +27,7 @@ class TemporalNodeMemory:
     batch_index: Tensor               # [N], logical sample index
     history_valid: Tensor             # [N]
     node_ids: Optional[Tensor] = None  # [N], preprocessing/debug identity
+    event_features: Optional[Tensor] = None  # [N,8], explicit event metadata
 
     @property
     def is_empty(self) -> bool:
@@ -71,6 +72,7 @@ class QueryState:
     temporal_salience: Tensor
     temporal_reliability: Tensor
     initial_references_cellscale: Optional[Tensor] = None
+    competition_group_ids: Optional[Tensor] = None
 
 
 @dataclass

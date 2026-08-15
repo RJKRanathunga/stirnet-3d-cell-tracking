@@ -39,6 +39,20 @@ class TemporalConfig:
     component_memory_enabled: bool = True
     query_memory_enabled: bool = True
     memory_debug_topk: int = 5
+    event_routing_enabled: bool = True
+    source_competition_enabled: bool = True
+    event_feature_dim: int = 8
+    event_hidden_dim: int = 32
+    event_prior_bias: float = -1.0
+    event_start_weight: float = 2.0
+    event_end_weight: float = 2.0
+    event_division_weight: float = 1.0
+    event_boundary_weight: float = -0.75
+    event_logit_clip: float = 5.0
+    event_strength_max: float = 4.0
+    competition_temperature_init: float = 0.5
+    competition_temperature_min: float = 0.15
+    competition_temperature_max: float = 2.0
 
 
 @dataclass
