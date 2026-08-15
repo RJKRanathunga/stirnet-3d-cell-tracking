@@ -132,22 +132,48 @@ class QueryDecoderLayer(nn.Module):
             self.center_step_by_type[QUERY_SPATIAL_PROPOSAL]
         )
 
-    def _bounded_center_delta(self, raw_delta: Tensor, q: QueryState) -> Tensor:
+    def _bounded_center_delta(
+            self,
+            raw_delta: Tensor,
+            q: QueryState,
+    ) -> Tensor:
         limits = raw_delta.new_tensor(self.center_step_by_type)
-        safe_types = q.query_types.clamp(0, len(self.center_step_by_type) - 1)
+        safe_types = q.query_types.clamp(
+            0,
+            len(self.center_step_by_type) - 1,
+        )
         max_step = limits[safe_types]
-        delta = torch.tanh(raw_delta) * max_step[..., None]
+
+        bounded = torch.tanh(raw_delta)
+        delta = bounded * max_step[..., None]
+
         proposal = q.query_types == QUERY_SPATIAL_PROPOSAL
-        if proposal.any():
-            proposal_direction = torch.tanh(raw_delta[proposal])
-            proposal_direction = proposal_direction / torch.linalg.vector_norm(
-                proposal_direction, dim=-1, keepdim=True
-            ).clamp_min(1.0)
-            delta[proposal] = (
-                proposal_direction
-                * max_step[proposal][..., None]
-            )
-        return delta.masked_fill(q.padding_mask[..., None], 0)
+
+        # Normalize proposal displacement by Euclidean norm in FP32 for
+        # numerical stability under autocast, then cast back.
+        direction_fp32 = bounded.float()
+        norm_fp32 = torch.linalg.vector_norm(
+            direction_fp32,
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1.0)
+
+        proposal_delta = (
+                direction_fp32
+                / norm_fp32
+                * max_step[..., None].float()
+        ).to(dtype=delta.dtype)
+
+        delta = torch.where(
+            proposal[..., None],
+            proposal_delta,
+            delta,
+        )
+
+        return delta.masked_fill(
+            q.padding_mask[..., None],
+            0,
+        )
 
     def forward(
         self,
