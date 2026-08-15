@@ -107,7 +107,7 @@ class Trainer:
         self.criterion.set_loss_weight_overrides(
             self.curriculum_stage.loss_weight_overrides
         )
-        self.model.train(); b=move_batch_to_device(batch,self.device)
+        self.model.train(); self.criterion.train(); b=move_batch_to_device(batch,self.device)
         self.optimizer.zero_grad(set_to_none=True)
         with self._autocast():
             out=model_forward_from_batch(
@@ -135,7 +135,7 @@ class Trainer:
 
     @torch.no_grad()
     def eval_step(self,batch:dict)->dict[str,float]:
-        self.model.eval();b=move_batch_to_device(batch,self.device)
+        self.model.eval();self.criterion.eval();b=move_batch_to_device(batch,self.device)
         with self._autocast():
             out=model_forward_from_batch(
                 self.model,

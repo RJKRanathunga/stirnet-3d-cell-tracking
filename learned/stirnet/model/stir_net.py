@@ -215,6 +215,10 @@ class StirNet(nn.Module):
             raise ValueError("local mask channel widths must be positive")
         if local.query_chunk_size <= 0:
             raise ValueError("local mask query chunk size must be positive")
+        if local.train_max_queries_per_batch < 1:
+            raise ValueError(
+                "local_masks.train_max_queries_per_batch must be at least 1"
+            )
 
     def _build_temporal(
         self, graph_x: Tensor, graph_edge_index: Tensor, graph_edge_attr: Tensor,
@@ -701,19 +705,21 @@ class StirNet(nn.Module):
                 raise ValueError(
                     "spatial-proposal rendering requires d0_features and spatial_inputs"
                 )
-            local_predictions = self.local_mask_decoder.decode_requests(
-                outputs.d0_features,
-                outputs.spatial_inputs,
-                outputs.dense_outputs,
-                outputs.query_embeddings,
-                outputs.query_initial_references_cellscale,
-                outputs.spacing_um,
-                outputs.dref_um,
-                local_requests,
-            )
-            for (batch_index, destination), prediction in zip(
-                local_destinations, local_predictions
+            for (batch_index, query_index), (_, destination) in zip(
+                local_requests, local_destinations
             ):
+                prediction = self.local_mask_decoder.decode_one(
+                    outputs.d0_features,
+                    outputs.spatial_inputs,
+                    outputs.dense_outputs,
+                    outputs.query_embeddings[batch_index, query_index],
+                    outputs.query_initial_references_cellscale[
+                        batch_index, query_index
+                    ],
+                    outputs.spacing_um[batch_index],
+                    outputs.dref_um[batch_index],
+                    batch_index=batch_index,
+                )
                 if prediction.logits is None:
                     raise RuntimeError("local mask decoder returned no logits")
                 rendered[batch_index][destination][prediction.slices] = (

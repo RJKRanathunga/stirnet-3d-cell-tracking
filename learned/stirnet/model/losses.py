@@ -123,6 +123,8 @@ class RefinementCriterion(nn.Module):
             proposal_match_radius_dref=self.proposal_cfg.match_radius_dref,
         )
         self.loss_weight_overrides: dict[str, float] = {}
+        self.last_local_original_request_counts: list[int] = []
+        self.last_local_sampled_requests: list[tuple[int, int]] = []
 
     def set_loss_weight_overrides(
         self, overrides: dict[str, float] | None
@@ -513,54 +515,81 @@ class RefinementCriterion(nn.Module):
             raise ValueError(
                 "proposal-local training requires d0_features and spatial_inputs"
             )
-        requests: list[tuple[int, int]] = []
-        target_requests: list[tuple[int, int]] = []
+        sampled_requests: list[tuple[int, int, int]] = []
+        original_counts: list[int] = []
+        train_cap = int(local_mask_decoder.cfg.train_max_queries_per_batch)
+        if train_cap < 1:
+            raise ValueError("train_max_queries_per_batch must be at least 1")
         for batch_index, match in enumerate(matches):
-            for query_index, target_index in zip(
-                match.pred_indices.tolist(), match.target_indices.tolist()
-            ):
-                requests.append((batch_index, int(query_index)))
-                target_requests.append((batch_index, int(target_index)))
+            count = int(match.pred_indices.numel())
+            original_counts.append(count)
+            selected = torch.arange(count, device=match.pred_indices.device)
+            if self.training and count > train_cap:
+                selected = torch.randperm(
+                    count, device=match.pred_indices.device
+                )[:train_cap]
+            for row in selected.tolist():
+                sampled_requests.append(
+                    (
+                        batch_index,
+                        int(match.pred_indices[row]),
+                        int(match.target_indices[row]),
+                    )
+                )
+        self.last_local_original_request_counts = original_counts
+        self.last_local_sampled_requests = [
+            (batch_index, query_index)
+            for batch_index, query_index, _ in sampled_requests
+        ]
         zero = outputs.exist_logits.sum() * 0
-        if not requests:
+        if not sampled_requests:
             return zero, zero
-        predictions = local_mask_decoder.decode_requests(
-            outputs.d0_features,
-            outputs.spatial_inputs,
-            outputs.dense_outputs,
-            outputs.query_embeddings,
-            outputs.query_initial_references_cellscale,
-            outputs.spacing_um,
-            outputs.dref_um,
-            requests,
-        )
-        dice_values = []
-        focal_values = []
-        for prediction, (batch_index, target_index) in zip(
-            predictions, target_requests
-        ):
-            if prediction.logits is None:
-                raise RuntimeError("local mask decoder returned no logits")
-            target_crop = self._local_native_target(
-                targets[batch_index],
-                target_index,
-                prediction,
-                prediction.logits.device,
-            )
-            support = prediction.support.to(device=prediction.logits.device)
-            # The whole allowed sphere is supervised.  GT outside it is not
-            # unioned into support; anchor/center objectives own localization.
-            target_crop = target_crop * support.float()
-            dice, focal = local_matched_mask_losses(
-                prediction.logits[None],
-                target_crop[None],
-                support[None],
-                alpha=self.cfg.mask_focal_alpha_pos,
-                gamma=self.cfg.mask_focal_gamma,
-            )
-            dice_values.append(dice)
-            focal_values.append(focal)
-        return torch.stack(dice_values).mean(), torch.stack(focal_values).mean()
+        dice_sum = zero
+        focal_sum = zero
+        decoded_count = 0
+        # Training retains at most the configured 1-2 crop graphs per batch
+        # item. Evaluation disables grad here and reduces each scalar before
+        # moving to the next crop, so it can inspect every matched proposal
+        # without retaining all local prediction tensors.
+        with torch.set_grad_enabled(self.training and torch.is_grad_enabled()):
+            for batch_index, query_index, target_index in sampled_requests:
+                prediction = local_mask_decoder.decode_one(
+                    outputs.d0_features,
+                    outputs.spatial_inputs,
+                    outputs.dense_outputs,
+                    outputs.query_embeddings[batch_index, query_index],
+                    outputs.query_initial_references_cellscale[
+                        batch_index, query_index
+                    ],
+                    outputs.spacing_um[batch_index],
+                    outputs.dref_um[batch_index],
+                    batch_index=batch_index,
+                )
+                if prediction.logits is None:
+                    raise RuntimeError("local mask decoder returned no logits")
+                target_crop = self._local_native_target(
+                    targets[batch_index],
+                    target_index,
+                    prediction,
+                    prediction.logits.device,
+                )
+                support = prediction.support.to(device=prediction.logits.device)
+                # The whole allowed sphere is supervised. GT outside it is not
+                # unioned into support; anchor/center objectives own localization.
+                target_crop = target_crop * support.float()
+                dice, focal = local_matched_mask_losses(
+                    prediction.logits[None],
+                    target_crop[None],
+                    support[None],
+                    alpha=self.cfg.mask_focal_alpha_pos,
+                    gamma=self.cfg.mask_focal_gamma,
+                )
+                dice_sum = dice_sum + dice
+                focal_sum = focal_sum + focal
+                decoded_count += 1
+        if decoded_count == 0:
+            return zero, zero
+        return dice_sum / decoded_count, focal_sum / decoded_count
 
     def _native_mask_losses(
         self,

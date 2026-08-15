@@ -167,6 +167,9 @@ class LocalMaskConfig:
     hidden_channels: int = 32
     query_channels: int = 32
     query_chunk_size: int = 1
+    # Maximum matched spatial-proposal masks supervised per batch item in a
+    # training step. Evaluation remains exhaustive and streams every match.
+    train_max_queries_per_batch: int = 2
     detach_dense_evidence: bool = True
 
 

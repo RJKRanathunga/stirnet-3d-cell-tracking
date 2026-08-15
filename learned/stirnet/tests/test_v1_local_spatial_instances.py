@@ -3,6 +3,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import torch
 
 from learned.stirnet.inference.postprocess import postprocess_batch
@@ -40,6 +41,7 @@ from learned.stirnet.training.curriculum import (
     curriculum_stage,
     model_parameter_groups,
 )
+from learned.stirnet.debugging.cli.inspect_checkpoint import config_from_dict
 
 
 def _small_config() -> StirNetConfig:
@@ -64,13 +66,18 @@ def _small_config() -> StirNetConfig:
     return cfg
 
 
-def _local_decoder(*, detach_dense: bool = True) -> LocalNativeMaskDecoder:
+def _local_decoder(
+    *,
+    detach_dense: bool = True,
+    train_cap: int = 2,
+) -> LocalNativeMaskDecoder:
     return LocalNativeMaskDecoder(
         LocalMaskConfig(
             support_radius_dref=1.5,
             hidden_channels=4,
             query_channels=4,
             query_chunk_size=1,
+            train_max_queries_per_batch=train_cap,
             detach_dense_evidence=detach_dense,
         ),
         d0_channels=2,
@@ -177,6 +184,54 @@ def test_proposal_center_bound_is_total_across_three_layers() -> None:
     assert state.references_cellscale[0, 1].abs().max() > cfg.temporal_center_step_dref
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_proposal_center_bound_is_amp_safe_across_three_cuda_layers() -> None:
+    cfg = DecoderConfig(
+        d_model=8,
+        heads=2,
+        layers=3,
+        ffn_dim=16,
+        mask_dim=2,
+        dropout=0.0,
+        proposal_center_max_offset_dref=0.5,
+    )
+    layers = [QueryDecoderLayer(cfg).cuda().eval() for _ in range(3)]
+    state = _decoder_state([QUERY_SPATIAL_PROPOSAL, QUERY_TEMPORAL])
+    for name, value in vars(state).items():
+        if isinstance(value, torch.Tensor):
+            value = value.cuda()
+            if name == "embeddings":
+                value = value.half()
+            setattr(state, name, value)
+    spatial_tokens = torch.randn(1, 1, 8, device="cuda", dtype=torch.float16)
+    spatial_positions = torch.zeros(1, 1, 3, device="cuda")
+    support = torch.ones(1, 2, 1, device="cuda", dtype=torch.bool)
+    dref_um = torch.ones(1, device="cuda")
+    mask_features = torch.randn(
+        1, 2, 1, 1, 1, device="cuda", dtype=torch.float16
+    )
+    for layer in layers:
+        with torch.no_grad():
+            layer.center.net[-1].weight.zero_()
+            layer.center.net[-1].bias.fill_(100.0)
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                state, _ = layer(
+                    state,
+                    spatial_tokens,
+                    spatial_positions,
+                    support,
+                    dref_um,
+                    mask_features,
+                )
+    assert torch.isfinite(state.references_cellscale).all()
+    proposal_distance = torch.linalg.vector_norm(
+        state.references_cellscale[0, 0]
+        - state.initial_references_cellscale[0, 0]
+    )
+    assert proposal_distance <= cfg.proposal_center_max_offset_dref + 1e-6
+    assert state.references_cellscale[0, 1].abs().max() > cfg.temporal_center_step_dref
+
+
 def test_physical_crop_uses_anisotropic_native_spacing() -> None:
     crop = physical_local_crop(
         (9, 15, 31),
@@ -222,24 +277,65 @@ def test_off_mask_local_decoder_and_exact_support_background() -> None:
     # off-mask proposal (source_instance_id=-1) follows this same path.
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fp16_cached_local_decoder_runs_outside_autocast_with_fp32_parameters() -> None:
+    decoder = _local_decoder().cuda().train()
+    shape = (7, 7, 7)
+    d0 = torch.randn(
+        1, 2, *shape, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    spatial = torch.randn(1, 5, *shape, device="cuda", dtype=torch.float16)
+    dense = {
+        key: torch.randn(1, 1, *shape, device="cuda", dtype=torch.float16)
+        for key in ("foreground_logits", "center_heatmap_logits", "boundary_logits")
+    }
+    prediction = decoder.decode_one(
+        d0,
+        spatial,
+        dense,
+        torch.randn(8, device="cuda", dtype=torch.float16),
+        torch.zeros(3, device="cuda"),
+        torch.ones(3, device="cuda"),
+        torch.tensor(2.0, device="cuda"),
+        batch_index=0,
+    )
+    assert prediction.logits is not None
+    assert prediction.logits.dtype == torch.float16
+    assert torch.isfinite(prediction.logits).all()
+    assert all(parameter.dtype == torch.float32 for parameter in decoder.parameters())
+    prediction.logits.float().mean().backward()
+    assert d0.grad is not None and torch.isfinite(d0.grad).all()
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in decoder.parameters()
+    )
+
+
 def _proposal_loss_output(
     d0: torch.Tensor,
     dense: dict[str, torch.Tensor],
+    *,
+    query_count: int = 1,
+    query_types: list[int] | None = None,
 ) -> StirNetOutput:
     shape = tuple(int(value) for value in d0.shape[-3:])
+    if query_types is None:
+        query_types = [QUERY_SPATIAL_PROPOSAL] * query_count
+    if len(query_types) != query_count:
+        raise ValueError("query_types must have query_count entries")
     return StirNetOutput(
-        exist_logits=torch.zeros(1, 1, requires_grad=True),
-        centers_cellscale=torch.zeros(1, 1, 3),
-        coarse_mask_logits=torch.zeros(1, 1, 1, 1, 1),
+        exist_logits=torch.zeros(1, query_count, requires_grad=True),
+        centers_cellscale=torch.zeros(1, query_count, 3),
+        coarse_mask_logits=torch.zeros(1, query_count, 1, 1, 1),
         coarse_spacing_um=torch.ones(1, 3),
-        query_embeddings=torch.randn(1, 1, 8, requires_grad=True),
-        native_mask_embeddings=torch.zeros(1, 1, 1),
-        query_types=torch.tensor([[QUERY_SPATIAL_PROPOSAL]]),
-        query_padding_mask=torch.zeros(1, 1, dtype=torch.bool),
-        source_instance_ids=torch.tensor([[-1]]),
-        query_initial_references_cellscale=torch.zeros(1, 1, 3),
-        temporal_salience=torch.zeros(1, 1, 1),
-        temporal_reliability=torch.zeros(1, 1, 1),
+        query_embeddings=torch.randn(1, query_count, 8, requires_grad=True),
+        native_mask_embeddings=torch.zeros(1, query_count, 1),
+        query_types=torch.tensor([query_types]),
+        query_padding_mask=torch.zeros(1, query_count, dtype=torch.bool),
+        source_instance_ids=torch.full((1, query_count), -1, dtype=torch.long),
+        query_initial_references_cellscale=torch.zeros(1, query_count, 3),
+        temporal_salience=torch.zeros(1, query_count, 1),
+        temporal_reliability=torch.zeros(1, query_count, 1),
         aux_outputs=[],
         dense_outputs=dense,
         mask_features=torch.zeros(1, 1, *shape),
@@ -249,6 +345,143 @@ def _proposal_loss_output(
         d0_features=d0,
         spatial_inputs=torch.zeros(1, 5, *shape),
     )
+
+
+def _many_proposal_loss_case(
+    query_count: int,
+) -> tuple[StirNetOutput, list[dict], list[MatchResult]]:
+    shape = (7, 7, 7)
+    d0 = torch.randn(1, 2, *shape, requires_grad=True)
+    dense = {
+        key: torch.randn(1, 1, *shape, requires_grad=True)
+        for key in ("foreground_logits", "center_heatmap_logits", "boundary_logits")
+    }
+    output = _proposal_loss_output(d0, dense, query_count=query_count)
+    labels = torch.zeros(shape, dtype=torch.long)
+    labels[3, 3, 3] = 1
+    target = {
+        "ids": torch.arange(1, query_count + 1),
+        "label_map": labels,
+        "centers_cellscale": torch.zeros(query_count, 3),
+    }
+    indices = torch.arange(query_count)
+    return output, [target], [MatchResult(indices, indices)]
+
+
+def test_training_samples_before_decoding_and_caps_each_batch_item() -> None:
+    output, targets, matches = _many_proposal_loss_case(7)
+    decoder = _local_decoder(train_cap=2)
+    criterion = RefinementCriterion(LossConfig(), QueryConfig()).train()
+    with patch.object(decoder, "decode_one", wraps=decoder.decode_one) as decode:
+        dice, focal = criterion._proposal_local_mask_losses(
+            output, targets, matches, decoder
+        )
+    assert decode.call_count == 2
+    assert criterion.last_local_original_request_counts == [7]
+    assert len(criterion.last_local_sampled_requests) == 2
+    assert len(set(criterion.last_local_sampled_requests)) == 2
+    assert torch.isfinite(dice + focal)
+
+
+def test_training_sampling_is_seeded_and_not_always_the_first_queries() -> None:
+    subsets = []
+    for seed in (41, 41, 42):
+        torch.manual_seed(seed)
+        output, targets, matches = _many_proposal_loss_case(8)
+        decoder = _local_decoder(train_cap=2)
+        criterion = RefinementCriterion(LossConfig(), QueryConfig()).train()
+        criterion._proposal_local_mask_losses(output, targets, matches, decoder)
+        subsets.append(criterion.last_local_sampled_requests)
+    assert subsets[0] == subsets[1]
+    assert subsets[0] != subsets[2]
+    assert [query for _, query in subsets[0]] != [0, 1]
+
+
+def test_evaluation_streams_every_matched_proposal_despite_training_cap() -> None:
+    output, targets, matches = _many_proposal_loss_case(6)
+    decoder = _local_decoder(train_cap=2)
+    criterion = RefinementCriterion(LossConfig(), QueryConfig()).eval()
+    with patch.object(decoder, "decode_one", wraps=decoder.decode_one) as decode:
+        dice, focal = criterion._proposal_local_mask_losses(
+            output, targets, matches, decoder
+        )
+    assert decode.call_count == 6
+    assert criterion.last_local_original_request_counts == [6]
+    assert criterion.last_local_sampled_requests == [(0, index) for index in range(6)]
+    assert torch.isfinite(dice + focal)
+
+
+def test_only_sampled_queries_receive_local_query_gradients() -> None:
+    torch.manual_seed(53)
+    output, targets, matches = _many_proposal_loss_case(5)
+    decoder = _local_decoder(train_cap=2)
+    criterion = RefinementCriterion(LossConfig(), QueryConfig()).train()
+    dice, focal = criterion._proposal_local_mask_losses(
+        output, targets, matches, decoder
+    )
+    (dice + focal).backward()
+    selected = {
+        query_index
+        for batch_index, query_index in criterion.last_local_sampled_requests
+        if batch_index == 0
+    }
+    gradient = output.query_embeddings.grad
+    assert gradient is not None
+    assert len(selected) == 2
+    assert all(gradient[0, index].abs().sum() > 0 for index in selected)
+    assert all(
+        gradient[0, index].abs().sum() == 0
+        for index in range(5)
+        if index not in selected
+    )
+
+
+def test_hybrid_mask_weighting_uses_original_match_counts_after_sampling() -> None:
+    proposal_count = 8
+    legacy_count = 2
+    query_types = [QUERY_SPATIAL_PROPOSAL] * proposal_count + [
+        QUERY_DISCOVERY
+    ] * legacy_count
+    shape = (3, 3, 3)
+    output = _proposal_loss_output(
+        torch.zeros(1, 2, *shape),
+        {
+            key: torch.zeros(1, 1, *shape)
+            for key in (
+                "foreground_logits",
+                "center_heatmap_logits",
+                "boundary_logits",
+            )
+        },
+        query_count=len(query_types),
+        query_types=query_types,
+    )
+    indices = torch.arange(len(query_types))
+    matches = [MatchResult(indices, indices)]
+    targets = [
+        {
+            "ids": torch.arange(1, len(query_types) + 1),
+            "label_map": torch.zeros(shape, dtype=torch.long),
+        }
+    ]
+    criterion = RefinementCriterion(LossConfig(), QueryConfig()).train()
+    with (
+        patch.object(
+            criterion,
+            "_proposal_local_mask_losses",
+            return_value=(torch.tensor(2.0), torch.tensor(4.0)),
+        ),
+        patch.object(
+            criterion,
+            "_legacy_native_mask_losses",
+            return_value=(torch.tensor(10.0), torch.tensor(20.0)),
+        ),
+    ):
+        dice, focal = criterion._native_mask_losses(
+            output, targets, matches, _local_decoder(train_cap=2)
+        )
+    torch.testing.assert_close(dice, torch.tensor(3.6))
+    torch.testing.assert_close(focal, torch.tensor(7.2))
 
 
 def test_local_loss_routes_gradients_and_detaches_dense_side_evidence() -> None:
@@ -425,6 +658,55 @@ def test_legacy_renderer_and_hybrid_selection_order_are_preserved() -> None:
     torch.testing.assert_close(rendered[:, 0, 0, 1], torch.tensor([3.0, 2.0, 1.0]))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fp16_cached_proposal_renders_outside_autocast() -> None:
+    cfg = _small_config()
+    cfg.proposals.max_proposals = 4
+    cfg.proposals.candidate_pool_size = 8
+    model = StirNet(cfg).cuda().eval()
+    labels = torch.zeros(1, 16, 16, 16, device="cuda", dtype=torch.long)
+    labels[:, 4:12, 4:12, 4:12] = 1
+    spatial = torch.randn(1, 5, 16, 16, 16, device="cuda")
+    spatial[:, 1] = (labels > 0).float()
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
+        output = model(
+            spatial,
+            labels,
+            torch.ones(1, 3, device="cuda"),
+            torch.tensor([4.0], device="cuda"),
+            torch.zeros(1, 14, device="cuda"),
+            torch.tensor([1], device="cuda"),
+            torch.tensor([0], device="cuda"),
+            torch.zeros(1, 3, device="cuda"),
+            torch.zeros(0, cfg.temporal.node_dim, device="cuda"),
+            torch.zeros(2, 0, device="cuda", dtype=torch.long),
+            torch.zeros(0, cfg.temporal.edge_dim, device="cuda"),
+            torch.zeros(0, device="cuda", dtype=torch.long),
+            torch.zeros(0, 3, device="cuda"),
+            torch.zeros(0, cfg.temporal.status_dim, device="cuda"),
+            torch.zeros(2, 0, device="cuda", dtype=torch.long),
+            torch.zeros(0, cfg.temporal.hypothesis_edge_dim, device="cuda"),
+            torch.zeros(0, device="cuda", dtype=torch.long),
+            bypass_coreasoning=True,
+        )
+    assert output.d0_features is not None
+    assert output.d0_features.dtype == torch.float16
+    proposal = torch.nonzero(
+        output.query_types[0] == QUERY_SPATIAL_PROPOSAL, as_tuple=False
+    ).flatten()[0]
+    with torch.no_grad():
+        rendered = model.render_masks(
+            output, [proposal[None]]
+        )[0]
+    assert rendered.shape == (1, 16, 16, 16)
+    assert rendered.dtype == torch.float16
+    assert torch.isfinite(rendered).all()
+    assert all(
+        parameter.dtype == torch.float32
+        for parameter in model.local_mask_decoder.parameters()
+    )
+
+
 def test_postprocess_uses_anchor_seed_only_for_spatial_proposals() -> None:
     output = _render_output()
     output.query_types = torch.tensor(
@@ -496,6 +778,16 @@ def test_old_checkpoint_initializes_local_decoder_and_migrates_config(tmp_path) 
     )
     assert migrated["decoder"]["proposal_center_max_offset_dref"] == 0.25
     assert notes
+
+
+def test_local_mask_training_cap_config_loads_and_defaults_for_old_configs() -> None:
+    assert config_from_dict({"local_masks": {}}).local_masks.train_max_queries_per_batch == 2
+    assert (
+        config_from_dict(
+            {"local_masks": {"train_max_queries_per_batch": 1}}
+        ).local_masks.train_max_queries_per_batch
+        == 1
+    )
 
 
 def test_curriculum_bootstraps_only_local_mask_and_joint_unfreezes_backbone() -> None:

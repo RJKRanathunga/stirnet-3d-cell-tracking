@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -95,6 +96,8 @@ class LocalNativeMaskDecoder(nn.Module):
         background_logit: float,
     ) -> None:
         super().__init__()
+        if cfg.train_max_queries_per_batch < 1:
+            raise ValueError("train_max_queries_per_batch must be at least 1")
         self.cfg = cfg
         self.background_logit = float(background_logit)
         input_channels = d0_channels + spatial_input_channels + 3 + 3
@@ -179,9 +182,36 @@ class LocalNativeMaskDecoder(nn.Module):
             ],
             dim=0,
         )[None]
-        logits = self(
-            local_spatial, query_embedding[None].to(dtype=d0_crop.dtype)
-        )[0]
+        parameter_dtype = next(self.parameters()).dtype
+        use_cuda_autocast = (
+            d0_crop.device.type == "cuda"
+            and d0_crop.dtype in (torch.float16, torch.bfloat16)
+        )
+        compute_context = (
+            torch.autocast(
+                device_type="cuda",
+                dtype=d0_crop.dtype,
+            )
+            if use_cuda_autocast
+            else nullcontext()
+        )
+        if use_cuda_autocast:
+            decoder_input = local_spatial
+            decoder_query = query_embedding[None].to(
+                device=d0_crop.device,
+                dtype=d0_crop.dtype,
+            )
+        else:
+            # Only the already-local crop is converted. Full-volume D0 and
+            # spatial tensors are never copied merely to satisfy parameter
+            # dtype outside an autocast context.
+            decoder_input = local_spatial.to(dtype=parameter_dtype)
+            decoder_query = query_embedding[None].to(
+                device=d0_crop.device,
+                dtype=parameter_dtype,
+            )
+        with compute_context:
+            logits = self(decoder_input, decoder_query)[0]
         logits = logits.masked_fill(
             ~geometry.support, self.background_logit
         )
