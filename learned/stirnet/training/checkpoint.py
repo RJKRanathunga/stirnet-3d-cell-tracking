@@ -98,10 +98,16 @@ def migrate_history_checkpoint_state_dict(model, state_dict: dict) -> tuple[dict
 
 def save_checkpoint(path, *, model, optimizer=None, scheduler=None, scaler=None, step=0, epoch=0, config=None, extra=None):
     path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
+    checkpoint_extra = dict(extra or {})
+    runtime_profile = getattr(config, "runtime_profile", None)
+    if runtime_profile is not None:
+        # Diagnostic only: load_checkpoint never applies this profile. The
+        # current launcher/process remains responsible for runtime selection.
+        checkpoint_extra.setdefault("runtime_profile", runtime_profile)
     payload={
         "model":model.state_dict(),"step":step,"epoch":epoch,
         "config":config.to_dict() if hasattr(config,"to_dict") else config,
-        "extra":extra or {},
+        "extra":checkpoint_extra,
     }
     if optimizer is not None: payload["optimizer"]=optimizer.state_dict()
     if scheduler is not None: payload["scheduler"]=scheduler.state_dict()

@@ -148,6 +148,9 @@ class DecoderConfig:
     dropout: float = 0.10
     mask_dim: int = 32
     mask_attention_threshold: float = 0.20
+    # Model/experiment setting, not a runtime-memory control. The query
+    # decoder adaptively pools spatial features above this threshold, so
+    # changing it changes the information presented to the model.
     max_spatial_tokens: int = 16384
     support_dilation_dref: float = 0.5
     primary_center_step_dref: float = 0.50
@@ -168,7 +171,9 @@ class LocalMaskConfig:
     query_channels: int = 32
     query_chunk_size: int = 1
     # Maximum matched spatial-proposal masks supervised per batch item in a
-    # training step. Evaluation remains exhaustive and streams every match.
+    # training step. This changes supervision density (but not model shapes or
+    # checkpoint compatibility). Evaluation remains exhaustive and streams
+    # every match.
     train_max_queries_per_batch: int = 2
     detach_dense_evidence: bool = True
 
@@ -254,6 +259,16 @@ class StirNetConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
+
+    @property
+    def runtime_profile(self) -> str | None:
+        """Last explicitly applied runtime profile, if any.
+
+        Runtime-profile identity is diagnostic process metadata rather than
+        model configuration, so it is deliberately excluded from ``to_dict``
+        and cannot constrain checkpoint loading.
+        """
+        return getattr(self, "_runtime_profile", None)
 
     def to_dict(self) -> dict:
         return asdict(self)

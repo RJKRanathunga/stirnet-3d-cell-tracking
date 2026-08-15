@@ -3,8 +3,11 @@ from .model import (
     LocalNativeMaskDecoder,
     ProposalConfig,
     RefinementCriterion,
+    RuntimeProfile,
     StirNet,
     StirNetConfig,
+    apply_runtime_profile,
+    describe_runtime_profile,
 )
 
 __all__ = [
@@ -14,4 +17,7 @@ __all__ = [
     "LocalMaskConfig",
     "LocalNativeMaskDecoder",
     "RefinementCriterion",
+    "RuntimeProfile",
+    "apply_runtime_profile",
+    "describe_runtime_profile",
 ]

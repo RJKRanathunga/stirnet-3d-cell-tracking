@@ -24,11 +24,28 @@ No `torch_geometric` dependency is required; the edge-aware GATv2-style layers a
 ## Minimal import
 
 ```python
-from stirnet import StirNet, StirNetConfig
+from learned.stirnet import (
+    RuntimeProfile,
+    StirNet,
+    StirNetConfig,
+    apply_runtime_profile,
+    describe_runtime_profile,
+)
 
 cfg = StirNetConfig()
+apply_runtime_profile(cfg, RuntimeProfile.LOCAL_6GB)
 model = StirNet(cfg)
+print(describe_runtime_profile(cfg))
 ```
+
+Select `local_6gb` or `cloud_24gb` explicitly before constructing the model and
+criterion. A runtime profile changes activation recomputation, exact chunk
+sizes, and the local-mask supervision cap; it does not change model parameter
+shapes. Model/experiment settings such as reduced channel widths and
+`decoder.max_spatial_tokens` remain orthogonal to the runtime profile. In
+particular, `max_spatial_tokens` changes adaptive pooling and model-visible
+information, while `local_masks.train_max_queries_per_batch` changes training
+supervision density without changing checkpoint compatibility.
 
 ## Training
 
