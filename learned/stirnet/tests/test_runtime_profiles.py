@@ -34,8 +34,8 @@ EXPECTED_RUNTIME_SETTINGS = {
         "losses.dense_chunk_voxels": 524_288,
         "local_masks.train_max_queries_per_batch": 2,
     },
-    RuntimeProfile.CLOUD_24GB: {
-        "runtime_profile": "cloud_24gb",
+    RuntimeProfile.CLOUD_48GB: {
+        "runtime_profile": "cloud_48gb",
         "training.activation_checkpointing": True,
         "training.checkpoint_spatial": True,
         "training.checkpoint_coreasoning": False,
@@ -77,7 +77,7 @@ def _small_model_config() -> StirNetConfig:
 
 @pytest.mark.parametrize(
     "profile",
-    [RuntimeProfile.LOCAL_6GB, RuntimeProfile.CLOUD_24GB],
+    [RuntimeProfile.LOCAL_6GB, RuntimeProfile.CLOUD_48GB],
 )
 def test_runtime_profile_selection_and_introspection(
     profile: RuntimeProfile,
@@ -194,7 +194,7 @@ def test_models_have_identical_shapes_and_strict_cross_profile_loading() -> None
         copy.deepcopy(base), RuntimeProfile.LOCAL_6GB
     )
     cloud_cfg = apply_runtime_profile(
-        copy.deepcopy(base), RuntimeProfile.CLOUD_24GB
+        copy.deepcopy(base), RuntimeProfile.CLOUD_48GB
     )
     local = StirNet(local_cfg)
     cloud = StirNet(cloud_cfg)
@@ -215,10 +215,10 @@ def test_runtime_profile_application_is_idempotent() -> None:
     cfg.losses.native_chunk_voxels = 17
     cfg.local_masks.train_max_queries_per_batch = 5
 
-    apply_runtime_profile(cfg, RuntimeProfile.CLOUD_24GB)
+    apply_runtime_profile(cfg, RuntimeProfile.CLOUD_48GB)
     first_config = copy.deepcopy(cfg.to_dict())
     first_description = describe_runtime_profile(cfg)
-    apply_runtime_profile(cfg, "cloud_24gb")
+    apply_runtime_profile(cfg, "cloud_48gb")
     assert cfg.to_dict() == first_config
     assert describe_runtime_profile(cfg) == first_description
 
@@ -227,7 +227,7 @@ def test_unknown_runtime_profile_fails_clearly() -> None:
     with pytest.raises(
         ValueError,
         match=(
-            "Unknown STIR-Net runtime profile.*local_6gb.*cloud_24gb"
+            "Unknown STIR-Net runtime profile.*local_6gb.*cloud_48gb"
         ),
     ):
         apply_runtime_profile(StirNetConfig(), "large_gpu")
@@ -241,7 +241,7 @@ def test_checkpoint_load_is_strict_and_does_not_force_saved_profile(
         copy.deepcopy(base), RuntimeProfile.LOCAL_6GB
     )
     cloud_cfg = apply_runtime_profile(
-        copy.deepcopy(base), RuntimeProfile.CLOUD_24GB
+        copy.deepcopy(base), RuntimeProfile.CLOUD_48GB
     )
     local = StirNet(local_cfg)
     cloud = StirNet(cloud_cfg)
@@ -253,7 +253,7 @@ def test_checkpoint_load_is_strict_and_does_not_force_saved_profile(
     assert "runtime_profile" not in raw["config"]
 
     load_checkpoint(path, cloud, map_location="cpu", strict=True)
-    assert cloud_cfg.runtime_profile == "cloud_24gb"
+    assert cloud_cfg.runtime_profile == "cloud_48gb"
     for key, value in local.state_dict().items():
         assert torch.equal(value, cloud.state_dict()[key]), key
 
@@ -263,4 +263,4 @@ def test_checkpoint_load_is_strict_and_does_not_force_saved_profile(
     del raw["extra"]["runtime_profile"]
     torch.save(raw, old_path)
     load_checkpoint(old_path, cloud, map_location="cpu", strict=True)
-    assert cloud_cfg.runtime_profile == "cloud_24gb"
+    assert cloud_cfg.runtime_profile == "cloud_48gb"

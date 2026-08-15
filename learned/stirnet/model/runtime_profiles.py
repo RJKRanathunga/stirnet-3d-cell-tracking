@@ -27,7 +27,7 @@ class RuntimeProfile(str, Enum):
     """Supported explicit STIR-Net execution profiles."""
 
     LOCAL_6GB = "local_6gb"
-    CLOUD_24GB = "cloud_24gb"
+    CLOUD_48GB = "cloud_48gb"
 
 
 @dataclass(frozen=True)
@@ -60,14 +60,16 @@ _RUNTIME_SETTINGS = {
         history_node_chunk_size=128,
         native_chunk_voxels=262_144,
         dense_chunk_voxels=524_288,
-        local_mask_train_cap=2,
+        local_mask_train_cap=1,
     ),
-    RuntimeProfile.CLOUD_24GB: _RuntimeSettings(
-        # The master switch remains enabled so spatial checkpointing can stay
-        # active while recomputation is disabled for the smaller paths.
+    RuntimeProfile.CLOUD_48GB: _RuntimeSettings(
+        # Use the larger VRAM budget to retain spatial activations, while
+        # co-reasoning remains checkpointed because its retained attention
+        # graph exceeds the practical 48 GB budget on the tested workload.
+        # History and streamed losses avoid checkpoint recomputation.
         activation_checkpointing=True,
-        checkpoint_spatial=True,
-        checkpoint_coreasoning=False,
+        checkpoint_spatial=False,
+        checkpoint_coreasoning=True,
         checkpoint_history=False,
         checkpoint_losses=False,
         temporal_query_chunk_size=64,

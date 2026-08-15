@@ -38,7 +38,7 @@ model = StirNet(cfg)
 print(describe_runtime_profile(cfg))
 ```
 
-Select `local_6gb` or `cloud_24gb` explicitly before constructing the model and
+Select `local_6gb` or `cloud_48gb` explicitly before constructing the model and
 criterion. A runtime profile changes activation recomputation, exact chunk
 sizes, and the local-mask supervision cap; it does not change model parameter
 shapes. Model/experiment settings such as reduced channel widths and
