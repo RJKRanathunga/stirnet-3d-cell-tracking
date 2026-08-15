@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+from torch import Tensor, nn
+import torch.nn.functional as F
+
+from ..config import SpatialConfig
+from ..types import SpatialDecodeState, SpatialPyramid
+from .acquisition import choose_downsample_stride, propagate_spacing
+from .blocks import DownsampleBlock, PhysicalAwareResBlock, UpsampleFuse
+
+
+class AnisotropyAwareSpatialBackbone(nn.Module):
+    """Native-resolution residual 3D U-Net with runtime physical downsampling."""
+
+    _STRIDES = (
+        (1, 1, 2),
+        (1, 2, 1),
+        (2, 1, 1),
+        (1, 2, 2),
+        (2, 1, 2),
+        (2, 2, 1),
+        (2, 2, 2),
+    )
+
+    def __init__(self, cfg: SpatialConfig):
+        super().__init__()
+        self.cfg = cfg
+        ch = cfg.channels
+        self.levels = nn.ModuleList(
+            [
+                nn.ModuleList(
+                    [
+                        PhysicalAwareResBlock(
+                            c,
+                            c,
+                            cfg.acquisition_dim,
+                            cfg.group_norm_max_groups,
+                        )
+                        for _ in range(cfg.blocks_per_level)
+                    ]
+                )
+                for c in ch
+            ]
+        )
+        self.downs = nn.ModuleList()
+        for i in range(3):
+            self.downs.append(
+                nn.ModuleDict(
+                    {
+                        "".join(map(str, stride)): DownsampleBlock(
+                            ch[i], ch[i + 1], stride
+                        )
+                        for stride in self._STRIDES
+                    }
+                )
+            )
+        self.up2 = UpsampleFuse(
+            ch[3], ch[2], ch[2], cfg.acquisition_dim, cfg.blocks_per_level, cfg.group_norm_max_groups
+        )
+        self.up1 = UpsampleFuse(
+            ch[2], ch[1], ch[1], cfg.acquisition_dim, cfg.blocks_per_level, cfg.group_norm_max_groups
+        )
+        self.up0 = UpsampleFuse(
+            ch[1], ch[0], ch[0], cfg.acquisition_dim, cfg.blocks_per_level, cfg.group_norm_max_groups
+        )
+
+    def forward(
+        self,
+        x0: Tensor,
+        spacing_um: Tensor,
+        acquisition_embedding: Tensor,
+        padding_mask: Tensor | None = None,
+    ) -> tuple[SpatialPyramid, SpatialDecodeState]:
+        features: list[Tensor] = []
+        spacings: list[Tensor] = []
+        strides: list[tuple[int, int, int]] = []
+        masks: list[Tensor] = []
+        x = x0
+        current_spacing = spacing_um
+        current_mask = padding_mask
+        for level_idx, blocks in enumerate(self.levels):
+            for block in blocks:
+                x = block(x, acquisition_embedding)
+            features.append(x)
+            spacings.append(current_spacing)
+            if current_mask is not None:
+                masks.append(current_mask)
+            if level_idx < 3:
+                stride = choose_downsample_stride(
+                    current_spacing, self.cfg.anisotropy_threshold
+                )
+                strides.append(stride)
+                x = self.downs[level_idx]["".join(map(str, stride))](x)
+                current_spacing = propagate_spacing(current_spacing, stride)
+                if current_mask is not None:
+                    current_mask = F.max_pool3d(
+                        current_mask.float().unsqueeze(1),
+                        kernel_size=stride,
+                        stride=stride,
+                    ).squeeze(1).bool()
+        pyramid = SpatialPyramid(
+            features=features,
+            spacings_um=spacings,
+            strides=strides,
+            padding_masks=masks if padding_mask is not None else None,
+        )
+        d2 = self.up2(features[3], features[2], acquisition_embedding)
+        d1 = self.up1(d2, features[1], acquisition_embedding)
+        d0 = self.up0(d1, features[0], acquisition_embedding)
+        return pyramid, SpatialDecodeState(d2=d2, d1=d1, d0=d0)

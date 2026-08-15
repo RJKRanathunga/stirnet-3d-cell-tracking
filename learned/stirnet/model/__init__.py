@@ -1,23 +1,38 @@
-from .config import LocalMaskConfig, ProposalConfig, StirNetConfig
-from .local_masks import LocalNativeMaskDecoder
+"""Spatial-first STIR-Net model package.
+
+The package is intentionally self-contained so it can be merged into the
+existing learned/stirnet/model tree by Codex after architecture review.
+"""
+
+from .config import ModelConfig, StirNetConfig
+from .geometry import GeometryCriterion, GeometryTargets, build_geometry_targets
+from .partition import RAGCriterion
 from .stir_net import StirNet
-from .losses import RefinementCriterion
-from .matcher import HungarianMatcher3D
-from .runtime_profiles import (
-    RuntimeProfile,
-    apply_runtime_profile,
-    describe_runtime_profile,
+from .types import (
+    GeometryState,
+    InstanceState,
+    PartitionState,
+    RAGState,
+    ReasoningState,
+    StirNetOutput,
+    TemporalInput,
+    TemporalState,
 )
 
 __all__ = [
     "StirNet",
+    "ModelConfig",
     "StirNetConfig",
-    "ProposalConfig",
-    "LocalMaskConfig",
-    "LocalNativeMaskDecoder",
-    "RefinementCriterion",
-    "HungarianMatcher3D",
-    "RuntimeProfile",
-    "apply_runtime_profile",
-    "describe_runtime_profile",
+    "StirNetOutput",
+    "GeometryState",
+    "RAGState",
+    "PartitionState",
+    "InstanceState",
+    "TemporalInput",
+    "TemporalState",
+    "ReasoningState",
+    "GeometryTargets",
+    "build_geometry_targets",
+    "GeometryCriterion",
+    "RAGCriterion",
 ]

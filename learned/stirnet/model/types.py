@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -14,20 +14,91 @@ class SpatialPyramid:
     strides: List[tuple[int, int, int]]
     padding_masks: Optional[List[Tensor]] = None
 
+    @property
+    def e0(self) -> Tensor:
+        return self.features[0]
+
+    @property
+    def e1(self) -> Tensor:
+        return self.features[1]
+
+    @property
+    def e2(self) -> Tensor:
+        return self.features[2]
+
+    @property
+    def e3(self) -> Tensor:
+        return self.features[3]
+
 
 @dataclass
-class TemporalNodeMemory:
-    """Fine per-detection memory retained after detection-GNN message passing."""
+class SpatialDecodeState:
+    d2: Tensor
+    d1: Tensor
+    d0: Tensor
 
-    tokens: Tensor                    # [N,D]
-    observed_ref_um: Tensor           # [N,3], physical observed zyx
-    projected_ref_um: Tensor          # [N,3], tracklet target-frame zyx
-    time_offset: Tensor               # [N], signed frames from target
-    tracklet_id: Tensor               # [N], packed coarse-memory index
-    batch_index: Tensor               # [N], logical sample index
-    history_valid: Tensor             # [N]
-    node_ids: Optional[Tensor] = None  # [N], preprocessing/debug identity
-    event_features: Optional[Tensor] = None  # [N,8], explicit event metadata
+
+@dataclass
+class GeometryState:
+    foreground_logits: Tensor
+    surface_logits: Tensor
+    separator_logits: Tensor
+    sdf: Tensor
+    flow: Tensor
+    centroid_offset: Tensor
+    seed_logits: Tensor
+    features: Tensor
+
+    def probabilities(self) -> Dict[str, Tensor]:
+        return {
+            "foreground": self.foreground_logits.sigmoid(),
+            "surface": self.surface_logits.sigmoid(),
+            "separator": self.separator_logits.sigmoid(),
+            "seed": self.seed_logits.sigmoid(),
+        }
+
+
+@dataclass
+class RAGState:
+    node_features: Tensor
+    node_embeddings: Tensor
+    node_batch: Tensor
+    node_supervoxel_id: Tensor
+    node_centroid_um: Tensor
+    node_volume_voxels: Tensor
+    edge_index: Tensor
+    edge_features: Tensor
+    edge_embeddings: Tensor
+    spatial_edge_logits: Tensor
+    edge_batch: Tensor
+    supervoxel_labels: List[Tensor]
+    node_offsets: Tensor
+
+    @property
+    def is_empty(self) -> bool:
+        return self.node_features.shape[0] == 0
+
+
+@dataclass
+class PartitionState:
+    labels: List[Tensor]
+    node_component: Tensor
+    node_component_global: Tensor
+    component_count_per_batch: Tensor
+    edge_logits: Tensor
+
+
+@dataclass
+class InstanceState:
+    tokens: Tensor
+    ref_um: Tensor
+    batch_index: Tensor
+    local_ids: Tensor
+    quality_logits: Tensor
+    labels: List[Tensor]
+    token_offsets: Tensor
+    node_to_instance: Tensor
+    spatial_tokens: Optional[Tensor] = None
 
     @property
     def is_empty(self) -> bool:
@@ -35,77 +106,89 @@ class TemporalNodeMemory:
 
 
 @dataclass
+class TemporalInput:
+    graph_x: Tensor
+    graph_edge_index: Tensor
+    graph_edge_attr: Tensor
+    tracklet_id: Tensor
+    temporal_ref_um: Tensor
+    temporal_status: Tensor
+    temporal_batch: Tensor
+    node_history_embedding: Optional[Tensor] = None
+
+
+@dataclass
 class TemporalState:
     tokens: Tensor
     ref_um: Tensor
-    ref_cellscale: Tensor
+    batch_index: Tensor
     salience: Tensor
     reliability: Tensor
     status: Tensor
-    edge_index: Tensor
-    edge_attr: Tensor
-    batch_index: Tensor
-    history_support: Optional[Tensor] = None
-    history_support_valid: Optional[Tensor] = None
-    history_support_dt: Optional[Tensor] = None
-    history_support_center_um: Optional[Tensor] = None
-    history_support_extent_um: Optional[Tensor] = None
-    node_history_valid: Optional[Tensor] = None
-    history_gate: Optional[Tensor] = None
-    best_current_component_id: Optional[Tensor] = None
-    best_component_overlap: Optional[Tensor] = None
-    second_best_component_overlap: Optional[Tensor] = None
-    node_memory: Optional[TemporalNodeMemory] = None
+    node_tokens: Optional[Tensor] = None
 
     @property
     def is_empty(self) -> bool:
-        return self.tokens.numel() == 0 or self.tokens.shape[0] == 0
+        return self.tokens.shape[0] == 0
 
 
 @dataclass
-class QueryState:
-    embeddings: Tensor
-    references_cellscale: Tensor
-    query_types: Tensor
-    padding_mask: Tensor
-    source_instance_ids: Tensor
-    temporal_salience: Tensor
-    temporal_reliability: Tensor
-    initial_references_cellscale: Optional[Tensor] = None
-    competition_group_ids: Optional[Tensor] = None
+class ReasoningState:
+    instance_tokens: Tensor
+    instance_exist_logits: Tensor
+    split_logits: Tensor
+    temporal_support: Tensor
+    temporal_attention_entropy: Tensor
+    edge_temporal_delta: Tensor
+    edge_temporal_gate: Tensor
+    final_edge_logits: Tensor
+    recovery_track_indices: Tensor
+    recovery_scores: Tensor
 
 
 @dataclass
-class SpatialProposalState:
-    embeddings: Tensor
-    references_cellscale: Tensor
-    scores: Tensor
-    padding_mask: Tensor
-    source_instance_ids: Tensor
-    fallback_mask: Tensor
+class RefinementRequest:
+    batch_index: int
+    center_um: Tensor
+    query_token: Tensor
+    kind: str
+    source_index: int
+    score: float
+
+
+@dataclass
+class RefinementState:
+    geometry: GeometryState
+    requests: List[RefinementRequest] = field(default_factory=list)
+    applied_count: int = 0
 
 
 @dataclass
 class StirNetOutput:
-    exist_logits: Tensor
-    centers_cellscale: Tensor
-    coarse_mask_logits: Tensor
-    coarse_spacing_um: Tensor
-    query_embeddings: Tensor
-    native_mask_embeddings: Tensor
-    query_types: Tensor
-    query_padding_mask: Tensor
-    source_instance_ids: Tensor
-    query_initial_references_cellscale: Tensor
-    temporal_salience: Tensor
-    temporal_reliability: Tensor
-    aux_outputs: List[Dict[str, Tensor]]
-    dense_outputs: Dict[str, Tensor]
-    mask_features: Tensor
-    spacing_um: Tensor
-    dref_um: Tensor
-    instance_labels: Tensor
+    final_labels: List[Tensor]
+    centers_um: List[Tensor]
+    geometry: GeometryState
+    spatial_pyramid: SpatialPyramid
+    decoded_spatial: SpatialDecodeState
+    rag: RAGState
+    spatial_partition: PartitionState
+    provisional_instances: InstanceState
+    temporal: TemporalState
+    reasoning: ReasoningState
+    final_partition: PartitionState
+    refinement: Optional[RefinementState] = None
     debug: Optional[Dict[str, Any]] = None
-    proposals: Optional[SpatialProposalState] = None
-    d0_features: Optional[Tensor] = None
-    spatial_inputs: Optional[Tensor] = None
+
+    @property
+    def dense_outputs(self) -> Dict[str, Tensor]:
+        # Compatibility helper for existing diagnostics/training code.
+        return {
+            "foreground_logits": self.geometry.foreground_logits,
+            "surface_boundary_logits": self.geometry.surface_logits,
+            "boundary_logits": self.geometry.separator_logits,
+            "separator_logits": self.geometry.separator_logits,
+            "sdf": self.geometry.sdf,
+            "flow": self.geometry.flow,
+            "centroid_offset": self.geometry.centroid_offset,
+            "seed_logits": self.geometry.seed_logits,
+        }
