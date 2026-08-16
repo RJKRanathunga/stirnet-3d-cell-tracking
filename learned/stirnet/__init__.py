@@ -3,11 +3,13 @@
 from .model import (
     GeometryCriterion,
     GeometryTargets,
+    GeometryForwardOutput,
     ModelConfig,
     RAGCriterion,
     StirNet,
     StirNetConfig,
     StirNetOutput,
+    SpatialForwardOutput,
     TemporalInput,
     build_geometry_targets,
 )
@@ -17,6 +19,8 @@ __all__ = [
     "ModelConfig",
     "StirNetConfig",
     "StirNetOutput",
+    "GeometryForwardOutput",
+    "SpatialForwardOutput",
     "TemporalInput",
     "GeometryTargets",
     "build_geometry_targets",

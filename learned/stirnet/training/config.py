@@ -18,6 +18,7 @@ class LossConfig:
     split_min_gt_coverage: float = 0.20
     recovery_search_radius_dref: float = 0.50
     recovery_missing_gt_coverage: float = 0.25
+    recovery_min_pred_precision: float = 0.10
 
 
 @dataclass
@@ -37,6 +38,9 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
     amp_dtype: str = "bf16"
+    refinement_teacher_forcing_start: float = 1.0
+    refinement_teacher_forcing_end: float = 0.0
+    refinement_teacher_forcing_decay_steps: int = 2_000
     loss: LossConfig = field(default_factory=LossConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
 
@@ -49,6 +53,12 @@ class TrainingConfig:
             raise ValueError("max_grad_norm must be positive")
         if self.amp_dtype not in {"fp16", "bf16", "fp32"}:
             raise ValueError("amp_dtype must be fp16, bf16, or fp32")
+        if not 0.0 <= self.refinement_teacher_forcing_start <= 1.0:
+            raise ValueError("refinement_teacher_forcing_start must be in [0, 1]")
+        if not 0.0 <= self.refinement_teacher_forcing_end <= 1.0:
+            raise ValueError("refinement_teacher_forcing_end must be in [0, 1]")
+        if self.refinement_teacher_forcing_decay_steps < 0:
+            raise ValueError("refinement_teacher_forcing_decay_steps cannot be negative")
         durations = (
             self.curriculum.geometry_bootstrap_steps,
             self.curriculum.spatial_partition_steps,

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy import ndimage as ndi
 
-from .targets import build_gt_targets, estimate_dref_um, extract_instance_metadata, make_instance_boundary
+from .targets import build_gt_targets, estimate_model_dref_um, extract_instance_metadata, make_instance_boundary
 from .graph_builder import DETECTION_EDGE_DIM
 from ..temporal_events import TEMPORAL_NODE_EVENT_FEATURE_DIM
 
@@ -18,6 +19,70 @@ SPATIAL_CHANNEL_NAMES = (
 )
 
 
+def renormalize_cached_dref(
+    sample: dict,
+    *,
+    cached_dref_um: float,
+    model_dref_um: float,
+    model_dref_source: str = "current_segmentation",
+) -> dict:
+    """Convert dref-normalized cached inputs without using GT-derived scale."""
+    result = dict(sample)
+    scale = float(cached_dref_um) / max(float(model_dref_um), 1e-6)
+    if "spatial_inputs" in result:
+        spatial = torch.as_tensor(result["spatial_inputs"]).clone()
+        if spatial.ndim == 5:
+            spatial[:, 2] *= scale
+        elif spatial.ndim == 4:
+            spatial[2] *= scale
+        else:
+            raise ValueError("spatial_inputs must be [C,Z,Y,X] or [B,C,Z,Y,X]")
+        result["spatial_inputs"] = spatial
+    if "graph_x" in result:
+        graph_x = result["graph_x"].clone()
+        for start, stop in ((1, 4), (5, 11), (17, 23), (25, 27)):
+            graph_x[:, start:stop] *= scale
+        result["graph_x"] = graph_x
+    if "graph_edge_attr" in result:
+        edge_attr = result["graph_edge_attr"].clone()
+        edge_attr[:, 1:5] *= scale
+        edge_attr[:, 7] *= scale
+        result["graph_edge_attr"] = edge_attr
+    history = result.get("node_instance_grid")
+    if history is not None and torch.as_tensor(history).numel():
+        history = torch.as_tensor(history)
+        original_dtype = history.dtype
+        values = history.float()
+        extent_scale = float(model_dref_um) / max(float(cached_dref_um), 1e-6)
+        theta = torch.zeros(
+            (values.shape[0], 3, 4), device=values.device, dtype=values.dtype
+        )
+        theta[:, 0, 0] = extent_scale
+        theta[:, 1, 1] = extent_scale
+        theta[:, 2, 2] = extent_scale
+        grid = F.affine_grid(theta, values.shape, align_corners=True)
+        values = F.grid_sample(
+            values,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        values[:, 1].mul_(scale).clamp_(-1.0, 1.0)
+        result["node_instance_grid"] = values.to(original_dtype)
+    result["dref_um"] = torch.as_tensor(model_dref_um, dtype=torch.float32)
+    metadata = dict(result.get("metadata", {}))
+    metadata.update(
+        {
+            "model_dref_um": float(model_dref_um),
+            "model_dref_source": model_dref_source,
+            "legacy_cached_dref_um": float(cached_dref_um),
+        }
+    )
+    result["metadata"] = metadata
+    return result
+
+
 def robust_normalize(raw: np.ndarray, low_pct: float = 1.0, high_pct: float = 99.8) -> np.ndarray:
     raw=np.asarray(raw,np.float32)
     lo,hi=np.percentile(raw,[low_pct,high_pct])
@@ -28,11 +93,16 @@ def robust_normalize(raw: np.ndarray, low_pct: float = 1.0, high_pct: float = 99
 def build_spatial_channels(raw_norm: np.ndarray, instance_labels: np.ndarray, spacing_um, dref_um: float, marker_heatmap=None) -> np.ndarray:
     foreground=(instance_labels>0).astype(np.float32)
     edt=np.zeros_like(raw_norm,np.float32)
-    for label in np.unique(instance_labels):
-        if label<=0:continue
-        m=instance_labels==label
-        d=ndi.distance_transform_edt(m,sampling=spacing_um)/max(dref_um,1e-6)
-        edt[m]=d[m]
+    for label, bbox in enumerate(ndi.find_objects(instance_labels), 1):
+        if bbox is None:
+            continue
+        local = instance_labels[bbox] == label
+        padded = np.pad(local, 1, mode="constant", constant_values=False)
+        distance = ndi.distance_transform_edt(
+            padded, sampling=spacing_um
+        )[tuple(slice(1, -1) for _ in range(3))]
+        view = edt[bbox]
+        view[local] = distance[local] / max(dref_um, 1e-6)
     boundary=make_instance_boundary(instance_labels).astype(np.float32)
     marker=np.zeros_like(raw_norm,np.float32) if marker_heatmap is None else np.asarray(marker_heatmap,np.float32)
     spatial = np.stack([raw_norm,foreground,edt,boundary,marker],axis=0)
@@ -55,7 +125,17 @@ def build_cached_sample(
 ) -> dict:
     spacing=tuple(float(v) for v in spacing_um)
     raw_norm=robust_normalize(raw) if normalize_raw else np.asarray(raw,np.float32)
-    dref=float(dref_um if dref_um is not None else estimate_dref_um(gt_labels,spacing))
+    dref=float(
+        dref_um
+        if dref_um is not None
+        else estimate_model_dref_um(np.asarray(instance_labels), spacing)
+    )
+    sample_metadata = dict(metadata or {})
+    sample_metadata.setdefault(
+        "model_dref_source",
+        "explicit_non_gt" if dref_um is not None else "current_segmentation",
+    )
+    sample_metadata["model_dref_um"] = dref
     spatial=build_spatial_channels(raw_norm,np.asarray(instance_labels),spacing,dref,marker_heatmap)
     inst=extract_instance_metadata(np.asarray(instance_labels),raw_norm,spacing,dref,spatial[4])
     target=build_gt_targets(
@@ -70,7 +150,7 @@ def build_cached_sample(
         "instance_features":inst.features,
         "instance_centroids_um":inst.centroids_um,
         "target":target,
-        "metadata":metadata or {},
+        "metadata":sample_metadata,
     }
     if temporal_graph: sample.update(temporal_graph)
     else:

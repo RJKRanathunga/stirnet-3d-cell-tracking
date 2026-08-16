@@ -14,6 +14,7 @@ from learned.stirnet.model.types import (
 )
 from learned.stirnet.training import StirNetCriterion, Trainer, build_instance_targets
 from learned.stirnet.training.trainer import gt_labels_from_batch
+from learned.stirnet.training.criterion import teacher_forcing_fraction
 
 from .conftest import fixed_stage_training, small_model_config, synthetic_batch
 
@@ -33,7 +34,7 @@ def test_geometry_backward_reaches_spatial_modules():
     batch = synthetic_batch(temporal=False)
     output = model(
         batch["spatial_inputs"], batch["spacing_um"], batch["dref_um"],
-        run_refinement=False, apply_existence_filter=False,
+        execution_stage="geometry",
     )
     criterion = StirNetCriterion(cfg)
     losses = criterion(
@@ -208,8 +209,8 @@ def test_local_refined_geometry_loss_reaches_refiner():
 
 def test_one_complete_training_step_is_finite():
     model_config = small_model_config()
-    model_config.refinement.split_threshold = 0.0
-    model_config.refinement.recovery_threshold = 0.0
+    model_config.refinement.split_threshold = 1.1
+    model_config.refinement.recovery_threshold = 1.1
     model = StirNet(model_config)
     with torch.no_grad():
         model.geometry_decoder.foreground.bias.fill_(4.0)
@@ -226,3 +227,31 @@ def test_one_complete_training_step_is_finite():
     assert metrics["grad_instances"] > 0
     assert metrics["grad_temporal"] > 0
     assert metrics["grad_refinement"] > 0
+    assert metrics["refinement_teacher_requests"] > 0
+    assert metrics["refinement_total_requests"] <= model_config.refinement.max_rois_per_batch
+
+
+def test_refinement_teacher_forcing_can_be_disabled():
+    model_config = small_model_config()
+    model_config.refinement.split_threshold = 1.1
+    model_config.refinement.recovery_threshold = 1.1
+    model_config.refinement.ambiguity_logit_abs_max = -1.0
+    training = fixed_stage_training("refinement_joint")
+    training.refinement_teacher_forcing_start = 0.0
+    training.refinement_teacher_forcing_end = 0.0
+    trainer = Trainer(StirNet(model_config), training, device="cpu")
+    metrics = trainer.train_step(synthetic_batch(temporal=True))
+    assert metrics["refinement_teacher_forcing_fraction"] == 0.0
+    assert metrics["refinement_teacher_requests"] == 0.0
+    assert metrics["refinement_total_requests"] == 0.0
+
+
+def test_refinement_teacher_forcing_schedule_decays_to_model_only():
+    training = fixed_stage_training("refinement_joint")
+    training.refinement_teacher_forcing_start = 1.0
+    training.refinement_teacher_forcing_end = 0.0
+    training.refinement_teacher_forcing_decay_steps = 100
+    assert teacher_forcing_fraction(training, 0) == 1.0
+    assert teacher_forcing_fraction(training, 50) == 0.5
+    assert teacher_forcing_fraction(training, 100) == 0.0
+    assert teacher_forcing_fraction(training, 1_000) == 0.0

@@ -10,11 +10,13 @@ from .partition import RAGCriterion
 from .stir_net import StirNet
 from .types import (
     GeometryState,
+    GeometryForwardOutput,
     InstanceState,
     PartitionState,
     RAGState,
     ReasoningState,
     StirNetOutput,
+    SpatialForwardOutput,
     TemporalInput,
     TemporalState,
 )
@@ -24,6 +26,8 @@ __all__ = [
     "ModelConfig",
     "StirNetConfig",
     "StirNetOutput",
+    "GeometryForwardOutput",
+    "SpatialForwardOutput",
     "GeometryState",
     "RAGState",
     "PartitionState",

@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Iterable
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from ..model import GeometryCriterion, RAGCriterion, StirNetOutput
-from ..model.geometry.targets import build_geometry_targets
+from ..model import GeometryCriterion, RAGCriterion
+from ..model.geometry.targets import GeometryTargets, build_geometry_targets
+from ..model.types import (
+    GeometryForwardOutput,
+    InstanceState,
+    RAGState,
+    ReasoningState,
+    RefinementRequest,
+    SpatialForwardOutput,
+    StirNetOutput,
+    TemporalState,
+)
+from ..model.utils.contingency import label_contingency
 from ..model.utils.physical import physical_crop_slices
-from .config import LossConfig
+from .config import LossConfig, TrainingConfig
 
 
 @dataclass
@@ -55,24 +67,19 @@ def build_instance_targets(
     split_min_gt_coverage: float,
     device: torch.device,
 ) -> InstanceTargets:
+    """Derive instance targets from one contingency scan per batch item."""
     existence_rows: list[Tensor] = []
     split_rows: list[Tensor] = []
     for batch_index, predicted in enumerate(provisional_labels):
         gt = gt_labels[batch_index].to(predicted.device).long()
-        for instance_id in range(1, int(predicted.max().item()) + 1):
-            mask = predicted == instance_id
-            pred_count = mask.sum().float().clamp_min(1)
-            values = gt[mask]
-            values = values[values > 0]
-            if values.numel() == 0:
-                existence_rows.append(pred_count.new_tensor(0.0))
-                split_rows.append(pred_count.new_tensor(0.0))
-                continue
-            ids, intersections = torch.unique(values, return_counts=True)
-            intersections = intersections.float()
-            gt_counts = torch.stack([(gt == gt_id).sum() for gt_id in ids]).float()
-            pred_fraction = intersections / pred_count
-            gt_coverage = intersections / gt_counts.clamp_min(1)
+        count = int(predicted.max().item())
+        existence = torch.zeros(count, device=predicted.device)
+        split = torch.zeros_like(existence)
+        table = label_contingency(predicted, gt)
+        if table.row_ids.numel() and table.column_ids.numel():
+            intersections = table.intersections.float()
+            pred_fraction = intersections / table.row_counts[:, None].clamp_min(1)
+            gt_coverage = intersections / table.column_counts[None, :].clamp_min(1)
             meaningful = (
                 (pred_fraction >= existence_min_precision)
                 & (gt_coverage >= existence_min_gt_coverage)
@@ -81,15 +88,97 @@ def build_instance_targets(
                 (pred_fraction >= split_min_pred_fraction)
                 & (gt_coverage >= split_min_gt_coverage)
             )
-            existence_rows.append(meaningful.any().float())
-            split_rows.append((split_parts.sum() >= 2).float())
+            rows = table.row_ids - 1
+            existence[rows] = meaningful.any(dim=1).float()
+            split[rows] = (split_parts.sum(dim=1) >= 2).float()
+        existence_rows.append(existence)
+        split_rows.append(split)
     if not existence_rows:
         empty = torch.zeros((0,), device=device)
         return InstanceTargets(empty, empty)
     return InstanceTargets(
-        torch.stack(existence_rows).to(device=device),
-        torch.stack(split_rows).to(device=device),
+        torch.cat(existence_rows).to(device=device),
+        torch.cat(split_rows).to(device=device),
     )
+
+
+def _recovery_targets_from_states(
+    temporal: TemporalState,
+    provisional_labels: list[Tensor],
+    gt_labels: Tensor,
+    spacing_um: Tensor,
+    dref_um: Tensor,
+    *,
+    search_radius_dref: float,
+    missing_gt_coverage: float,
+    min_provisional_precision: float,
+) -> RecoveryTargets:
+    count = temporal.tokens.shape[0]
+    target = temporal.tokens.new_zeros((count,))
+    valid = torch.zeros(count, device=target.device, dtype=torch.bool)
+    for batch_index, provisional in enumerate(provisional_labels):
+        gt = gt_labels[batch_index].to(target.device).long()
+        table = label_contingency(provisional.to(target.device), gt)
+        best_coverage = target.new_zeros((table.column_ids.numel(),))
+        if table.intersections.numel():
+            precision = (
+                table.intersections.float()
+                / table.row_counts[:, None].clamp_min(1).float()
+            )
+            coverage = (
+                table.intersections.float()
+                / table.column_counts[None, :].clamp_min(1).float()
+            )
+            best_coverage = (
+                coverage
+                * (precision >= min_provisional_precision).to(coverage.dtype)
+            ).max(dim=0).values
+        rows = torch.nonzero(
+            temporal.batch_index == batch_index, as_tuple=False
+        ).flatten()
+        radius_um = search_radius_dref * dref_um[batch_index]
+        for row in rows.tolist():
+            status = temporal.status[row]
+            if status.shape[0] > 5 and bool(status[5] > 0.5):
+                continue
+            slices = physical_crop_slices(
+                tuple(gt.shape),
+                spacing_um[batch_index],
+                temporal.ref_um[row],
+                radius_um,
+            )
+            local = gt[slices]
+            points = torch.nonzero(local > 0, as_tuple=False)
+            if points.numel() == 0:
+                continue
+            origin = torch.as_tensor(
+                [axis.start for axis in slices],
+                device=points.device,
+                dtype=torch.float32,
+            )
+            absolute = points.float() + origin
+            extent = (
+                torch.as_tensor(gt.shape, device=points.device).float() - 1
+            ) * spacing_um[batch_index]
+            points_um = absolute * spacing_um[batch_index] - 0.5 * extent
+            distances = torch.linalg.vector_norm(
+                points_um - temporal.ref_um[row].float(), dim=-1
+            )
+            nearest = distances.argmin()
+            if bool(distances[nearest] > radius_um):
+                continue
+            voxel = absolute[nearest].long()
+            gt_id = gt[voxel[0], voxel[1], voxel[2]]
+            column = torch.searchsorted(table.column_ids, gt_id)
+            coverage = target.new_tensor(0.0)
+            if (
+                column < table.column_ids.numel()
+                and table.column_ids[column] == gt_id
+            ):
+                coverage = best_coverage[column]
+            target[row] = (coverage < missing_gt_coverage).float()
+            valid[row] = True
+    return RecoveryTargets(target, valid)
 
 
 def build_recovery_targets(
@@ -100,134 +189,286 @@ def build_recovery_targets(
     *,
     search_radius_dref: float,
     missing_gt_coverage: float,
+    min_provisional_precision: float = 0.10,
 ) -> RecoveryTargets:
-    count = output.temporal.tokens.shape[0]
-    target = output.temporal.tokens.new_zeros((count,))
-    valid = torch.zeros(count, device=target.device, dtype=torch.bool)
-    for row in range(count):
-        batch_index = int(output.temporal.batch_index[row].item())
-        status = output.temporal.status[row]
-        if status.shape[0] > 5 and bool(status[5] > 0.5):
-            continue
-        gt = gt_labels[batch_index].to(target.device).long()
-        radius_um = search_radius_dref * dref_um[batch_index]
-        slices = physical_crop_slices(
-            tuple(gt.shape),
-            spacing_um[batch_index],
-            output.temporal.ref_um[row],
-            radius_um,
+    return _recovery_targets_from_states(
+        output.temporal,
+        output.initial_provisional_instances.labels,
+        gt_labels,
+        spacing_um,
+        dref_um,
+        search_radius_dref=search_radius_dref,
+        missing_gt_coverage=missing_gt_coverage,
+        min_provisional_precision=min_provisional_precision,
+    )
+
+
+def teacher_forcing_fraction(config: TrainingConfig, step: int) -> float:
+    duration = config.refinement_teacher_forcing_decay_steps
+    if duration <= 0:
+        return float(config.refinement_teacher_forcing_end)
+    progress = min(max(step, 0) / duration, 1.0)
+    return float(
+        config.refinement_teacher_forcing_start
+        + progress
+        * (
+            config.refinement_teacher_forcing_end
+            - config.refinement_teacher_forcing_start
         )
-        local = gt[slices]
-        points = torch.nonzero(local > 0, as_tuple=False)
-        if points.numel() == 0:
-            continue
-        origin = torch.tensor(
-            [axis.start for axis in slices], device=points.device, dtype=torch.float32
+    )
+
+
+def build_teacher_refinement_requests(
+    instances: InstanceState,
+    rag: RAGState,
+    temporal: TemporalState,
+    reasoning: ReasoningState,
+    dref_um: Tensor,
+    *,
+    gt_labels: Tensor,
+    spacing_um: Tensor,
+    loss_config: LossConfig,
+    rag_criterion: RAGCriterion,
+    fraction: float,
+    ambiguity_logit_abs_max: float,
+    target_cache: dict[str, object] | None = None,
+) -> list[RefinementRequest]:
+    """Use GT only to select useful training ROIs, never as refiner input."""
+    if fraction <= 0:
+        return []
+    requests: list[RefinementRequest] = []
+    instance_targets = build_instance_targets(
+        instances.labels,
+        gt_labels,
+        existence_min_precision=loss_config.existence_min_precision,
+        existence_min_gt_coverage=loss_config.existence_min_gt_coverage,
+        split_min_pred_fraction=loss_config.split_min_pred_fraction,
+        split_min_gt_coverage=loss_config.split_min_gt_coverage,
+        device=instances.tokens.device,
+    )
+    for row in torch.nonzero(instance_targets.split > 0.5, as_tuple=False).flatten().tolist():
+        requests.append(
+            RefinementRequest(
+                batch_index=int(instances.batch_index[row].item()),
+                center_um=instances.ref_um[row],
+                query_token=reasoning.instance_tokens[row],
+                kind="split",
+                source_index=row,
+                score=3.0,
+                selection_source="teacher",
+            )
         )
-        absolute = points.float() + origin
-        extent = (gt.new_tensor(gt.shape).float() - 1) * spacing_um[batch_index]
-        points_um = absolute * spacing_um[batch_index] - 0.5 * extent
-        distances = torch.linalg.vector_norm(
-            points_um - output.temporal.ref_um[row].float(), dim=-1
+    recovery = _recovery_targets_from_states(
+        temporal,
+        instances.labels,
+        gt_labels,
+        spacing_um,
+        dref_um,
+        search_radius_dref=loss_config.recovery_search_radius_dref,
+        missing_gt_coverage=loss_config.recovery_missing_gt_coverage,
+        min_provisional_precision=loss_config.recovery_min_pred_precision,
+    )
+    recovery_rows = torch.nonzero(
+        recovery.valid & (recovery.target > 0.5), as_tuple=False
+    ).flatten()
+    for row in recovery_rows.tolist():
+        requests.append(
+            RefinementRequest(
+                batch_index=int(temporal.batch_index[row].item()),
+                center_um=temporal.ref_um[row],
+                query_token=temporal.tokens[row],
+                kind="recovery",
+                source_index=row,
+                score=3.0,
+                selection_source="teacher",
+            )
         )
-        nearest = int(distances.argmin().item())
-        if bool(distances[nearest] > radius_um):
-            continue
-        voxel = absolute[nearest].long()
-        gt_id = int(gt[voxel[0], voxel[1], voxel[2]].item())
-        if gt_id <= 0:
-            continue
-        gt_mask = gt == gt_id
-        provisional = output.initial_provisional_instances.labels[batch_index]
-        overlaps = provisional[gt_mask]
-        overlaps = overlaps[overlaps > 0]
-        coverage = 0.0
-        if overlaps.numel():
-            _, counts = torch.unique(overlaps, return_counts=True)
-            coverage = float(counts.max().item()) / max(int(gt_mask.sum().item()), 1)
-        target[row] = float(coverage < missing_gt_coverage)
-        valid[row] = True
-    return RecoveryTargets(target, valid)
+    rag_targets = rag_criterion.build_targets(rag, gt_labels)
+    if target_cache is not None:
+        target_cache.update(
+            {
+                "instance": instance_targets,
+                "recovery": recovery,
+                "rag": rag_targets,
+            }
+        )
+    if rag.edge_index.shape[1] and reasoning.instance_tokens.numel():
+        predicted = rag.spatial_edge_logits.detach() >= 0
+        useful = rag_targets.valid & (
+            (predicted != rag_targets.target.bool())
+            | (rag.spatial_edge_logits.detach().abs() <= ambiguity_logit_abs_max)
+        )
+        for edge_row in torch.nonzero(useful, as_tuple=False).flatten().tolist():
+            a = int(rag.edge_index[0, edge_row].item())
+            b = int(rag.edge_index[1, edge_row].item())
+            ia = int(instances.node_to_instance[a].item())
+            ib = int(instances.node_to_instance[b].item())
+            requests.append(
+                RefinementRequest(
+                    batch_index=int(rag.edge_batch[edge_row].item()),
+                    center_um=0.5
+                    * (rag.node_centroid_um[a] + rag.node_centroid_um[b]),
+                    query_token=0.5
+                    * (
+                        reasoning.instance_tokens[ia]
+                        + reasoning.instance_tokens[ib]
+                    ),
+                    kind="edge",
+                    source_index=edge_row,
+                    score=2.0,
+                    selection_source="teacher",
+                )
+            )
+    requests.sort(key=lambda request: request.score, reverse=True)
+    keep = min(len(requests), max(1, math.ceil(fraction * len(requests))))
+    return requests[:keep]
 
 
 class StirNetCriterion(nn.Module):
-    """Differentiable V2 objective applied before hard watershed/union-find decisions."""
-
-    _STAGE_LOSSES = {
-        "geometry_bootstrap": frozenset({"geometry"}),
-        "spatial_partition": frozenset({"geometry", "spatial_rag"}),
-        "instance_temporal": frozenset(
-            {"geometry", "spatial_rag", "final_rag", "existence", "split", "recovery"}
-        ),
-        "refinement_joint": frozenset(
-            {"geometry", "spatial_rag", "final_rag", "existence", "split", "recovery"}
-        ),
-    }
+    """Stage-aware V2 supervision before hard watershed/union-find decisions."""
 
     def __init__(self, model_config, loss_config: LossConfig | None = None):
         super().__init__()
         self.model_config = model_config
         self.cfg = loss_config or LossConfig()
         self.geometry = GeometryCriterion(model_config.geometry)
-        self.rag = RAGCriterion()
+        self.rag = RAGCriterion(model_config.partition)
+
+    def build_geometry_targets(
+        self,
+        gt_labels: Tensor,
+        spacing_um: Tensor,
+        dref_um: Tensor,
+        *,
+        device: torch.device | None = None,
+    ) -> GeometryTargets:
+        geometry_cfg = self.model_config.geometry
+        return build_geometry_targets(
+            gt_labels.detach().cpu().long(),
+            spacing_um.detach().cpu(),
+            dref_um.detach().cpu(),
+            sdf_clip_dref=geometry_cfg.sdf_clip_dref,
+            surface_target_sigma_um=geometry_cfg.surface_target_sigma_um,
+            separator_target_sigma_um=geometry_cfg.separator_target_sigma_um,
+            device=device,
+        )
 
     def forward(
         self,
-        output: StirNetOutput,
+        output: GeometryForwardOutput | SpatialForwardOutput | StirNetOutput,
         gt_labels: Tensor,
         spacing_um: Tensor,
         dref_um: Tensor,
         *,
         stage: str = "refinement_joint",
+        precomputed_geometry_targets: GeometryTargets | None = None,
+        precomputed_discrete_targets: dict[str, object] | None = None,
     ) -> dict[str, Tensor]:
-        if stage not in self._STAGE_LOSSES:
+        if stage not in {
+            "geometry_bootstrap",
+            "spatial_partition",
+            "instance_temporal",
+            "refinement_joint",
+        }:
             raise ValueError(f"Unknown V2 training stage: {stage}")
-        active = self._STAGE_LOSSES[stage]
         device = output.geometry.sdf.device
-        gt_cpu = gt_labels.detach().cpu().long()
-        geometry_target = build_geometry_targets(
-            gt_cpu,
-            spacing_um.detach().cpu(),
-            dref_um.detach().cpu(),
-            sdf_clip_dref=self.model_config.geometry.sdf_clip_dref,
-            device=device,
+        geometry_target = (
+            self.build_geometry_targets(gt_labels, spacing_um, dref_um, device=device)
+            if precomputed_geometry_targets is None
+            else precomputed_geometry_targets.to(device)
         )
         geometry_losses = self.geometry(
             output.geometry, geometry_target, spacing_um, dref_um
         )
         geometry_total = torch.stack(list(geometry_losses.values())).sum()
-
-        spatial_rag = self.rag(output.rag, gt_labels)
-        final_rag = self.rag(
-            output.rag, gt_labels, logits=output.reasoning.final_edge_logits
+        metrics: dict[str, Tensor] = {
+            "geometry_loss": geometry_total,
+            **{f"geometry_{name}": value for name, value in geometry_losses.items()},
+        }
+        if stage == "geometry_bootstrap":
+            metrics["loss"] = self.cfg.geometry_weight * geometry_total
+            return metrics
+        if not isinstance(output, (SpatialForwardOutput, StirNetOutput)):
+            raise TypeError("spatial and later stages require a spatial output")
+        cached_rag_targets = (
+            precomputed_discrete_targets.get("rag")
+            if precomputed_discrete_targets is not None
+            else None
         )
-        initial_spatial_rag = self.rag(output.initial_rag, gt_labels)
-        initial_final_rag = self.rag(
-            output.initial_rag,
+        can_reuse_initial = isinstance(output, StirNetOutput) and (
+            output.rag is output.initial_rag
+        )
+        spatial_targets = (
+            cached_rag_targets
+            if cached_rag_targets is not None and can_reuse_initial
+            else self.rag.build_targets(output.rag, gt_labels)
+        )
+        spatial_rag = self.rag(
+            output.rag, gt_labels, targets=spatial_targets
+        )
+        metrics.update(
+            {
+                "spatial_rag_bce": spatial_rag["rag_bce"],
+                "spatial_rag_accuracy": spatial_rag["rag_accuracy"],
+                "rag_valid_edge_fraction": spatial_rag["rag_valid_edge_fraction"],
+                "rag_mean_node_purity": spatial_rag["rag_mean_node_purity"],
+                "rag_impure_node_fraction": spatial_rag["rag_impure_node_fraction"],
+            }
+        )
+        if stage == "spatial_partition":
+            metrics["loss"] = (
+                self.cfg.geometry_weight * geometry_total
+                + self.cfg.spatial_rag_weight * spatial_rag["rag_bce"]
+            )
+            return metrics
+        if not isinstance(output, StirNetOutput):
+            raise TypeError("temporal and refinement stages require a full output")
+        final_rag = self.rag(
+            output.rag,
             gt_labels,
-            logits=output.initial_reasoning.final_edge_logits,
+            logits=output.reasoning.final_edge_logits,
+            targets=spatial_targets,
         )
         refinement_applied = bool(
             output.refinement is not None and output.refinement.applied_count
         )
-        spatial_rag_loss = (
-            0.5 * (spatial_rag["rag_bce"] + initial_spatial_rag["rag_bce"])
-            if refinement_applied
-            else spatial_rag["rag_bce"]
-        )
-        final_rag_loss = (
-            0.5 * (final_rag["rag_bce"] + initial_final_rag["rag_bce"])
-            if refinement_applied
-            else final_rag["rag_bce"]
-        )
-        instance_target = build_instance_targets(
-            output.initial_provisional_instances.labels,
-            gt_labels,
-            existence_min_precision=self.cfg.existence_min_precision,
-            existence_min_gt_coverage=self.cfg.existence_min_gt_coverage,
-            split_min_pred_fraction=self.cfg.split_min_pred_fraction,
-            split_min_gt_coverage=self.cfg.split_min_gt_coverage,
-            device=device,
+        if refinement_applied:
+            initial_targets = (
+                cached_rag_targets
+                if cached_rag_targets is not None
+                else self.rag.build_targets(output.initial_rag, gt_labels)
+            )
+            initial_spatial = self.rag(
+                output.initial_rag, gt_labels, targets=initial_targets
+            )
+            initial_final = self.rag(
+                output.initial_rag,
+                gt_labels,
+                logits=output.initial_reasoning.final_edge_logits,
+                targets=initial_targets,
+            )
+            spatial_rag_loss = 0.5 * (
+                spatial_rag["rag_bce"] + initial_spatial["rag_bce"]
+            )
+            final_rag_loss = 0.5 * (
+                final_rag["rag_bce"] + initial_final["rag_bce"]
+            )
+        else:
+            spatial_rag_loss = spatial_rag["rag_bce"]
+            final_rag_loss = final_rag["rag_bce"]
+        instance_target = (
+            precomputed_discrete_targets["instance"]
+            if precomputed_discrete_targets is not None
+            and "instance" in precomputed_discrete_targets
+            else build_instance_targets(
+                output.initial_provisional_instances.labels,
+                gt_labels,
+                existence_min_precision=self.cfg.existence_min_precision,
+                existence_min_gt_coverage=self.cfg.existence_min_gt_coverage,
+                split_min_pred_fraction=self.cfg.split_min_pred_fraction,
+                split_min_gt_coverage=self.cfg.split_min_gt_coverage,
+                device=device,
+            )
         )
         request_reasoning = output.initial_reasoning
         if request_reasoning.instance_exist_logits.numel():
@@ -246,50 +487,46 @@ class StirNetCriterion(nn.Module):
         split_metrics = _safe_binary_metrics(
             request_reasoning.split_logits, instance_target.split
         )
-
-        recovery_target = build_recovery_targets(
-            output,
-            gt_labels,
-            spacing_um,
-            dref_um,
-            search_radius_dref=self.cfg.recovery_search_radius_dref,
-            missing_gt_coverage=self.cfg.recovery_missing_gt_coverage,
+        recovery_target = (
+            precomputed_discrete_targets["recovery"]
+            if precomputed_discrete_targets is not None
+            and "recovery" in precomputed_discrete_targets
+            else build_recovery_targets(
+                output,
+                gt_labels,
+                spacing_um,
+                dref_um,
+                search_radius_dref=self.cfg.recovery_search_radius_dref,
+                missing_gt_coverage=self.cfg.recovery_missing_gt_coverage,
+                min_provisional_precision=self.cfg.recovery_min_pred_precision,
+            )
         )
         if recovery_target.valid.any():
+            recovery_logits = request_reasoning.recovery_logits[recovery_target.valid]
+            recovery_truth = recovery_target.target[recovery_target.valid]
             recovery_loss = F.binary_cross_entropy_with_logits(
-                request_reasoning.recovery_logits[recovery_target.valid],
-                recovery_target.target[recovery_target.valid],
+                recovery_logits, recovery_truth
             )
-            recovery_metrics = _safe_binary_metrics(
-                request_reasoning.recovery_logits[recovery_target.valid],
-                recovery_target.target[recovery_target.valid],
-            )
+            recovery_metrics = _safe_binary_metrics(recovery_logits, recovery_truth)
         else:
             recovery_loss = request_reasoning.recovery_logits.sum() * 0
             recovery_metrics = _safe_binary_metrics(
                 request_reasoning.recovery_logits[:0], recovery_target.target[:0]
             )
-
-        weighted = {
-            "geometry": self.cfg.geometry_weight * geometry_total,
-            "spatial_rag": self.cfg.spatial_rag_weight * spatial_rag_loss,
-            "final_rag": self.cfg.final_rag_weight * final_rag_loss,
-            "existence": self.cfg.existence_weight * existence_loss,
-            "split": self.cfg.split_weight * split_loss,
-            "recovery": self.cfg.recovery_weight * recovery_loss,
-        }
-        total = sum(weighted[name] for name in active)
-        metrics: dict[str, Tensor] = {"loss": total}
-        metrics.update({f"geometry_{name}": value for name, value in geometry_losses.items()})
+        total = (
+            self.cfg.geometry_weight * geometry_total
+            + self.cfg.spatial_rag_weight * spatial_rag_loss
+            + self.cfg.final_rag_weight * final_rag_loss
+            + self.cfg.existence_weight * existence_loss
+            + self.cfg.split_weight * split_loss
+            + self.cfg.recovery_weight * recovery_loss
+        )
         metrics.update(
             {
-                "geometry_loss": geometry_total,
+                "loss": total,
                 "spatial_rag_bce": spatial_rag_loss,
-                "spatial_rag_accuracy": spatial_rag["rag_accuracy"],
-                "initial_spatial_rag_bce": initial_spatial_rag["rag_bce"],
                 "final_rag_bce": final_rag_loss,
                 "final_rag_accuracy": final_rag["rag_accuracy"],
-                "initial_final_rag_bce": initial_final_rag["rag_bce"],
                 "existence_bce": existence_loss,
                 "existence_accuracy": existence_metrics["accuracy"],
                 "existence_precision": existence_metrics["precision"],
@@ -300,8 +537,17 @@ class StirNetCriterion(nn.Module):
                 "recovery_accuracy": recovery_metrics["accuracy"],
                 "recovery_valid_count": recovery_target.valid.sum().detach().float(),
                 "refined_geometry_loss": geometry_total
-                if output.refinement is not None and output.refinement.applied_count
+                if refinement_applied
                 else geometry_total.detach() * 0,
+                "refinement_teacher_requests": output.geometry.sdf.new_tensor(
+                    0 if output.refinement is None else output.refinement.teacher_request_count
+                ),
+                "refinement_model_requests": output.geometry.sdf.new_tensor(
+                    0 if output.refinement is None else output.refinement.model_request_count
+                ),
+                "refinement_total_requests": output.geometry.sdf.new_tensor(
+                    0 if output.refinement is None else len(output.refinement.requests)
+                ),
             }
         )
         return metrics
@@ -313,4 +559,6 @@ __all__ = [
     "StirNetCriterion",
     "build_instance_targets",
     "build_recovery_targets",
+    "build_teacher_refinement_requests",
+    "teacher_forcing_fraction",
 ]

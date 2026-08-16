@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import torch
@@ -10,6 +11,7 @@ from ..config import PartitionConfig, SpatialConfig
 from ..types import GeometryState, RAGState
 from ..utils.physical import relative_grid_coordinates_um
 from ..utils.tensor_ops import pool_labeled_features
+from ..utils.contingency import label_contingency
 
 
 def _adjacent_pairs_and_stats(
@@ -248,29 +250,62 @@ class RAGBuilder(nn.Module):
         )
 
 
+@dataclass(frozen=True)
+class RAGTargets:
+    target: Tensor
+    valid: Tensor
+    weight: Tensor
+    node_purity: Tensor
+    dominant_gt: Tensor
+
+
 class RAGCriterion(nn.Module):
     """Supervise whether adjacent supervoxels belong to the same GT instance."""
 
-    @staticmethod
-    def build_targets(rag: RAGState, gt_labels: Tensor) -> Tensor:
-        if rag.edge_index.shape[1] == 0:
-            return rag.node_features.new_zeros((0,))
+    def __init__(self, cfg: PartitionConfig | None = None):
+        super().__init__()
+        self.cfg = cfg or PartitionConfig()
+
+    def build_targets(self, rag: RAGState, gt_labels: Tensor) -> RAGTargets:
         dominant = torch.zeros(
             rag.node_features.shape[0], device=rag.node_features.device, dtype=torch.long
         )
+        purity = rag.node_features.new_zeros((rag.node_features.shape[0],))
         for b, supervox in enumerate(rag.supervoxel_labels):
             gt = gt_labels[b].to(supervox.device).long()
             start = int(rag.node_offsets[b].item())
-            n = int(supervox.max().item())
-            for local_id in range(1, n + 1):
-                values = gt[supervox == local_id]
-                values = values[values > 0]
-                if values.numel():
-                    uniq, counts = torch.unique(values, return_counts=True)
-                    dominant[start + local_id - 1] = uniq[counts.argmax()]
+            table = label_contingency(supervox, gt)
+            if not table.row_ids.numel() or not table.column_ids.numel():
+                continue
+            foreground_overlap = table.intersections.sum(dim=1)
+            dominant_count, dominant_column = table.intersections.max(dim=1)
+            node_rows = start + table.row_ids - 1
+            has_foreground = foreground_overlap > 0
+            dominant[node_rows[has_foreground]] = table.column_ids[
+                dominant_column[has_foreground]
+            ]
+            purity[node_rows] = (
+                dominant_count.float() / foreground_overlap.clamp_min(1).float()
+            )
+        if rag.edge_index.shape[1] == 0:
+            empty = rag.node_features.new_zeros((0,))
+            return RAGTargets(empty, empty.bool(), empty, purity, dominant)
         a = dominant[rag.edge_index[0]]
         b = dominant[rag.edge_index[1]]
-        return ((a > 0) & (a == b)).float()
+        target = ((a > 0) & (a == b)).float()
+        valid = (
+            (a > 0)
+            & (b > 0)
+            & (purity[rag.edge_index[0]] >= self.cfg.rag_min_node_purity)
+            & (purity[rag.edge_index[1]] >= self.cfg.rag_min_node_purity)
+        )
+        return RAGTargets(
+            target=target,
+            valid=valid,
+            weight=torch.ones_like(target),
+            node_purity=purity,
+            dominant_gt=dominant,
+        )
 
     def forward(
         self,
@@ -278,19 +313,51 @@ class RAGCriterion(nn.Module):
         gt_labels: Tensor,
         *,
         logits: Tensor | None = None,
+        targets: RAGTargets | None = None,
     ) -> Dict[str, Tensor]:
-        target = self.build_targets(rag, gt_labels)
+        targets = self.build_targets(rag, gt_labels) if targets is None else targets
+        target = targets.target
         predictions = rag.spatial_edge_logits if logits is None else logits
         if predictions.shape != target.shape:
             raise ValueError("RAG logits must align one-to-one with RAG targets")
-        if target.numel() == 0:
+        valid = targets.valid
+        if target.numel() == 0 or not valid.any():
             zero = rag.node_features.sum() * 0
-            return {"rag_bce": zero, "rag_accuracy": zero.detach()}
-        positives = target.sum()
-        negatives = target.numel() - positives
+            valid_fraction = valid.float().mean() if valid.numel() else zero.detach()
+            mean_purity = (
+                targets.node_purity.mean()
+                if targets.node_purity.numel()
+                else zero.detach()
+            )
+            impure = (
+                (targets.node_purity < self.cfg.rag_min_node_purity).float().mean()
+                if targets.node_purity.numel()
+                else zero.detach()
+            )
+            return {
+                "rag_bce": zero,
+                "rag_accuracy": zero.detach(),
+                "rag_valid_edge_fraction": valid_fraction.detach(),
+                "rag_mean_node_purity": mean_purity.detach(),
+                "rag_impure_node_fraction": impure.detach(),
+            }
+        selected_target = target[valid]
+        selected_predictions = predictions[valid]
+        positives = selected_target.sum()
+        negatives = selected_target.numel() - positives
         pos_weight = (negatives / positives.clamp_min(1)).clamp(0.5, 20.0)
         loss = F.binary_cross_entropy_with_logits(
-            predictions, target, pos_weight=pos_weight
+            selected_predictions, selected_target, pos_weight=pos_weight
         )
-        accuracy = ((predictions.sigmoid() >= 0.5) == target.bool()).float().mean()
-        return {"rag_bce": loss, "rag_accuracy": accuracy.detach()}
+        accuracy = (
+            (selected_predictions.sigmoid() >= 0.5) == selected_target.bool()
+        ).float().mean()
+        return {
+            "rag_bce": loss,
+            "rag_accuracy": accuracy.detach(),
+            "rag_valid_edge_fraction": valid.float().mean().detach(),
+            "rag_mean_node_purity": targets.node_purity.mean().detach(),
+            "rag_impure_node_fraction": (
+                targets.node_purity < self.cfg.rag_min_node_purity
+            ).float().mean().detach(),
+        }

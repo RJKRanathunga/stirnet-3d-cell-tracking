@@ -35,6 +35,10 @@ class GeometryConfig:
     sdf_clip_dref: float = 2.5
     boundary_pos_weight: float = 6.0
     separator_pos_weight: float = 10.0
+    surface_target_sigma_um: float = 0.75
+    separator_target_sigma_um: float = 0.50
+    surface_dice_weight: float = 1.0
+    separator_dice_weight: float = 1.0
     seed_pos_weight: float = 4.0
     consistency_weight: float = 0.25
     eikonal_weight: float = 0.10
@@ -59,6 +63,7 @@ class PartitionConfig:
     spatial_merge_threshold: float = 0.50
     final_merge_threshold: float = 0.50
     max_supervoxels: int = 4096
+    rag_min_node_purity: float = 0.80
 
 
 @dataclass
@@ -141,6 +146,12 @@ class ModelConfig:
             raise ValueError("max_supervoxels must be positive")
         if self.geometry.sdf_clip_dref <= 0:
             raise ValueError("sdf_clip_dref must be positive")
+        if self.geometry.surface_target_sigma_um <= 0:
+            raise ValueError("surface_target_sigma_um must be positive")
+        if self.geometry.separator_target_sigma_um <= 0:
+            raise ValueError("separator_target_sigma_um must be positive")
+        if not 0.0 <= self.partition.rag_min_node_purity <= 1.0:
+            raise ValueError("rag_min_node_purity must be in [0, 1]")
         channels = self.evidence.raw_channels + self.evidence.prior_channels
         if sorted(channels) != list(range(self.spatial.in_channels)):
             raise ValueError(

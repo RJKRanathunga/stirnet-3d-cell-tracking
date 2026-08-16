@@ -40,6 +40,7 @@ class CurriculumStage:
     lr_scales: dict[str, float]
     use_temporal: bool
     run_refinement: bool
+    execution_stage: str
 
 
 def stage_name_for_step(config: CurriculumConfig, step: int) -> str:
@@ -77,15 +78,17 @@ def curriculum_stage(config: CurriculumConfig, step: int) -> CurriculumStage:
             {group: float(group in trainable) for group in groups},
             use_temporal=False,
             run_refinement=False,
+            execution_stage="geometry",
         )
     if name == "spatial_partition":
-        trainable = frozenset({"geometry_spatial", "partition", "instances"})
+        trainable = frozenset({"geometry_spatial", "partition"})
         return CurriculumStage(
             name,
             trainable,
             {group: float(group in trainable) for group in groups},
             use_temporal=False,
             run_refinement=False,
+            execution_stage="spatial",
         )
     if name == "instance_temporal":
         trainable = frozenset(
@@ -99,6 +102,7 @@ def curriculum_stage(config: CurriculumConfig, step: int) -> CurriculumStage:
             scales,
             use_temporal=True,
             run_refinement=False,
+            execution_stage="temporal",
         )
     if name != "refinement_joint":
         raise ValueError(f"Unknown V2 curriculum stage: {name}")
@@ -110,6 +114,7 @@ def curriculum_stage(config: CurriculumConfig, step: int) -> CurriculumStage:
         scales,
         use_temporal=True,
         run_refinement=True,
+        execution_stage="refinement",
     )
 
 

@@ -714,6 +714,10 @@ def prepare_spatial_data():
     )
 
     dref_um = _estimate_dref_um(
+        target_instances,
+        SPACING_ZYX_UM,
+    )
+    oracle_gt_dref_um = _estimate_dref_um(
         target_gt,
         SPACING_ZYX_UM,
     )
@@ -814,6 +818,15 @@ def prepare_spatial_data():
         ],
         "dref_um": float(
             dref_um
+        ),
+        "model_dref_um": float(
+            dref_um
+        ),
+        "model_dref_source": (
+            "current_segmentation"
+        ),
+        "oracle_gt_dref_um": float(
+            oracle_gt_dref_um
         ),
         "channels": {
             "raw_norm": (

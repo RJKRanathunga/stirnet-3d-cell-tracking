@@ -22,6 +22,8 @@ def build_refinement_requests(
     reasoning: ReasoningState,
     dref_um: torch.Tensor,
     cfg: RefinementConfig,
+    *,
+    select: bool = True,
 ) -> List[RefinementRequest]:
     """Select only ambiguous/recovery ROIs; strong spatial geometry is untouched."""
     requests: List[RefinementRequest] = []
@@ -87,7 +89,15 @@ def build_refinement_requests(
                 )
             )
 
-    # Bound work per batch while keeping the highest-value requests.
+    return select_refinement_requests(requests, dref_um, cfg) if select else requests
+
+
+def select_refinement_requests(
+    requests: List[RefinementRequest],
+    dref_um: torch.Tensor,
+    cfg: RefinementConfig,
+) -> List[RefinementRequest]:
+    """Apply one physical NMS/cap policy to model and teacher requests."""
     grouped: dict[int, list[RefinementRequest]] = defaultdict(list)
     for request in requests:
         grouped[request.batch_index].append(request)
@@ -108,3 +118,6 @@ def build_refinement_requests(
                 break
         selected.extend(kept)
     return selected
+
+
+__all__ = ["build_refinement_requests", "select_refinement_requests"]

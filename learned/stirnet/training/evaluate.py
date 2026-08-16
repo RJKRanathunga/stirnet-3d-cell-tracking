@@ -25,8 +25,12 @@ def evaluate_losses(
         output = model_forward_from_batch(
             model,
             moved,
-            use_temporal=stage in {"instance_temporal", "refinement_joint"},
-            run_refinement=stage == "refinement_joint",
+            execution_stage={
+                "geometry_bootstrap": "geometry",
+                "spatial_partition": "spatial",
+                "instance_temporal": "temporal",
+                "refinement_joint": "refinement",
+            }[stage],
             apply_existence_filter=False,
         )
         losses = criterion(

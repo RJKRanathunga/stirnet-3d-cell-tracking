@@ -105,11 +105,11 @@ def extract_instance_metadata(
 
 def estimate_dref_um(labels: np.ndarray, spacing_um: tuple[float,float,float], min_voxels: int = 20) -> float:
     voxel_volume = float(np.prod(spacing_um))
+    ids, counts = np.unique(labels, return_counts=True)
     diameters = []
-    for label in np.unique(labels):
-        if label <= 0: continue
-        n = int(np.count_nonzero(labels == label))
-        if n < min_voxels: continue
+    for label, n in zip(ids, counts):
+        if label <= 0 or n < min_voxels:
+            continue
         vol = n * voxel_volume
         diameters.append(2 * ((3 * vol) / (4 * np.pi)) ** (1 / 3))
     if not diameters:
@@ -118,6 +118,15 @@ def estimate_dref_um(labels: np.ndarray, spacing_um: tuple[float,float,float], m
     lo, hi = np.percentile(arr, [10, 90]) if len(arr) >= 10 else (arr.min(), arr.max())
     good = arr[(arr >= lo) & (arr <= hi)]
     return float(np.median(good if len(good) else arr))
+
+
+def estimate_model_dref_um(
+    current_labels: np.ndarray,
+    spacing_um: tuple[float, float, float],
+    min_voxels: int = 20,
+) -> float:
+    """Estimate model scale only from the current/noisy segmentation prior."""
+    return estimate_dref_um(current_labels, spacing_um, min_voxels=min_voxels)
 
 
 def make_center_heatmap(shape: tuple[int,int,int], centers_um_relative: np.ndarray, spacing_um, sigma_um: float = 2.0) -> np.ndarray:

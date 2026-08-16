@@ -10,12 +10,13 @@ from torch.utils.data import Dataset
 from .targets import (
     add_source_gt_compatibility,
     build_gt_targets,
-    estimate_dref_um,
+    estimate_model_dref_um,
     extract_instance_metadata,
     make_internal_boundary_target,
     make_instance_boundary,
 )
 from .trackastra_cache import load_cache
+from .sample_builder import renormalize_cached_dref
 
 
 class CachedStirNetDataset(Dataset):
@@ -45,6 +46,31 @@ class CachedStirNetDataset(Dataset):
         if "spatial_inputs" in s:
             if "target" in s and "instance_labels" in s:
                 s = dict(s)
+                metadata = dict(s.get("metadata", {}))
+                source = metadata.get("model_dref_source")
+                trusted_sources = {
+                    "current_segmentation",
+                    "fixed_acquisition_prior",
+                    "explicit_non_gt",
+                }
+                if source not in trusted_sources:
+                    spacing = tuple(float(value) for value in s["spacing_um"])
+                    model_dref = estimate_model_dref_um(
+                        torch.as_tensor(s["instance_labels"]).cpu().numpy(), spacing
+                    )
+                    cached_dref = float(torch.as_tensor(s.get("dref_um", model_dref)))
+                    s = renormalize_cached_dref(
+                        s,
+                        cached_dref_um=cached_dref,
+                        model_dref_um=model_dref,
+                    )
+                    target = dict(s["target"])
+                    if "centers_um" in target:
+                        target["centers_cellscale"] = (
+                            torch.as_tensor(target["centers_um"]).float()
+                            / max(model_dref, 1e-6)
+                        )
+                    s["target"] = target
                 target = add_source_gt_compatibility(
                     s["target"], s["instance_labels"]
                 )
@@ -62,7 +88,7 @@ class CachedStirNetDataset(Dataset):
         labels=np.asarray(s["instance_labels"],np.int64)
         gt=np.asarray(s["gt_labels"],np.int64)
         spacing=tuple(float(x) for x in s["spacing_um"])
-        dref=float(s.get("dref_um",estimate_dref_um(gt,spacing)))
+        dref=float(s.get("dref_um",estimate_model_dref_um(labels,spacing)))
         foreground=(labels>0).astype(np.float32)
         from scipy import ndimage as ndi
         edt=np.zeros_like(raw,np.float32)
@@ -81,6 +107,14 @@ class CachedStirNetDataset(Dataset):
             "instance_labels":torch.as_tensor(labels,dtype=torch.long),
             "spacing_um":torch.tensor(spacing,dtype=torch.float32),
             "dref_um":torch.tensor(dref,dtype=torch.float32),
+            "metadata": {
+                **dict(s.get("metadata", {})),
+                "model_dref_um": dref,
+                "model_dref_source": (
+                    dict(s.get("metadata", {})).get("model_dref_source")
+                    or ("explicit_non_gt" if "dref_um" in s else "current_segmentation")
+                ),
+            },
             "instance_ids":meta.ids,
             "instance_features":meta.features,
             "instance_centroids_um":meta.centroids_um,

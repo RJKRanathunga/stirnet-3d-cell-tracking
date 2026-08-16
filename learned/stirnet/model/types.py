@@ -155,6 +155,7 @@ class RefinementRequest:
     kind: str
     source_index: int
     score: float
+    selection_source: str = "model"
 
 
 @dataclass
@@ -162,6 +163,21 @@ class RefinementState:
     geometry: GeometryState
     requests: List[RefinementRequest] = field(default_factory=list)
     applied_count: int = 0
+    model_request_count: int = 0
+    teacher_request_count: int = 0
+
+
+@dataclass
+class GeometryForwardOutput:
+    geometry: GeometryState
+    spatial_pyramid: SpatialPyramid
+    decoded_spatial: SpatialDecodeState
+
+
+@dataclass
+class SpatialForwardOutput(GeometryForwardOutput):
+    rag: RAGState
+    spatial_partition: PartitionState
 
 
 @dataclass

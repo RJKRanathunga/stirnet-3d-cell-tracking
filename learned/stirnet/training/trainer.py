@@ -3,14 +3,20 @@ from __future__ import annotations
 from contextlib import nullcontext
 import math
 from pathlib import Path
+import time
 from typing import Any
 
 import torch
 
 from ..model import StirNet
+from ..model.geometry.targets import GeometryTargets
 from .checkpoint import save_checkpoint
 from .config import TrainingConfig
-from .criterion import StirNetCriterion
+from .criterion import (
+    StirNetCriterion,
+    build_teacher_refinement_requests,
+    teacher_forcing_fraction,
+)
 from .curriculum import (
     CurriculumController,
     model_parameter_groups,
@@ -72,9 +78,17 @@ def model_forward_from_batch(
     *,
     use_temporal: bool = True,
     run_refinement: bool = False,
+    execution_stage: str | None = None,
+    teacher_request_builder=None,
     apply_existence_filter: bool = False,
     return_debug: bool = False,
 ):
+    if execution_stage is None:
+        execution_stage = (
+            "refinement"
+            if run_refinement
+            else ("temporal" if use_temporal else "spatial")
+        )
     temporal_kwargs = {}
     if use_temporal:
         temporal_kwargs = {
@@ -96,7 +110,8 @@ def model_forward_from_batch(
         batch["spacing_um"],
         batch["dref_um"],
         spatial_padding_mask=batch.get("spatial_padding_mask"),
-        run_refinement=run_refinement,
+        execution_stage=execution_stage,
+        teacher_request_builder=teacher_request_builder,
         apply_existence_filter=apply_existence_filter,
         return_debug=return_debug,
         **temporal_kwargs,
@@ -173,36 +188,125 @@ class Trainer:
         )
         return torch.autocast(device_type="cuda", dtype=dtype)
 
-    def _forward_and_loss(self, batch: dict, *, return_debug: bool = False):
+    def prepare_geometry_targets(
+        self,
+        batch: dict,
+        *,
+        gt_labels: torch.Tensor | None = None,
+    ) -> GeometryTargets:
+        labels = gt_labels_from_batch(batch) if gt_labels is None else gt_labels
+        return self.criterion.build_geometry_targets(
+            labels,
+            batch["spacing_um"],
+            batch["dref_um"],
+            device=self.device,
+        )
+
+    def _sync_device(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _forward_and_loss(
+        self,
+        batch: dict,
+        *,
+        return_debug: bool = False,
+        gt_labels: torch.Tensor | None = None,
+        precomputed_geometry_targets: GeometryTargets | None = None,
+    ):
+        labels = gt_labels_from_batch(batch) if gt_labels is None else gt_labels
+        curriculum_cfg = self.training_config.curriculum
+        if curriculum_cfg.fixed_stage == "refinement_joint" or not curriculum_cfg.enabled:
+            refinement_step = self.global_step
+        else:
+            refinement_step = max(
+                0,
+                self.global_step
+                - curriculum_cfg.geometry_bootstrap_steps
+                - curriculum_cfg.spatial_partition_steps
+                - curriculum_cfg.instance_temporal_steps,
+            )
+        fraction = (
+            teacher_forcing_fraction(self.training_config, refinement_step)
+            if self.curriculum_stage.name == "refinement_joint"
+            else 0.0
+        )
+        teacher_builder = None
+        discrete_target_cache: dict[str, object] = {}
+        if fraction > 0:
+            def teacher_builder(instances, rag, temporal, reasoning, dref_um):
+                return build_teacher_refinement_requests(
+                    instances,
+                    rag,
+                    temporal,
+                    reasoning,
+                    dref_um,
+                    gt_labels=labels,
+                    spacing_um=batch["spacing_um"],
+                    loss_config=self.training_config.loss,
+                    rag_criterion=self.criterion.rag,
+                    fraction=fraction,
+                    ambiguity_logit_abs_max=self.model.cfg.refinement.ambiguity_logit_abs_max,
+                    target_cache=discrete_target_cache,
+                )
+        self._sync_device()
+        forward_started = time.perf_counter()
         output = model_forward_from_batch(
             self.model,
             batch,
-            use_temporal=self.curriculum_stage.use_temporal,
-            run_refinement=self.curriculum_stage.run_refinement,
+            execution_stage=self.curriculum_stage.execution_stage,
+            teacher_request_builder=teacher_builder,
             apply_existence_filter=False,
             return_debug=return_debug,
         )
-        gt_labels = gt_labels_from_batch(batch)
+        self._sync_device()
+        forward_seconds = time.perf_counter() - forward_started
+        target_started = time.perf_counter()
         losses = self.criterion(
             output,
-            gt_labels,
+            labels,
             batch["spacing_um"],
             batch["dref_um"],
             stage=self.curriculum_stage.name,
+            precomputed_geometry_targets=precomputed_geometry_targets,
+            precomputed_discrete_targets=(
+                discrete_target_cache if discrete_target_cache else None
+            ),
         )
-        return output, losses
+        self._sync_device()
+        target_seconds = time.perf_counter() - target_started
+        return output, losses, {
+            "forward_seconds": forward_seconds,
+            "target_seconds": target_seconds,
+            "refinement_teacher_forcing_fraction": fraction,
+        }
 
-    def train_step(self, batch: dict) -> dict[str, float]:
+    def train_step(
+        self,
+        batch: dict,
+        *,
+        gt_labels: torch.Tensor | None = None,
+        precomputed_geometry_targets: GeometryTargets | None = None,
+    ) -> dict[str, float]:
+        total_started = time.perf_counter()
         self.curriculum_stage = self.curriculum.apply(self.global_step)
         self.model.train()
         self.criterion.train()
         moved = move_batch_to_device(batch, self.device)
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
         self.optimizer.zero_grad(set_to_none=True)
         with self._autocast():
-            _, losses = self._forward_and_loss(moved)
+            _, losses, timing = self._forward_and_loss(
+                moved,
+                gt_labels=gt_labels,
+                precomputed_geometry_targets=precomputed_geometry_targets,
+            )
             loss = losses["loss"]
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError(f"Non-finite STIR-Net V2 loss: {loss.detach()}")
+        self._sync_device()
+        backward_started = time.perf_counter()
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
         grad_metrics = _group_gradient_norms(self.model)
@@ -221,22 +325,46 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             if self.scaler.is_enabled():
                 self.scaler.update(new_scale=max(self.scaler.get_scale() * 0.5, 1.0))
+        self._sync_device()
+        backward_seconds = time.perf_counter() - backward_started
         metrics = {key: float(value.detach().float().cpu()) for key, value in losses.items()}
         metrics.update(grad_metrics)
         metrics["grad_norm"] = float(torch.as_tensor(total_grad).detach().cpu())
         metrics["optimizer_step_skipped"] = float(optimizer_step_skipped)
+        metrics.update(timing)
+        metrics["backward_seconds"] = backward_seconds
+        metrics["total_step_seconds"] = time.perf_counter() - total_started
+        if self.device.type == "cuda":
+            metrics["peak_allocated_mb"] = torch.cuda.max_memory_allocated(
+                self.device
+            ) / (1024**2)
+            metrics["peak_reserved_mb"] = torch.cuda.max_memory_reserved(
+                self.device
+            ) / (1024**2)
         return metrics
 
     @torch.no_grad()
-    def eval_step(self, batch: dict) -> dict[str, float]:
+    def eval_step(
+        self,
+        batch: dict,
+        *,
+        gt_labels: torch.Tensor | None = None,
+        precomputed_geometry_targets: GeometryTargets | None = None,
+    ) -> dict[str, float]:
         self.model.eval()
         self.criterion.eval()
         moved = move_batch_to_device(batch, self.device)
         with self._autocast():
-            _, losses = self._forward_and_loss(moved)
-        return {
+            _, losses, timing = self._forward_and_loss(
+                moved,
+                gt_labels=gt_labels,
+                precomputed_geometry_targets=precomputed_geometry_targets,
+            )
+        result = {
             key: float(value.detach().float().cpu()) for key, value in losses.items()
         }
+        result.update(timing)
+        return result
 
     def fit(
         self,

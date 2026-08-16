@@ -31,8 +31,9 @@ class LocalGeometryRefiner(nn.Module):
         super().__init__()
         self.cfg = cfg
         # D0 + original inputs + probabilities/geometry:
-        # fg,surface,sep,sdf,flow3,offset3,seed = 11 channels.
-        in_channels = spatial_cfg.channels[0] + spatial_cfg.in_channels + 11
+        # fg,surface,sep,sdf,flow3,offset3,seed = 11 channels, plus
+        # request-relative physical dz/dy/dx/distance = 4 channels.
+        in_channels = spatial_cfg.channels[0] + spatial_cfg.in_channels + 11 + 4
         h = cfg.hidden_channels
         q = cfg.query_channels
         self.spatial = nn.Sequential(
@@ -44,19 +45,49 @@ class LocalGeometryRefiner(nn.Module):
             nn.SiLU(),
         )
         self.query = nn.Sequential(
-            nn.Linear(d_model, q), nn.SiLU(), nn.Linear(q, q)
+            nn.Linear(d_model, q), nn.SiLU(), nn.Linear(q, 2 * h)
         )
         self.fuse = nn.Sequential(
-            nn.Conv3d(h + q, h, 1),
+            nn.Conv3d(h, h, 1),
             nn.SiLU(),
             nn.Conv3d(h, 11, 1),
         )
 
     def _decode_crop(self, local: Tensor, token: Tensor) -> Tensor:
         spatial = self.spatial(local[None])
-        q = self.query(token[None])[..., None, None, None]
-        q = q.expand(-1, -1, *spatial.shape[-3:])
-        return self.fuse(torch.cat([spatial, q], dim=1))[0]
+        scale, bias = self.query(token[None]).chunk(2, dim=-1)
+        scale = 0.5 * torch.tanh(scale)[..., None, None, None]
+        bias = bias[..., None, None, None]
+        return self.fuse(spatial * (1.0 + scale) + bias)[0]
+
+    @staticmethod
+    def _relative_coordinates(
+        shape: tuple[int, int, int],
+        crop: tuple[slice, slice, slice],
+        spacing_um: Tensor,
+        center_um: Tensor,
+        dref_um: Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        patch_center_voxel = 0.5 * (
+            torch.as_tensor(shape, device=device, dtype=torch.float32) - 1
+        )
+        axes = []
+        for axis, axis_slice in enumerate(crop):
+            voxel = torch.arange(
+                int(axis_slice.start),
+                int(axis_slice.stop),
+                device=device,
+                dtype=torch.float32,
+            )
+            axes.append((voxel - patch_center_voxel[axis]) * spacing_um[axis].float())
+        zz, yy, xx = torch.meshgrid(*axes, indexing="ij")
+        coordinates = torch.stack([zz, yy, xx], dim=0)
+        delta = (coordinates - center_um.float()[:, None, None, None]) / dref_um.float().clamp_min(1e-6)
+        distance = torch.linalg.vector_norm(delta, dim=0, keepdim=True)
+        return torch.cat([delta, distance], dim=0).to(dtype=dtype)
 
     def _bounded_crop(
         self,
@@ -137,6 +168,15 @@ class LocalGeometryRefiner(nn.Module):
                         dtype=d0[b].dtype
                     ),
                     dense_crop,
+                    self._relative_coordinates(
+                        tuple(geometry.sdf.shape[-3:]),
+                        zyx,
+                        spacing_um[b],
+                        request.center_um,
+                        dref_um[b],
+                        device=d0.device,
+                        dtype=d0.dtype,
+                    ),
                 ],
                 dim=0,
             )

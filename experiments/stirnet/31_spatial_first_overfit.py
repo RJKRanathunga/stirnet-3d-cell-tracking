@@ -13,13 +13,28 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from learned.stirnet import StirNet, StirNetConfig
-from learned.stirnet.data.targets import build_gt_targets
+from learned.stirnet import (
+    GeometryForwardOutput,
+    SpatialForwardOutput,
+    StirNet,
+    StirNetConfig,
+    StirNetOutput,
+)
+from learned.stirnet.data.sample_builder import (
+    build_spatial_channels,
+    renormalize_cached_dref,
+)
+from learned.stirnet.data.targets import (
+    build_gt_targets,
+    estimate_dref_um,
+    estimate_model_dref_um,
+)
 from learned.stirnet.data.trackastra_cache import load_cache
 from learned.stirnet.training import TrainingConfig, instance_metrics
 from learned.stirnet.training.checkpoint import load_checkpoint, save_checkpoint
 from learned.stirnet.training.trainer import (
     Trainer,
+    gt_labels_from_batch,
     model_forward_from_batch,
     move_batch_to_device,
 )
@@ -58,27 +73,46 @@ def _roi_with_all_cells(instance_movie, gt_movie, spacing, margin_um=12.0):
     return tuple(slice(int(a), int(b)) for a, b in zip(low, high))
 
 
+def _renormalize_temporal_cache(
+    temporal: dict, old_dref_um: float, model_dref_um: float
+) -> dict:
+    """Convert legacy dref-normalized cache fields to the model scale."""
+    result = renormalize_cached_dref(
+        temporal,
+        cached_dref_um=old_dref_um,
+        model_dref_um=model_dref_um,
+    )
+    result.pop("dref_um", None)
+    result.pop("metadata", None)
+    return result
+
+
 def build_real_batch(data_dir: Path) -> tuple[dict, dict]:
     source_dir = data_dir / "stirnet_source"
     instance_movie = np.load(data_dir / "instance_movie.npy", mmap_mode="r")
     gt_movie = np.load(data_dir / "gt_movie.npy", mmap_mode="r")
     metadata = json.loads((data_dir / "metadata.json").read_text(encoding="utf-8"))
     spacing = np.asarray(metadata["spacing_zyx_um"], dtype=np.float32)
-    dref_um = float(np.load(source_dir / "dref_um.npy"))
     roi = _roi_with_all_cells(instance_movie, gt_movie, spacing)
     target_time = 2
+    model_dref_um = estimate_model_dref_um(
+        np.asarray(instance_movie[target_time]), tuple(spacing)
+    )
+    oracle_gt_dref_um = estimate_dref_um(
+        np.asarray(gt_movie[target_time]), tuple(spacing)
+    )
+    cached_dref_um = float(np.load(source_dir / "dref_um.npy"))
     current = np.asarray(instance_movie[target_time][roi]).astype(np.int64, copy=True)
     gt = np.asarray(gt_movie[target_time][roi]).astype(np.int64, copy=True)
-    channel_files = (
-        "raw_norm_target.npy",
-        "foreground_target.npy",
-        "edt_target.npy",
-        "boundary_target.npy",
-        "marker_heatmap_target.npy",
-    )
-    spatial = np.stack(
-        [np.asarray(np.load(source_dir / name, mmap_mode="r")[roi]) for name in channel_files]
+    raw_norm = np.asarray(
+        np.load(source_dir / "raw_norm_target.npy", mmap_mode="r")[roi]
     ).astype(np.float32, copy=False)
+    marker = np.asarray(
+        np.load(source_dir / "marker_heatmap_target.npy", mmap_mode="r")[roi]
+    ).astype(np.float32, copy=False)
+    spatial = build_spatial_channels(
+        raw_norm, current, tuple(spacing), model_dref_um, marker
+    )
     if spatial.shape[0] != 5:
         raise RuntimeError("Prepared sample does not satisfy the V2 five-channel contract")
     temporal_path = data_dir / "temporal_v3" / "temporal_graph.pt"
@@ -87,15 +121,20 @@ def build_real_batch(data_dir: Path) -> tuple[dict, dict]:
             "Experiment 31 requires the prepared temporal_v3/temporal_graph.pt cache"
         )
     temporal = load_cache(temporal_path)
+    temporal = _renormalize_temporal_cache(
+        temporal, cached_dref_um, model_dref_um
+    )
     temporal["temporal_batch"] = torch.zeros(
         len(temporal["temporal_ref_um"]), dtype=torch.long
     )
-    target = build_gt_targets(gt, tuple(spacing), dref_um, current_labels=current)
+    target = build_gt_targets(
+        gt, tuple(spacing), model_dref_um, current_labels=current
+    )
     batch = {
         "spatial_inputs": torch.from_numpy(spatial).unsqueeze(0),
         "instance_labels": torch.from_numpy(current).unsqueeze(0),
         "spacing_um": torch.from_numpy(spacing).unsqueeze(0),
-        "dref_um": torch.tensor([dref_um], dtype=torch.float32),
+        "dref_um": torch.tensor([model_dref_um], dtype=torch.float32),
         "targets": [target],
         **temporal,
     }
@@ -105,6 +144,10 @@ def build_real_batch(data_dir: Path) -> tuple[dict, dict]:
         "gt_instance_count": int(np.unique(gt[gt > 0]).size),
         "temporal_node_count": int(len(temporal["graph_x"])),
         "temporal_tracklet_count": int(len(temporal["temporal_ref_um"])),
+        "model_dref_um": float(model_dref_um),
+        "model_dref_source": "current_segmentation",
+        "oracle_gt_dref_um": float(oracle_gt_dref_um),
+        "legacy_cached_dref_um": float(cached_dref_um),
     }
     return batch, scene
 
@@ -203,11 +246,27 @@ def collect_diagnostics(trainer: Trainer, batch: dict, scene: dict) -> tuple[dic
     output = model_forward_from_batch(
         trainer.model,
         moved,
-        use_temporal=stage.use_temporal,
-        run_refinement=stage.run_refinement,
+        execution_stage=stage.execution_stage,
         apply_existence_filter=False,
         return_debug=True,
     )
+    diagnostic = {"stage": stage.name}
+    if isinstance(output, GeometryForwardOutput) and not isinstance(
+        output, (SpatialForwardOutput, StirNetOutput)
+    ):
+        return diagnostic, output
+    diagnostic.update(
+        {
+            "supervoxel_count": int(
+                output.rag.supervoxel_labels[0].max().item()
+            ),
+            "spatial_partition_count": int(
+                output.spatial_partition.labels[0].max().item()
+            ),
+        }
+    )
+    if isinstance(output, SpatialForwardOutput):
+        return diagnostic, output
     predicted = output.final_labels[0].detach().cpu().numpy()
     gt = np.asarray(batch["targets"][0]["label_map"])
     metrics = instance_metrics(predicted, gt)
@@ -215,10 +274,7 @@ def collect_diagnostics(trainer: Trainer, batch: dict, scene: dict) -> tuple[dic
     if output.refinement is not None:
         for request in output.refinement.requests:
             request_kinds[request.kind] = request_kinds.get(request.kind, 0) + 1
-    diagnostic = {
-        "stage": stage.name,
-        "supervoxel_count": int(output.rag.supervoxel_labels[0].max().item()),
-        "spatial_partition_count": int(output.spatial_partition.labels[0].max().item()),
+    diagnostic.update({
         "final_instance_count": int(output.final_labels[0].max().item()),
         "gt_instance_count": scene["gt_instance_count"],
         "temporal_edge_delta_mean_abs": float(
@@ -237,7 +293,7 @@ def collect_diagnostics(trainer: Trainer, batch: dict, scene: dict) -> tuple[dic
         else output.refinement.applied_count,
         "refinement_request_kinds": request_kinds,
         **metrics,
-    }
+    })
     return diagnostic, output
 
 
@@ -252,22 +308,24 @@ def save_artifacts(run_dir: Path, batch: dict, output, history, scene, cfg, trai
         encoding="utf-8",
     )
     geometry = output.geometry
-    np.savez_compressed(
-        run_dir / "partitions_and_geometry.npz",
-        predicted_final_labels=output.final_labels[0].detach().cpu().numpy(),
-        spatial_partition=output.spatial_partition.labels[0].detach().cpu().numpy(),
-        supervoxels=output.rag.supervoxel_labels[0].detach().cpu().numpy(),
-        gt_labels=np.asarray(batch["targets"][0]["label_map"]),
-        current_noisy_labels=batch["instance_labels"][0].numpy(),
-        centers_um=_tensor(output.centers_um[0]),
-        foreground=_tensor(geometry.foreground_logits[0, 0].sigmoid()),
-        surface=_tensor(geometry.surface_logits[0, 0].sigmoid()),
-        separator=_tensor(geometry.separator_logits[0, 0].sigmoid()),
-        sdf=_tensor(geometry.sdf[0, 0]),
-        flow=_tensor(geometry.flow[0]),
-        centroid_offset=_tensor(geometry.centroid_offset[0]),
-        seed=_tensor(geometry.seed_logits[0, 0].sigmoid()),
-    )
+    arrays = {
+        "gt_labels": np.asarray(batch["targets"][0]["label_map"]),
+        "current_noisy_labels": batch["instance_labels"][0].numpy(),
+        "foreground": _tensor(geometry.foreground_logits[0, 0].sigmoid()),
+        "surface": _tensor(geometry.surface_logits[0, 0].sigmoid()),
+        "separator": _tensor(geometry.separator_logits[0, 0].sigmoid()),
+        "sdf": _tensor(geometry.sdf[0, 0]),
+        "flow": _tensor(geometry.flow[0]),
+        "centroid_offset": _tensor(geometry.centroid_offset[0]),
+        "seed": _tensor(geometry.seed_logits[0, 0].sigmoid()),
+    }
+    if isinstance(output, (SpatialForwardOutput, StirNetOutput)):
+        arrays["spatial_partition"] = output.spatial_partition.labels[0].detach().cpu().numpy()
+        arrays["supervoxels"] = output.rag.supervoxel_labels[0].detach().cpu().numpy()
+    if isinstance(output, StirNetOutput):
+        arrays["predicted_final_labels"] = output.final_labels[0].detach().cpu().numpy()
+        arrays["centers_um"] = _tensor(output.centers_um[0])
+    np.savez_compressed(run_dir / "partitions_and_geometry.npz", **arrays)
 
 
 def parse_args():
@@ -329,13 +387,29 @@ def main() -> int:
         )
         trainer.global_step = int(loaded.get("global_step", 0))
 
+    fixed_gt_labels = gt_labels_from_batch(batch)
+    target_started = time.perf_counter()
+    fixed_geometry_targets = trainer.prepare_geometry_targets(
+        batch, gt_labels=fixed_gt_labels
+    )
+    if trainer.device.type == "cuda":
+        torch.cuda.synchronize(trainer.device)
+    scene["geometry_target_precompute_seconds"] = (
+        time.perf_counter() - target_started
+    )
+    scene["geometry_targets_reused"] = True
+
     history: list[dict] = []
     started = time.monotonic()
     output = None
     for local_step in range(total_steps):
         if time.monotonic() - started > args.hard_time_limit_seconds - 30:
             break
-        metrics = trainer.train_step(batch)
+        metrics = trainer.train_step(
+            batch,
+            gt_labels=fixed_gt_labels,
+            precomputed_geometry_targets=fixed_geometry_targets,
+        )
         row = {
             "step": trainer.global_step,
             "stage": trainer.curriculum_stage.name,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, Callable, Literal
 
 import torch
 from torch import Tensor, nn
@@ -14,7 +14,10 @@ from .partition.partitioner import GraphPartitioner
 from .partition.rag import RAGBuilder
 from .partition.watershed import LearnedGeometryWatershed
 from .refinement.local_refiner import LocalGeometryRefiner
-from .refinement.requests import build_refinement_requests
+from .refinement.requests import (
+    build_refinement_requests,
+    select_refinement_requests,
+)
 from .spatial.acquisition import AcquisitionEmbedding
 from .spatial.backbone import AnisotropyAwareSpatialBackbone
 from .spatial.evidence_stem import EvidenceFusionStem
@@ -24,11 +27,14 @@ from .temporal.history import HistoricalInstanceEncoder
 from .temporal.observer import TemporalSpatialObserver
 from .types import (
     GeometryState,
+    GeometryForwardOutput,
     InstanceState,
     PartitionState,
     RAGState,
     ReasoningState,
     RefinementState,
+    RefinementRequest,
+    SpatialForwardOutput,
     StirNetOutput,
     TemporalInput,
     TemporalState,
@@ -152,7 +158,7 @@ class StirNet(nn.Module):
             data = replace(data, node_history_embedding=history)
         return data
 
-    def _spatial_objects(
+    def _spatial_rag(
         self,
         geometry: GeometryState,
         decoded,
@@ -160,7 +166,7 @@ class StirNet(nn.Module):
         spacing_um: Tensor,
         dref_um: Tensor,
         spatial_padding_mask: Tensor | None,
-    ) -> tuple[RAGState, PartitionState, InstanceState]:
+    ) -> tuple[RAGState, PartitionState]:
         supervoxels = self.watershed(
             geometry, spacing_um, dref_um, spatial_padding_mask
         )
@@ -178,23 +184,19 @@ class StirNet(nn.Module):
             rag.spatial_edge_logits,
             self.cfg.partition.spatial_merge_threshold,
         )
-        instances = self.instance_tokenizer(
-            partition, rag, decoded, geometry, spacing_um, dref_um
-        )
-        return rag, partition, instances
+        return rag, partition
 
-    def _temporal_state(
+    def _observe_temporal(
         self,
-        temporal_data: TemporalInput | None,
+        temporal_base: TemporalState,
         decoded,
         geometry: GeometryState,
         pyramid,
         spacing_um: Tensor,
         dref_um: Tensor,
     ) -> TemporalState:
-        temporal = self.temporal_encoder(temporal_data)
         return self.temporal_observer(
-            temporal,
+            temporal_base,
             decoded,
             geometry,
             pyramid.spacings_um,
@@ -262,6 +264,12 @@ class StirNet(nn.Module):
         spatial_padding_mask: Tensor | None = None,
         prior_keep_mask: Tensor | None = None,
         run_refinement: bool | None = None,
+        execution_stage: Literal["geometry", "spatial", "temporal", "refinement"] | None = None,
+        teacher_request_builder: Callable[
+            [InstanceState, RAGState, TemporalState, ReasoningState, Tensor],
+            list[RefinementRequest],
+        ]
+        | None = None,
         apply_existence_filter: bool | None = None,
         return_debug: bool = False,
         # Compatibility bridge for the current repository's temporal tensors.
@@ -274,7 +282,7 @@ class StirNet(nn.Module):
         temporal_batch: Tensor | None = None,
         node_instance_grid: Tensor | None = None,
         node_history_valid: Tensor | None = None,
-    ) -> StirNetOutput:
+    ) -> GeometryForwardOutput | SpatialForwardOutput | StirNetOutput:
         if spatial_inputs.ndim != 5:
             raise ValueError("spatial_inputs must have shape [B,C,Z,Y,X]")
         if spatial_inputs.shape[1] != self.cfg.spatial.in_channels:
@@ -291,6 +299,61 @@ class StirNet(nn.Module):
         if dref_um.shape != (spatial_inputs.shape[0],):
             raise ValueError("dref_um must have shape [B]")
 
+        if execution_stage is None:
+            use_refinement = (
+                self.cfg.refinement.enabled
+                if run_refinement is None
+                else bool(run_refinement)
+            )
+            execution_stage = "refinement" if use_refinement else "temporal"
+        elif run_refinement is not None:
+            raise ValueError(
+                "execution_stage is explicit; do not also pass run_refinement"
+            )
+        if execution_stage not in {"geometry", "spatial", "temporal", "refinement"}:
+            raise ValueError(f"Unknown STIR-Net execution stage: {execution_stage}")
+
+        acquisition = self.acquisition(spacing_um, dref_um)
+        stem = self.evidence_stem(
+            spatial_inputs, acquisition, prior_keep_mask=prior_keep_mask
+        )
+        pyramid, decoded = self.spatial_backbone(
+            stem, spacing_um, acquisition, spatial_padding_mask
+        )
+        initial_geometry = self.geometry_decoder(decoded.d0, acquisition)
+
+        if execution_stage == "geometry":
+            return GeometryForwardOutput(
+                geometry=initial_geometry,
+                spatial_pyramid=pyramid,
+                decoded_spatial=decoded,
+            )
+
+        initial_rag, initial_partition = self._spatial_rag(
+            initial_geometry,
+            decoded,
+            spatial_inputs,
+            spacing_um,
+            dref_um,
+            spatial_padding_mask,
+        )
+        if execution_stage == "spatial":
+            return SpatialForwardOutput(
+                geometry=initial_geometry,
+                spatial_pyramid=pyramid,
+                decoded_spatial=decoded,
+                rag=initial_rag,
+                spatial_partition=initial_partition,
+            )
+
+        initial_instances = self.instance_tokenizer(
+            initial_partition,
+            initial_rag,
+            decoded,
+            initial_geometry,
+            spacing_um,
+            dref_um,
+        )
         temporal_data = self._coerce_temporal_input(
             temporal_input,
             graph_x=graph_x,
@@ -303,26 +366,9 @@ class StirNet(nn.Module):
             node_instance_grid=node_instance_grid,
             node_history_valid=node_history_valid,
         )
-
-        acquisition = self.acquisition(spacing_um, dref_um)
-        stem = self.evidence_stem(
-            spatial_inputs, acquisition, prior_keep_mask=prior_keep_mask
-        )
-        pyramid, decoded = self.spatial_backbone(
-            stem, spacing_um, acquisition, spatial_padding_mask
-        )
-        initial_geometry = self.geometry_decoder(decoded.d0, acquisition)
-
-        initial_rag, initial_partition, initial_instances = self._spatial_objects(
-            initial_geometry,
-            decoded,
-            spatial_inputs,
-            spacing_um,
-            dref_um,
-            spatial_padding_mask,
-        )
-        temporal = self._temporal_state(
-            temporal_data,
+        temporal_base = self.temporal_encoder(temporal_data)
+        temporal = self._observe_temporal(
+            temporal_base,
             decoded,
             initial_geometry,
             pyramid,
@@ -334,7 +380,7 @@ class StirNet(nn.Module):
         )
 
         use_refinement = (
-            self.cfg.refinement.enabled if run_refinement is None else run_refinement
+            execution_stage == "refinement" and self.cfg.refinement.enabled
         )
         refinement: RefinementState | None = None
         geometry = initial_geometry
@@ -344,14 +390,31 @@ class StirNet(nn.Module):
         reasoning = initial_reasoning
 
         if use_refinement:
-            requests = build_refinement_requests(
+            model_requests = build_refinement_requests(
                 initial_instances,
                 initial_rag,
                 temporal,
                 initial_reasoning,
                 dref_um,
                 self.cfg.refinement,
+                select=teacher_request_builder is None,
             )
+            teacher_requests: list[RefinementRequest] = []
+            if teacher_request_builder is not None:
+                teacher_requests = teacher_request_builder(
+                    initial_instances,
+                    initial_rag,
+                    temporal,
+                    initial_reasoning,
+                    dref_um,
+                )
+                requests = select_refinement_requests(
+                    [*teacher_requests, *model_requests],
+                    dref_um,
+                    self.cfg.refinement,
+                )
+            else:
+                requests = model_requests
             refinement = self.local_refiner(
                 decoded.d0,
                 spatial_inputs,
@@ -360,12 +423,21 @@ class StirNet(nn.Module):
                 dref_um,
                 requests,
             )
+            refinement = replace(
+                refinement,
+                model_request_count=sum(
+                    request.selection_source == "model" for request in requests
+                ),
+                teacher_request_count=sum(
+                    request.selection_source == "teacher" for request in requests
+                ),
+            )
             if refinement.applied_count:
                 geometry = refinement.geometry
                 # Re-run the complete partition after local geometry changes.
                 # This is how recovery can create a new object and split requests
                 # can create a new separator without independent mask painting.
-                rag, spatial_partition, instances = self._spatial_objects(
+                rag, spatial_partition = self._spatial_rag(
                     geometry,
                     decoded,
                     spatial_inputs,
@@ -373,8 +445,16 @@ class StirNet(nn.Module):
                     dref_um,
                     spatial_padding_mask,
                 )
-                temporal = self._temporal_state(
-                    temporal_data,
+                instances = self.instance_tokenizer(
+                    spatial_partition,
+                    rag,
+                    decoded,
+                    geometry,
+                    spacing_um,
+                    dref_um,
+                )
+                temporal = self._observe_temporal(
+                    temporal_base,
                     decoded,
                     geometry,
                     pyramid,

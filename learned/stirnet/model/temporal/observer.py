@@ -59,6 +59,7 @@ class TemporalSpatialObserver(nn.Module):
         self.d1_proj = nn.Conv3d(spatial_cfg.channels[1], d, 1, bias=False)
         self.d2_proj = nn.Conv3d(spatial_cfg.channels[2], d, 1, bias=False)
         self.geometry_proj = nn.Conv3d(geometry_cfg.hidden_channels, d, 1, bias=False)
+        self.geometry_field_proj = nn.Conv3d(11, d, 1, bias=False)
         self.message = nn.Sequential(
             nn.Linear(3 * d, 2 * d), nn.SiLU(), nn.Linear(2 * d, d)
         )
@@ -80,7 +81,22 @@ class TemporalSpatialObserver(nn.Module):
             return temporal
         d1 = self.d1_proj(decoded.d1)
         d2 = self.d2_proj(decoded.d2)
-        geo = self.geometry_proj(geometry.features)
+        probabilities = geometry.probabilities()
+        explicit_geometry = torch.cat(
+            [
+                probabilities["foreground"],
+                probabilities["surface"],
+                probabilities["separator"],
+                geometry.sdf,
+                geometry.flow,
+                geometry.centroid_offset,
+                probabilities["seed"],
+            ],
+            dim=1,
+        ).to(geometry.features.dtype)
+        geo = self.geometry_proj(geometry.features) + self.geometry_field_proj(
+            explicit_geometry
+        )
         messages = torch.zeros_like(temporal.tokens)
         for b in range(decoded.d0.shape[0]):
             idx = torch.nonzero(temporal.batch_index == b, as_tuple=False).flatten()

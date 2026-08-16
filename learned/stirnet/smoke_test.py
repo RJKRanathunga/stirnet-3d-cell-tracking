@@ -47,8 +47,7 @@ def criterion_backward_smoke() -> None:
         spatial,
         spacing,
         dref,
-        run_refinement=False,
-        apply_existence_filter=False,
+        execution_stage="geometry",
     )
     criterion = StirNetCriterion(cfg, LossConfig())
     losses = criterion(

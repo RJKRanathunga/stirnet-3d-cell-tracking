@@ -41,11 +41,18 @@ class GeometryCriterion(nn.Module):
             pred.foreground_logits, fg
         )
         losses["foreground_dice"] = soft_dice_loss(pred.foreground_logits, fg)
-        losses["surface"] = weighted_bce(
+        losses["surface_bce"] = weighted_bce(
             pred.surface_logits, target.surface, self.cfg.boundary_pos_weight
         )
-        losses["separator"] = weighted_bce(
+        losses["surface_dice"] = self.cfg.surface_dice_weight * soft_dice_loss(
+            pred.surface_logits, target.surface
+        )
+        losses["separator_bce"] = weighted_bce(
             pred.separator_logits, target.separator, self.cfg.separator_pos_weight
+        )
+        losses["separator_dice"] = (
+            self.cfg.separator_dice_weight
+            * soft_dice_loss(pred.separator_logits, target.separator)
         )
 
         near = target.sdf.abs() <= self.cfg.sdf_clip_dref

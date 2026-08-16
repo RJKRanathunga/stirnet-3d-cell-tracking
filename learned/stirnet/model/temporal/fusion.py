@@ -107,8 +107,8 @@ class PhysicalLocalCrossAttention(nn.Module):
             support[~valid_rows] = 0
             entropy = -(mean_weight.clamp_min(1e-8) * mean_weight.clamp_min(1e-8).log()).sum(-1, keepdim=True)
             entropy[~valid_rows] = 0
-            support_out[qi] = support
-            entropy_out[qi] = entropy
+            support_out[qi] = support.to(support_out.dtype)
+            entropy_out[qi] = entropy.to(entropy_out.dtype)
         return output, support_out, entropy_out
 
 
