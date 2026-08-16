@@ -36,7 +36,20 @@ EXPERIMENT_SCRIPT = "31_spatial_first_overfit.py"
 
 # Keep the experiment's internal cap below Modal's 3600-second hard timeout so
 # it can flush scalar statistics and the wrapper can commit the runs Volume.
+# EXPERIMENT_ARGS = [
+#     "--hard-time-limit-seconds",
+#     "3480",
+# ]
+
 EXPERIMENT_ARGS = [
+    "--stage",
+    "refinement_joint",
+    "--stage-steps",
+    "1",
+    "--eval-every",
+    "1",
+    "--amp-dtype",
+    "bf16",
     "--hard-time-limit-seconds",
     "3480",
 ]

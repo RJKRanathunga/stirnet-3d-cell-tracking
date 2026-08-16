@@ -4,7 +4,6 @@ from dataclasses import replace
 
 import torch
 from torch import Tensor, nn
-import torch.nn.functional as F
 
 from ..config import GeometryConfig, SpatialConfig, TemporalConfig
 from ..types import GeometryState, SpatialDecodeState, TemporalState
@@ -16,27 +15,77 @@ def _sample_local_grid(
     spacing_um: Tensor,
     radius_um: Tensor,
 ) -> Tensor:
-    """Sample a 3x3x3 physical neighborhood for each reference; return [N,C]."""
+    """Sample a 3x3x3 physical neighborhood for each reference; return [N,C].
+
+    This is the align_corners=True, border-padded trilinear interpolation used
+    by grid_sample, expressed as bounded gathers. CUDA autocast otherwise
+    promotes the complete source volume to FP32 before sampling. Here only the
+    gathered corner values and interpolation accumulator use FP32.
+    """
     if refs_um.shape[0] == 0:
         return feature.new_zeros((0, feature.shape[0]))
     shape = feature.shape[-3:]
-    extent = refs_um.new_tensor(
-        [(shape[0] - 1), (shape[1] - 1), (shape[2] - 1)]
-    ) * spacing_um.float()
-    unit = torch.tensor([-1.0, 0.0, 1.0], device=refs_um.device)
-    base = torch.stack(torch.meshgrid(unit, unit, unit, indexing="ij"), dim=-1).reshape(-1, 3)
-    offsets = base[None] * radius_um.reshape(-1, 1, 1)
-    points = refs_um[:, None] + offsets
-    normalized_zyx = points / (0.5 * extent[None, None]).clamp_min(1e-6)
-    grid_xyz = normalized_zyx[..., [2, 1, 0]]
-    sampled = F.grid_sample(
-        feature[None],
-        grid_xyz.reshape(1, refs_um.shape[0], 27, 1, 3),
-        mode="bilinear",
-        padding_mode="border",
-        align_corners=True,
-    )[0, :, :, :, 0].permute(1, 0, 2)
-    return sampled.mean(dim=-1)
+    coordinate_dtype = torch.float32
+    unit = torch.tensor(
+        [-1.0, 0.0, 1.0],
+        device=refs_um.device,
+        dtype=coordinate_dtype,
+    )
+    base = torch.stack(
+        torch.meshgrid(unit, unit, unit, indexing="ij"), dim=-1
+    ).reshape(-1, 3)
+    points_um = refs_um.float()[:, None] + (
+        base[None] * radius_um.float().reshape(-1, 1, 1)
+    )
+    center_vox = points_um.new_tensor(
+        [(shape[0] - 1) * 0.5, (shape[1] - 1) * 0.5, (shape[2] - 1) * 0.5]
+    )
+    points_vox = points_um / spacing_um.float().reshape(1, 1, 3) + center_vox
+    maximum = points_um.new_tensor(
+        [shape[0] - 1, shape[1] - 1, shape[2] - 1]
+    )
+    points_vox = torch.minimum(
+        points_vox.clamp_min(0), maximum.reshape(1, 1, 3)
+    ).reshape(-1, 3)
+    lower = points_vox.floor().long()
+    upper = torch.minimum(lower + 1, maximum.long())
+    fraction = points_vox - lower.to(points_vox.dtype)
+    accumulation_dtype = (
+        torch.float32
+        if feature.dtype in {torch.float16, torch.bfloat16}
+        else feature.dtype
+    )
+    flattened = feature.reshape(feature.shape[0], -1)
+    corner_indices = []
+    corner_weights = []
+    for z_index, z_weight in (
+        (lower[:, 0], 1 - fraction[:, 0]),
+        (upper[:, 0], fraction[:, 0]),
+    ):
+        for y_index, y_weight in (
+            (lower[:, 1], 1 - fraction[:, 1]),
+            (upper[:, 1], fraction[:, 1]),
+        ):
+            for x_index, x_weight in (
+                (lower[:, 2], 1 - fraction[:, 2]),
+                (upper[:, 2], fraction[:, 2]),
+            ):
+                linear_index = (
+                    z_index * shape[1] * shape[2]
+                    + y_index * shape[2]
+                    + x_index
+                )
+                corner_indices.append(linear_index)
+                corner_weights.append(z_weight * y_weight * x_weight)
+    all_indices = torch.stack(corner_indices)
+    all_weights = torch.stack(corner_weights).to(accumulation_dtype)
+    sampled = flattened.index_select(1, all_indices.reshape(-1)).to(
+        accumulation_dtype
+    ).reshape(feature.shape[0], 8, -1)
+    sampled = (sampled * all_weights[None]).sum(dim=1)
+    return sampled.reshape(feature.shape[0], refs_um.shape[0], 27).permute(
+        1, 0, 2
+    ).mean(dim=-1)
 
 
 class TemporalSpatialObserver(nn.Module):
@@ -56,10 +105,15 @@ class TemporalSpatialObserver(nn.Module):
         super().__init__()
         d = temporal_cfg.d_model
         self.cfg = temporal_cfg
-        self.d1_proj = nn.Conv3d(spatial_cfg.channels[1], d, 1, bias=False)
-        self.d2_proj = nn.Conv3d(spatial_cfg.channels[2], d, 1, bias=False)
-        self.geometry_proj = nn.Conv3d(geometry_cfg.hidden_channels, d, 1, bias=False)
-        self.geometry_field_proj = nn.Conv3d(11, d, 1, bias=False)
+        # A 1x1x1 convolution commutes with trilinear sampling and local mean
+        # aggregation when it has no bias. Applying the equivalent Linear only
+        # to sampled vectors avoids dense d_model-channel feature volumes.
+        self.d1_proj = nn.Linear(spatial_cfg.channels[1], d, bias=False)
+        self.d2_proj = nn.Linear(spatial_cfg.channels[2], d, bias=False)
+        self.geometry_proj = nn.Linear(
+            geometry_cfg.hidden_channels, d, bias=False
+        )
+        self.geometry_field_proj = nn.Linear(11, d, bias=False)
         self.message = nn.Sequential(
             nn.Linear(3 * d, 2 * d), nn.SiLU(), nn.Linear(2 * d, d)
         )
@@ -67,6 +121,43 @@ class TemporalSpatialObserver(nn.Module):
             nn.Linear(2 * d + 1, d), nn.Sigmoid()
         )
         self.norm = nn.LayerNorm(d)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # V2 checkpoints written before sample-first observation store these
+        # algebraically equivalent projections as [out,in,1,1,1] Conv3d
+        # kernels. Accept them under strict loading for warm-start continuity.
+        for name in (
+            "d1_proj",
+            "d2_proj",
+            "geometry_proj",
+            "geometry_field_proj",
+        ):
+            key = f"{prefix}{name}.weight"
+            weight = state_dict.get(key)
+            if weight is not None and weight.ndim == 5 and weight.shape[-3:] == (
+                1,
+                1,
+                1,
+            ):
+                state_dict[key] = weight[..., 0, 0, 0]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(
         self,
@@ -79,24 +170,6 @@ class TemporalSpatialObserver(nn.Module):
     ) -> TemporalState:
         if temporal.is_empty:
             return temporal
-        d1 = self.d1_proj(decoded.d1)
-        d2 = self.d2_proj(decoded.d2)
-        probabilities = geometry.probabilities()
-        explicit_geometry = torch.cat(
-            [
-                probabilities["foreground"],
-                probabilities["surface"],
-                probabilities["separator"],
-                geometry.sdf,
-                geometry.flow,
-                geometry.centroid_offset,
-                probabilities["seed"],
-            ],
-            dim=1,
-        ).to(geometry.features.dtype)
-        geo = self.geometry_proj(geometry.features) + self.geometry_field_proj(
-            explicit_geometry
-        )
         messages = torch.zeros_like(temporal.tokens)
         for b in range(decoded.d0.shape[0]):
             idx = torch.nonzero(temporal.batch_index == b, as_tuple=False).flatten()
@@ -105,16 +178,63 @@ class TemporalSpatialObserver(nn.Module):
             refs = temporal.ref_um[idx]
             radius = dref_um[b] * self.cfg.observation_radius_dref
             radius_vec = radius.expand(len(idx))
-            p1 = _sample_local_grid(
-                d1[b], refs, spatial_spacings_um[1][b], radius_vec
+            d1_local = _sample_local_grid(
+                decoded.d1[b], refs, spatial_spacings_um[1][b], radius_vec
             )
-            p2 = _sample_local_grid(
-                d2[b], refs, spatial_spacings_um[2][b], radius_vec
+            d2_local = _sample_local_grid(
+                decoded.d2[b], refs, spatial_spacings_um[2][b], radius_vec
             )
-            pg = _sample_local_grid(
-                geo[b], refs, spacing_um[b], radius_vec
+            hidden_geometry_local = _sample_local_grid(
+                geometry.features[b], refs, spacing_um[b], radius_vec
             )
-            messages[idx] = self.message(torch.cat([p1, p2, pg], dim=-1))
+            explicit_geometry_local = torch.cat(
+                [
+                    _sample_local_grid(
+                        geometry.foreground_logits[b].sigmoid(),
+                        refs,
+                        spacing_um[b],
+                        radius_vec,
+                    ),
+                    _sample_local_grid(
+                        geometry.surface_logits[b].sigmoid(),
+                        refs,
+                        spacing_um[b],
+                        radius_vec,
+                    ),
+                    _sample_local_grid(
+                        geometry.separator_logits[b].sigmoid(),
+                        refs,
+                        spacing_um[b],
+                        radius_vec,
+                    ),
+                    _sample_local_grid(
+                        geometry.sdf[b], refs, spacing_um[b], radius_vec
+                    ),
+                    _sample_local_grid(
+                        geometry.flow[b], refs, spacing_um[b], radius_vec
+                    ),
+                    _sample_local_grid(
+                        geometry.centroid_offset[b],
+                        refs,
+                        spacing_um[b],
+                        radius_vec,
+                    ),
+                    _sample_local_grid(
+                        geometry.seed_logits[b].sigmoid(),
+                        refs,
+                        spacing_um[b],
+                        radius_vec,
+                    ),
+                ],
+                dim=-1,
+            ).to(hidden_geometry_local.dtype)
+            p1 = self.d1_proj(d1_local)
+            p2 = self.d2_proj(d2_local)
+            pg = self.geometry_proj(
+                hidden_geometry_local
+            ) + self.geometry_field_proj(explicit_geometry_local)
+            local_message = self.message(torch.cat([p1, p2, pg], dim=-1))
+            messages[idx] = local_message.to(messages.dtype)
         gate = self.gate(
             torch.cat([temporal.tokens, messages, temporal.reliability], dim=-1)
         )
