@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from ..config import SpatialConfig
 from ..types import SpatialDecodeState, SpatialPyramid
@@ -64,6 +66,16 @@ class AnisotropyAwareSpatialBackbone(nn.Module):
             ch[1], ch[0], ch[0], cfg.acquisition_dim, cfg.blocks_per_level, cfg.group_norm_max_groups
         )
 
+    def _run(self, module: nn.Module, *args: Tensor) -> Tensor:
+        if (
+            self.cfg.activation_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+            and any(arg.requires_grad for arg in args)
+        ):
+            return checkpoint(module, *args, use_reentrant=False)
+        return module(*args)
+
     def forward(
         self,
         x0: Tensor,
@@ -80,7 +92,7 @@ class AnisotropyAwareSpatialBackbone(nn.Module):
         current_mask = padding_mask
         for level_idx, blocks in enumerate(self.levels):
             for block in blocks:
-                x = block(x, acquisition_embedding)
+                x = self._run(block, x, acquisition_embedding)
             features.append(x)
             spacings.append(current_spacing)
             if current_mask is not None:
@@ -104,7 +116,7 @@ class AnisotropyAwareSpatialBackbone(nn.Module):
             strides=strides,
             padding_masks=masks if padding_mask is not None else None,
         )
-        d2 = self.up2(features[3], features[2], acquisition_embedding)
-        d1 = self.up1(d2, features[1], acquisition_embedding)
-        d0 = self.up0(d1, features[0], acquisition_embedding)
+        d2 = self._run(self.up2, features[3], features[2], acquisition_embedding)
+        d1 = self._run(self.up1, d2, features[1], acquisition_embedding)
+        d0 = self._run(self.up0, d1, features[0], acquisition_embedding)
         return pyramid, SpatialDecodeState(d2=d2, d1=d1, d0=d0)

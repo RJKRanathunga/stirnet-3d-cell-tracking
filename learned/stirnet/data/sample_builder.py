@@ -9,6 +9,15 @@ from .graph_builder import DETECTION_EDGE_DIM
 from ..temporal_events import TEMPORAL_NODE_EVENT_FEATURE_DIM
 
 
+SPATIAL_CHANNEL_NAMES = (
+    "raw",
+    "current_foreground_prior",
+    "current_edt_prior",
+    "current_boundary_prior",
+    "current_marker_prior",
+)
+
+
 def robust_normalize(raw: np.ndarray, low_pct: float = 1.0, high_pct: float = 99.8) -> np.ndarray:
     raw=np.asarray(raw,np.float32)
     lo,hi=np.percentile(raw,[low_pct,high_pct])
@@ -26,7 +35,10 @@ def build_spatial_channels(raw_norm: np.ndarray, instance_labels: np.ndarray, sp
         edt[m]=d[m]
     boundary=make_instance_boundary(instance_labels).astype(np.float32)
     marker=np.zeros_like(raw_norm,np.float32) if marker_heatmap is None else np.asarray(marker_heatmap,np.float32)
-    return np.stack([raw_norm,foreground,edt,boundary,marker],axis=0)
+    spatial = np.stack([raw_norm,foreground,edt,boundary,marker],axis=0)
+    if spatial.shape[0] != len(SPATIAL_CHANNEL_NAMES):
+        raise RuntimeError("STIR-Net spatial channel contract is inconsistent")
+    return spatial
 
 
 def build_cached_sample(

@@ -28,7 +28,13 @@ def stirnet_collate(samples:list[dict])->dict:
     if not samples: raise ValueError("empty batch")
     shapes={tuple(s["spatial_inputs"].shape) for s in samples}
     if len(shapes)!=1:
-        raise ValueError(f"STIR-Net V1 uses spacing/shape buckets; got incompatible shapes: {shapes}")
+        raise ValueError(f"STIR-Net uses spacing/shape buckets; got incompatible shapes: {shapes}")
+    channels={int(s["spatial_inputs"].shape[0]) for s in samples}
+    if channels != {5}:
+        raise ValueError(
+            "spatial_inputs must use the five-channel V2 order: raw, current "
+            "foreground, current EDT, current boundary, current marker"
+        )
     B=len(samples)
     batch={
         "spatial_inputs":torch.stack([s["spatial_inputs"] for s in samples]),

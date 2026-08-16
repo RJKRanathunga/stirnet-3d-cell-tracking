@@ -1,67 +1,109 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 from scipy import ndimage as ndi
+from torch import Tensor
 
-from ..model.query_builder import QUERY_SPATIAL_PROPOSAL
+from ..model.instances.tokenizer import centers_from_labels
 from ..model.types import StirNetOutput
 
 
-def _component_near_center(mask: np.ndarray, center_vox: np.ndarray, min_voxels: int) -> np.ndarray:
-    cc,n=ndi.label(mask)
-    if n==0:return np.zeros_like(mask,bool)
-    center=np.rint(center_vox).astype(int)
-    if np.all(center>=0) and np.all(center<np.asarray(mask.shape)):
-        lab=cc[tuple(center)]
-        if lab>0 and np.count_nonzero(cc==lab)>=min_voxels:return cc==lab
-    best=None;best_d=np.inf
-    for lab in range(1,n+1):
-        pts=np.argwhere(cc==lab)
-        if len(pts)<min_voxels:continue
-        d=np.min(np.linalg.norm(pts-center[None],axis=1))
-        if d<best_d:best_d=d;best=lab
-    return cc==best if best is not None else np.zeros_like(mask,bool)
+@dataclass
+class PostprocessConfig:
+    min_object_voxels: int = 4
+
+
+def _valid_region_mask(
+    shape: tuple[int, int, int],
+    spacing_um: np.ndarray,
+    valid_min_rel_um,
+    valid_max_rel_um,
+) -> np.ndarray:
+    axes = [
+        np.arange(size, dtype=np.float32) * spacing_um[axis]
+        - 0.5 * (size - 1) * spacing_um[axis]
+        for axis, size in enumerate(shape)
+    ]
+    zz, yy, xx = np.meshgrid(*axes, indexing="ij")
+    coordinates = np.stack([zz, yy, xx], axis=-1)
+    minimum = np.asarray(valid_min_rel_um, dtype=np.float32)
+    maximum = np.asarray(valid_max_rel_um, dtype=np.float32)
+    return np.all((coordinates >= minimum) & (coordinates <= maximum), axis=-1)
+
+
+def postprocess_labels(
+    labels: Tensor,
+    spacing_um: Tensor,
+    *,
+    min_object_voxels: int = 4,
+    valid_min_rel_um=None,
+    valid_max_rel_um=None,
+) -> Tensor:
+    """Crop, split disconnected remnants, reject tiny objects, and relabel."""
+    array = labels.detach().cpu().numpy().astype(np.int64, copy=True)
+    if (valid_min_rel_um is None) != (valid_max_rel_um is None):
+        raise ValueError("valid_min_rel_um and valid_max_rel_um must be provided together")
+    if valid_min_rel_um is not None:
+        valid = _valid_region_mask(
+            tuple(array.shape),
+            spacing_um.detach().cpu().numpy(),
+            valid_min_rel_um,
+            valid_max_rel_um,
+        )
+        array[~valid] = 0
+    result = np.zeros_like(array, dtype=np.int64)
+    next_id = 1
+    connectivity = ndi.generate_binary_structure(3, 1)
+    for instance_id in np.unique(array):
+        if instance_id <= 0:
+            continue
+        components, count = ndi.label(array == instance_id, structure=connectivity)
+        for component_id in range(1, count + 1):
+            mask = components == component_id
+            if int(mask.sum()) < min_object_voxels:
+                continue
+            result[mask] = next_id
+            next_id += 1
+    return torch.from_numpy(result).to(device=labels.device, dtype=torch.long)
 
 
 @torch.no_grad()
-def postprocess_batch(model,outputs:StirNetOutput,render_threshold=0.30,final_exist_threshold=0.50,mask_threshold=0.50,min_mask_voxels=8,valid_min_rel_um=None,valid_max_rel_um=None):
-    probs=torch.sigmoid(outputs.exist_logits).masked_fill(outputs.query_padding_mask,0)
-    selected=[torch.nonzero(probs[b]>render_threshold,as_tuple=False).flatten() for b in range(probs.shape[0])]
-    rendered=model.render_masks(outputs,selected)
-    results=[]
-    for b,idx in enumerate(selected):
-        shape=outputs.instance_labels.shape[-3:]
-        accepted=[]
-        spacing=outputs.spacing_um[b].detach().cpu().numpy();dref=float(outputs.dref_um[b].item())
-        extent=(np.asarray(shape)-1)*spacing
-        for local,qi in enumerate(idx.tolist()):
-            ep=float(probs[b,qi].item())
-            if ep<final_exist_threshold:continue
-            center_rel=(outputs.centers_cellscale[b,qi]*outputs.dref_um[b]).detach().cpu().numpy()
-            if valid_min_rel_um is not None and valid_max_rel_um is not None:
-                vmin=np.asarray(valid_min_rel_um[b]); vmax=np.asarray(valid_max_rel_um[b])
-                if np.any(center_rel < vmin) or np.any(center_rel > vmax):
-                    continue
-            mp=torch.sigmoid(rendered[b][local]).detach().cpu().numpy()
-            mask=mp>mask_threshold
-            seed_rel = (
-                outputs.query_initial_references_cellscale[b, qi]
-                * outputs.dref_um[b]
-                if int(outputs.query_types[b, qi]) == QUERY_SPATIAL_PROPOSAL
-                else outputs.centers_cellscale[b, qi] * outputs.dref_um[b]
-            ).detach().cpu().numpy()
-            seed_vox=(seed_rel+0.5*extent)/spacing
-            mask=_component_near_center(mask,seed_vox,min_mask_voxels)
-            if mask.sum()<min_mask_voxels:continue
-            accepted.append((qi,ep,mp,mask))
-        labels=np.zeros(shape,np.int32)
-        if accepted:
-            scores=np.stack([ep*mp for _,ep,mp,_ in accepted],axis=0)
-            valid=np.stack([m for *_,m in accepted],axis=0)
-            scores=np.where(valid,scores,-np.inf)
-            winner=np.argmax(scores,axis=0);best=np.max(scores,axis=0)
-            for i in range(len(accepted)):
-                labels[(winner==i)&np.isfinite(best)&(best>0)]=i+1
-        results.append({"labels":labels,"accepted_queries":[q for q,_,_,_ in accepted],"exist_probs":[p for _,p,_,_ in accepted]})
+def postprocess_batch(
+    outputs: StirNetOutput,
+    spacing_um: Tensor,
+    *,
+    config: PostprocessConfig | None = None,
+    valid_min_rel_um=None,
+    valid_max_rel_um=None,
+) -> list[dict]:
+    cfg = config or PostprocessConfig()
+    results: list[dict] = []
+    for batch_index, source in enumerate(outputs.final_labels):
+        minimum = None if valid_min_rel_um is None else valid_min_rel_um[batch_index]
+        maximum = None if valid_max_rel_um is None else valid_max_rel_um[batch_index]
+        labels = postprocess_labels(
+            source,
+            spacing_um[batch_index],
+            min_object_voxels=cfg.min_object_voxels,
+            valid_min_rel_um=minimum,
+            valid_max_rel_um=maximum,
+        )
+        centers = centers_from_labels(
+            [labels],
+            spacing_um[batch_index : batch_index + 1],
+            outputs.geometry.sdf[batch_index : batch_index + 1],
+        )[0]
+        results.append(
+            {
+                "labels": labels.detach().cpu(),
+                "centers_um": centers.detach().cpu(),
+                "instance_count": int(labels.max().item()),
+            }
+        )
     return results
+
+
+__all__ = ["PostprocessConfig", "postprocess_batch", "postprocess_labels"]

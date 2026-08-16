@@ -1,23 +1,25 @@
+"""Public API for the spatial-first STIR-Net implementation."""
+
 from .model import (
-    LocalMaskConfig,
-    LocalNativeMaskDecoder,
-    ProposalConfig,
-    RefinementCriterion,
-    RuntimeProfile,
+    GeometryCriterion,
+    GeometryTargets,
+    ModelConfig,
+    RAGCriterion,
     StirNet,
     StirNetConfig,
-    apply_runtime_profile,
-    describe_runtime_profile,
+    StirNetOutput,
+    TemporalInput,
+    build_geometry_targets,
 )
 
 __all__ = [
     "StirNet",
+    "ModelConfig",
     "StirNetConfig",
-    "ProposalConfig",
-    "LocalMaskConfig",
-    "LocalNativeMaskDecoder",
-    "RefinementCriterion",
-    "RuntimeProfile",
-    "apply_runtime_profile",
-    "describe_runtime_profile",
+    "StirNetOutput",
+    "TemporalInput",
+    "GeometryTargets",
+    "build_geometry_targets",
+    "GeometryCriterion",
+    "RAGCriterion",
 ]

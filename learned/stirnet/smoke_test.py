@@ -1,57 +1,83 @@
-"""Small CPU smoke test for the complete V1 forward + criterion path."""
 from __future__ import annotations
 
 import torch
 
-from .model import RefinementCriterion, StirNet, StirNetConfig
+from .model import StirNet, StirNetConfig
+from .model.smoke_test import main as model_smoke_main
+from .training import LossConfig, StirNetCriterion
 
 
-def run():
-    cfg=StirNetConfig()
-    cfg.queries.discovery_queries=2
-    cfg.queries.max_queries=16
-    cfg.proposals.max_proposals=12
-    cfg.proposals.candidate_pool_size=32
-    cfg.decoder.max_spatial_tokens=4096
-    model=StirNet(cfg)
-    B,Z,Y,X=1,8,32,32
-    spatial=torch.randn(B,5,Z,Y,X)
-    labels=torch.zeros(B,Z,Y,X,dtype=torch.long)
-    labels[:,2:6,10:20,10:20]=1
-    spacing=torch.tensor([[1.625,0.40625,0.40625]])
-    dref=torch.tensor([8.0])
-    instance_features=torch.zeros(1,14)
-    instance_ids=torch.tensor([1])
-    instance_batch=torch.tensor([0])
-    instance_centroids=torch.zeros(1,3)
-    gx=torch.zeros(2,32);gx[:,0]=torch.tensor([-0.5,0.5])
-    ei=torch.tensor([[0,1],[1,0]],dtype=torch.long);ea=torch.zeros(2,14)
-    tracklet=torch.tensor([0,0])
-    tref=torch.zeros(1,3);status=torch.zeros(1,10);status[:,3]=1
-    hei=torch.zeros(2,0,dtype=torch.long);hea=torch.zeros(0,8);tb=torch.tensor([0])
-    outputs=model(spatial,labels,spacing,dref,instance_features,instance_ids,instance_batch,instance_centroids,
-                  gx,ei,ea,tracklet,tref,status,hei,hea,tb)
-    target_mask=labels[0:1]==1
-    targets=[{
-        "ids":torch.tensor([1]),
-        "masks":target_mask,
-        "centers_cellscale":torch.zeros(1,3),
-        "foreground":target_mask[0].float(),
-        "center_heatmap":torch.zeros(Z,Y,X),
-        "boundary":torch.zeros(Z,Y,X),
-        "internal_boundary":torch.zeros(Z,Y,X),
-        "source_ids":torch.tensor([1]),
-        "source_gt_overlap":torch.ones(1,1,dtype=torch.long),
-    }]
-    criterion=RefinementCriterion(
-        cfg.losses,cfg.queries,cfg.training,cfg.proposals
+def _small_config() -> StirNetConfig:
+    cfg = StirNetConfig()
+    cfg.evidence.stem_channels = 8
+    cfg.evidence.prior_gate_hidden = 8
+    cfg.spatial.channels = (8, 12, 16, 24)
+    cfg.spatial.blocks_per_level = 1
+    cfg.spatial.acquisition_dim = 16
+    cfg.geometry.hidden_channels = 16
+    cfg.geometry.residual_blocks = 1
+    cfg.partition.node_feature_channels = 8
+    cfg.partition.rag_hidden_dim = 16
+    cfg.partition.rag_layers = 1
+    cfg.partition.max_supervoxels = 128
+    cfg.instances.d_model = 32
+    cfg.instances.pooled_feature_dim = 8
+    cfg.history.hidden_channels = 8
+    cfg.temporal.d_model = 32
+    cfg.temporal.graph_hidden_dim = 48
+    cfg.temporal.graph_layers = 1
+    cfg.temporal.cross_heads = 4
+    cfg.refinement.hidden_channels = 16
+    cfg.refinement.query_channels = 8
+    cfg.refinement.enabled = False
+    cfg.validate()
+    return cfg
+
+
+def criterion_backward_smoke() -> None:
+    torch.manual_seed(11)
+    cfg = _small_config()
+    model = StirNet(cfg).train()
+    spatial = torch.rand(1, 5, 6, 12, 12)
+    spacing = torch.tensor([[1.6, 0.4, 0.4]])
+    dref = torch.tensor([4.0])
+    gt = torch.zeros((1, 6, 12, 12), dtype=torch.long)
+    gt[:, 1:5, 3:9, 3:9] = 1
+    output = model(
+        spatial,
+        spacing,
+        dref,
+        run_refinement=False,
+        apply_existence_filter=False,
     )
-    loss=criterion(
-        outputs,targets,local_mask_decoder=model.local_mask_decoder
-    )["loss"]
-    loss.backward()
-    print("STIR-Net smoke test OK",float(loss.detach()))
+    criterion = StirNetCriterion(cfg, LossConfig())
+    losses = criterion(
+        output, gt, spacing, dref, stage="geometry_bootstrap"
+    )
+    losses["loss"].backward()
+    groups = {
+        "evidence_stem": model.evidence_stem,
+        "spatial_backbone": model.spatial_backbone,
+        "geometry_decoder": model.geometry_decoder,
+    }
+    for name, module in groups.items():
+        gradients = [
+            parameter.grad
+            for parameter in module.parameters()
+            if parameter.grad is not None
+        ]
+        if not gradients or not any(
+            bool(torch.isfinite(grad).all() and grad.abs().sum() > 0)
+            for grad in gradients
+        ):
+            raise AssertionError(f"No finite nonzero gradient reached {name}")
+    print("STIR-Net V2 criterion/backward smoke test OK")
 
 
-if __name__=="__main__":
-    run()
+def main() -> None:
+    model_smoke_main()
+    criterion_backward_smoke()
+
+
+if __name__ == "__main__":
+    main()

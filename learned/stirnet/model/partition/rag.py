@@ -251,10 +251,10 @@ class RAGBuilder(nn.Module):
 class RAGCriterion(nn.Module):
     """Supervise whether adjacent supervoxels belong to the same GT instance."""
 
-    def forward(self, rag: RAGState, gt_labels: Tensor) -> Dict[str, Tensor]:
+    @staticmethod
+    def build_targets(rag: RAGState, gt_labels: Tensor) -> Tensor:
         if rag.edge_index.shape[1] == 0:
-            zero = rag.node_features.sum() * 0
-            return {"rag_bce": zero, "rag_accuracy": zero.detach()}
+            return rag.node_features.new_zeros((0,))
         dominant = torch.zeros(
             rag.node_features.shape[0], device=rag.node_features.device, dtype=torch.long
         )
@@ -270,12 +270,27 @@ class RAGCriterion(nn.Module):
                     dominant[start + local_id - 1] = uniq[counts.argmax()]
         a = dominant[rag.edge_index[0]]
         b = dominant[rag.edge_index[1]]
-        target = ((a > 0) & (a == b)).float()
+        return ((a > 0) & (a == b)).float()
+
+    def forward(
+        self,
+        rag: RAGState,
+        gt_labels: Tensor,
+        *,
+        logits: Tensor | None = None,
+    ) -> Dict[str, Tensor]:
+        target = self.build_targets(rag, gt_labels)
+        predictions = rag.spatial_edge_logits if logits is None else logits
+        if predictions.shape != target.shape:
+            raise ValueError("RAG logits must align one-to-one with RAG targets")
+        if target.numel() == 0:
+            zero = rag.node_features.sum() * 0
+            return {"rag_bce": zero, "rag_accuracy": zero.detach()}
         positives = target.sum()
         negatives = target.numel() - positives
         pos_weight = (negatives / positives.clamp_min(1)).clamp(0.5, 20.0)
         loss = F.binary_cross_entropy_with_logits(
-            rag.spatial_edge_logits, target, pos_weight=pos_weight
+            predictions, target, pos_weight=pos_weight
         )
-        accuracy = ((rag.spatial_edge_logits.sigmoid() >= 0.5) == target.bool()).float().mean()
+        accuracy = ((predictions.sigmoid() >= 0.5) == target.bool()).float().mean()
         return {"rag_bce": loss, "rag_accuracy": accuracy.detach()}

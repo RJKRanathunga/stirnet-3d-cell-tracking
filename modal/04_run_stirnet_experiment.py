@@ -32,13 +32,11 @@ import modal
 # User-editable experiment selection
 # ===========================================================================
 
-EXPERIMENT_SCRIPT = "30_overfit_oracle.py"
+EXPERIMENT_SCRIPT = "31_spatial_first_overfit.py"
 
 # Keep the experiment's internal cap below Modal's 3600-second hard timeout so
 # it can flush scalar statistics and the wrapper can commit the runs Volume.
 EXPERIMENT_ARGS = [
-    "--runtime-profile",
-    "cloud_48gb",
     "--hard-time-limit-seconds",
     "3480",
 ]
@@ -251,4 +249,3 @@ def run_selected_experiment() -> dict:
 def main() -> None:
     report = run_selected_experiment.remote()
     print(report)
-

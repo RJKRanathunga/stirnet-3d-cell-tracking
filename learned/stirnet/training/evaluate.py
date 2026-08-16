@@ -2,21 +2,44 @@ from __future__ import annotations
 
 import torch
 
-from .trainer import move_to_device, model_forward_from_batch
+from .trainer import (
+    gt_labels_from_batch,
+    model_forward_from_batch,
+    move_batch_to_device,
+)
 
 
 @torch.no_grad()
-def evaluate_losses(model,criterion,loader,device):
-    model.eval();sums={};n=0
+def evaluate_losses(
+    model,
+    criterion,
+    loader,
+    device,
+    stage: str = "refinement_joint",
+) -> dict[str, float]:
+    model.eval()
+    sums: dict[str, float] = {}
+    count = 0
     for batch in loader:
-        b=move_to_device(batch,device);out=model_forward_from_batch(model,b);losses=criterion(
-            out,
-            b["targets"],
-            local_mask_decoder=(
-                model.local_mask_decoder
-                if model.cfg.local_masks.enabled
-                else None
-            ),
-        );n+=1
-        for k,v in losses.items():sums[k]=sums.get(k,0.0)+float(v.detach().cpu())
-    return {k:v/max(n,1) for k,v in sums.items()}
+        moved = move_batch_to_device(batch, torch.device(device))
+        output = model_forward_from_batch(
+            model,
+            moved,
+            use_temporal=stage in {"instance_temporal", "refinement_joint"},
+            run_refinement=stage == "refinement_joint",
+            apply_existence_filter=False,
+        )
+        losses = criterion(
+            output,
+            gt_labels_from_batch(moved),
+            moved["spacing_um"],
+            moved["dref_um"],
+            stage=stage,
+        )
+        count += 1
+        for key, value in losses.items():
+            sums[key] = sums.get(key, 0.0) + float(value.detach().cpu())
+    return {key: value / max(count, 1) for key, value in sums.items()}
+
+
+__all__ = ["evaluate_losses"]

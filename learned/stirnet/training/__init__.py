@@ -1,11 +1,41 @@
-from .trainer import Trainer
 from .checkpoint import (
+    ARCHITECTURE_ID,
+    CHECKPOINT_VERSION,
     load_checkpoint,
-    migrate_history_checkpoint_state_dict,
-    migrate_stirnet_checkpoint_config,
     save_checkpoint,
 )
+from .config import CurriculumConfig, LossConfig, TrainingConfig
+from .criterion import (
+    InstanceTargets,
+    RecoveryTargets,
+    StirNetCriterion,
+    build_instance_targets,
+    build_recovery_targets,
+)
+from .curriculum import (
+    CurriculumController,
+    curriculum_stage,
+    stage_name_for_step,
+)
 from .metrics import instance_metrics
-from .curriculum import CurriculumController, curriculum_stage, stage_name_for_step
+from .trainer import Trainer
 
-__all__=["Trainer","save_checkpoint","load_checkpoint","migrate_history_checkpoint_state_dict","migrate_stirnet_checkpoint_config","instance_metrics","CurriculumController","curriculum_stage","stage_name_for_step"]
+__all__ = [
+    "ARCHITECTURE_ID",
+    "CHECKPOINT_VERSION",
+    "CurriculumConfig",
+    "CurriculumController",
+    "InstanceTargets",
+    "LossConfig",
+    "RecoveryTargets",
+    "StirNetCriterion",
+    "Trainer",
+    "TrainingConfig",
+    "build_instance_targets",
+    "build_recovery_targets",
+    "curriculum_stage",
+    "instance_metrics",
+    "load_checkpoint",
+    "save_checkpoint",
+    "stage_name_for_step",
+]

@@ -6,17 +6,30 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from ..config import InstanceConfig, PartitionConfig, TemporalConfig
+from ..config import (
+    InstanceConfig,
+    PartitionConfig,
+    RefinementConfig,
+    TemporalConfig,
+)
 from ..types import InstanceState, RAGState, ReasoningState, TemporalState
 
 
 class PhysicalLocalCrossAttention(nn.Module):
-    def __init__(self, d_model: int, heads: int, radius_dref: float, dropout: float):
+    def __init__(
+        self,
+        d_model: int,
+        heads: int,
+        radius_dref: float,
+        dropout: float,
+        reliability_floor: float,
+    ):
         super().__init__()
         self.d_model = d_model
         self.heads = heads
         self.head_dim = d_model // heads
         self.radius_dref = radius_dref
+        self.reliability_floor = reliability_floor
         self.q = nn.Linear(d_model, d_model, bias=False)
         self.k = nn.Linear(d_model, d_model, bias=False)
         self.v = nn.Linear(d_model, d_model, bias=False)
@@ -24,6 +37,8 @@ class PhysicalLocalCrossAttention(nn.Module):
         self.pos_bias = nn.Sequential(
             nn.Linear(4, 32), nn.SiLU(), nn.Linear(32, heads)
         )
+        self.salience_scale = nn.Parameter(torch.full((heads,), 0.25))
+        self.reliability_scale = nn.Parameter(torch.full((heads,), 0.25))
         self.dropout = dropout
 
     def _split(self, x: Tensor) -> Tensor:
@@ -62,6 +77,15 @@ class PhysicalLocalCrossAttention(nn.Module):
             rel = torch.cat([delta_norm, dist[..., None] / dref], dim=-1)
             logits = torch.einsum("hqd,hkd->hqk", q, k) / math.sqrt(self.head_dim)
             logits = logits + self.pos_bias(rel).permute(2, 0, 1)
+            salience = temporal.salience[ti, 0].float().clamp_min(1e-6)
+            reliability = temporal.reliability[ti, 0].float().clamp_min(
+                self.reliability_floor
+            )
+            logits = logits + (
+                self.salience_scale[:, None, None] * salience.log()[None, None]
+                + self.reliability_scale[:, None, None]
+                * reliability.log()[None, None]
+            ).to(logits.dtype)
             allowed = dist <= self.radius_dref * dref
             # Queries with no local temporal evidence receive exactly zero
             # message rather than being forced to attend a far-away track.
@@ -96,17 +120,27 @@ class InstanceTemporalReasoner(nn.Module):
         temporal_cfg: TemporalConfig,
         instance_cfg: InstanceConfig,
         partition_cfg: PartitionConfig,
+        refinement_cfg: RefinementConfig,
     ):
         super().__init__()
         d = temporal_cfg.d_model
         self.temporal_cfg = temporal_cfg
         self.partition_cfg = partition_cfg
+        self.refinement_cfg = refinement_cfg
         self.instance_attention = PhysicalLocalCrossAttention(
-            d, temporal_cfg.cross_heads, temporal_cfg.instance_match_radius_dref, temporal_cfg.dropout
+            d,
+            temporal_cfg.cross_heads,
+            temporal_cfg.instance_match_radius_dref,
+            temporal_cfg.dropout,
+            temporal_cfg.reliability_floor,
         )
         self.node_to_model = nn.Linear(partition_cfg.rag_hidden_dim, d)
         self.node_attention = PhysicalLocalCrossAttention(
-            d, temporal_cfg.cross_heads, temporal_cfg.instance_match_radius_dref, temporal_cfg.dropout
+            d,
+            temporal_cfg.cross_heads,
+            temporal_cfg.instance_match_radius_dref,
+            temporal_cfg.dropout,
+            temporal_cfg.reliability_floor,
         )
         self.instance_gate = nn.Sequential(
             nn.Linear(2 * d + 1, d), nn.Sigmoid()
@@ -127,15 +161,16 @@ class InstanceTemporalReasoner(nn.Module):
             nn.Linear(d + 2, d), nn.SiLU(), nn.Linear(d, 1)
         )
 
-    def _recovery_scores(
+    def _recovery_outputs(
         self,
         temporal: TemporalState,
         instances: InstanceState,
         dref_um: Tensor,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         if temporal.is_empty:
             return (
                 torch.zeros(0, device=instances.tokens.device, dtype=torch.long),
+                instances.tokens.new_zeros((0,)),
                 instances.tokens.new_zeros((0,)),
             )
         distances = temporal.tokens.new_full((temporal.tokens.shape[0],), 10.0)
@@ -147,17 +182,16 @@ class InstanceTemporalReasoner(nn.Module):
                 continue
             dist = torch.cdist(temporal.ref_um[ti].float(), instances.ref_um[ii].float())
             distances[ti] = dist.min(dim=1).values / dref_um[b].float().clamp_min(1e-6)
-        score = torch.sigmoid(
-            self.recovery(
-                torch.cat(
-                    [temporal.tokens, temporal.reliability, distances[:, None]], dim=-1
-                )
-            ).squeeze(-1)
-        )
+        logits = self.recovery(
+            torch.cat(
+                [temporal.tokens, temporal.reliability, distances[:, None]], dim=-1
+            )
+        ).squeeze(-1)
+        score = torch.sigmoid(logits)
         idx = torch.nonzero(
-            score >= self.partition_cfg.final_merge_threshold, as_tuple=False
+            score >= self.refinement_cfg.recovery_threshold, as_tuple=False
         ).flatten()
-        return idx, score[idx]
+        return idx, logits, score
 
     def forward(
         self,
@@ -235,7 +269,7 @@ class InstanceTemporalReasoner(nn.Module):
             gate = rag.spatial_edge_logits.new_zeros((0,))
             final_logits = rag.spatial_edge_logits
 
-        recovery_idx, recovery_scores = self._recovery_scores(
+        recovery_idx, recovery_logits, recovery_scores = self._recovery_outputs(
             temporal, instances, dref_um
         )
         base_quality = instances.quality_logits
@@ -259,5 +293,6 @@ class InstanceTemporalReasoner(nn.Module):
             edge_temporal_gate=gate,
             final_edge_logits=final_logits,
             recovery_track_indices=recovery_idx,
+            recovery_logits=recovery_logits,
             recovery_scores=recovery_scores,
         )

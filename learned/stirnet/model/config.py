@@ -77,6 +77,8 @@ class HistoryConfig:
     input_channels: int = 4
     hidden_channels: int = 32
     dropout: float = 0.10
+    node_chunk_size: int = 128
+    activation_checkpointing: bool = True
 
 
 
@@ -105,6 +107,8 @@ class RefinementConfig:
     hidden_channels: int = 48
     query_channels: int = 32
     max_rois_per_batch: int = 16
+    max_roi_voxels: int = 262_144
+    request_nms_radius_dref: float = 0.50
     split_threshold: float = 0.55
     recovery_threshold: float = 0.60
     ambiguity_logit_abs_max: float = 0.85
@@ -137,6 +141,20 @@ class ModelConfig:
             raise ValueError("max_supervoxels must be positive")
         if self.geometry.sdf_clip_dref <= 0:
             raise ValueError("sdf_clip_dref must be positive")
+        channels = self.evidence.raw_channels + self.evidence.prior_channels
+        if sorted(channels) != list(range(self.spatial.in_channels)):
+            raise ValueError(
+                "Evidence raw/prior channels must form an exact, non-overlapping "
+                "partition of spatial input channels"
+            )
+        if self.history.node_chunk_size < 1:
+            raise ValueError("history.node_chunk_size must be positive")
+        if self.refinement.max_rois_per_batch < 1:
+            raise ValueError("refinement.max_rois_per_batch must be positive")
+        if self.refinement.max_roi_voxels < 1:
+            raise ValueError("refinement.max_roi_voxels must be positive")
+        if self.refinement.request_nms_radius_dref < 0:
+            raise ValueError("refinement.request_nms_radius_dref cannot be negative")
 
     def to_dict(self) -> dict:
         self.validate()

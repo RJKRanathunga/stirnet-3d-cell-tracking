@@ -20,6 +20,7 @@ def build_refinement_requests(
     rag: RAGState,
     temporal: TemporalState,
     reasoning: ReasoningState,
+    dref_um: torch.Tensor,
     cfg: RefinementConfig,
 ) -> List[RefinementRequest]:
     """Select only ambiguous/recovery ROIs; strong spatial geometry is untouched."""
@@ -41,8 +42,8 @@ def build_refinement_requests(
             )
 
     # Reliable temporal hypothesis without a satisfactory current spatial cell.
-    for row, tidx in enumerate(reasoning.recovery_track_indices.tolist()):
-        score = float(reasoning.recovery_scores[row].item())
+    for tidx in reasoning.recovery_track_indices.tolist():
+        score = float(reasoning.recovery_scores[tidx].item())
         if score < cfg.recovery_threshold:
             continue
         requests.append(
@@ -93,5 +94,17 @@ def build_refinement_requests(
     selected: List[RefinementRequest] = []
     for b in sorted(grouped):
         ranked = sorted(grouped[b], key=lambda r: r.score, reverse=True)
-        selected.extend(ranked[: cfg.max_rois_per_batch])
+        kept: list[RefinementRequest] = []
+        min_distance = cfg.request_nms_radius_dref * float(dref_um[b].item())
+        for candidate in ranked:
+            if min_distance > 0 and any(
+                float(torch.linalg.vector_norm(candidate.center_um - row.center_um).item())
+                < min_distance
+                for row in kept
+            ):
+                continue
+            kept.append(candidate)
+            if len(kept) >= cfg.max_rois_per_batch:
+                break
+        selected.extend(kept)
     return selected

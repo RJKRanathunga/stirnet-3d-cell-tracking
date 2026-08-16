@@ -58,6 +58,28 @@ class LocalGeometryRefiner(nn.Module):
         q = q.expand(-1, -1, *spatial.shape[-3:])
         return self.fuse(torch.cat([spatial, q], dim=1))[0]
 
+    def _bounded_crop(
+        self,
+        shape: tuple[int, int, int],
+        spacing_um: Tensor,
+        center_um: Tensor,
+        radius_um: Tensor,
+    ) -> tuple[slice, slice, slice]:
+        radius = radius_um.float()
+        for _ in range(24):
+            slices = physical_crop_slices(shape, spacing_um, center_um, radius)
+            voxels = 1
+            for axis_slice in slices:
+                voxels *= max(int(axis_slice.stop) - int(axis_slice.start), 0)
+            if voxels <= self.cfg.max_roi_voxels:
+                return slices
+            scale = max(
+                0.10,
+                0.95 * (self.cfg.max_roi_voxels / max(voxels, 1)) ** (1.0 / 3.0),
+            )
+            radius = radius * scale
+        raise RuntimeError("Unable to bound local refinement ROI")
+
     def forward(
         self,
         d0: Tensor,
@@ -70,32 +92,32 @@ class LocalGeometryRefiner(nn.Module):
         if not self.cfg.enabled or not requests:
             return RefinementState(geometry=geometry, requests=requests, applied_count=0)
         probs = geometry.probabilities()
-        base_fields = [
-            geometry.foreground_logits,
-            geometry.surface_logits,
-            geometry.separator_logits,
-            geometry.sdf,
-            geometry.flow,
-            geometry.centroid_offset,
-            geometry.seed_logits,
-        ]
-        # 11 residual channels correspond to 1+1+1+1+3+3+1.
-        accum = geometry.sdf.new_zeros(
-            (geometry.sdf.shape[0], 11, *geometry.sdf.shape[-3:])
-        )
-        weight = geometry.sdf.new_zeros(
-            (geometry.sdf.shape[0], 1, *geometry.sdf.shape[-3:])
-        )
-        applied = 0
+        planned: list[tuple[RefinementRequest, tuple[slice, slice, slice]]] = []
         for request in requests:
-            b = request.batch_index
-            radius_um = self.cfg.roi_radius_dref * dref_um[b]
-            zyx = physical_crop_slices(
-                tuple(geometry.sdf.shape[-3:]),
-                spacing_um[b],
-                request.center_um,
-                radius_um,
+            batch_index = request.batch_index
+            planned.append(
+                (
+                    request,
+                    self._bounded_crop(
+                        tuple(geometry.sdf.shape[-3:]),
+                        spacing_um[batch_index],
+                        request.center_um,
+                        self.cfg.roi_radius_dref * dref_um[batch_index],
+                    ),
+                )
             )
+        fields = [
+            geometry.foreground_logits.clone(),
+            geometry.surface_logits.clone(),
+            geometry.separator_logits.clone(),
+            geometry.sdf.clone(),
+            geometry.flow.clone(),
+            geometry.centroid_offset.clone(),
+            geometry.seed_logits.clone(),
+        ]
+        applied = 0
+        for request, zyx in planned:
+            b = request.batch_index
             dense_crop = torch.cat(
                 [
                     probs["foreground"][b, :, zyx[0], zyx[1], zyx[2]],
@@ -107,43 +129,49 @@ class LocalGeometryRefiner(nn.Module):
                     probs["seed"][b, :, zyx[0], zyx[1], zyx[2]],
                 ],
                 dim=0,
-            )
+            ).to(dtype=d0[b].dtype)
             local = torch.cat(
                 [
                     d0[b, :, zyx[0], zyx[1], zyx[2]],
-                    spatial_inputs[b, :, zyx[0], zyx[1], zyx[2]],
+                    spatial_inputs[b, :, zyx[0], zyx[1], zyx[2]].to(
+                        dtype=d0[b].dtype
+                    ),
                     dense_crop,
                 ],
                 dim=0,
             )
             residual = self._decode_crop(local, request.query_token.to(local.dtype))
             residual = self.cfg.residual_scale * torch.tanh(residual)
-            accum[b, :, zyx[0], zyx[1], zyx[2]] = (
-                accum[b, :, zyx[0], zyx[1], zyx[2]] + residual
-            )
-            weight[b, :, zyx[0], zyx[1], zyx[2]] = (
-                weight[b, :, zyx[0], zyx[1], zyx[2]] + 1.0
-            )
+            crop_shape = tuple(axis.stop - axis.start for axis in zyx)
+            overlap = residual.new_zeros((1, *crop_shape))
+            for other_request, other in planned:
+                if other_request.batch_index != b:
+                    continue
+                lower = [max(zyx[axis].start, other[axis].start) for axis in range(3)]
+                upper = [min(zyx[axis].stop, other[axis].stop) for axis in range(3)]
+                if any(stop <= start for start, stop in zip(lower, upper)):
+                    continue
+                local_slices = tuple(
+                    slice(lower[axis] - zyx[axis].start, upper[axis] - zyx[axis].start)
+                    for axis in range(3)
+                )
+                overlap[(slice(None), *local_slices)] += 1
+            residual = residual / overlap.clamp_min(1)
+            deltas = torch.split(residual, (1, 1, 1, 1, 3, 3, 1), dim=0)
+            for field, delta in zip(fields, deltas):
+                field[b, :, zyx[0], zyx[1], zyx[2]] = (
+                    field[b, :, zyx[0], zyx[1], zyx[2]] + delta.to(field.dtype)
+                )
             applied += 1
-        correction = accum / weight.clamp_min(1)
-        correction = correction * (weight > 0).to(correction.dtype)
-        i = 0
-        fg = geometry.foreground_logits + correction[:, i : i + 1]; i += 1
-        surface = geometry.surface_logits + correction[:, i : i + 1]; i += 1
-        separator = geometry.separator_logits + correction[:, i : i + 1]; i += 1
-        sdf = geometry.sdf + correction[:, i : i + 1]; i += 1
-        flow = geometry.flow + correction[:, i : i + 3]; i += 3
-        offset = geometry.centroid_offset + correction[:, i : i + 3]; i += 3
-        seed = geometry.seed_logits + correction[:, i : i + 1]
         refined = replace(
             geometry,
-            foreground_logits=fg,
-            surface_logits=surface,
-            separator_logits=separator,
-            sdf=sdf,
-            flow=flow,
-            centroid_offset=offset,
-            seed_logits=seed,
+            foreground_logits=fields[0],
+            surface_logits=fields[1],
+            separator_logits=fields[2],
+            sdf=fields[3],
+            flow=fields[4],
+            centroid_offset=fields[5],
+            seed_logits=fields[6],
         )
         return RefinementState(
             geometry=refined, requests=requests, applied_count=applied

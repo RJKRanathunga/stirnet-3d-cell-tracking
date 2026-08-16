@@ -143,6 +143,7 @@ class ReasoningState:
     edge_temporal_gate: Tensor
     final_edge_logits: Tensor
     recovery_track_indices: Tensor
+    recovery_logits: Tensor
     recovery_scores: Tensor
 
 
@@ -176,6 +177,11 @@ class StirNetOutput:
     temporal: TemporalState
     reasoning: ReasoningState
     final_partition: PartitionState
+    initial_geometry: GeometryState
+    initial_rag: RAGState
+    initial_spatial_partition: PartitionState
+    initial_provisional_instances: InstanceState
+    initial_reasoning: ReasoningState
     refinement: Optional[RefinementState] = None
     debug: Optional[Dict[str, Any]] = None
 

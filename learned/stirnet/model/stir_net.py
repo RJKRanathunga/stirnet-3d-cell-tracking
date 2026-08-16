@@ -79,7 +79,10 @@ class StirNet(nn.Module):
             self.cfg.temporal, self.cfg.spatial, self.cfg.geometry
         )
         self.instance_temporal = InstanceTemporalReasoner(
-            self.cfg.temporal, self.cfg.instances, self.cfg.partition
+            self.cfg.temporal,
+            self.cfg.instances,
+            self.cfg.partition,
+            self.cfg.refinement,
         )
         self.local_refiner = LocalGeometryRefiner(
             self.cfg.refinement,
@@ -346,6 +349,7 @@ class StirNet(nn.Module):
                 initial_rag,
                 temporal,
                 initial_reasoning,
+                dref_um,
                 self.cfg.refinement,
             )
             refinement = self.local_refiner(
@@ -456,6 +460,11 @@ class StirNet(nn.Module):
             temporal=temporal,
             reasoning=reasoning,
             final_partition=final_partition,
+            initial_geometry=initial_geometry,
+            initial_rag=initial_rag,
+            initial_spatial_partition=initial_partition,
+            initial_provisional_instances=initial_instances,
+            initial_reasoning=initial_reasoning,
             refinement=refinement,
             debug=debug,
         )
