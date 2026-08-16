@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import List
+from typing import Callable, List
 
 import torch
 from torch import Tensor, nn
@@ -9,7 +9,16 @@ import torch.nn.functional as F
 
 from ..config import RefinementConfig, SpatialConfig
 from ..spatial.blocks import groups_for
-from ..types import GeometryState, RefinementRequest, RefinementState
+from ..types import (
+    GeometryLike,
+    GeometryState,
+    RefinedGeometryView,
+    RefinementRequest,
+    RefinementState,
+    SparseGeometryDelta,
+    SparseGeometryROI,
+    geometry_field_crop,
+)
 from ..utils.physical import physical_crop_slices
 
 
@@ -111,14 +120,47 @@ class LocalGeometryRefiner(nn.Module):
             radius = radius * scale
         raise RuntimeError("Unable to bound local refinement ROI")
 
+    @staticmethod
+    def _feature_crop(
+        feature: Tensor,
+        native_shape: tuple[int, int, int],
+        crop: tuple[slice, slice, slice],
+    ) -> Tensor:
+        if tuple(feature.shape[-3:]) == native_shape:
+            return feature[:, crop[0], crop[1], crop[2]]
+        normalized_axes = []
+        for axis, axis_slice in enumerate(crop):
+            index = torch.arange(
+                int(axis_slice.start),
+                int(axis_slice.stop),
+                device=feature.device,
+                dtype=torch.float32,
+            )
+            denominator = max(native_shape[axis] - 1, 1)
+            normalized_axes.append(2.0 * index / denominator - 1.0)
+        zz, yy, xx = torch.meshgrid(*normalized_axes, indexing="ij")
+        grid = torch.stack([xx, yy, zz], dim=-1)[None]
+        return F.grid_sample(
+            feature[None],
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )[0]
+
     def forward(
         self,
         d0: Tensor,
         spatial_inputs: Tensor,
-        geometry: GeometryState,
+        geometry: GeometryLike,
         spacing_um: Tensor,
         dref_um: Tensor,
         requests: List[RefinementRequest],
+        *,
+        d0_crop_provider: Callable[
+            [int, tuple[slice, slice, slice]], Tensor
+        ]
+        | None = None,
     ) -> RefinementState:
         if not self.cfg.enabled or not requests:
             return RefinementState(geometry=geometry, requests=requests, applied_count=0)
@@ -137,15 +179,7 @@ class LocalGeometryRefiner(nn.Module):
                     ),
                 )
             )
-        fields = [
-            geometry.foreground_logits.clone(),
-            geometry.surface_logits.clone(),
-            geometry.separator_logits.clone(),
-            geometry.sdf.clone(),
-            geometry.flow.clone(),
-            geometry.centroid_offset.clone(),
-            geometry.seed_logits.clone(),
-        ]
+        sparse_rois: list[SparseGeometryROI] = []
         applied = 0
         for request, zyx in planned:
             b = request.batch_index
@@ -163,7 +197,13 @@ class LocalGeometryRefiner(nn.Module):
             ).to(dtype=d0[b].dtype)
             local = torch.cat(
                 [
-                    d0[b, :, zyx[0], zyx[1], zyx[2]],
+                    (
+                        d0_crop_provider(b, zyx)
+                        if d0_crop_provider is not None
+                        else self._feature_crop(
+                            d0[b], tuple(geometry.sdf.shape[-3:]), zyx
+                        )
+                    ),
                     spatial_inputs[b, :, zyx[0], zyx[1], zyx[2]].to(
                         dtype=d0[b].dtype
                     ),
@@ -197,21 +237,26 @@ class LocalGeometryRefiner(nn.Module):
                 )
                 overlap[(slice(None), *local_slices)] += 1
             residual = residual / overlap.clamp_min(1)
-            deltas = torch.split(residual, (1, 1, 1, 1, 3, 3, 1), dim=0)
-            for field, delta in zip(fields, deltas):
-                field[b, :, zyx[0], zyx[1], zyx[2]] = (
-                    field[b, :, zyx[0], zyx[1], zyx[2]] + delta.to(field.dtype)
+            sparse_rois.append(
+                SparseGeometryROI(
+                    batch_index=b,
+                    slices_zyx=zyx,
+                    delta=residual,
                 )
+            )
             applied += 1
-        refined = replace(
-            geometry,
-            foreground_logits=fields[0],
-            surface_logits=fields[1],
-            separator_logits=fields[2],
-            sdf=fields[3],
-            flow=fields[4],
-            centroid_offset=fields[5],
-            seed_logits=fields[6],
+        refined = RefinedGeometryView(
+            base=geometry.base if isinstance(geometry, RefinedGeometryView) else geometry,
+            delta=SparseGeometryDelta(
+                rois=[
+                    *(
+                        geometry.delta.rois
+                        if isinstance(geometry, RefinedGeometryView)
+                        else []
+                    ),
+                    *sparse_rois,
+                ]
+            ),
         )
         return RefinementState(
             geometry=refined, requests=requests, applied_count=applied

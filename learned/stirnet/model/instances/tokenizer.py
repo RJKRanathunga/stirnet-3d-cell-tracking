@@ -6,9 +6,40 @@ import torch
 from torch import Tensor, nn
 
 from ..config import InstanceConfig, SpatialConfig
-from ..types import GeometryState, InstanceState, PartitionState, RAGState, SpatialDecodeState
-from ..utils.physical import relative_grid_coordinates_um
-from ..utils.tensor_ops import pool_labeled_features, resize_labels_nearest
+from ..types import (
+    GeometryLike,
+    InstanceState,
+    PartitionState,
+    RAGState,
+    SpatialDecodeState,
+    geometry_field,
+    geometry_probability,
+)
+from ..utils.tensor_ops import (
+    LabeledVoxelStats,
+    pool_labeled_features,
+    project_pooled_mean_max,
+    reduce_labeled_voxels,
+    resize_labels_nearest,
+)
+
+
+def _physical_points_from_flat_indices(
+    flat_index: Tensor,
+    shape: tuple[int, int, int],
+    spacing_um: Tensor,
+) -> Tensor:
+    y_size, x_size = shape[1:]
+    z = torch.div(flat_index, y_size * x_size, rounding_mode="floor")
+    remainder = flat_index % (y_size * x_size)
+    y = torch.div(remainder, x_size, rounding_mode="floor")
+    x = remainder % x_size
+    voxel = torch.stack([z, y, x], dim=-1).to(torch.float32)
+    center = 0.5 * (
+        torch.as_tensor(shape, device=flat_index.device, dtype=torch.float32) - 1
+    )
+    spacing = spacing_um.to(device=flat_index.device, dtype=torch.float32)
+    return (voxel - center) * spacing
 
 
 def centers_from_labels(
@@ -21,29 +52,27 @@ def centers_from_labels(
     """
     result: List[Tensor] = []
     for b, lab in enumerate(labels):
-        n = int(lab.max().item())
-        if n == 0:
+        stats = reduce_labeled_voxels(
+            lab,
+            spacing_um[b],
+            argmax_field=None if sdf is None else sdf[b, 0],
+        )
+        if stats.counts.numel() == 0:
             result.append(spacing_um.new_zeros((0, 3)))
             continue
-        coords = relative_grid_coordinates_um(
-            tuple(lab.shape), spacing_um[b], device=lab.device
+        flat_index = (
+            stats.argmax_flat_index
+            if sdf is not None
+            else stats.nearest_centroid_flat_index
         )
-        centers = []
-        for instance_id in range(1, n + 1):
-            mask = lab == instance_id
-            points = torch.nonzero(mask, as_tuple=False)
-            if points.numel() == 0:
-                centers.append(spacing_um.new_zeros((3,)))
-                continue
-            if sdf is not None:
-                values = sdf[b, 0][mask]
-                voxel = points[values.argmax()]
-            else:
-                # Pick the in-mask voxel nearest the geometric centroid.
-                centroid = points.float().mean(0)
-                voxel = points[torch.linalg.vector_norm(points.float() - centroid, dim=-1).argmin()]
-            centers.append(coords[voxel[0], voxel[1], voxel[2]])
-        result.append(torch.stack(centers))
+        if flat_index is None:
+            raise RuntimeError("argmax center reduction was not produced")
+        centers = _physical_points_from_flat_indices(
+            flat_index, tuple(lab.shape), spacing_um[b]
+        )
+        centers = centers.to(device=spacing_um.device, dtype=spacing_um.dtype)
+        centers[stats.counts.to(centers.device) == 0] = 0
+        result.append(centers)
     return result
 
 
@@ -57,46 +86,64 @@ def _pad_pooled(pooled: Tensor, n: int) -> Tensor:
 
 def _shape_features(
     labels: Tensor,
-    geometry: GeometryState,
+    geometry: GeometryLike,
     b: int,
     spacing_um: Tensor,
     dref_um: Tensor,
+    *,
+    stats: LabeledVoxelStats | None = None,
 ) -> Tensor:
     n = int(labels.max().item())
     if n == 0:
-        return geometry.sdf.new_zeros((0, 12))
-    coords = relative_grid_coordinates_um(
-        tuple(labels.shape), spacing_um, device=labels.device
+        return geometry_field(geometry, "sdf").new_zeros((0, 12))
+    stats = stats or _geometry_stats(labels, geometry, b, spacing_um)
+    positive = stats.counts > 0
+    median_count = stats.counts[positive].median().clamp_min(1)
+    extent = (
+        (stats.max_voxel - stats.min_voxel).to(torch.float32)
+        * spacing_um.float()[None]
+        / dref_um.float().clamp_min(1e-6)
     )
-    probs = geometry.probabilities()
-    rows = []
-    counts_all = torch.stack([(labels == i).sum() for i in range(1, n + 1)]).float()
-    median_count = counts_all[counts_all > 0].median().clamp_min(1)
-    for instance_id in range(1, n + 1):
-        mask = labels == instance_id
-        xyz = coords[mask]
-        if xyz.numel() == 0:
-            rows.append(geometry.sdf.new_zeros((12,)))
-            continue
-        extent = (xyz.max(0).values - xyz.min(0).values) / dref_um.clamp_min(1e-6)
-        var = xyz.var(0, unbiased=False) / dref_um.square().clamp_min(1e-6)
-        sdf_vals = geometry.sdf[b, 0][mask]
-        sep_vals = probs["separator"][b, 0][mask]
-        fg_vals = probs["foreground"][b, 0][mask]
-        row = torch.cat(
-            [
-                torch.log1p(mask.sum().float())[None] - torch.log1p(median_count)[None],
-                extent,
-                var,
-                sdf_vals.mean()[None],
-                sdf_vals.max()[None],
-                sep_vals.mean()[None],
-                sep_vals.max()[None],
-                fg_vals.mean()[None],
-            ]
-        )
-        rows.append(row)
-    return torch.stack(rows)
+    variance = stats.variance_um2 / dref_um.float().square().clamp_min(1e-6)
+    result = torch.cat(
+        [
+            (
+                torch.log1p(stats.counts) - torch.log1p(median_count)
+            )[:, None],
+            extent,
+            variance,
+            stats.field_means["sdf"][:, None],
+            stats.field_maxima["sdf"][:, None],
+            stats.field_means["separator"][:, None],
+            stats.field_maxima["separator"][:, None],
+            stats.field_means["foreground"][:, None],
+        ],
+        dim=-1,
+    )
+    return torch.where(positive[:, None], result, torch.zeros_like(result))
+
+
+def _geometry_stats(
+    labels: Tensor,
+    geometry: GeometryLike,
+    batch_index: int,
+    spacing_um: Tensor,
+) -> LabeledVoxelStats:
+    sdf = geometry_field(geometry, "sdf")[batch_index, 0]
+    return reduce_labeled_voxels(
+        labels,
+        spacing_um,
+        fields={
+            "sdf": sdf,
+            "separator": geometry_probability(geometry, "separator")[
+                batch_index, 0
+            ],
+            "foreground": geometry_probability(geometry, "foreground")[
+                batch_index, 0
+            ],
+        },
+        argmax_field=sdf,
+    )
 
 
 class InstanceTokenizer(nn.Module):
@@ -106,9 +153,9 @@ class InstanceTokenizer(nn.Module):
         super().__init__()
         self.cfg = cfg
         p = cfg.pooled_feature_dim
-        self.proj_d0 = nn.Conv3d(spatial_cfg.channels[0], p, 1, bias=False)
-        self.proj_d1 = nn.Conv3d(spatial_cfg.channels[1], p, 1, bias=False)
-        self.proj_d2 = nn.Conv3d(spatial_cfg.channels[2], p, 1, bias=False)
+        self.proj_d0 = nn.Linear(spatial_cfg.channels[0], p, bias=False)
+        self.proj_d1 = nn.Linear(spatial_cfg.channels[1], p, bias=False)
+        self.proj_d2 = nn.Linear(spatial_cfg.channels[2], p, bias=False)
         # Geometry pooled channels: fg, surface, separator, sdf, flow(3),
         # centroid offset(3), seed = 11; mean+max -> 22.
         in_dim = 3 * (2 * p) + 22 + cfg.shape_feature_dim
@@ -122,19 +169,43 @@ class InstanceTokenizer(nn.Module):
             nn.LayerNorm(cfg.d_model), nn.Linear(cfg.d_model, 1)
         )
 
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        for name in ("proj_d0", "proj_d1", "proj_d2"):
+            key = f"{prefix}{name}.weight"
+            weight = state_dict.get(key)
+            if weight is not None and weight.ndim == 5 and weight.shape[-3:] == (1, 1, 1):
+                state_dict[key] = weight[..., 0, 0, 0]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def forward(
         self,
         partition: PartitionState,
         rag: RAGState,
         decoded: SpatialDecodeState,
-        geometry: GeometryState,
+        geometry: GeometryLike,
         spacing_um: Tensor,
         dref_um: Tensor,
+        *,
+        pooled_supervoxel_scales: tuple[List[Tensor], List[Tensor], List[Tensor]] | None = None,
+        pooled_supervoxel_counts: tuple[List[Tensor], List[Tensor], List[Tensor]] | None = None,
     ) -> InstanceState:
-        d0 = self.proj_d0(decoded.d0)
-        d1 = self.proj_d1(decoded.d1)
-        d2 = self.proj_d2(decoded.d2)
-        probs = geometry.probabilities()
         tokens = []
         refs = []
         batches = []
@@ -146,30 +217,115 @@ class InstanceTokenizer(nn.Module):
                 offsets.append(offsets[-1])
                 continue
             pooled_scales = []
-            for feature in (d0[b], d1[b], d2[b]):
-                lab_scale = resize_labels_nearest(labels, tuple(feature.shape[-3:]))
-                pooled, _ = pool_labeled_features(feature, lab_scale)
-                pooled_scales.append(_pad_pooled(pooled, n))
-            dense = torch.cat(
-                [
-                    probs["foreground"][b],
-                    probs["surface"][b],
-                    probs["separator"][b],
-                    geometry.sdf[b],
-                    geometry.flow[b],
-                    geometry.centroid_offset[b],
-                    probs["seed"][b],
-                ],
-                dim=0,
+            if pooled_supervoxel_scales is None:
+                for feature, projection in zip(
+                    (decoded.d0[b], decoded.d1[b], decoded.d2[b]),
+                    (self.proj_d0, self.proj_d1, self.proj_d2),
+                ):
+                    lab_scale = resize_labels_nearest(
+                        labels, tuple(feature.shape[-3:])
+                    )
+                    pooled, _ = pool_labeled_features(feature, lab_scale)
+                    pooled_scales.append(
+                        _pad_pooled(
+                            project_pooled_mean_max(pooled, projection), n
+                        )
+                    )
+            else:
+                if pooled_supervoxel_counts is None:
+                    raise ValueError(
+                        "streamed pooled scales require matching count rows"
+                    )
+                start = int(rag.node_offsets[b].item())
+                stop = int(rag.node_offsets[b + 1].item())
+                component = partition.node_component[start:stop]
+                for scale, projection in enumerate(
+                    (self.proj_d0, self.proj_d1, self.proj_d2)
+                ):
+                    node_pooled = pooled_supervoxel_scales[scale][b]
+                    node_counts = pooled_supervoxel_counts[scale][b]
+                    node_pooled = _pad_pooled(node_pooled, stop - start)
+                    node_counts = torch.cat(
+                        [
+                            node_counts[: stop - start],
+                            node_counts.new_zeros(
+                                (max(stop - start - node_counts.shape[0], 0),)
+                            ),
+                        ]
+                    )
+                    mean, maximum = node_pooled.chunk(2, dim=-1)
+                    instance_counts = node_counts.new_zeros((n,))
+                    instance_counts.index_add_(0, component, node_counts)
+                    instance_sums = mean.new_zeros((n, mean.shape[1]))
+                    instance_sums.index_add_(
+                        0, component, mean * node_counts[:, None]
+                    )
+                    instance_mean = instance_sums / instance_counts.clamp_min(1)[:, None]
+                    instance_max = maximum.new_full((n, maximum.shape[1]), -torch.inf)
+                    valid_nodes = node_counts > 0
+                    if valid_nodes.any():
+                        instance_max.scatter_reduce_(
+                            0,
+                            component[valid_nodes, None].expand(
+                                -1, maximum.shape[1]
+                            ),
+                            maximum[valid_nodes],
+                            reduce="amax",
+                            include_self=True,
+                        )
+                    instance_max = torch.where(
+                        torch.isfinite(instance_max),
+                        instance_max,
+                        torch.zeros_like(instance_max),
+                    )
+                    pooled_scales.append(
+                        project_pooled_mean_max(
+                            torch.cat([instance_mean, instance_max], dim=-1),
+                            projection,
+                        )
+                    )
+            geometry_means: list[Tensor] = []
+            geometry_maxima: list[Tensor] = []
+
+            def append_geometry(dense_field: Tensor) -> None:
+                pooled_field, _ = pool_labeled_features(dense_field, labels)
+                mean, maximum = pooled_field.chunk(2, dim=-1)
+                geometry_means.append(mean)
+                geometry_maxima.append(maximum)
+
+            append_geometry(geometry_probability(geometry, "foreground")[b])
+            append_geometry(geometry_probability(geometry, "surface")[b])
+            append_geometry(geometry_probability(geometry, "separator")[b])
+            append_geometry(geometry_field(geometry, "sdf")[b])
+            append_geometry(geometry_field(geometry, "flow")[b])
+            append_geometry(geometry_field(geometry, "centroid_offset")[b])
+            append_geometry(geometry_probability(geometry, "seed")[b])
+            pooled_geometry = torch.cat(
+                [*geometry_means, *geometry_maxima], dim=-1
             )
-            pooled_geometry, _ = pool_labeled_features(dense, labels)
             pooled_geometry = _pad_pooled(pooled_geometry, n)
+            stats = _geometry_stats(
+                labels, geometry, b, spacing_um[b]
+            )
             shape = _shape_features(
-                labels, geometry, b, spacing_um[b], dref_um[b]
+                labels,
+                geometry,
+                b,
+                spacing_um[b],
+                dref_um[b],
+                stats=stats,
             )
             feature = torch.cat([*pooled_scales, pooled_geometry, shape], dim=-1)
             tokens.append(self.token_mlp(feature))
-            refs.append(centers_from_labels([labels], spacing_um[b:b+1], geometry.sdf[b:b+1])[0])
+            if stats.argmax_flat_index is None:
+                raise RuntimeError("SDF argmax centers were not reduced")
+            refs.append(
+                _physical_points_from_flat_indices(
+                    stats.argmax_flat_index,
+                    tuple(labels.shape),
+                    spacing_um[b],
+                ).to(spacing_um.dtype)
+            )
             batches.append(torch.full((n,), b, device=labels.device, dtype=torch.long))
             local_ids.append(torch.arange(1, n + 1, device=labels.device, dtype=torch.long))
             offsets.append(offsets[-1] + n)

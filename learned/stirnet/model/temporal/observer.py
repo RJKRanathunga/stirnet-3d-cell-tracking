@@ -6,7 +6,15 @@ import torch
 from torch import Tensor, nn
 
 from ..config import GeometryConfig, SpatialConfig, TemporalConfig
-from ..types import GeometryState, SpatialDecodeState, TemporalState
+from ..types import (
+    GeometryLike,
+    GeometryState,
+    SpatialDecodeState,
+    SpatialObservationCache,
+    TemporalState,
+    geometry_field,
+    geometry_probability,
+)
 
 
 def _sample_local_grid(
@@ -159,18 +167,30 @@ class TemporalSpatialObserver(nn.Module):
             error_msgs,
         )
 
-    def forward(
+    def build_cache(
         self,
         temporal: TemporalState,
         decoded: SpatialDecodeState,
-        geometry: GeometryState,
+        geometry: GeometryLike,
         spatial_spacings_um: list[Tensor],
         spacing_um: Tensor,
         dref_um: Tensor,
-    ) -> TemporalState:
+    ) -> SpatialObservationCache:
+        count = temporal.tokens.shape[0]
+        width = self.cfg.d_model
+        d1_projected = temporal.tokens.new_zeros((count, width))
+        d2_projected = temporal.tokens.new_zeros((count, width))
+        hidden_projected = temporal.tokens.new_zeros((count, width))
         if temporal.is_empty:
-            return temporal
-        messages = torch.zeros_like(temporal.tokens)
+            return SpatialObservationCache(
+                d1_projected=d1_projected,
+                d2_projected=d2_projected,
+                hidden_geometry_projected=hidden_projected,
+            )
+        if geometry.features is None:
+            raise ValueError(
+                "hidden geometry is required when building an observation cache"
+            )
         for b in range(decoded.d0.shape[0]):
             idx = torch.nonzero(temporal.batch_index == b, as_tuple=False).flatten()
             if idx.numel() == 0:
@@ -184,55 +204,108 @@ class TemporalSpatialObserver(nn.Module):
             d2_local = _sample_local_grid(
                 decoded.d2[b], refs, spatial_spacings_um[2][b], radius_vec
             )
-            hidden_geometry_local = _sample_local_grid(
-                geometry.features[b], refs, spacing_um[b], radius_vec
+            hidden_spacing = (
+                spacing_um[b]
+                if geometry.feature_spacing_um is None
+                else geometry.feature_spacing_um[b]
             )
+            hidden_geometry_local = _sample_local_grid(
+                geometry.features[b], refs, hidden_spacing, radius_vec
+            )
+            d1_projected[idx] = self.d1_proj(d1_local).to(d1_projected.dtype)
+            d2_projected[idx] = self.d2_proj(d2_local).to(d2_projected.dtype)
+            hidden_projected[idx] = self.geometry_proj(
+                hidden_geometry_local
+            ).to(hidden_projected.dtype)
+        return SpatialObservationCache(
+            d1_projected=d1_projected,
+            d2_projected=d2_projected,
+            hidden_geometry_projected=hidden_projected,
+        )
+
+    def forward(
+        self,
+        temporal: TemporalState,
+        decoded: SpatialDecodeState,
+        geometry: GeometryLike,
+        spatial_spacings_um: list[Tensor],
+        spacing_um: Tensor,
+        dref_um: Tensor,
+        *,
+        cache: SpatialObservationCache | None = None,
+    ) -> TemporalState:
+        if temporal.is_empty:
+            return temporal
+        cache = cache or self.build_cache(
+            temporal,
+            decoded,
+            geometry,
+            spatial_spacings_um,
+            spacing_um,
+            dref_um,
+        )
+        if cache.d1_projected.shape != temporal.tokens.shape:
+            raise ValueError("observation cache must align with temporal tokens")
+        messages = torch.zeros_like(temporal.tokens)
+        for b in range(decoded.d0.shape[0]):
+            idx = torch.nonzero(temporal.batch_index == b, as_tuple=False).flatten()
+            if idx.numel() == 0:
+                continue
+            refs = temporal.ref_um[idx]
+            radius = dref_um[b] * self.cfg.observation_radius_dref
+            radius_vec = radius.expand(len(idx))
             explicit_geometry_local = torch.cat(
                 [
                     _sample_local_grid(
-                        geometry.foreground_logits[b].sigmoid(),
+                        geometry_probability(geometry, "foreground")[b],
                         refs,
                         spacing_um[b],
                         radius_vec,
                     ),
                     _sample_local_grid(
-                        geometry.surface_logits[b].sigmoid(),
+                        geometry_probability(geometry, "surface")[b],
                         refs,
                         spacing_um[b],
                         radius_vec,
                     ),
                     _sample_local_grid(
-                        geometry.separator_logits[b].sigmoid(),
+                        geometry_probability(geometry, "separator")[b],
                         refs,
                         spacing_um[b],
                         radius_vec,
                     ),
                     _sample_local_grid(
-                        geometry.sdf[b], refs, spacing_um[b], radius_vec
-                    ),
-                    _sample_local_grid(
-                        geometry.flow[b], refs, spacing_um[b], radius_vec
-                    ),
-                    _sample_local_grid(
-                        geometry.centroid_offset[b],
+                        geometry_field(geometry, "sdf")[b],
                         refs,
                         spacing_um[b],
                         radius_vec,
                     ),
                     _sample_local_grid(
-                        geometry.seed_logits[b].sigmoid(),
+                        geometry_field(geometry, "flow")[b],
+                        refs,
+                        spacing_um[b],
+                        radius_vec,
+                    ),
+                    _sample_local_grid(
+                        geometry_field(geometry, "centroid_offset")[b],
+                        refs,
+                        spacing_um[b],
+                        radius_vec,
+                    ),
+                    _sample_local_grid(
+                        geometry_probability(geometry, "seed")[b],
                         refs,
                         spacing_um[b],
                         radius_vec,
                     ),
                 ],
                 dim=-1,
-            ).to(hidden_geometry_local.dtype)
-            p1 = self.d1_proj(d1_local)
-            p2 = self.d2_proj(d2_local)
-            pg = self.geometry_proj(
-                hidden_geometry_local
-            ) + self.geometry_field_proj(explicit_geometry_local)
+            ).to(cache.hidden_geometry_projected.dtype)
+            p1 = cache.d1_projected[idx]
+            p2 = cache.d2_projected[idx]
+            pg = cache.hidden_geometry_projected[idx] + self.geometry_field_proj(
+                explicit_geometry_local
+            )
             local_message = self.message(torch.cat([p1, p2, pg], dim=-1))
             messages[idx] = local_message.to(messages.dtype)
         gate = self.gate(

@@ -38,6 +38,7 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
     amp_dtype: str = "bf16"
+    profile_memory: bool = False
     refinement_teacher_forcing_start: float = 1.0
     refinement_teacher_forcing_end: float = 0.0
     refinement_teacher_forcing_decay_steps: int = 2_000

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -24,6 +24,9 @@ class SpatialConfig:
     acquisition_dim: int = 64
     group_norm_max_groups: int = 8
     activation_checkpointing: bool = True
+    canonical_spacing_um: Optional[Tuple[float, float, float]] = None
+    axis_conv_variant: str = "dense"
+    axis_conv_bottleneck_ratio: float = 0.5
 
 
 @dataclass
@@ -123,6 +126,18 @@ class RefinementConfig:
     recovery_threshold: float = 0.60
     ambiguity_logit_abs_max: float = 0.85
     residual_scale: float = 0.75
+    partition_update: str = "local"
+    partition_halo_dref: float = 1.0
+
+
+@dataclass
+class InferenceConfig:
+    mode: str = "full"
+    tiled_dense_enabled: bool = False
+    tile_shape_zyx: Tuple[int, int, int] = (32, 128, 128)
+    tile_overlap_zyx: Tuple[int, int, int] = (8, 32, 32)
+    tile_halo_zyx: Tuple[int, int, int] = (4, 16, 16)
+    tile_batch_size: int = 1
 
 
 @dataclass
@@ -135,12 +150,21 @@ class ModelConfig:
     history: HistoryConfig = field(default_factory=HistoryConfig)
     temporal: TemporalConfig = field(default_factory=TemporalConfig)
     refinement: RefinementConfig = field(default_factory=RefinementConfig)
+    inference: InferenceConfig = field(default_factory=InferenceConfig)
 
     def validate(self) -> None:
         if len(self.spatial.channels) != 4:
             raise ValueError("SpatialConfig.channels must contain four levels E0..E3")
         if any(c <= 0 for c in self.spatial.channels):
             raise ValueError("All spatial channel widths must be positive")
+        if self.spatial.canonical_spacing_um is not None and any(
+            value <= 0 for value in self.spatial.canonical_spacing_um
+        ):
+            raise ValueError("canonical_spacing_um values must be positive")
+        if self.spatial.axis_conv_variant not in {"dense", "depthwise"}:
+            raise ValueError("axis_conv_variant must be 'dense' or 'depthwise'")
+        if not 0 < self.spatial.axis_conv_bottleneck_ratio <= 1:
+            raise ValueError("axis_conv_bottleneck_ratio must be in (0, 1]")
         if self.instances.d_model != self.temporal.d_model:
             raise ValueError("Instance and temporal d_model must match")
         if self.temporal.d_model % self.temporal.cross_heads:
@@ -175,6 +199,25 @@ class ModelConfig:
             raise ValueError("refinement.max_roi_voxels must be positive")
         if self.refinement.request_nms_radius_dref < 0:
             raise ValueError("refinement.request_nms_radius_dref cannot be negative")
+        if self.refinement.partition_update not in {"local", "full"}:
+            raise ValueError("refinement.partition_update must be 'local' or 'full'")
+        if self.refinement.partition_halo_dref < 0:
+            raise ValueError("refinement.partition_halo_dref cannot be negative")
+        if self.inference.mode not in {"full", "tiled"}:
+            raise ValueError("inference.mode must be 'full' or 'tiled'")
+        if self.inference.tile_batch_size < 1:
+            raise ValueError("inference.tile_batch_size must be positive")
+        for size, overlap, halo in zip(
+            self.inference.tile_shape_zyx,
+            self.inference.tile_overlap_zyx,
+            self.inference.tile_halo_zyx,
+        ):
+            if size < 1 or overlap < 0 or halo < 0:
+                raise ValueError("tile sizes must be positive; overlap/halo non-negative")
+            if overlap >= size:
+                raise ValueError("tile overlap must be smaller than tile shape")
+            if halo * 2 >= size:
+                raise ValueError("tile halo must leave a non-empty reliable interior")
 
     def to_dict(self) -> dict:
         self.validate()

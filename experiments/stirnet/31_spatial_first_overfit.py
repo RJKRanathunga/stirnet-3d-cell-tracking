@@ -38,6 +38,9 @@ from learned.stirnet.training.trainer import (
     model_forward_from_batch,
     move_batch_to_device,
 )
+from learned.stirnet.inference import (
+    tiled_temporal_inference,
+)
 
 
 STAGES = (
@@ -352,7 +355,89 @@ def parse_args():
     parser.add_argument("--device")
     parser.add_argument("--hard-time-limit-seconds", type=float, default=3480)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--profile-memory", action="store_true")
+    parser.add_argument("--benchmark-inference", action="store_true")
+    parser.add_argument("--benchmark-shape", type=int, nargs=3, metavar=("Z", "Y", "X"))
+    parser.add_argument("--inference-mode", choices=("full", "tiled"), default="full")
+    parser.add_argument("--canonical-spacing-um", type=float, nargs=3)
+    parser.add_argument("--blasto-lateral-normalization", action="store_true")
+    parser.add_argument("--axis-conv-variant", choices=("dense", "depthwise"), default="dense")
     return parser.parse_args()
+
+
+def _apply_experimental_options(cfg: StirNetConfig, args) -> None:
+    cfg.inference.mode = args.inference_mode
+    cfg.inference.tiled_dense_enabled = args.inference_mode == "tiled"
+    cfg.spatial.axis_conv_variant = args.axis_conv_variant
+    if args.canonical_spacing_um is not None:
+        cfg.spatial.canonical_spacing_um = tuple(args.canonical_spacing_um)
+    elif args.blasto_lateral_normalization:
+        cfg.spatial.canonical_spacing_um = (2.0, 0.4, 0.4)
+    cfg.validate()
+
+
+def _run_inference_benchmark(
+    trainer: Trainer,
+    batch: dict,
+    *,
+    inference_mode: str,
+) -> dict:
+    moved = move_batch_to_device(batch, trainer.device)
+    trainer.model.eval()
+    if trainer.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(trainer.device)
+        torch.cuda.synchronize(trainer.device)
+    started = time.perf_counter()
+    with torch.inference_mode(), trainer._autocast():
+        if inference_mode == "full":
+            output = model_forward_from_batch(
+                trainer.model,
+                moved,
+                execution_stage="refinement",
+                teacher_request_builder=None,
+                apply_existence_filter=False,
+            )
+            output_shape = list(output.geometry.sdf.shape[-3:])
+            instance_count = sum(int(labels.max().item()) for labels in output.final_labels)
+            path = "full_global_pipeline"
+        else:
+            tiled = tiled_temporal_inference(
+                trainer.model,
+                moved["spatial_inputs"],
+                moved["spacing_um"],
+                moved["dref_um"],
+                config=trainer.model.cfg.inference,
+                spatial_padding_mask=moved.get("spatial_padding_mask"),
+                run_refinement=True,
+                apply_existence_filter=False,
+            )
+            output_shape = list(tiled.spatial.dense.geometry.sdf.shape[-3:])
+            instance_count = sum(
+                int(labels.max().item())
+                for labels in tiled.final_labels
+            )
+            path = "tiled_global_pipeline_streamed_features"
+    if trainer.device.type == "cuda":
+        torch.cuda.synchronize(trainer.device)
+    elapsed = time.perf_counter() - started
+    result = {
+        "benchmark": "inference_only",
+        "path": path,
+        "shape_zyx": output_shape,
+        "wall_seconds": elapsed,
+        "proposal_count": instance_count,
+        "amp_dtype": trainer.training_config.amp_dtype,
+        "peak_allocated_mb": 0.0,
+        "peak_reserved_mb": 0.0,
+    }
+    if trainer.device.type == "cuda":
+        result["peak_allocated_mb"] = torch.cuda.max_memory_allocated(
+            trainer.device
+        ) / (1024**2)
+        result["peak_reserved_mb"] = torch.cuda.max_memory_reserved(
+            trainer.device
+        ) / (1024**2)
+    return result
 
 
 def main() -> int:
@@ -364,12 +449,46 @@ def main() -> int:
     args.run_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(40266)
     np.random.seed(40266)
+    cfg = reduced_config()
+    _apply_experimental_options(cfg, args)
+    train_cfg = TrainingConfig(lr=args.learning_rate)
+    train_cfg.amp_dtype = args.amp_dtype
+    train_cfg.profile_memory = args.profile_memory
+    if args.benchmark_inference and args.benchmark_shape is not None:
+        shape = tuple(args.benchmark_shape)
+        benchmark_batch = {
+            "spatial_inputs": torch.rand((1, cfg.spatial.in_channels, *shape)),
+            "spacing_um": torch.tensor([[1.6, 0.4, 0.4]]),
+            "dref_um": torch.tensor([4.0]),
+        }
+        benchmark_trainer = Trainer(StirNet(cfg), train_cfg, device=args.device)
+        print(
+            json.dumps(
+                _run_inference_benchmark(
+                    benchmark_trainer,
+                    benchmark_batch,
+                    inference_mode=args.inference_mode,
+                )
+            ),
+            flush=True,
+        )
+        return 0
     batch, scene = build_real_batch(args.data_dir)
     if args.smoke:
         batch, scene = crop_batch_for_smoke(batch, scene)
-    cfg = reduced_config()
-    train_cfg = TrainingConfig(lr=args.learning_rate)
-    train_cfg.amp_dtype = args.amp_dtype
+    if args.benchmark_inference:
+        benchmark_trainer = Trainer(StirNet(cfg), train_cfg, device=args.device)
+        print(
+            json.dumps(
+                _run_inference_benchmark(
+                    benchmark_trainer,
+                    batch,
+                    inference_mode=args.inference_mode,
+                )
+            ),
+            flush=True,
+        )
+        return 0
     steps_per_stage = 1 if args.smoke else args.stage_steps
     if args.stage == "all":
         train_cfg.curriculum.geometry_bootstrap_steps = steps_per_stage

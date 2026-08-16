@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 
 
 @dataclass
@@ -47,7 +48,8 @@ class GeometryState:
     flow: Tensor
     centroid_offset: Tensor
     seed_logits: Tensor
-    features: Tensor
+    features: Optional[Tensor] = None
+    feature_spacing_um: Optional[Tensor] = None
 
     def probabilities(self) -> Dict[str, Tensor]:
         return {
@@ -56,6 +58,189 @@ class GeometryState:
             "separator": self.separator_logits.sigmoid(),
             "seed": self.seed_logits.sigmoid(),
         }
+
+
+_GEOMETRY_DELTA_CHANNELS = {
+    "foreground_logits": slice(0, 1),
+    "surface_logits": slice(1, 2),
+    "separator_logits": slice(2, 3),
+    "sdf": slice(3, 4),
+    "flow": slice(4, 7),
+    "centroid_offset": slice(7, 10),
+    "seed_logits": slice(10, 11),
+}
+
+
+@dataclass(frozen=True)
+class SparseGeometryROI:
+    batch_index: int
+    slices_zyx: tuple[slice, slice, slice]
+    delta: Tensor
+
+
+@dataclass(frozen=True)
+class SparseGeometryDelta:
+    rois: List[SparseGeometryROI] = field(default_factory=list)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.rois
+
+
+@dataclass(frozen=True)
+class RefinedGeometryView:
+    """Lazy base-plus-sparse-delta view of corrected dense geometry."""
+
+    base: GeometryState
+    delta: SparseGeometryDelta
+
+    def materialize_field(self, name: str) -> Tensor:
+        if name not in _GEOMETRY_DELTA_CHANNELS:
+            raise KeyError(f"Unknown geometry field: {name}")
+        base = getattr(self.base, name)
+        channel_slice = _GEOMETRY_DELTA_CHANNELS[name]
+        shape = base.shape[-3:]
+        batches: list[Tensor] = []
+        for batch_index in range(base.shape[0]):
+            overlay: Tensor | None = None
+            for roi in self.delta.rois:
+                if roi.batch_index != batch_index:
+                    continue
+                zyx = roi.slices_zyx
+                padding = (
+                    int(zyx[2].start),
+                    shape[2] - int(zyx[2].stop),
+                    int(zyx[1].start),
+                    shape[1] - int(zyx[1].stop),
+                    int(zyx[0].start),
+                    shape[0] - int(zyx[0].stop),
+                )
+                padded = F.pad(roi.delta[channel_slice][None], padding)
+                overlay = padded if overlay is None else overlay + padded
+            row = base[batch_index : batch_index + 1]
+            batches.append(row if overlay is None else row + overlay.to(row.dtype))
+        return torch.cat(batches, dim=0)
+
+    def field_crop(
+        self,
+        name: str,
+        batch_index: int,
+        crop: tuple[slice, slice, slice],
+    ) -> Tensor:
+        base = getattr(self.base, name)
+        result = base[batch_index, :, crop[0], crop[1], crop[2]]
+        channel_slice = _GEOMETRY_DELTA_CHANNELS[name]
+        crop_shape = tuple(int(axis.stop) - int(axis.start) for axis in crop)
+        for roi in self.delta.rois:
+            if roi.batch_index != batch_index:
+                continue
+            overlap_start = [
+                max(int(crop[axis].start), int(roi.slices_zyx[axis].start))
+                for axis in range(3)
+            ]
+            overlap_stop = [
+                min(int(crop[axis].stop), int(roi.slices_zyx[axis].stop))
+                for axis in range(3)
+            ]
+            if any(stop <= start for start, stop in zip(overlap_start, overlap_stop)):
+                continue
+            source = tuple(
+                slice(
+                    overlap_start[axis] - int(roi.slices_zyx[axis].start),
+                    overlap_stop[axis] - int(roi.slices_zyx[axis].start),
+                )
+                for axis in range(3)
+            )
+            padding = (
+                overlap_start[2] - int(crop[2].start),
+                int(crop[2].stop) - overlap_stop[2],
+                overlap_start[1] - int(crop[1].start),
+                int(crop[1].stop) - overlap_stop[1],
+                overlap_start[0] - int(crop[0].start),
+                int(crop[0].stop) - overlap_stop[0],
+            )
+            local = roi.delta[channel_slice, source[0], source[1], source[2]]
+            result = result + F.pad(local, padding).to(result.dtype)
+        if result.shape[-3:] != crop_shape:
+            raise RuntimeError("sparse geometry crop shape mismatch")
+        return result
+
+    @property
+    def foreground_logits(self) -> Tensor:
+        return self.materialize_field("foreground_logits")
+
+    @property
+    def surface_logits(self) -> Tensor:
+        return self.materialize_field("surface_logits")
+
+    @property
+    def separator_logits(self) -> Tensor:
+        return self.materialize_field("separator_logits")
+
+    @property
+    def sdf(self) -> Tensor:
+        return self.materialize_field("sdf")
+
+    @property
+    def flow(self) -> Tensor:
+        return self.materialize_field("flow")
+
+    @property
+    def centroid_offset(self) -> Tensor:
+        return self.materialize_field("centroid_offset")
+
+    @property
+    def seed_logits(self) -> Tensor:
+        return self.materialize_field("seed_logits")
+
+    @property
+    def features(self) -> Optional[Tensor]:
+        return self.base.features
+
+    @property
+    def feature_spacing_um(self) -> Optional[Tensor]:
+        return self.base.feature_spacing_um
+
+    def probabilities(self) -> Dict[str, Tensor]:
+        return {
+            "foreground": self.foreground_logits.sigmoid(),
+            "surface": self.surface_logits.sigmoid(),
+            "separator": self.separator_logits.sigmoid(),
+            "seed": self.seed_logits.sigmoid(),
+        }
+
+
+GeometryLike = GeometryState | RefinedGeometryView
+
+
+def geometry_field(geometry: GeometryLike, name: str) -> Tensor:
+    return (
+        geometry.materialize_field(name)
+        if isinstance(geometry, RefinedGeometryView)
+        else getattr(geometry, name)
+    )
+
+
+def geometry_field_crop(
+    geometry: GeometryLike,
+    name: str,
+    batch_index: int,
+    crop: tuple[slice, slice, slice],
+) -> Tensor:
+    if isinstance(geometry, RefinedGeometryView):
+        return geometry.field_crop(name, batch_index, crop)
+    field = getattr(geometry, name)
+    return field[batch_index, :, crop[0], crop[1], crop[2]]
+
+
+def geometry_probability(geometry: GeometryLike, name: str) -> Tensor:
+    field_name = {
+        "foreground": "foreground_logits",
+        "surface": "surface_logits",
+        "separator": "separator_logits",
+        "seed": "seed_logits",
+    }[name]
+    return geometry_field(geometry, field_name).sigmoid()
 
 
 @dataclass
@@ -133,6 +318,15 @@ class TemporalState:
 
 
 @dataclass
+class SpatialObservationCache:
+    """Compact sample-first spatial evidence aligned with temporal rows."""
+
+    d1_projected: Tensor
+    d2_projected: Tensor
+    hidden_geometry_projected: Tensor
+
+
+@dataclass
 class ReasoningState:
     instance_tokens: Tensor
     instance_exist_logits: Tensor
@@ -160,11 +354,14 @@ class RefinementRequest:
 
 @dataclass
 class RefinementState:
-    geometry: GeometryState
+    geometry: GeometryLike
     requests: List[RefinementRequest] = field(default_factory=list)
     applied_count: int = 0
     model_request_count: int = 0
     teacher_request_count: int = 0
+    partition_update: str = "none"
+    partition_fallback: bool = False
+    partition_fallback_reason: str = ""
 
 
 @dataclass
@@ -184,7 +381,7 @@ class SpatialForwardOutput(GeometryForwardOutput):
 class StirNetOutput:
     final_labels: List[Tensor]
     centers_um: List[Tensor]
-    geometry: GeometryState
+    geometry: GeometryLike
     spatial_pyramid: SpatialPyramid
     decoded_spatial: SpatialDecodeState
     rag: RAGState

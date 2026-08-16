@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -37,6 +39,8 @@ class AnisotropyAwareSpatialBackbone(nn.Module):
                             c,
                             cfg.acquisition_dim,
                             cfg.group_norm_max_groups,
+                            cfg.axis_conv_variant,
+                            cfg.axis_conv_bottleneck_ratio,
                         )
                         for _ in range(cfg.blocks_per_level)
                     ]
@@ -57,13 +61,16 @@ class AnisotropyAwareSpatialBackbone(nn.Module):
                 )
             )
         self.up2 = UpsampleFuse(
-            ch[3], ch[2], ch[2], cfg.acquisition_dim, cfg.blocks_per_level, cfg.group_norm_max_groups
+            ch[3], ch[2], ch[2], cfg.acquisition_dim, cfg.blocks_per_level, cfg.group_norm_max_groups,
+            cfg.axis_conv_variant, cfg.axis_conv_bottleneck_ratio,
         )
         self.up1 = UpsampleFuse(
-            ch[2], ch[1], ch[1], cfg.acquisition_dim, cfg.blocks_per_level, cfg.group_norm_max_groups
+            ch[2], ch[1], ch[1], cfg.acquisition_dim, cfg.blocks_per_level, cfg.group_norm_max_groups,
+            cfg.axis_conv_variant, cfg.axis_conv_bottleneck_ratio,
         )
         self.up0 = UpsampleFuse(
-            ch[1], ch[0], ch[0], cfg.acquisition_dim, cfg.blocks_per_level, cfg.group_norm_max_groups
+            ch[1], ch[0], ch[0], cfg.acquisition_dim, cfg.blocks_per_level, cfg.group_norm_max_groups,
+            cfg.axis_conv_variant, cfg.axis_conv_bottleneck_ratio,
         )
 
     def _run(self, module: nn.Module, *args: Tensor) -> Tensor:
@@ -82,41 +89,54 @@ class AnisotropyAwareSpatialBackbone(nn.Module):
         spacing_um: Tensor,
         acquisition_embedding: Tensor,
         padding_mask: Tensor | None = None,
+        stage_profiler=None,
     ) -> tuple[SpatialPyramid, SpatialDecodeState]:
-        features: list[Tensor] = []
-        spacings: list[Tensor] = []
-        strides: list[tuple[int, int, int]] = []
-        masks: list[Tensor] = []
-        x = x0
-        current_spacing = spacing_um
-        current_mask = padding_mask
-        for level_idx, blocks in enumerate(self.levels):
-            for block in blocks:
-                x = self._run(block, x, acquisition_embedding)
-            features.append(x)
-            spacings.append(current_spacing)
-            if current_mask is not None:
-                masks.append(current_mask)
-            if level_idx < 3:
-                stride = choose_downsample_stride(
-                    current_spacing, self.cfg.anisotropy_threshold
-                )
-                strides.append(stride)
-                x = self.downs[level_idx]["".join(map(str, stride))](x)
-                current_spacing = propagate_spacing(current_spacing, stride)
-                if current_mask is not None:
-                    current_mask = F.max_pool3d(
-                        current_mask.float().unsqueeze(1),
-                        kernel_size=stride,
-                        stride=stride,
-                    ).squeeze(1).bool()
-        pyramid = SpatialPyramid(
-            features=features,
-            spacings_um=spacings,
-            strides=strides,
-            padding_masks=masks if padding_mask is not None else None,
+        encoder_context = (
+            nullcontext()
+            if stage_profiler is None
+            else stage_profiler.profile("backbone_encoder")
         )
-        d2 = self._run(self.up2, features[3], features[2], acquisition_embedding)
-        d1 = self._run(self.up1, d2, features[1], acquisition_embedding)
-        d0 = self._run(self.up0, d1, features[0], acquisition_embedding)
+        with encoder_context:
+            features: list[Tensor] = []
+            spacings: list[Tensor] = []
+            strides: list[tuple[int, int, int]] = []
+            masks: list[Tensor] = []
+            x = x0
+            current_spacing = spacing_um
+            current_mask = padding_mask
+            for level_idx, blocks in enumerate(self.levels):
+                for block in blocks:
+                    x = self._run(block, x, acquisition_embedding)
+                features.append(x)
+                spacings.append(current_spacing)
+                if current_mask is not None:
+                    masks.append(current_mask)
+                if level_idx < 3:
+                    stride = choose_downsample_stride(
+                        current_spacing, self.cfg.anisotropy_threshold
+                    )
+                    strides.append(stride)
+                    x = self.downs[level_idx]["".join(map(str, stride))](x)
+                    current_spacing = propagate_spacing(current_spacing, stride)
+                    if current_mask is not None:
+                        current_mask = F.max_pool3d(
+                            current_mask.float().unsqueeze(1),
+                            kernel_size=stride,
+                            stride=stride,
+                        ).squeeze(1).bool()
+            pyramid = SpatialPyramid(
+                features=features,
+                spacings_um=spacings,
+                strides=strides,
+                padding_masks=masks if padding_mask is not None else None,
+            )
+        decoder_context = (
+            nullcontext()
+            if stage_profiler is None
+            else stage_profiler.profile("backbone_decoder")
+        )
+        with decoder_context:
+            d2 = self._run(self.up2, features[3], features[2], acquisition_embedding)
+            d1 = self._run(self.up1, d2, features[1], acquisition_embedding)
+            d0 = self._run(self.up0, d1, features[0], acquisition_embedding)
         return pyramid, SpatialDecodeState(d2=d2, d1=d1, d0=d0)

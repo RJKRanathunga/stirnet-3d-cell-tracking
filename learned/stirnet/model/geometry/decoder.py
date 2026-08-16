@@ -36,6 +36,8 @@ class DenseGeometryDecoder(nn.Module):
                     hidden,
                     spatial_cfg.acquisition_dim,
                     spatial_cfg.group_norm_max_groups,
+                    spatial_cfg.axis_conv_variant,
+                    spatial_cfg.axis_conv_bottleneck_ratio,
                 )
                 for _ in range(cfg.residual_blocks)
             ]
@@ -48,20 +50,27 @@ class DenseGeometryDecoder(nn.Module):
         self.centroid_offset = nn.Conv3d(hidden, 3, 1)
         self.seed = nn.Conv3d(hidden, 1, 1)
 
-    def forward(self, d0: Tensor, acquisition_embedding: Tensor) -> GeometryState:
+    def _trunk(self, d0: Tensor, acquisition_embedding: Tensor) -> Tensor:
         x = self.input_proj(d0)
         for block in self.blocks:
-            if (
-                self.activation_checkpointing
-                and self.training
-                and torch.is_grad_enabled()
-                and (x.requires_grad or acquisition_embedding.requires_grad)
-            ):
-                x = checkpoint(
-                    block, x, acquisition_embedding, use_reentrant=False
-                )
-            else:
-                x = block(x, acquisition_embedding)
+            x = block(x, acquisition_embedding)
+        return x
+
+    def forward(self, d0: Tensor, acquisition_embedding: Tensor) -> GeometryState:
+        if (
+            self.activation_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+            and (d0.requires_grad or acquisition_embedding.requires_grad)
+        ):
+            x = checkpoint(
+                self._trunk,
+                d0,
+                acquisition_embedding,
+                use_reentrant=False,
+            )
+        else:
+            x = self._trunk(d0, acquisition_embedding)
         # SDF is bounded in cell-reference units, preventing large outliers from
         # dominating watershed energy while retaining signed geometry.
         sdf = self.cfg.sdf_clip_dref * F.tanh(self.sdf(x))

@@ -19,6 +19,7 @@ from .curriculum import (
 )
 from .metrics import instance_metrics
 from .trainer import Trainer
+from .profiler import StageProfileRecord, StageProfiler
 
 __all__ = [
     "ARCHITECTURE_ID",
@@ -30,6 +31,8 @@ __all__ = [
     "RecoveryTargets",
     "StirNetCriterion",
     "Trainer",
+    "StageProfileRecord",
+    "StageProfiler",
     "TrainingConfig",
     "build_instance_targets",
     "build_recovery_targets",

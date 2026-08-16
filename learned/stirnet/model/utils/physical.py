@@ -28,6 +28,68 @@ def relative_grid_coordinates_um(
     return torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1)
 
 
+def canonical_resample_spec(
+    native_shape: tuple[int, int, int],
+    spacing_um: Tensor,
+    canonical_spacing_um: tuple[float, float, float],
+) -> tuple[tuple[int, int, int], Tensor]:
+    """Return an endpoint-preserving canonical grid and its actual spacing."""
+    if spacing_um.ndim == 1:
+        spacing_um = spacing_um[None]
+    native_extent = (
+        torch.as_tensor(native_shape, device=spacing_um.device, dtype=spacing_um.dtype)
+        - 1
+    ) * spacing_um
+    requested = spacing_um.new_tensor(canonical_spacing_um)
+    target_shapes = torch.round(native_extent / requested).long() + 1
+    target_shapes = target_shapes.clamp_min(1)
+    if not torch.equal(target_shapes, target_shapes[0:1].expand_as(target_shapes)):
+        raise ValueError(
+            "batched canonical resampling requires a common target voxel shape"
+        )
+    target_shape = tuple(int(value) for value in target_shapes[0].tolist())
+    denominator = (target_shapes - 1).clamp_min(1).to(spacing_um.dtype)
+    actual_spacing = native_extent / denominator
+    actual_spacing = torch.where(
+        target_shapes > 1, actual_spacing, spacing_um
+    )
+    return target_shape, actual_spacing
+
+
+def resample_continuous_volume(
+    value: Tensor,
+    target_shape: tuple[int, int, int],
+) -> Tensor:
+    if tuple(value.shape[-3:]) == target_shape:
+        return value
+    return F.interpolate(
+        value,
+        size=target_shape,
+        mode="trilinear",
+        align_corners=True,
+    )
+
+
+def resample_labels_volume(
+    labels: Tensor,
+    target_shape: tuple[int, int, int],
+) -> Tensor:
+    """Nearest-neighbor-only label resampling with integer output."""
+    original_ndim = labels.ndim
+    if original_ndim == 3:
+        labels = labels[None, None]
+    elif original_ndim == 4:
+        labels = labels[:, None]
+    elif original_ndim != 5:
+        raise ValueError("labels must be [Z,Y,X], [B,Z,Y,X], or [B,1,Z,Y,X]")
+    resized = F.interpolate(labels.float(), size=target_shape, mode="nearest").long()
+    if original_ndim == 3:
+        return resized[0, 0]
+    if original_ndim == 4:
+        return resized[:, 0]
+    return resized
+
+
 def physical_crop_slices(
     shape: tuple[int, int, int],
     spacing_um: Tensor,

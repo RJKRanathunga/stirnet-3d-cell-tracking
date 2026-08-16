@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, Callable, Literal
 
@@ -10,6 +11,7 @@ from .config import ModelConfig
 from .geometry.decoder import DenseGeometryDecoder
 from .instances.tokenizer import InstanceTokenizer, centers_from_labels
 from .partition.graph_net import SpatialRAGNetwork
+from .partition.local_update import LocalPartitionUpdater
 from .partition.partitioner import GraphPartitioner
 from .partition.rag import RAGBuilder
 from .partition.watershed import LearnedGeometryWatershed
@@ -25,8 +27,22 @@ from .temporal.fusion import InstanceTemporalReasoner
 from .temporal.graph_encoder import TemporalGraphEncoder
 from .temporal.history import HistoricalInstanceEncoder
 from .temporal.observer import TemporalSpatialObserver
+from .utils.physical import (
+    canonical_resample_spec,
+    resample_continuous_volume,
+    resample_labels_volume,
+)
+
+
+def _profile_stage(stage_profiler, name: str):
+    return (
+        nullcontext()
+        if stage_profiler is None
+        else stage_profiler.profile(name)
+    )
 from .types import (
     GeometryState,
+    GeometryLike,
     GeometryForwardOutput,
     InstanceState,
     PartitionState,
@@ -34,6 +50,7 @@ from .types import (
     ReasoningState,
     RefinementState,
     RefinementRequest,
+    SpatialObservationCache,
     SpatialForwardOutput,
     StirNetOutput,
     TemporalInput,
@@ -66,6 +83,9 @@ class StirNet(nn.Module):
         )
 
         self.watershed = LearnedGeometryWatershed(self.cfg.partition)
+        self.local_partition_updater = LocalPartitionUpdater(
+            self.watershed, self.cfg.refinement
+        )
         self.rag_builder = RAGBuilder(self.cfg.partition, self.cfg.spatial)
         self.rag_network = SpatialRAGNetwork(
             self.cfg.partition,
@@ -160,25 +180,53 @@ class StirNet(nn.Module):
 
     def _spatial_rag(
         self,
-        geometry: GeometryState,
+        geometry: GeometryLike,
         decoded,
         spatial_inputs: Tensor,
         spacing_um: Tensor,
         dref_um: Tensor,
         spatial_padding_mask: Tensor | None,
+        stage_profiler=None,
+        profile_prefix: str = "initial",
     ) -> tuple[RAGState, PartitionState]:
-        supervoxels = self.watershed(
-            geometry, spacing_um, dref_um, spatial_padding_mask
-        )
-        rag = self.rag_builder(
+        with _profile_stage(stage_profiler, f"{profile_prefix}_watershed"):
+            supervoxels = self.watershed(
+                geometry, spacing_um, dref_um, spatial_padding_mask
+            )
+        return self._rag_from_supervoxels(
             supervoxels,
-            decoded.d0,
-            spatial_inputs,
             geometry,
+            decoded,
+            spatial_inputs,
             spacing_um,
             dref_um,
+            stage_profiler=stage_profiler,
+            profile_prefix=profile_prefix,
         )
-        rag = self.rag_network(rag)
+
+    def _rag_from_supervoxels(
+        self,
+        supervoxels: list[Tensor],
+        geometry: GeometryLike,
+        decoded,
+        spatial_inputs: Tensor,
+        spacing_um: Tensor,
+        dref_um: Tensor,
+        *,
+        stage_profiler=None,
+        profile_prefix: str = "initial",
+    ) -> tuple[RAGState, PartitionState]:
+        with _profile_stage(stage_profiler, f"{profile_prefix}_rag_build"):
+            rag = self.rag_builder(
+                supervoxels,
+                decoded.d0,
+                spatial_inputs,
+                geometry,
+                spacing_um,
+                dref_um,
+            )
+        with _profile_stage(stage_profiler, f"{profile_prefix}_rag_network"):
+            rag = self.rag_network(rag)
         partition = self.partitioner(
             rag,
             rag.spatial_edge_logits,
@@ -190,10 +238,11 @@ class StirNet(nn.Module):
         self,
         temporal_base: TemporalState,
         decoded,
-        geometry: GeometryState,
+        geometry: GeometryLike,
         pyramid,
         spacing_um: Tensor,
         dref_um: Tensor,
+        cache: SpatialObservationCache | None = None,
     ) -> TemporalState:
         return self.temporal_observer(
             temporal_base,
@@ -202,6 +251,7 @@ class StirNet(nn.Module):
             pyramid.spacings_um,
             spacing_um,
             dref_um,
+            cache=cache,
         )
 
     @staticmethod
@@ -272,6 +322,8 @@ class StirNet(nn.Module):
         | None = None,
         apply_existence_filter: bool | None = None,
         return_debug: bool = False,
+        precomputed_geometry: GeometryForwardOutput | None = None,
+        stage_profiler=None,
         # Compatibility bridge for the current repository's temporal tensors.
         graph_x: Tensor | None = None,
         graph_edge_index: Tensor | None = None,
@@ -313,14 +365,72 @@ class StirNet(nn.Module):
         if execution_stage not in {"geometry", "spatial", "temporal", "refinement"}:
             raise ValueError(f"Unknown STIR-Net execution stage: {execution_stage}")
 
-        acquisition = self.acquisition(spacing_um, dref_um)
-        stem = self.evidence_stem(
-            spatial_inputs, acquisition, prior_keep_mask=prior_keep_mask
-        )
-        pyramid, decoded = self.spatial_backbone(
-            stem, spacing_um, acquisition, spatial_padding_mask
-        )
-        initial_geometry = self.geometry_decoder(decoded.d0, acquisition)
+        if precomputed_geometry is None:
+            network_inputs = spatial_inputs
+            network_spacing_um = spacing_um
+            network_padding_mask = spatial_padding_mask
+            canonical_spacing = self.cfg.spatial.canonical_spacing_um
+            if canonical_spacing is not None:
+                target_shape, network_spacing_um = canonical_resample_spec(
+                    tuple(spatial_inputs.shape[-3:]),
+                    spacing_um,
+                    canonical_spacing,
+                )
+                network_inputs = resample_continuous_volume(
+                    spatial_inputs, target_shape
+                )
+                if spatial_padding_mask is not None:
+                    network_padding_mask = resample_labels_volume(
+                        spatial_padding_mask.long(), target_shape
+                    ).bool()
+            acquisition = self.acquisition(network_spacing_um, dref_um)
+            with _profile_stage(stage_profiler, "evidence_stem"):
+                stem = self.evidence_stem(
+                    network_inputs, acquisition, prior_keep_mask=prior_keep_mask
+                )
+            pyramid, decoded = self.spatial_backbone(
+                stem,
+                network_spacing_um,
+                acquisition,
+                network_padding_mask,
+                stage_profiler=stage_profiler,
+            )
+            with _profile_stage(stage_profiler, "geometry"):
+                initial_geometry = self.geometry_decoder(decoded.d0, acquisition)
+            initial_geometry = replace(
+                initial_geometry,
+                feature_spacing_um=network_spacing_um,
+            )
+            native_shape = tuple(spatial_inputs.shape[-3:])
+            if tuple(initial_geometry.sdf.shape[-3:]) != native_shape:
+                initial_geometry = replace(
+                    initial_geometry,
+                    foreground_logits=resample_continuous_volume(
+                        initial_geometry.foreground_logits, native_shape
+                    ),
+                    surface_logits=resample_continuous_volume(
+                        initial_geometry.surface_logits, native_shape
+                    ),
+                    separator_logits=resample_continuous_volume(
+                        initial_geometry.separator_logits, native_shape
+                    ),
+                    sdf=resample_continuous_volume(initial_geometry.sdf, native_shape),
+                    flow=resample_continuous_volume(initial_geometry.flow, native_shape),
+                    centroid_offset=resample_continuous_volume(
+                        initial_geometry.centroid_offset, native_shape
+                    ),
+                    seed_logits=resample_continuous_volume(
+                        initial_geometry.seed_logits, native_shape
+                    ),
+                )
+        else:
+            initial_geometry = precomputed_geometry.geometry
+            pyramid = precomputed_geometry.spatial_pyramid
+            decoded = precomputed_geometry.decoded_spatial
+            if decoded.d0.shape[0] != spatial_inputs.shape[0]:
+                raise ValueError("precomputed geometry batch does not match spatial inputs")
+            if initial_geometry.sdf.shape[-3:] != spatial_inputs.shape[-3:]:
+                raise ValueError("precomputed explicit geometry shape does not match inputs")
 
         if execution_stage == "geometry":
             return GeometryForwardOutput(
@@ -336,6 +446,8 @@ class StirNet(nn.Module):
             spacing_um,
             dref_um,
             spatial_padding_mask,
+            stage_profiler=stage_profiler,
+            profile_prefix="initial",
         )
         if execution_stage == "spatial":
             return SpatialForwardOutput(
@@ -346,14 +458,15 @@ class StirNet(nn.Module):
                 spatial_partition=initial_partition,
             )
 
-        initial_instances = self.instance_tokenizer(
-            initial_partition,
-            initial_rag,
-            decoded,
-            initial_geometry,
-            spacing_um,
-            dref_um,
-        )
+        with _profile_stage(stage_profiler, "instance_tokenizer"):
+            initial_instances = self.instance_tokenizer(
+                initial_partition,
+                initial_rag,
+                decoded,
+                initial_geometry,
+                spacing_um,
+                dref_um,
+            )
         temporal_data = self._coerce_temporal_input(
             temporal_input,
             graph_x=graph_x,
@@ -366,18 +479,31 @@ class StirNet(nn.Module):
             node_instance_grid=node_instance_grid,
             node_history_valid=node_history_valid,
         )
-        temporal_base = self.temporal_encoder(temporal_data)
-        temporal = self._observe_temporal(
-            temporal_base,
-            decoded,
-            initial_geometry,
-            pyramid,
-            spacing_um,
-            dref_um,
-        )
-        initial_reasoning = self.instance_temporal(
-            initial_instances, initial_rag, temporal, dref_um
-        )
+        with _profile_stage(stage_profiler, "temporal_encoder"):
+            temporal_base = self.temporal_encoder(temporal_data)
+        with _profile_stage(stage_profiler, "temporal_observer"):
+            observation_cache = self.temporal_observer.build_cache(
+                temporal_base,
+                decoded,
+                initial_geometry,
+                pyramid.spacings_um,
+                spacing_um,
+                dref_um,
+            )
+            initial_geometry = replace(initial_geometry, features=None)
+            temporal = self._observe_temporal(
+                temporal_base,
+                decoded,
+                initial_geometry,
+                pyramid,
+                spacing_um,
+                dref_um,
+                observation_cache,
+            )
+        with _profile_stage(stage_profiler, "temporal_reasoning"):
+            initial_reasoning = self.instance_temporal(
+                initial_instances, initial_rag, temporal, dref_um
+            )
 
         use_refinement = (
             execution_stage == "refinement" and self.cfg.refinement.enabled
@@ -415,14 +541,15 @@ class StirNet(nn.Module):
                 )
             else:
                 requests = model_requests
-            refinement = self.local_refiner(
-                decoded.d0,
-                spatial_inputs,
-                initial_geometry,
-                spacing_um,
-                dref_um,
-                requests,
-            )
+            with _profile_stage(stage_profiler, "local_refinement"):
+                refinement = self.local_refiner(
+                    decoded.d0,
+                    spatial_inputs,
+                    initial_geometry,
+                    spacing_um,
+                    dref_um,
+                    requests,
+                )
             refinement = replace(
                 refinement,
                 model_request_count=sum(
@@ -434,36 +561,92 @@ class StirNet(nn.Module):
             )
             if refinement.applied_count:
                 geometry = refinement.geometry
-                # Re-run the complete partition after local geometry changes.
-                # This is how recovery can create a new object and split requests
-                # can create a new separator without independent mask painting.
-                rag, spatial_partition = self._spatial_rag(
-                    geometry,
-                    decoded,
-                    spatial_inputs,
-                    spacing_um,
-                    dref_um,
-                    spatial_padding_mask,
-                )
-                instances = self.instance_tokenizer(
-                    spatial_partition,
-                    rag,
-                    decoded,
-                    geometry,
-                    spacing_um,
-                    dref_um,
-                )
-                temporal = self._observe_temporal(
-                    temporal_base,
-                    decoded,
-                    geometry,
-                    pyramid,
-                    spacing_um,
-                    dref_um,
-                )
-                reasoning = self.instance_temporal(
-                    instances, rag, temporal, dref_um
-                )
+                if self.cfg.refinement.partition_update == "local":
+                    with _profile_stage(stage_profiler, "refined_partition_update"):
+                        local_update = self.local_partition_updater(
+                            initial_rag.supervoxel_labels,
+                            geometry,
+                            spacing_um,
+                            dref_um,
+                            spatial_padding_mask,
+                        )
+                    if local_update.used_fallback:
+                        rag, spatial_partition = self._rag_from_supervoxels(
+                            local_update.supervoxel_labels,
+                            geometry,
+                            decoded,
+                            spatial_inputs,
+                            spacing_um,
+                            dref_um,
+                            stage_profiler=stage_profiler,
+                            profile_prefix="refined",
+                        )
+                    else:
+                        with _profile_stage(
+                            stage_profiler, "refined_rag_local_update"
+                        ):
+                            rag = self.rag_builder.update_local(
+                                initial_rag,
+                                local_update.supervoxel_labels,
+                                local_update.updated_boxes or [],
+                                decoded.d0,
+                                spatial_inputs,
+                                geometry,
+                                spacing_um,
+                                dref_um,
+                            )
+                        with _profile_stage(
+                            stage_profiler, "refined_rag_network"
+                        ):
+                            rag = self.rag_network(rag)
+                        spatial_partition = self.partitioner(
+                            rag,
+                            rag.spatial_edge_logits,
+                            self.cfg.partition.spatial_merge_threshold,
+                        )
+                    refinement = replace(
+                        refinement,
+                        partition_update="local",
+                        partition_fallback=local_update.used_fallback,
+                        partition_fallback_reason=local_update.fallback_reason,
+                    )
+                else:
+                    rag, spatial_partition = self._spatial_rag(
+                        geometry,
+                        decoded,
+                        spatial_inputs,
+                        spacing_um,
+                        dref_um,
+                        spatial_padding_mask,
+                        stage_profiler=stage_profiler,
+                        profile_prefix="refined",
+                    )
+                    refinement = replace(
+                        refinement,
+                        partition_update="full",
+                    )
+                with _profile_stage(stage_profiler, "refined_tokenizer"):
+                    instances = self.instance_tokenizer(
+                        spatial_partition,
+                        rag,
+                        decoded,
+                        geometry,
+                        spacing_um,
+                        dref_um,
+                    )
+                with _profile_stage(stage_profiler, "refined_temporal"):
+                    temporal = self._observe_temporal(
+                        temporal_base,
+                        decoded,
+                        geometry,
+                        pyramid,
+                        spacing_um,
+                        dref_um,
+                        observation_cache,
+                    )
+                    reasoning = self.instance_temporal(
+                        instances, rag, temporal, dref_um
+                    )
 
         final_partition = self.partitioner(
             rag,
@@ -526,6 +709,15 @@ class StirNet(nn.Module):
                     }
                     for r in refinement.requests
                 ],
+                "refinement_partition_update": (
+                    "none" if refinement is None else refinement.partition_update
+                ),
+                "refinement_partition_fallback": bool(
+                    refinement is not None and refinement.partition_fallback
+                ),
+                "refinement_partition_fallback_reason": (
+                    "" if refinement is None else refinement.partition_fallback_reason
+                ),
             }
 
         return StirNetOutput(

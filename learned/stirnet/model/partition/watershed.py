@@ -9,7 +9,7 @@ from skimage.segmentation import watershed
 from torch import Tensor, nn
 
 from ..config import PartitionConfig
-from ..types import GeometryState
+from ..types import GeometryLike, geometry_field, geometry_probability
 from .seeds import build_markers
 
 
@@ -52,25 +52,39 @@ class LearnedGeometryWatershed(nn.Module):
     @torch.no_grad()
     def forward(
         self,
-        geometry: GeometryState,
+        geometry: GeometryLike,
         spacing_um: Tensor,
         dref_um: Tensor,
         padding_mask: Tensor | None = None,
     ) -> List[Tensor]:
-        probs = geometry.probabilities()
         results: List[Tensor] = []
-        for b in range(geometry.foreground_logits.shape[0]):
-            fg_prob = probs["foreground"][b, 0].float().cpu().numpy()
-            surface = probs["surface"][b, 0].float().cpu().numpy()
-            separator = probs["separator"][b, 0].float().cpu().numpy()
-            seed_head = probs["seed"][b, 0].float().cpu().numpy()
-            sdf = geometry.sdf[b, 0].float().cpu().numpy()
+        base_field = geometry_field(geometry, "foreground_logits")
+        batch_size = base_field.shape[0]
+        del base_field
+        for b in range(batch_size):
+            fg_prob = geometry_probability(geometry, "foreground")[
+                b, 0
+            ].float().cpu().numpy()
+            surface = geometry_probability(geometry, "surface")[
+                b, 0
+            ].float().cpu().numpy()
+            separator = geometry_probability(geometry, "separator")[
+                b, 0
+            ].float().cpu().numpy()
+            seed_head = geometry_probability(geometry, "seed")[
+                b, 0
+            ].float().cpu().numpy()
+            sdf_tensor = geometry_field(geometry, "sdf")
+            sdf = sdf_tensor[b, 0].float().cpu().numpy()
+            del sdf_tensor
             fg = fg_prob >= self.cfg.foreground_threshold
             if padding_mask is not None:
                 fg &= ~padding_mask[b].detach().cpu().numpy().astype(bool)
             if not fg.any():
                 results.append(
-                    torch.zeros_like(geometry.sdf[b, 0], dtype=torch.long)
+                    torch.zeros_like(
+                        geometry_field(geometry, "sdf")[b, 0], dtype=torch.long
+                    )
                 )
                 continue
 
@@ -112,7 +126,7 @@ class LearnedGeometryWatershed(nn.Module):
                 )
             results.append(
                 torch.from_numpy(labels).to(
-                    device=geometry.sdf.device, dtype=torch.long
+                    device=geometry_field(geometry, "sdf").device, dtype=torch.long
                 )
             )
         return results

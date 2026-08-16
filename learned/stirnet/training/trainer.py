@@ -22,6 +22,7 @@ from .curriculum import (
     model_parameter_groups,
     optimizer_parameter_groups,
 )
+from .profiler import StageProfiler
 
 
 MODEL_INPUT_KEYS = frozenset(
@@ -82,6 +83,8 @@ def model_forward_from_batch(
     teacher_request_builder=None,
     apply_existence_filter: bool = False,
     return_debug: bool = False,
+    precomputed_geometry=None,
+    stage_profiler=None,
 ):
     if execution_stage is None:
         execution_stage = (
@@ -114,6 +117,8 @@ def model_forward_from_batch(
         teacher_request_builder=teacher_request_builder,
         apply_existence_filter=apply_existence_filter,
         return_debug=return_debug,
+        precomputed_geometry=precomputed_geometry,
+        stage_profiler=stage_profiler,
         **temporal_kwargs,
     )
 
@@ -178,6 +183,10 @@ class Trainer:
         )
         self.global_step = 0
         self.refinement_stage_step = 0
+        self.stage_profiler = StageProfiler(
+            enabled=self.training_config.profile_memory,
+            device=self.device,
+        )
 
     def checkpoint_metadata(self) -> dict[str, int | str]:
         """Return the stage-local progress required for an exact resume."""
@@ -275,21 +284,23 @@ class Trainer:
             teacher_request_builder=teacher_builder,
             apply_existence_filter=False,
             return_debug=return_debug,
+            stage_profiler=self.stage_profiler,
         )
         self._sync_device()
         forward_seconds = time.perf_counter() - forward_started
         target_started = time.perf_counter()
-        losses = self.criterion(
-            output,
-            labels,
-            batch["spacing_um"],
-            batch["dref_um"],
-            stage=self.curriculum_stage.name,
-            precomputed_geometry_targets=precomputed_geometry_targets,
-            precomputed_discrete_targets=(
-                discrete_target_cache if discrete_target_cache else None
-            ),
-        )
+        with self.stage_profiler.profile("criterion"):
+            losses = self.criterion(
+                output,
+                labels,
+                batch["spacing_um"],
+                batch["dref_um"],
+                stage=self.curriculum_stage.name,
+                precomputed_geometry_targets=precomputed_geometry_targets,
+                precomputed_discrete_targets=(
+                    discrete_target_cache if discrete_target_cache else None
+                ),
+            )
         self._sync_device()
         target_seconds = time.perf_counter() - target_started
         return output, losses, {
@@ -298,6 +309,189 @@ class Trainer:
             "refinement_teacher_forcing_fraction": fraction,
             "refinement_stage_step": float(self.refinement_stage_step),
         }
+
+    def _split_refinement_backward(
+        self,
+        batch: dict,
+        *,
+        gt_labels: torch.Tensor | None,
+        precomputed_geometry_targets: GeometryTargets | None,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+        """Accumulate refinement-stage gradients across two bounded graphs."""
+        labels = gt_labels_from_batch(batch) if gt_labels is None else gt_labels
+        fraction = teacher_forcing_fraction(
+            self.training_config, self.refinement_stage_step
+        )
+        cpu_rng_state = torch.random.get_rng_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state(self.device)
+            if self.device.type == "cuda"
+            else None
+        )
+
+        forward_seconds = 0.0
+        target_seconds = 0.0
+        backward_seconds = 0.0
+
+        self._sync_device()
+        started = time.perf_counter()
+        with self._autocast():
+            base_output = model_forward_from_batch(
+                self.model,
+                batch,
+                execution_stage="temporal",
+                apply_existence_filter=False,
+                stage_profiler=self.stage_profiler,
+            )
+        self._sync_device()
+        forward_seconds += time.perf_counter() - started
+
+        started = time.perf_counter()
+        with self._autocast():
+            with self.stage_profiler.profile("criterion"):
+                phase_a_metrics = self.criterion(
+                    base_output,
+                    labels,
+                    batch["spacing_um"],
+                    batch["dref_um"],
+                    stage="refinement_joint",
+                    precomputed_geometry_targets=precomputed_geometry_targets,
+                )
+            phase_a_loss = self.criterion.refinement_phase_a_objective(
+                phase_a_metrics
+            )
+        self._sync_device()
+        target_seconds += time.perf_counter() - started
+        if not bool(torch.isfinite(phase_a_loss)):
+            raise FloatingPointError(
+                f"Non-finite STIR-Net V2 Phase A loss: {phase_a_loss.detach()}"
+            )
+        phase_a_geometry_loss = phase_a_metrics["geometry_loss"].detach()
+        phase_a_report = {
+            key: value.detach() for key, value in phase_a_metrics.items()
+        }
+        started = time.perf_counter()
+        with self.stage_profiler.profile("backward"):
+            self.scaler.scale(phase_a_loss).backward()
+        self._sync_device()
+        backward_seconds += time.perf_counter() - started
+        phase_a_gradient_norms = _group_gradient_norms(self.model)
+        del base_output, phase_a_metrics
+
+        # Replaying the pre-forward RNG state makes all stochastic base choices
+        # (prior dropout and MLP dropout) identical in both contributions.
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state, self.device)
+
+        self._sync_device()
+        started = time.perf_counter()
+        with torch.no_grad(), self._autocast():
+            detached_dense = model_forward_from_batch(
+                self.model,
+                batch,
+                execution_stage="geometry",
+                apply_existence_filter=False,
+                stage_profiler=self.stage_profiler,
+            )
+
+        discrete_target_cache: dict[str, object] = {}
+
+        def teacher_builder(instances, rag, temporal, reasoning, dref_um):
+            return build_teacher_refinement_requests(
+                instances,
+                rag,
+                temporal,
+                reasoning,
+                dref_um,
+                gt_labels=labels,
+                spacing_um=batch["spacing_um"],
+                loss_config=self.training_config.loss,
+                rag_criterion=self.criterion.rag,
+                fraction=fraction,
+                ambiguity_logit_abs_max=self.model.cfg.refinement.ambiguity_logit_abs_max,
+                target_cache=discrete_target_cache,
+            )
+
+        with self._autocast():
+            refined_output = model_forward_from_batch(
+                self.model,
+                batch,
+                execution_stage="refinement",
+                teacher_request_builder=teacher_builder if fraction > 0 else None,
+                apply_existence_filter=False,
+                precomputed_geometry=detached_dense,
+                stage_profiler=self.stage_profiler,
+            )
+        del detached_dense
+        self._sync_device()
+        forward_seconds += time.perf_counter() - started
+
+        started = time.perf_counter()
+        with self._autocast():
+            with self.stage_profiler.profile("criterion"):
+                phase_b_metrics = self.criterion(
+                    refined_output,
+                    labels,
+                    batch["spacing_um"],
+                    batch["dref_um"],
+                    stage="refinement_joint",
+                    precomputed_geometry_targets=precomputed_geometry_targets,
+                    precomputed_discrete_targets=(
+                        discrete_target_cache if discrete_target_cache else None
+                    ),
+                )
+            refinement_applied = bool(
+                refined_output.refinement is not None
+                and refined_output.refinement.applied_count
+            )
+            phase_b_loss = self.criterion.refinement_phase_b_objective(
+                phase_b_metrics,
+                phase_a_geometry_loss=phase_a_geometry_loss,
+                refinement_applied=refinement_applied,
+            )
+        self._sync_device()
+        target_seconds += time.perf_counter() - started
+        if not bool(torch.isfinite(phase_b_loss)):
+            raise FloatingPointError(
+                f"Non-finite STIR-Net V2 Phase B loss: {phase_b_loss.detach()}"
+            )
+        started = time.perf_counter()
+        with self.stage_profiler.profile("backward"):
+            self.scaler.scale(phase_b_loss).backward()
+        self._sync_device()
+        backward_seconds += time.perf_counter() - started
+        phase_b_gradient_norms = _group_gradient_norms(self.model)
+
+        combined = phase_a_loss.detach() + phase_b_loss.detach()
+        monolithic_reference = phase_b_metrics["loss"].detach()
+        reported = {key: value for key, value in phase_b_metrics.items()}
+        reported.update(
+            {
+                "loss": combined,
+                "split_phase_a_loss": phase_a_loss.detach(),
+                "split_phase_b_loss": phase_b_loss.detach(),
+                "split_monolithic_reference_loss": monolithic_reference,
+                "split_objective_abs_error": (
+                    combined - monolithic_reference
+                ).abs(),
+                "phase_a_geometry_loss": phase_a_report["geometry_loss"],
+            }
+        )
+        timing = {
+            "forward_seconds": forward_seconds,
+            "target_seconds": target_seconds,
+            "backward_seconds": backward_seconds,
+            "refinement_teacher_forcing_fraction": fraction,
+            "refinement_stage_step": float(self.refinement_stage_step),
+            "phase_a_grad_geometry_spatial": phase_a_gradient_norms[
+                "grad_geometry_spatial"
+            ],
+            "phase_b_accumulated_grad_geometry_spatial": phase_b_gradient_norms[
+                "grad_geometry_spatial"
+            ],
+        }
+        return reported, timing
 
     def train_step(
         self,
@@ -310,22 +504,36 @@ class Trainer:
         self.curriculum_stage = self.curriculum.apply(self.global_step)
         self.model.train()
         self.criterion.train()
+        self.stage_profiler.clear()
         moved = move_batch_to_device(batch, self.device)
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
         self.optimizer.zero_grad(set_to_none=True)
-        with self._autocast():
-            _, losses, timing = self._forward_and_loss(
+        if self.curriculum_stage.name == "refinement_joint":
+            losses, timing = self._split_refinement_backward(
                 moved,
                 gt_labels=gt_labels,
                 precomputed_geometry_targets=precomputed_geometry_targets,
             )
-            loss = losses["loss"]
-        if not bool(torch.isfinite(loss)):
-            raise FloatingPointError(f"Non-finite STIR-Net V2 loss: {loss.detach()}")
-        self._sync_device()
-        backward_started = time.perf_counter()
-        self.scaler.scale(loss).backward()
+            backward_seconds = timing["backward_seconds"]
+        else:
+            with self._autocast():
+                _, losses, timing = self._forward_and_loss(
+                    moved,
+                    gt_labels=gt_labels,
+                    precomputed_geometry_targets=precomputed_geometry_targets,
+                )
+                loss = losses["loss"]
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError(
+                    f"Non-finite STIR-Net V2 loss: {loss.detach()}"
+                )
+            self._sync_device()
+            backward_started = time.perf_counter()
+            with self.stage_profiler.profile("backward"):
+                self.scaler.scale(loss).backward()
+            self._sync_device()
+            backward_seconds = time.perf_counter() - backward_started
         self.scaler.unscale_(self.optimizer)
         grad_metrics = _group_gradient_norms(self.model)
         total_grad = torch.nn.utils.clip_grad_norm_(
@@ -345,8 +553,6 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             if self.scaler.is_enabled():
                 self.scaler.update(new_scale=max(self.scaler.get_scale() * 0.5, 1.0))
-        self._sync_device()
-        backward_seconds = time.perf_counter() - backward_started
         metrics = {key: float(value.detach().float().cpu()) for key, value in losses.items()}
         metrics.update(grad_metrics)
         metrics["grad_norm"] = float(torch.as_tensor(total_grad).detach().cpu())
@@ -355,12 +561,18 @@ class Trainer:
         metrics["backward_seconds"] = backward_seconds
         metrics["total_step_seconds"] = time.perf_counter() - total_started
         if self.device.type == "cuda":
-            metrics["peak_allocated_mb"] = torch.cuda.max_memory_allocated(
-                self.device
-            ) / (1024**2)
+            metrics["peak_allocated_mb"] = (
+                self.stage_profiler.overall_peak_allocated_mb
+                if self.stage_profiler.enabled
+                else torch.cuda.max_memory_allocated(self.device) / (1024**2)
+            )
             metrics["peak_reserved_mb"] = torch.cuda.max_memory_reserved(
                 self.device
             ) / (1024**2)
+        if self.stage_profiler.enabled:
+            for stage_name, row in self.stage_profiler.summary().items():
+                for key, value in row.items():
+                    metrics[f"profile_{stage_name}_{key}"] = float(value)
         return metrics
 
     @torch.no_grad()
@@ -373,6 +585,7 @@ class Trainer:
     ) -> dict[str, float]:
         self.model.eval()
         self.criterion.eval()
+        self.stage_profiler.clear()
         moved = move_batch_to_device(batch, self.device)
         with self._autocast():
             _, losses, timing = self._forward_and_loss(

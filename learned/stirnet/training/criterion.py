@@ -354,6 +354,41 @@ class StirNetCriterion(nn.Module):
             device=device,
         )
 
+    def refinement_phase_a_objective(self, metrics: dict[str, Tensor]) -> Tensor:
+        """Base contribution for memory-bounded refinement training."""
+        return (
+            self.cfg.geometry_weight * metrics["geometry_loss"]
+            + 0.5 * self.cfg.spatial_rag_weight * metrics["working_spatial_rag_bce"]
+            + 0.5 * self.cfg.final_rag_weight * metrics["working_final_rag_bce"]
+            + self.cfg.existence_weight * metrics["existence_bce"]
+            + self.cfg.split_weight * metrics["split_bce"]
+            + self.cfg.recovery_weight * metrics["recovery_bce"]
+        )
+
+    def refinement_phase_b_objective(
+        self,
+        metrics: dict[str, Tensor],
+        *,
+        phase_a_geometry_loss: Tensor,
+        refinement_applied: bool,
+    ) -> Tensor:
+        """Detached-dense refinement contribution.
+
+        The geometry difference makes Phase A + Phase B reproduce the refined
+        geometry scalar while routing the base gradient only through Phase A.
+        Initial request losses intentionally do not appear a second time.
+        """
+        geometry_delta = (
+            metrics["geometry_loss"] - phase_a_geometry_loss.detach()
+            if refinement_applied
+            else metrics["geometry_loss"] * 0
+        )
+        return (
+            self.cfg.geometry_weight * geometry_delta
+            + 0.5 * self.cfg.spatial_rag_weight * metrics["working_spatial_rag_bce"]
+            + 0.5 * self.cfg.final_rag_weight * metrics["working_final_rag_bce"]
+        )
+
     def forward(
         self,
         output: GeometryForwardOutput | SpatialForwardOutput | StirNetOutput,
@@ -440,6 +475,8 @@ class StirNetCriterion(nn.Module):
         refinement_applied = bool(
             output.refinement is not None and output.refinement.applied_count
         )
+        initial_spatial_loss = spatial_rag["rag_bce"]
+        initial_final_loss = final_rag["rag_bce"]
         if refinement_applied:
             initial_targets = (
                 cached_rag_targets
@@ -461,6 +498,8 @@ class StirNetCriterion(nn.Module):
             final_rag_loss = 0.5 * (
                 final_rag["rag_bce"] + initial_final["rag_bce"]
             )
+            initial_spatial_loss = initial_spatial["rag_bce"]
+            initial_final_loss = initial_final["rag_bce"]
         else:
             spatial_rag_loss = spatial_rag["rag_bce"]
             final_rag_loss = final_rag["rag_bce"]
@@ -534,6 +573,10 @@ class StirNetCriterion(nn.Module):
                 "loss": total,
                 "spatial_rag_bce": spatial_rag_loss,
                 "final_rag_bce": final_rag_loss,
+                "working_spatial_rag_bce": spatial_rag["rag_bce"],
+                "working_final_rag_bce": final_rag["rag_bce"],
+                "initial_spatial_rag_bce": initial_spatial_loss,
+                "initial_final_rag_bce": initial_final_loss,
                 "final_rag_accuracy": final_rag["rag_accuracy"],
                 "existence_bce": existence_loss,
                 "existence_accuracy": existence_metrics["accuracy"],
