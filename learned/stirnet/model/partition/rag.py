@@ -256,6 +256,7 @@ class RAGTargets:
     valid: Tensor
     weight: Tensor
     node_purity: Tensor
+    node_gt_support: Tensor
     dominant_gt: Tensor
 
 
@@ -271,15 +272,21 @@ class RAGCriterion(nn.Module):
             rag.node_features.shape[0], device=rag.node_features.device, dtype=torch.long
         )
         purity = rag.node_features.new_zeros((rag.node_features.shape[0],))
+        support = rag.node_features.new_zeros((rag.node_features.shape[0],))
         for b, supervox in enumerate(rag.supervoxel_labels):
             gt = gt_labels[b].to(supervox.device).long()
             start = int(rag.node_offsets[b].item())
             table = label_contingency(supervox, gt)
-            if not table.row_ids.numel() or not table.column_ids.numel():
+            if not table.row_ids.numel():
                 continue
             foreground_overlap = table.intersections.sum(dim=1)
-            dominant_count, dominant_column = table.intersections.max(dim=1)
             node_rows = start + table.row_ids - 1
+            support[node_rows] = (
+                foreground_overlap.float() / table.row_counts.clamp_min(1).float()
+            )
+            if not table.column_ids.numel():
+                continue
+            dominant_count, dominant_column = table.intersections.max(dim=1)
             has_foreground = foreground_overlap > 0
             dominant[node_rows[has_foreground]] = table.column_ids[
                 dominant_column[has_foreground]
@@ -289,7 +296,14 @@ class RAGCriterion(nn.Module):
             )
         if rag.edge_index.shape[1] == 0:
             empty = rag.node_features.new_zeros((0,))
-            return RAGTargets(empty, empty.bool(), empty, purity, dominant)
+            return RAGTargets(
+                target=empty,
+                valid=empty.bool(),
+                weight=empty,
+                node_purity=purity,
+                node_gt_support=support,
+                dominant_gt=dominant,
+            )
         a = dominant[rag.edge_index[0]]
         b = dominant[rag.edge_index[1]]
         target = ((a > 0) & (a == b)).float()
@@ -298,12 +312,21 @@ class RAGCriterion(nn.Module):
             & (b > 0)
             & (purity[rag.edge_index[0]] >= self.cfg.rag_min_node_purity)
             & (purity[rag.edge_index[1]] >= self.cfg.rag_min_node_purity)
+            & (
+                support[rag.edge_index[0]]
+                >= self.cfg.rag_min_node_gt_support
+            )
+            & (
+                support[rag.edge_index[1]]
+                >= self.cfg.rag_min_node_gt_support
+            )
         )
         return RAGTargets(
             target=target,
             valid=valid,
             weight=torch.ones_like(target),
             node_purity=purity,
+            node_gt_support=support,
             dominant_gt=dominant,
         )
 
@@ -334,12 +357,27 @@ class RAGCriterion(nn.Module):
                 if targets.node_purity.numel()
                 else zero.detach()
             )
+            mean_support = (
+                targets.node_gt_support.mean()
+                if targets.node_gt_support.numel()
+                else zero.detach()
+            )
+            low_support = (
+                (
+                    targets.node_gt_support
+                    < self.cfg.rag_min_node_gt_support
+                ).float().mean()
+                if targets.node_gt_support.numel()
+                else zero.detach()
+            )
             return {
                 "rag_bce": zero,
                 "rag_accuracy": zero.detach(),
                 "rag_valid_edge_fraction": valid_fraction.detach(),
                 "rag_mean_node_purity": mean_purity.detach(),
                 "rag_impure_node_fraction": impure.detach(),
+                "rag_mean_node_gt_support": mean_support.detach(),
+                "rag_low_support_node_fraction": low_support.detach(),
             }
         selected_target = target[valid]
         selected_predictions = predictions[valid]
@@ -359,5 +397,9 @@ class RAGCriterion(nn.Module):
             "rag_mean_node_purity": targets.node_purity.mean().detach(),
             "rag_impure_node_fraction": (
                 targets.node_purity < self.cfg.rag_min_node_purity
+            ).float().mean().detach(),
+            "rag_mean_node_gt_support": targets.node_gt_support.mean().detach(),
+            "rag_low_support_node_fraction": (
+                targets.node_gt_support < self.cfg.rag_min_node_gt_support
             ).float().mean().detach(),
         }

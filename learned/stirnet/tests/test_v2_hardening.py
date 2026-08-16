@@ -15,7 +15,10 @@ from learned.stirnet import (
     build_geometry_targets,
 )
 from learned.stirnet.data.sample_builder import build_cached_sample
-from learned.stirnet.model.geometry.targets import _boundaries, _soft_interface_target
+from learned.stirnet.model.geometry.targets import (
+    _face_centered_soft_interface_target,
+    _soft_interface_target,
+)
 from learned.stirnet.model.geometry import targets as geometry_targets_module
 from learned.stirnet.model.refinement.local_refiner import LocalGeometryRefiner
 from learned.stirnet.model.types import RAGState, RefinementRequest, TemporalInput
@@ -29,12 +32,11 @@ from .conftest import fixed_stage_training, small_model_config, synthetic_batch
 def _slow_geometry_reference(labels, spacing, dref, cfg):
     labels = np.asarray(labels, dtype=np.int64)
     foreground = labels > 0
-    surface_interface, separator_interface = _boundaries(labels)
-    surface = _soft_interface_target(
-        surface_interface, spacing, cfg.surface_target_sigma_um
+    surface = _face_centered_soft_interface_target(
+        labels, spacing, cfg.surface_target_sigma_um, cell_cell=False
     )
-    separator = _soft_interface_target(
-        separator_interface, spacing, cfg.separator_target_sigma_um
+    separator = _face_centered_soft_interface_target(
+        labels, spacing, cfg.separator_target_sigma_um, cell_cell=True
     )
     sdf_um = np.zeros(labels.shape, np.float32)
     if (~foreground).any():
@@ -59,11 +61,15 @@ def _slow_geometry_reference(labels, spacing, dref, cfg):
             offset[axis, mask] = (center_um[axis] - coordinate_um[mask]) / dref
         maximum = float(distance[mask].max())
         seed[mask] = distance[mask] / maximum
+    sdf_unclipped = sdf_um / dref
     return {
         "foreground": foreground.astype(np.float32)[None],
         "surface": surface[None],
         "separator": separator[None],
-        "sdf": np.clip(sdf_um / dref, -cfg.sdf_clip_dref, cfg.sdf_clip_dref)[None],
+        "sdf": np.clip(sdf_unclipped, -cfg.sdf_clip_dref, cfg.sdf_clip_dref)[None],
+        "sdf_valid": (
+            foreground | (np.abs(sdf_unclipped) <= cfg.sdf_supervision_radius_dref)
+        )[None],
         "flow": flow,
         "centroid_offset": offset,
         "seed": seed[None],
@@ -146,6 +152,7 @@ def test_local_geometry_targets_match_slow_reference():
         torch.from_numpy(spacing)[None],
         torch.tensor([4.2]),
         sdf_clip_dref=cfg.sdf_clip_dref,
+        sdf_supervision_radius_dref=cfg.sdf_supervision_radius_dref,
         surface_target_sigma_um=cfg.surface_target_sigma_um,
         separator_target_sigma_um=cfg.separator_target_sigma_um,
     )
@@ -176,10 +183,10 @@ def test_per_instance_edt_is_bounding_box_local():
             torch.tensor([4.0]),
         )
     full_shape = tuple(labels.shape[-3:])
-    # Surface band + background SDF are allowed volume-wide; neither per-cell
-    # transform is allowed to have the native volume shape.
-    assert sum(shape == full_shape for shape in shapes) <= 2
-    assert sum(shape != full_shape for shape in shapes) == 2
+    # Only the background SDF transform may use the exact native shape. Face
+    # targets use a single half-grid axis, while per-cell transforms stay local.
+    assert sum(shape == full_shape for shape in shapes) <= 1
+    assert any(all(a < b for a, b in zip(shape, full_shape)) for shape in shapes)
 
 
 def test_precomputed_geometry_targets_are_reused():
@@ -280,6 +287,7 @@ def test_rag_targets_are_vectorized_and_impure_edges_are_invalid():
     targets = criterion.build_targets(rag, gt)
     assert targets.dominant_gt.tolist() == [1, 1, 2]
     assert torch.allclose(targets.node_purity, torch.tensor([1.0, 0.5, 1.0]))
+    assert torch.allclose(targets.node_gt_support, torch.ones(3))
     assert targets.valid.tolist() == [False, False]
     metrics = criterion(rag, gt)
     assert metrics["rag_valid_edge_fraction"] == 0

@@ -348,6 +348,7 @@ class StirNetCriterion(nn.Module):
             spacing_um.detach().cpu(),
             dref_um.detach().cpu(),
             sdf_clip_dref=geometry_cfg.sdf_clip_dref,
+            sdf_supervision_radius_dref=geometry_cfg.sdf_supervision_radius_dref,
             surface_target_sigma_um=geometry_cfg.surface_target_sigma_um,
             separator_target_sigma_um=geometry_cfg.separator_target_sigma_um,
             device=device,
@@ -383,6 +384,7 @@ class StirNetCriterion(nn.Module):
         geometry_total = torch.stack(list(geometry_losses.values())).sum()
         metrics: dict[str, Tensor] = {
             "geometry_loss": geometry_total,
+            "sdf_valid_fraction": geometry_target.sdf_valid.float().mean().detach(),
             **{f"geometry_{name}": value for name, value in geometry_losses.items()},
         }
         if stage == "geometry_bootstrap":
@@ -413,6 +415,12 @@ class StirNetCriterion(nn.Module):
                 "rag_valid_edge_fraction": spatial_rag["rag_valid_edge_fraction"],
                 "rag_mean_node_purity": spatial_rag["rag_mean_node_purity"],
                 "rag_impure_node_fraction": spatial_rag["rag_impure_node_fraction"],
+                "rag_mean_node_gt_support": spatial_rag[
+                    "rag_mean_node_gt_support"
+                ],
+                "rag_low_support_node_fraction": spatial_rag[
+                    "rag_low_support_node_fraction"
+                ],
             }
         )
         if stage == "spatial_partition":

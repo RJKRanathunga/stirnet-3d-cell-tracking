@@ -343,6 +343,7 @@ def parse_args():
     parser.add_argument("--run-dir", type=Path, default=root / "runs" / "stirnet_v2_overfit")
     parser.add_argument("--runs-root", type=Path)
     parser.add_argument("--warm-start", type=Path)
+    parser.add_argument("--resume", type=Path)
     parser.add_argument("--stage", choices=(*STAGES, "all"), default="all")
     parser.add_argument("--stage-steps", type=int, default=100)
     parser.add_argument("--eval-every", type=int, default=10)
@@ -358,6 +359,8 @@ def main() -> int:
     args = parse_args()
     if args.stage_steps < 1:
         raise ValueError("stage-steps must be positive")
+    if args.warm_start is not None and args.resume is not None:
+        raise ValueError("choose either --warm-start or --resume, not both")
     args.run_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(40266)
     np.random.seed(40266)
@@ -377,15 +380,18 @@ def main() -> int:
         train_cfg.curriculum.fixed_stage = args.stage
         total_steps = steps_per_stage
     trainer = Trainer(StirNet(cfg), train_cfg, device=args.device)
-    if args.warm_start is not None:
+    checkpoint_path = args.resume if args.resume is not None else args.warm_start
+    if checkpoint_path is not None:
         loaded = load_checkpoint(
-            args.warm_start,
+            checkpoint_path,
             trainer.model,
             optimizer=trainer.optimizer,
             scaler=trainer.scaler,
             map_location=trainer.device,
         )
-        trainer.global_step = int(loaded.get("global_step", 0))
+        trainer.restore_training_progress(
+            loaded, resume=args.resume is not None
+        )
 
     fixed_gt_labels = gt_labels_from_batch(batch)
     target_started = time.perf_counter()
@@ -433,7 +439,10 @@ def main() -> int:
         step=trainer.global_step,
         model_config=cfg,
         training_config=train_cfg,
-        extra={"experiment": "31_spatial_first_overfit", "stage": trainer.curriculum_stage.name},
+        extra={
+            "experiment": "31_spatial_first_overfit",
+            **trainer.checkpoint_metadata(),
+        },
     )
     print(f"Saved V2 experiment artifacts to {args.run_dir}")
     return 0

@@ -14,6 +14,7 @@ class GeometryTargets:
     surface: Tensor
     separator: Tensor
     sdf: Tensor
+    sdf_valid: Tensor
     flow: Tensor
     centroid_offset: Tensor
     seed: Tensor
@@ -62,23 +63,82 @@ def _soft_interface_target(
     )
 
 
+def _face_centered_soft_interface_target(
+    labels: np.ndarray,
+    spacing_um: np.ndarray,
+    sigma_um: float,
+    *,
+    cell_cell: bool,
+) -> np.ndarray:
+    """Build a soft interface band from physical voxel-face locations.
+
+    Each axis is temporarily sampled at half its native pitch so the face
+    between two differing labels lies on an actual grid point. Distances are
+    evaluated there and sampled back only at native voxel centers. Processing
+    one doubled axis at a time avoids an eightfold full half-grid volume.
+    """
+    labels = np.asarray(labels)
+    spacing_um = np.asarray(spacing_um, dtype=np.float64)
+    nearest_um = np.full(labels.shape, np.inf, dtype=np.float32)
+    found_interface = False
+    for axis in range(3):
+        lower_index = [slice(None)] * 3
+        upper_index = [slice(None)] * 3
+        lower_index[axis] = slice(0, -1)
+        upper_index[axis] = slice(1, None)
+        lower = labels[tuple(lower_index)]
+        upper = labels[tuple(upper_index)]
+        if cell_cell:
+            faces = (lower > 0) & (upper > 0) & (lower != upper)
+        else:
+            faces = (lower != upper) & ((lower == 0) ^ (upper == 0))
+        if not faces.any():
+            continue
+        found_interface = True
+        half_shape = list(labels.shape)
+        half_shape[axis] = max(2 * labels.shape[axis] - 1, 1)
+        face_grid = np.zeros(half_shape, dtype=bool)
+        face_index = [slice(None)] * 3
+        face_index[axis] = slice(1, None, 2)
+        face_grid[tuple(face_index)] = faces
+        half_spacing = spacing_um.copy()
+        half_spacing[axis] *= 0.5
+        distance_half = ndi.distance_transform_edt(
+            ~face_grid, sampling=half_spacing
+        ).astype(np.float32)
+        center_index = [slice(None)] * 3
+        center_index[axis] = slice(0, None, 2)
+        np.minimum(nearest_um, distance_half[tuple(center_index)], out=nearest_um)
+    if not found_interface:
+        return np.zeros(labels.shape, dtype=np.float32)
+    return np.exp(
+        -0.5 * np.square(nearest_um / max(float(sigma_um), 1e-6))
+    ).astype(np.float32)
+
+
 def _single_volume_targets(
     labels: np.ndarray,
     spacing_um: np.ndarray,
     dref_um: float,
     sdf_clip_dref: float,
+    sdf_supervision_radius_dref: float,
     surface_target_sigma_um: float,
     separator_target_sigma_um: float,
 ) -> dict[str, np.ndarray]:
     labels = labels.astype(np.int64, copy=False)
     shape = labels.shape
     fg = labels > 0
-    surface_interface, separator_interface = _boundaries(labels)
-    surface = _soft_interface_target(
-        surface_interface, spacing_um, surface_target_sigma_um
+    surface = _face_centered_soft_interface_target(
+        labels,
+        spacing_um,
+        surface_target_sigma_um,
+        cell_cell=False,
     )
-    separator = _soft_interface_target(
-        separator_interface, spacing_um, separator_target_sigma_um
+    separator = _face_centered_soft_interface_target(
+        labels,
+        spacing_um,
+        separator_target_sigma_um,
+        cell_cell=True,
     )
     sdf_um = np.zeros(shape, np.float32)
     flow = np.zeros((3, *shape), np.float32)
@@ -150,12 +210,18 @@ def _single_volume_targets(
                 dist[local_mask] / max_dist, 0.0, 1.0
             )
 
-    sdf = np.clip(sdf_um / max(dref_um, 1e-6), -sdf_clip_dref, sdf_clip_dref)
+    sdf_unclipped = sdf_um / max(dref_um, 1e-6)
+    # Preserve complete foreground/interior supervision, but exclude distant
+    # background using the *unclipped* signed distance. Comparing the clipped
+    # tensor to sdf_clip_dref makes every saturated voxel appear valid.
+    sdf_valid = fg | (np.abs(sdf_unclipped) <= sdf_supervision_radius_dref)
+    sdf = np.clip(sdf_unclipped, -sdf_clip_dref, sdf_clip_dref)
     return {
         "foreground": fg.astype(np.float32)[None],
         "surface": surface[None],
         "separator": separator[None],
         "sdf": sdf.astype(np.float32)[None],
+        "sdf_valid": sdf_valid[None],
         "flow": flow,
         "centroid_offset": offsets,
         "seed": seed.astype(np.float32)[None],
@@ -168,6 +234,7 @@ def build_geometry_targets(
     dref_um: Tensor,
     *,
     sdf_clip_dref: float = 2.5,
+    sdf_supervision_radius_dref: float = 2.5,
     surface_target_sigma_um: float = 0.75,
     separator_target_sigma_um: float = 0.50,
     device: torch.device | None = None,
@@ -194,6 +261,7 @@ def build_geometry_targets(
                 spacing_cpu[b],
                 float(dref_cpu[b]),
                 sdf_clip_dref,
+                sdf_supervision_radius_dref,
                 surface_target_sigma_um,
                 separator_target_sigma_um,
             )
@@ -201,7 +269,8 @@ def build_geometry_targets(
     target_device = device or instance_labels.device
     fields = {}
     for key in batches[0].keys():
+        dtype = torch.bool if key == "sdf_valid" else torch.float32
         fields[key] = torch.from_numpy(np.stack([x[key] for x in batches])).to(
-            device=target_device, dtype=torch.float32
+            device=target_device, dtype=dtype
         )
     return GeometryTargets(**fields)

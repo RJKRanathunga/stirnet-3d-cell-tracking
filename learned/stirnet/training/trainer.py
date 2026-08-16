@@ -177,6 +177,32 @@ class Trainer:
             "cuda", enabled=self.device.type == "cuda" and amp_dtype == "fp16"
         )
         self.global_step = 0
+        self.refinement_stage_step = 0
+
+    def checkpoint_metadata(self) -> dict[str, int | str]:
+        """Return the stage-local progress required for an exact resume."""
+        return {
+            "curriculum_stage": self.curriculum_stage.name,
+            "refinement_stage_step": int(self.refinement_stage_step),
+        }
+
+    def restore_training_progress(
+        self,
+        checkpoint: dict,
+        *,
+        resume: bool,
+    ) -> None:
+        """Restore global progress, preserving local refinement only on resume."""
+        self.global_step = int(checkpoint.get("global_step", 0))
+        self.curriculum_stage = self.curriculum.apply(self.global_step)
+        extra = dict(checkpoint.get("extra", {}))
+        checkpoint_stage = extra.get("curriculum_stage", extra.get("stage"))
+        if resume and checkpoint_stage == "refinement_joint":
+            self.refinement_stage_step = max(
+                0, int(extra.get("refinement_stage_step", 0))
+            )
+        else:
+            self.refinement_stage_step = 0
 
     def _autocast(self):
         if self.device.type != "cuda" or self.training_config.amp_dtype == "fp32":
@@ -215,19 +241,10 @@ class Trainer:
         precomputed_geometry_targets: GeometryTargets | None = None,
     ):
         labels = gt_labels_from_batch(batch) if gt_labels is None else gt_labels
-        curriculum_cfg = self.training_config.curriculum
-        if curriculum_cfg.fixed_stage == "refinement_joint" or not curriculum_cfg.enabled:
-            refinement_step = self.global_step
-        else:
-            refinement_step = max(
-                0,
-                self.global_step
-                - curriculum_cfg.geometry_bootstrap_steps
-                - curriculum_cfg.spatial_partition_steps
-                - curriculum_cfg.instance_temporal_steps,
-            )
         fraction = (
-            teacher_forcing_fraction(self.training_config, refinement_step)
+            teacher_forcing_fraction(
+                self.training_config, self.refinement_stage_step
+            )
             if self.curriculum_stage.name == "refinement_joint"
             else 0.0
         )
@@ -279,6 +296,7 @@ class Trainer:
             "forward_seconds": forward_seconds,
             "target_seconds": target_seconds,
             "refinement_teacher_forcing_fraction": fraction,
+            "refinement_stage_step": float(self.refinement_stage_step),
         }
 
     def train_step(
@@ -321,6 +339,8 @@ class Trainer:
             if self.scheduler is not None:
                 self.scheduler.step()
             self.global_step += 1
+            if self.curriculum_stage.name == "refinement_joint":
+                self.refinement_stage_step += 1
         else:
             self.optimizer.zero_grad(set_to_none=True)
             if self.scaler.is_enabled():
@@ -412,7 +432,7 @@ class Trainer:
                     epoch=epoch + 1,
                     model_config=self.model.cfg,
                     training_config=self.training_config,
-                    extra={"curriculum_stage": self.curriculum_stage.name},
+                    extra=self.checkpoint_metadata(),
                 )
 
 

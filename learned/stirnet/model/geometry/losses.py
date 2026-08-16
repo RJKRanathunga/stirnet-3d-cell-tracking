@@ -55,8 +55,12 @@ class GeometryCriterion(nn.Module):
             * soft_dice_loss(pred.separator_logits, target.separator)
         )
 
-        near = target.sdf.abs() <= self.cfg.sdf_clip_dref
-        losses["sdf"] = F.smooth_l1_loss(pred.sdf[near], target.sdf[near])
+        sdf_valid = target.sdf_valid.bool()
+        losses["sdf"] = (
+            F.smooth_l1_loss(pred.sdf[sdf_valid], target.sdf[sdf_valid])
+            if sdf_valid.any()
+            else pred.sdf.sum() * 0
+        )
 
         fg3 = fg.expand_as(pred.flow) > 0.5
         if fg3.any():

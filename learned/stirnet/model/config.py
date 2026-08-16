@@ -33,6 +33,7 @@ class GeometryConfig:
     hidden_channels: int = 48
     residual_blocks: int = 3
     sdf_clip_dref: float = 2.5
+    sdf_supervision_radius_dref: float = 2.5
     boundary_pos_weight: float = 6.0
     separator_pos_weight: float = 10.0
     surface_target_sigma_um: float = 0.75
@@ -64,6 +65,10 @@ class PartitionConfig:
     final_merge_threshold: float = 0.50
     max_supervoxels: int = 4096
     rag_min_node_purity: float = 0.80
+    # Require at least half of a proposed node to be backed by GT foreground.
+    # This keeps mostly-background supervoxels out of edge supervision while
+    # still tolerating imperfect proposal boundaries during early training.
+    rag_min_node_gt_support: float = 0.50
 
 
 @dataclass
@@ -146,12 +151,16 @@ class ModelConfig:
             raise ValueError("max_supervoxels must be positive")
         if self.geometry.sdf_clip_dref <= 0:
             raise ValueError("sdf_clip_dref must be positive")
+        if self.geometry.sdf_supervision_radius_dref <= 0:
+            raise ValueError("sdf_supervision_radius_dref must be positive")
         if self.geometry.surface_target_sigma_um <= 0:
             raise ValueError("surface_target_sigma_um must be positive")
         if self.geometry.separator_target_sigma_um <= 0:
             raise ValueError("separator_target_sigma_um must be positive")
         if not 0.0 <= self.partition.rag_min_node_purity <= 1.0:
             raise ValueError("rag_min_node_purity must be in [0, 1]")
+        if not 0.0 <= self.partition.rag_min_node_gt_support <= 1.0:
+            raise ValueError("rag_min_node_gt_support must be in [0, 1]")
         channels = self.evidence.raw_channels + self.evidence.prior_channels
         if sorted(channels) != list(range(self.spatial.in_channels)):
             raise ValueError(

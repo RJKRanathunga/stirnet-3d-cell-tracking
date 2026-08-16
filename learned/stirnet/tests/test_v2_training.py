@@ -209,6 +209,10 @@ def test_local_refined_geometry_loss_reaches_refiner():
 
 def test_one_complete_training_step_is_finite():
     model_config = small_model_config()
+    # This test exercises gradient connectivity with intentionally coarse
+    # synthetic proposals; support gating itself is covered by dedicated RAG
+    # target tests.
+    model_config.partition.rag_min_node_gt_support = 0.0
     model_config.refinement.split_threshold = 1.1
     model_config.refinement.recovery_threshold = 1.1
     model = StirNet(model_config)

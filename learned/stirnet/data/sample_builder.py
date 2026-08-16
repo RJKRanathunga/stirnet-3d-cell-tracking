@@ -18,6 +18,39 @@ SPATIAL_CHANNEL_NAMES = (
     "current_marker_prior",
 )
 
+TRUSTED_MODEL_DREF_SOURCES = frozenset(
+    {
+        "current_segmentation",
+        "fixed_acquisition_prior",
+        "explicit_non_gt",
+    }
+)
+
+
+def resolve_model_dref(
+    instance_labels: np.ndarray,
+    spacing_um,
+    *,
+    cached_dref_um: float | torch.Tensor | None = None,
+    metadata: dict | None = None,
+) -> tuple[float, str, bool]:
+    """Resolve model scale from explicit non-GT provenance or current labels.
+
+    The presence of a cached numeric value is intentionally insufficient: old
+    caches may have serialized a GT-derived dref without provenance metadata.
+    """
+    provenance = dict(metadata or {})
+    source = provenance.get("model_dref_source")
+    candidate = cached_dref_um
+    if candidate is None:
+        candidate = provenance.get("model_dref_um")
+    if source in TRUSTED_MODEL_DREF_SOURCES and candidate is not None:
+        value = float(torch.as_tensor(candidate))
+        if np.isfinite(value) and value > 0:
+            return value, str(source), True
+    value = float(estimate_model_dref_um(np.asarray(instance_labels), spacing_um))
+    return value, "current_segmentation", False
+
 
 def renormalize_cached_dref(
     sample: dict,
@@ -39,12 +72,12 @@ def renormalize_cached_dref(
             raise ValueError("spatial_inputs must be [C,Z,Y,X] or [B,C,Z,Y,X]")
         result["spatial_inputs"] = spatial
     if "graph_x" in result:
-        graph_x = result["graph_x"].clone()
+        graph_x = torch.as_tensor(result["graph_x"]).clone()
         for start, stop in ((1, 4), (5, 11), (17, 23), (25, 27)):
             graph_x[:, start:stop] *= scale
         result["graph_x"] = graph_x
     if "graph_edge_attr" in result:
-        edge_attr = result["graph_edge_attr"].clone()
+        edge_attr = torch.as_tensor(result["graph_edge_attr"]).clone()
         edge_attr[:, 1:5] *= scale
         edge_attr[:, 7] *= scale
         result["graph_edge_attr"] = edge_attr
@@ -120,21 +153,22 @@ def build_cached_sample(
     marker_heatmap: np.ndarray | None = None,
     temporal_graph: dict | None = None,
     dref_um: float | None = None,
+    model_dref_source: str | None = None,
     normalize_raw: bool = True,
     metadata: dict | None = None,
 ) -> dict:
     spacing=tuple(float(v) for v in spacing_um)
     raw_norm=robust_normalize(raw) if normalize_raw else np.asarray(raw,np.float32)
-    dref=float(
-        dref_um
-        if dref_um is not None
-        else estimate_model_dref_um(np.asarray(instance_labels), spacing)
-    )
     sample_metadata = dict(metadata or {})
-    sample_metadata.setdefault(
-        "model_dref_source",
-        "explicit_non_gt" if dref_um is not None else "current_segmentation",
+    if model_dref_source is not None:
+        sample_metadata["model_dref_source"] = model_dref_source
+    dref, resolved_source, _ = resolve_model_dref(
+        np.asarray(instance_labels),
+        spacing,
+        cached_dref_um=dref_um,
+        metadata=sample_metadata,
     )
+    sample_metadata["model_dref_source"] = resolved_source
     sample_metadata["model_dref_um"] = dref
     spatial=build_spatial_channels(raw_norm,np.asarray(instance_labels),spacing,dref,marker_heatmap)
     inst=extract_instance_metadata(np.asarray(instance_labels),raw_norm,spacing,dref,spatial[4])
