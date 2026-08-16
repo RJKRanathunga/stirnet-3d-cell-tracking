@@ -126,7 +126,7 @@ class RefinementConfig:
     recovery_threshold: float = 0.60
     ambiguity_logit_abs_max: float = 0.85
     residual_scale: float = 0.75
-    partition_update: str = "local"
+    partition_update: str = "full"
     partition_halo_dref: float = 1.0
 
 

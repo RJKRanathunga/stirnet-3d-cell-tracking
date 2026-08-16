@@ -395,8 +395,9 @@ class StirNet(nn.Module):
                 network_padding_mask,
                 stage_profiler=stage_profiler,
             )
-            with _profile_stage(stage_profiler, "geometry"):
-                initial_geometry = self.geometry_decoder(decoded.d0, acquisition)
+            initial_geometry = self.geometry_decoder(
+                decoded.d0, acquisition, stage_profiler=stage_profiler
+            )
             initial_geometry = replace(
                 initial_geometry,
                 feature_spacing_um=network_spacing_um,
@@ -611,16 +612,19 @@ class StirNet(nn.Module):
                         partition_fallback_reason=local_update.fallback_reason,
                     )
                 else:
-                    rag, spatial_partition = self._spatial_rag(
-                        geometry,
-                        decoded,
-                        spatial_inputs,
-                        spacing_um,
-                        dref_um,
-                        spatial_padding_mask,
-                        stage_profiler=stage_profiler,
-                        profile_prefix="refined",
-                    )
+                    with _profile_stage(
+                        stage_profiler, "refined_partition_update"
+                    ):
+                        rag, spatial_partition = self._spatial_rag(
+                            geometry,
+                            decoded,
+                            spatial_inputs,
+                            spacing_um,
+                            dref_um,
+                            spatial_padding_mask,
+                            stage_profiler=stage_profiler,
+                            profile_prefix="refined",
+                        )
                     refinement = replace(
                         refinement,
                         partition_update="full",
@@ -634,7 +638,9 @@ class StirNet(nn.Module):
                         spacing_um,
                         dref_um,
                     )
-                with _profile_stage(stage_profiler, "refined_temporal"):
+                with _profile_stage(
+                    stage_profiler, "refined_temporal_observer"
+                ):
                     temporal = self._observe_temporal(
                         temporal_base,
                         decoded,
@@ -644,6 +650,9 @@ class StirNet(nn.Module):
                         dref_um,
                         observation_cache,
                     )
+                with _profile_stage(
+                    stage_profiler, "refined_temporal_reasoning"
+                ):
                     reasoning = self.instance_temporal(
                         instances, rag, temporal, dref_um
                     )

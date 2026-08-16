@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from typing import Tuple
 
 
 @dataclass
@@ -30,6 +31,18 @@ class CurriculumConfig:
     fixed_stage: str | None = None
     spatial_lr_scale_temporal: float = 0.25
     spatial_lr_scale_refinement: float = 0.10
+    refinement_crop_enabled: bool = True
+    refinement_crop_shape_zyx: Tuple[int, int, int] = (32, 192, 192)
+    refinement_crops_per_step: int = 1
+    refinement_crop_sampling: str = "mixed"
+    refinement_crop_min_foreground_fraction: float = 0.001
+    refinement_crop_geometry_weight: float = 1.0
+    refinement_crop_rag_weight: float = 0.0
+    refinement_crop_seed: int = 40_266
+    full_frame_spatial_grad: bool = False
+    geometry_bootstrap_crop_enabled: bool = False
+    spatial_partition_crop_enabled: bool = False
+    instance_temporal_detached_spatial: bool = False
 
 
 @dataclass
@@ -39,6 +52,7 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     amp_dtype: str = "bf16"
     profile_memory: bool = False
+    memory_profile_path: str | None = None
     refinement_teacher_forcing_start: float = 1.0
     refinement_teacher_forcing_end: float = 0.0
     refinement_teacher_forcing_decay_steps: int = 2_000
@@ -67,6 +81,22 @@ class TrainingConfig:
         )
         if any(value < 0 for value in durations):
             raise ValueError("curriculum durations cannot be negative")
+        if any(value < 1 for value in self.curriculum.refinement_crop_shape_zyx):
+            raise ValueError("refinement crop dimensions must be positive")
+        if self.curriculum.refinement_crops_per_step < 1:
+            raise ValueError("refinement_crops_per_step must be positive")
+        if self.curriculum.refinement_crop_sampling != "mixed":
+            raise ValueError("only mixed refinement crop sampling is supported")
+        if not 0.0 <= self.curriculum.refinement_crop_min_foreground_fraction <= 1.0:
+            raise ValueError(
+                "refinement_crop_min_foreground_fraction must be in [0, 1]"
+            )
+        if self.curriculum.refinement_crop_geometry_weight < 0:
+            raise ValueError("refinement_crop_geometry_weight cannot be negative")
+        if self.curriculum.refinement_crop_rag_weight < 0:
+            raise ValueError("refinement_crop_rag_weight cannot be negative")
+        if self.curriculum.refinement_crop_seed < 0:
+            raise ValueError("refinement_crop_seed cannot be negative")
         weights = (
             self.loss.geometry_weight,
             self.loss.spatial_rag_weight,

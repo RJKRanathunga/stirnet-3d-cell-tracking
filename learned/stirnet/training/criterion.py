@@ -12,6 +12,7 @@ from ..model import GeometryCriterion, RAGCriterion
 from ..model.geometry.targets import GeometryTargets, build_geometry_targets
 from ..model.types import (
     GeometryForwardOutput,
+    GeometryState,
     InstanceState,
     RAGState,
     ReasoningState,
@@ -19,6 +20,7 @@ from ..model.types import (
     SpatialForwardOutput,
     StirNetOutput,
     TemporalState,
+    geometry_field_crop,
 )
 from ..model.utils.contingency import label_contingency
 from ..model.utils.physical import physical_crop_slices
@@ -354,6 +356,115 @@ class StirNetCriterion(nn.Module):
             device=device,
         )
 
+    def crop_phase_a_objective(
+        self,
+        metrics: dict[str, Tensor],
+        *,
+        geometry_scale: float = 1.0,
+        rag_scale: float = 0.0,
+    ) -> Tensor:
+        """Dense crop estimator used before detached full-frame reasoning."""
+        result = (
+            geometry_scale
+            * self.cfg.geometry_weight
+            * metrics["geometry_loss"]
+        )
+        if rag_scale:
+            result = result + (
+                rag_scale
+                * self.cfg.spatial_rag_weight
+                * metrics["spatial_rag_bce"]
+            )
+        return result
+
+    def refined_local_geometry_losses(
+        self,
+        output: StirNetOutput,
+        targets: GeometryTargets,
+        spacing_um: Tensor,
+        dref_um: Tensor,
+    ) -> tuple[dict[str, Tensor], Tensor]:
+        """Supervise only corrected ROIs, retaining gradients to sparse deltas."""
+        refinement = output.refinement
+        rois = (
+            []
+            if refinement is None
+            else list(refinement.geometry.delta.rois)
+            if hasattr(refinement.geometry, "delta")
+            else []
+        )
+        if not rois:
+            zero = output.initial_geometry.sdf.sum() * 0
+            names = (
+                "foreground_bce",
+                "foreground_dice",
+                "surface_bce",
+                "surface_dice",
+                "separator_bce",
+                "separator_dice",
+                "sdf",
+                "flow_direction",
+                "flow_l1",
+                "centroid_offset",
+                "seed",
+                "flow_sdf_consistency",
+                "eikonal",
+            )
+            return {name: zero for name in names}, zero.detach()
+
+        weighted: dict[str, Tensor] = {}
+        valid_numerator = output.initial_geometry.sdf.new_zeros(())
+        total_voxels = sum(math.prod(roi.delta.shape[-3:]) for roi in rois)
+        for roi in rois:
+            b = roi.batch_index
+            crop = roi.slices_zyx
+            prediction = GeometryState(
+                foreground_logits=geometry_field_crop(
+                    output.geometry, "foreground_logits", b, crop
+                )[None],
+                surface_logits=geometry_field_crop(
+                    output.geometry, "surface_logits", b, crop
+                )[None],
+                separator_logits=geometry_field_crop(
+                    output.geometry, "separator_logits", b, crop
+                )[None],
+                sdf=geometry_field_crop(output.geometry, "sdf", b, crop)[None],
+                flow=geometry_field_crop(output.geometry, "flow", b, crop)[None],
+                centroid_offset=geometry_field_crop(
+                    output.geometry, "centroid_offset", b, crop
+                )[None],
+                seed_logits=geometry_field_crop(
+                    output.geometry, "seed_logits", b, crop
+                )[None],
+                features=None,
+            )
+            target = GeometryTargets(
+                **{
+                    name: value[
+                        b : b + 1,
+                        :,
+                        crop[0],
+                        crop[1],
+                        crop[2],
+                    ].to(prediction.sdf.device)
+                    for name, value in targets.__dict__.items()
+                }
+            )
+            row = self.geometry(
+                prediction,
+                target,
+                spacing_um[b : b + 1],
+                dref_um[b : b + 1],
+            )
+            voxels = math.prod(roi.delta.shape[-3:])
+            weight = voxels / max(total_voxels, 1)
+            for name, value in row.items():
+                weighted[name] = weighted.get(name, value * 0) + weight * value
+            valid_numerator = valid_numerator + (
+                weight * target.sdf_valid.float().mean()
+            )
+        return weighted, valid_numerator.detach()
+
     def refinement_phase_a_objective(self, metrics: dict[str, Tensor]) -> Tensor:
         """Base contribution for memory-bounded refinement training."""
         return (
@@ -399,6 +510,8 @@ class StirNetCriterion(nn.Module):
         stage: str = "refinement_joint",
         precomputed_geometry_targets: GeometryTargets | None = None,
         precomputed_discrete_targets: dict[str, object] | None = None,
+        geometry_losses_override: dict[str, Tensor] | None = None,
+        geometry_valid_fraction_override: Tensor | None = None,
     ) -> dict[str, Tensor]:
         if stage not in {
             "geometry_bootstrap",
@@ -407,19 +520,36 @@ class StirNetCriterion(nn.Module):
             "refinement_joint",
         }:
             raise ValueError(f"Unknown V2 training stage: {stage}")
-        device = output.geometry.sdf.device
-        geometry_target = (
-            self.build_geometry_targets(gt_labels, spacing_um, dref_um, device=device)
-            if precomputed_geometry_targets is None
-            else precomputed_geometry_targets.to(device)
+        reference_tensor = (
+            output.initial_geometry.sdf
+            if isinstance(output, StirNetOutput)
+            else output.geometry.sdf
         )
-        geometry_losses = self.geometry(
-            output.geometry, geometry_target, spacing_um, dref_um
-        )
+        device = reference_tensor.device
+        geometry_target = None
+        if geometry_losses_override is None:
+            geometry_target = (
+                self.build_geometry_targets(
+                    gt_labels, spacing_um, dref_um, device=device
+                )
+                if precomputed_geometry_targets is None
+                else precomputed_geometry_targets.to(device)
+            )
+            geometry_losses = self.geometry(
+                output.geometry, geometry_target, spacing_um, dref_um
+            )
+            sdf_valid_fraction = geometry_target.sdf_valid.float().mean().detach()
+        else:
+            geometry_losses = geometry_losses_override
+            sdf_valid_fraction = (
+                output.initial_geometry.sdf.new_zeros(())
+                if geometry_valid_fraction_override is None
+                else geometry_valid_fraction_override
+            )
         geometry_total = torch.stack(list(geometry_losses.values())).sum()
         metrics: dict[str, Tensor] = {
             "geometry_loss": geometry_total,
-            "sdf_valid_fraction": geometry_target.sdf_valid.float().mean().detach(),
+            "sdf_valid_fraction": sdf_valid_fraction,
             **{f"geometry_{name}": value for name, value in geometry_losses.items()},
         }
         if stage == "geometry_bootstrap":
@@ -526,8 +656,8 @@ class StirNetCriterion(nn.Module):
                 request_reasoning.split_logits, instance_target.split
             )
         else:
-            existence_loss = output.geometry.sdf.sum() * 0
-            split_loss = output.geometry.sdf.sum() * 0
+            existence_loss = reference_tensor.sum() * 0
+            split_loss = reference_tensor.sum() * 0
         existence_metrics = _safe_binary_metrics(
             request_reasoning.instance_exist_logits, instance_target.existence
         )
@@ -590,13 +720,13 @@ class StirNetCriterion(nn.Module):
                 "refined_geometry_loss": geometry_total
                 if refinement_applied
                 else geometry_total.detach() * 0,
-                "refinement_teacher_requests": output.geometry.sdf.new_tensor(
+                "refinement_teacher_requests": reference_tensor.new_tensor(
                     0 if output.refinement is None else output.refinement.teacher_request_count
                 ),
-                "refinement_model_requests": output.geometry.sdf.new_tensor(
+                "refinement_model_requests": reference_tensor.new_tensor(
                     0 if output.refinement is None else output.refinement.model_request_count
                 ),
-                "refinement_total_requests": output.geometry.sdf.new_tensor(
+                "refinement_total_requests": reference_tensor.new_tensor(
                     0 if output.refinement is None else len(output.refinement.requests)
                 ),
             }

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -50,13 +52,32 @@ class DenseGeometryDecoder(nn.Module):
         self.centroid_offset = nn.Conv3d(hidden, 3, 1)
         self.seed = nn.Conv3d(hidden, 1, 1)
 
-    def _trunk(self, d0: Tensor, acquisition_embedding: Tensor) -> Tensor:
-        x = self.input_proj(d0)
-        for block in self.blocks:
-            x = block(x, acquisition_embedding)
+    def _trunk(
+        self,
+        d0: Tensor,
+        acquisition_embedding: Tensor,
+        stage_profiler=None,
+    ) -> Tensor:
+        def profiled(name: str):
+            return (
+                nullcontext()
+                if stage_profiler is None
+                else stage_profiler.profile(name)
+            )
+
+        with profiled("geometry_input_projection"):
+            x = self.input_proj(d0)
+        with profiled("geometry_trunk"):
+            for block in self.blocks:
+                x = block(x, acquisition_embedding)
         return x
 
-    def forward(self, d0: Tensor, acquisition_embedding: Tensor) -> GeometryState:
+    def forward(
+        self,
+        d0: Tensor,
+        acquisition_embedding: Tensor,
+        stage_profiler=None,
+    ) -> GeometryState:
         if (
             self.activation_checkpointing
             and self.training
@@ -64,27 +85,35 @@ class DenseGeometryDecoder(nn.Module):
             and (d0.requires_grad or acquisition_embedding.requires_grad)
         ):
             x = checkpoint(
-                self._trunk,
+                lambda source, acquisition: self._trunk(
+                    source, acquisition, stage_profiler
+                ),
                 d0,
                 acquisition_embedding,
                 use_reentrant=False,
             )
         else:
-            x = self._trunk(d0, acquisition_embedding)
-        # SDF is bounded in cell-reference units, preventing large outliers from
-        # dominating watershed energy while retaining signed geometry.
-        sdf = self.cfg.sdf_clip_dref * F.tanh(self.sdf(x))
-        # Omnipose-style flow is a direction field; tanh keeps each component
-        # bounded and the loss later normalizes it before angular comparison.
-        flow = torch.tanh(self.flow(x))
-        centroid_offset = self.centroid_offset(x)
-        return GeometryState(
-            foreground_logits=self.foreground(x),
-            surface_logits=self.surface(x),
-            separator_logits=self.separator(x),
-            sdf=sdf,
-            flow=flow,
-            centroid_offset=centroid_offset,
-            seed_logits=self.seed(x),
-            features=x,
+            x = self._trunk(d0, acquisition_embedding, stage_profiler)
+        heads_context = (
+            nullcontext()
+            if stage_profiler is None
+            else stage_profiler.profile("geometry_heads")
         )
+        with heads_context:
+            # SDF is bounded in cell-reference units, preventing large outliers
+            # from dominating watershed energy while retaining signed geometry.
+            sdf = self.cfg.sdf_clip_dref * F.tanh(self.sdf(x))
+            # Omnipose-style flow is a direction field; tanh keeps each component
+            # bounded and the loss later normalizes it before angular comparison.
+            flow = torch.tanh(self.flow(x))
+            centroid_offset = self.centroid_offset(x)
+            return GeometryState(
+                foreground_logits=self.foreground(x),
+                surface_logits=self.surface(x),
+                separator_logits=self.separator(x),
+                sdf=sdf,
+                flow=flow,
+                centroid_offset=centroid_offset,
+                seed_logits=self.seed(x),
+                features=x,
+            )

@@ -102,7 +102,7 @@ def benchmark_split_refinement(
         torch.cuda.reset_peak_memory_stats(split.device)
     _sync(split.device)
     started = time.perf_counter()
-    split_losses, _ = split._split_refinement_backward(
+    split_losses, _ = split._full_frame_split_refinement_backward(
         split_moved,
         gt_labels=labels,
         precomputed_geometry_targets=split_targets,
@@ -157,4 +157,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

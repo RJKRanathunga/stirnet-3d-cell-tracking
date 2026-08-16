@@ -42,7 +42,9 @@ def test_split_refinement_routes_gradients_and_steps_optimizer_once():
     assert metrics["grad_instances"] > 0
     assert metrics["grad_temporal"] > 0
     assert metrics["grad_refinement"] > 0
-    assert metrics["split_objective_abs_error"] < 1e-5
+    assert metrics["crop_phase_a_loss"] > 0
+    assert metrics["phase_b_loss"] > 0
+    assert "split_objective_abs_error" not in metrics
 
 
 def test_split_and_monolithic_select_same_requests_and_hard_partitions():
@@ -92,4 +94,3 @@ def test_split_and_monolithic_select_same_requests_and_hard_partitions():
         assert torch.equal(actual, expected)
     for actual, expected in zip(split.final_labels, monolithic.final_labels):
         assert torch.equal(actual, expected)
-

@@ -18,6 +18,7 @@ from .curriculum import (
     stage_name_for_step,
 )
 from .metrics import instance_metrics
+from .crops import CropBatch, CropCandidateCache, CropSpec
 from .trainer import Trainer
 from .profiler import StageProfileRecord, StageProfiler
 
@@ -26,6 +27,9 @@ __all__ = [
     "CHECKPOINT_VERSION",
     "CurriculumConfig",
     "CurriculumController",
+    "CropBatch",
+    "CropCandidateCache",
+    "CropSpec",
     "InstanceTargets",
     "LossConfig",
     "RecoveryTargets",

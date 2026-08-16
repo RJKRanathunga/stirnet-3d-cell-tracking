@@ -356,6 +356,31 @@ def parse_args():
     parser.add_argument("--hard-time-limit-seconds", type=float, default=3480)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--profile-memory", action="store_true")
+    parser.add_argument(
+        "--refinement-crop-shape",
+        type=int,
+        nargs=3,
+        metavar=("Z", "Y", "X"),
+    )
+    parser.add_argument("--refinement-crops-per-step", type=int)
+    parser.add_argument(
+        "--training-crop-shape",
+        type=int,
+        nargs=3,
+        metavar=("Z", "Y", "X"),
+        help="Enable crop training for geometry_bootstrap/spatial_partition.",
+    )
+    parser.add_argument("--training-crops-per-step", type=int)
+    parser.add_argument(
+        "--full-frame-spatial-grad",
+        action="store_true",
+        help="Debug/reference only; unsafe for giant full frames.",
+    )
+    parser.add_argument(
+        "--instance-temporal-detached-spatial",
+        action="store_true",
+        help="Run the full dense base under no_grad in instance_temporal.",
+    )
     parser.add_argument("--benchmark-inference", action="store_true")
     parser.add_argument("--benchmark-shape", type=int, nargs=3, metavar=("Z", "Y", "X"))
     parser.add_argument("--inference-mode", choices=("full", "tiled"), default="full")
@@ -388,35 +413,44 @@ def _run_inference_benchmark(
         torch.cuda.reset_peak_memory_stats(trainer.device)
         torch.cuda.synchronize(trainer.device)
     started = time.perf_counter()
-    with torch.inference_mode(), trainer._autocast():
-        if inference_mode == "full":
-            output = model_forward_from_batch(
-                trainer.model,
-                moved,
-                execution_stage="refinement",
-                teacher_request_builder=None,
-                apply_existence_filter=False,
-            )
-            output_shape = list(output.geometry.sdf.shape[-3:])
-            instance_count = sum(int(labels.max().item()) for labels in output.final_labels)
-            path = "full_global_pipeline"
-        else:
-            tiled = tiled_temporal_inference(
-                trainer.model,
-                moved["spatial_inputs"],
-                moved["spacing_um"],
-                moved["dref_um"],
-                config=trainer.model.cfg.inference,
-                spatial_padding_mask=moved.get("spatial_padding_mask"),
-                run_refinement=True,
-                apply_existence_filter=False,
-            )
-            output_shape = list(tiled.spatial.dense.geometry.sdf.shape[-3:])
-            instance_count = sum(
-                int(labels.max().item())
-                for labels in tiled.final_labels
-            )
-            path = "tiled_global_pipeline_streamed_features"
+    trainer.stage_profiler.set_context(phase="inference")
+    with trainer.stage_profiler.phase_scope("inference"):
+        with trainer.stage_profiler.profile("total"):
+            with torch.inference_mode(), trainer._autocast():
+                if inference_mode == "full":
+                    output = model_forward_from_batch(
+                        trainer.model,
+                        moved,
+                        execution_stage="refinement",
+                        teacher_request_builder=None,
+                        apply_existence_filter=False,
+                        stage_profiler=trainer.stage_profiler,
+                    )
+                    output_shape = list(output.geometry.sdf.shape[-3:])
+                    instance_count = sum(
+                        int(labels.max().item())
+                        for labels in output.final_labels
+                    )
+                    path = "full_global_pipeline"
+                else:
+                    tiled = tiled_temporal_inference(
+                        trainer.model,
+                        moved["spatial_inputs"],
+                        moved["spacing_um"],
+                        moved["dref_um"],
+                        config=trainer.model.cfg.inference,
+                        spatial_padding_mask=moved.get("spatial_padding_mask"),
+                        run_refinement=True,
+                        apply_existence_filter=False,
+                    )
+                    output_shape = list(
+                        tiled.spatial.dense.geometry.sdf.shape[-3:]
+                    )
+                    instance_count = sum(
+                        int(labels.max().item())
+                        for labels in tiled.final_labels
+                    )
+                    path = "tiled_global_pipeline_streamed_features"
     if trainer.device.type == "cuda":
         torch.cuda.synchronize(trainer.device)
     elapsed = time.perf_counter() - started
@@ -454,6 +488,36 @@ def main() -> int:
     train_cfg = TrainingConfig(lr=args.learning_rate)
     train_cfg.amp_dtype = args.amp_dtype
     train_cfg.profile_memory = args.profile_memory
+    train_cfg.memory_profile_path = (
+        str(args.run_dir / "memory_profile.jsonl")
+        if args.profile_memory
+        else None
+    )
+    if args.refinement_crop_shape is not None:
+        train_cfg.curriculum.refinement_crop_shape_zyx = tuple(
+            args.refinement_crop_shape
+        )
+    if args.refinement_crops_per_step is not None:
+        train_cfg.curriculum.refinement_crops_per_step = (
+            args.refinement_crops_per_step
+        )
+    if args.training_crop_shape is not None:
+        train_cfg.curriculum.refinement_crop_shape_zyx = tuple(
+            args.training_crop_shape
+        )
+        train_cfg.curriculum.geometry_bootstrap_crop_enabled = True
+        train_cfg.curriculum.spatial_partition_crop_enabled = True
+    if args.training_crops_per_step is not None:
+        train_cfg.curriculum.refinement_crops_per_step = (
+            args.training_crops_per_step
+        )
+    train_cfg.curriculum.full_frame_spatial_grad = (
+        args.full_frame_spatial_grad
+    )
+    train_cfg.curriculum.instance_temporal_detached_spatial = (
+        args.instance_temporal_detached_spatial
+    )
+    train_cfg.validate()
     if args.benchmark_inference and args.benchmark_shape is not None:
         shape = tuple(args.benchmark_shape)
         benchmark_batch = {

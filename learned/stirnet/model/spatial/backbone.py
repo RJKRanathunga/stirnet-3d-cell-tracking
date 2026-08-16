@@ -91,27 +91,30 @@ class AnisotropyAwareSpatialBackbone(nn.Module):
         padding_mask: Tensor | None = None,
         stage_profiler=None,
     ) -> tuple[SpatialPyramid, SpatialDecodeState]:
-        encoder_context = (
-            nullcontext()
-            if stage_profiler is None
-            else stage_profiler.profile("backbone_encoder")
-        )
-        with encoder_context:
-            features: list[Tensor] = []
-            spacings: list[Tensor] = []
-            strides: list[tuple[int, int, int]] = []
-            masks: list[Tensor] = []
-            x = x0
-            current_spacing = spacing_um
-            current_mask = padding_mask
-            for level_idx, blocks in enumerate(self.levels):
+        def profiled(name: str):
+            return (
+                nullcontext()
+                if stage_profiler is None
+                else stage_profiler.profile(name)
+            )
+
+        features: list[Tensor] = []
+        spacings: list[Tensor] = []
+        strides: list[tuple[int, int, int]] = []
+        masks: list[Tensor] = []
+        x = x0
+        current_spacing = spacing_um
+        current_mask = padding_mask
+        for level_idx, blocks in enumerate(self.levels):
+            with profiled(f"encoder_level{level_idx}"):
                 for block in blocks:
                     x = self._run(block, x, acquisition_embedding)
-                features.append(x)
-                spacings.append(current_spacing)
-                if current_mask is not None:
-                    masks.append(current_mask)
-                if level_idx < 3:
+            features.append(x)
+            spacings.append(current_spacing)
+            if current_mask is not None:
+                masks.append(current_mask)
+            if level_idx < 3:
+                with profiled(f"down{level_idx}"):
                     stride = choose_downsample_stride(
                         current_spacing, self.cfg.anisotropy_threshold
                     )
@@ -124,19 +127,16 @@ class AnisotropyAwareSpatialBackbone(nn.Module):
                             kernel_size=stride,
                             stride=stride,
                         ).squeeze(1).bool()
-            pyramid = SpatialPyramid(
-                features=features,
-                spacings_um=spacings,
-                strides=strides,
-                padding_masks=masks if padding_mask is not None else None,
-            )
-        decoder_context = (
-            nullcontext()
-            if stage_profiler is None
-            else stage_profiler.profile("backbone_decoder")
+        pyramid = SpatialPyramid(
+            features=features,
+            spacings_um=spacings,
+            strides=strides,
+            padding_masks=masks if padding_mask is not None else None,
         )
-        with decoder_context:
+        with profiled("decoder_up2"):
             d2 = self._run(self.up2, features[3], features[2], acquisition_embedding)
+        with profiled("decoder_up1"):
             d1 = self._run(self.up1, d2, features[1], acquisition_embedding)
+        with profiled("decoder_up0"):
             d0 = self._run(self.up0, d1, features[0], acquisition_embedding)
         return pyramid, SpatialDecodeState(d2=d2, d1=d1, d0=d0)
