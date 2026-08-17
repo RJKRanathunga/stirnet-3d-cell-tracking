@@ -5,6 +5,7 @@ import json
 from typing import List
 
 import torch
+from skimage.measure import label as skimage_label
 from torch import Tensor, nn
 
 from ..config import RefinementConfig
@@ -295,44 +296,44 @@ def _owned_supervoxel_ids(
     rag: RAGState,
     instances: InstanceState,
 ) -> tuple[int, ...]:
-    """Map request semantics to the old supervoxels it may change."""
+    """Map request semantics to the exact old supervoxels it may change."""
     if request.kind == "recovery":
         return ()
 
-    node_to_instance = instances.node_to_instance
-    if node_to_instance.numel() != rag.node_supervoxel_id.numel():
-        return ()
-
-    if request.kind == "split":
-        instance_rows = torch.tensor(
-            [int(request.source_index)],
-            device=node_to_instance.device,
-            dtype=torch.long,
-        )
-    elif request.kind == "edge":
+    if request.kind == "edge":
         edge_row = int(request.source_index)
         if edge_row < 0 or edge_row >= rag.edge_index.shape[1]:
             return ()
         endpoints = rag.edge_index[:, edge_row].long()
         if bool((endpoints < 0).any()) or bool(
-            (endpoints >= node_to_instance.numel()).any()
+            (endpoints >= rag.node_supervoxel_id.numel()).any()
         ):
             return ()
-        instance_rows = torch.unique(node_to_instance[endpoints])
-        instance_rows = instance_rows[instance_rows >= 0]
-        if instance_rows.numel() == 0:
+        endpoint_batches = rag.node_batch[endpoints]
+        if bool((endpoint_batches != int(request.batch_index)).any()):
             return ()
-    else:
+        labels = torch.unique(rag.node_supervoxel_id[endpoints].long())
+        labels = labels[labels > 0]
+        return tuple(
+            sorted(int(value) for value in labels.detach().cpu().tolist())
+        )
+
+    if request.kind != "split":
         return ()
 
+    node_to_instance = instances.node_to_instance
+    if node_to_instance.numel() != rag.node_supervoxel_id.numel():
+        return ()
     same_batch = rag.node_batch == int(request.batch_index)
-    belongs = torch.isin(node_to_instance, instance_rows)
+    belongs = node_to_instance == int(request.source_index)
     node_rows = torch.nonzero(same_batch & belongs, as_tuple=False).flatten()
     if node_rows.numel() == 0:
         return ()
     labels = torch.unique(rag.node_supervoxel_id[node_rows].long())
     labels = labels[labels > 0]
-    return tuple(sorted(int(value) for value in labels.detach().cpu().tolist()))
+    return tuple(
+        sorted(int(value) for value in labels.detach().cpu().tolist())
+    )
 
 
 def _owned_bbox_from_statistics(
@@ -368,9 +369,10 @@ def _owned_bbox_from_statistics(
 def _cluster_request_tasks(
     tasks: list[_LocalPartitionTask],
 ) -> list[list[_LocalPartitionTask]]:
-    """Cluster by core/ownership interaction, never halo-only contact."""
+    """Cluster only genuinely shared ownership; recovery is always singleton."""
     if not tasks:
         return []
+
     parent = list(range(len(tasks)))
 
     def find(index: int) -> int:
@@ -389,10 +391,16 @@ def _cluster_request_tasks(
         for right in range(left + 1, len(tasks)):
             if tasks[left].batch_index != tasks[right].batch_index:
                 continue
-            if _boxes_overlap(tasks[left].core_box, tasks[right].core_box):
-                union(left, right)
+            if (
+                tasks[left].request_kind == "recovery"
+                or tasks[right].request_kind == "recovery"
+            ):
                 continue
-            if owned_sets[left] and owned_sets[left].intersection(owned_sets[right]):
+            if (
+                owned_sets[left]
+                and owned_sets[right]
+                and owned_sets[left].intersection(owned_sets[right])
+            ):
                 union(left, right)
 
     groups: dict[int, list[_LocalPartitionTask]] = {}
@@ -460,6 +468,35 @@ def _touches_nonvolume_box_boundary(
     )
 
 
+def _label_writable_components(
+    local_labels: Tensor,
+    writable_mask: Tensor,
+) -> Tensor:
+    """Label 6-connected equal-ID writable components after masking protection."""
+    if local_labels.shape != writable_mask.shape:
+        raise ValueError("local labels/writable mask must have identical shape")
+    if not bool(writable_mask.any()):
+        return torch.zeros_like(local_labels, dtype=torch.long)
+
+    packed = torch.where(
+        writable_mask,
+        local_labels,
+        torch.zeros((), device=local_labels.device, dtype=local_labels.dtype),
+    )
+    packed_cpu = packed.detach().to(
+        device="cpu", dtype=torch.int32
+    ).numpy()
+    components_cpu = skimage_label(
+        packed_cpu,
+        background=0,
+        connectivity=1,
+    )
+    return torch.from_numpy(components_cpu).to(
+        device=local_labels.device,
+        dtype=torch.long,
+    )
+
+
 def reconcile_request_local_labels(
     global_labels: Tensor,
     local_labels: Tensor,
@@ -470,50 +507,42 @@ def reconcile_request_local_labels(
     copy_output: bool = True,
     next_label_id: int | None = None,
 ) -> tuple[Tensor | None, str]:
-    """Reconcile request-owned topology while protecting unrelated labels."""
+    """Reconcile connected writable pieces while protected labels stay fixed."""
     old_crop = global_labels[box]
-    if old_crop.shape != local_labels.shape or writable_mask.shape != local_labels.shape:
-        raise ValueError("local labels/writable mask must align with update box")
+    if (
+        old_crop.shape != local_labels.shape
+        or writable_mask.shape != local_labels.shape
+    ):
+        raise ValueError(
+            "local labels/writable mask must align with the update box"
+        )
     if not bool(writable_mask.any()):
         return global_labels.clone() if copy_output else global_labels, ""
 
-    protected_mask = ~writable_mask
     owned_set = set(int(value) for value in owned_label_ids)
-    local_ids = torch.unique(local_labels[writable_mask])
-    local_ids = local_ids[local_ids > 0]
+    component_labels = _label_writable_components(
+        local_labels, writable_mask
+    )
+    component_ids = torch.unique(component_labels)
+    component_ids = component_ids[component_ids > 0]
     assignments: dict[int, int] = {}
-    protected_owners: dict[int, set[int]] = {}
     next_id = (
         int(global_labels.max().item()) + 1
         if next_label_id is None
         else int(next_label_id)
     )
 
-    for local_id_tensor in local_ids:
-        local_id = int(local_id_tensor.item())
-        component = local_labels == local_id
-        protected_ids = torch.unique(old_crop[component & protected_mask])
-        protected_ids = protected_ids[protected_ids > 0]
-        overlap_ids = torch.unique(old_crop[component & writable_mask])
-        overlap_ids = overlap_ids[overlap_ids > 0]
+    for component_id_tensor in component_ids:
+        component_id = int(component_id_tensor.item())
+        component = component_labels == component_id
 
-        if protected_ids.numel() > 1:
-            return None, "local component touches multiple external labels"
-
-        if protected_ids.numel() == 1:
-            owner = int(protected_ids.item())
-            if overlap_ids.numel() and any(
-                int(value) in owned_set
-                for value in overlap_ids.detach().cpu().tolist()
-            ):
-                return None, "owned component touches protected external label"
-            assignments[local_id] = owner
-            protected_owners.setdefault(owner, set()).add(local_id)
-            continue
-
-        if _touches_nonvolume_box_boundary(component, box, tuple(global_labels.shape)):
+        if _touches_nonvolume_box_boundary(
+            component, box, tuple(global_labels.shape)
+        ):
             return None, "unowned component touches halo boundary"
 
+        overlap_ids = torch.unique(old_crop[component])
+        overlap_ids = overlap_ids[overlap_ids > 0]
         if overlap_ids.numel():
             overlap_counts: dict[int, int] = {}
             for value in overlap_ids.detach().cpu().tolist():
@@ -521,39 +550,42 @@ def reconcile_request_local_labels(
                 if old_id not in owned_set:
                     return None, "local component would merge existing labels"
                 overlap_counts[old_id] = int(
-                    (component & writable_mask & (old_crop == old_id)).sum().item()
+                    (component & (old_crop == old_id)).sum().item()
                 )
             owner = max(
                 overlap_counts,
                 key=lambda old_id: (overlap_counts[old_id], -old_id),
             )
-            assignments[local_id] = owner
+            assignments[component_id] = owner
         else:
-            assignments[local_id] = next_id
+            assignments[component_id] = next_id
             next_id += 1
 
-    if any(len(local_set) > 1 for local_set in protected_owners.values()):
-        return None, "split components reconnect through an external label"
-
     by_assignment: dict[int, list[int]] = {}
-    for local_id, old_id in assignments.items():
-        by_assignment.setdefault(old_id, []).append(local_id)
+    for component_id, old_id in assignments.items():
+        by_assignment.setdefault(old_id, []).append(component_id)
     for old_id, proposed_ids in by_assignment.items():
-        if len(proposed_ids) <= 1 or old_id in protected_owners:
+        if old_id not in owned_set or len(proposed_ids) <= 1:
             continue
         sizes = {
-            local_id: int(((local_labels == local_id) & writable_mask).sum().item())
-            for local_id in proposed_ids
+            component_id: int(
+                (component_labels == component_id).sum().item()
+            )
+            for component_id in proposed_ids
         }
-        keep = max(proposed_ids, key=lambda value: (sizes[value], -value))
-        for local_id in proposed_ids:
-            if local_id != keep:
-                assignments[local_id] = next_id
+        keep = max(
+            proposed_ids,
+            key=lambda value: (sizes[value], -value),
+        )
+        for component_id in proposed_ids:
+            if component_id != keep:
+                assignments[component_id] = next_id
                 next_id += 1
 
     mapped = torch.zeros_like(local_labels)
-    for local_id, global_id in assignments.items():
-        mapped[local_labels == local_id] = global_id
+    for component_id, global_id in assignments.items():
+        mapped[component_labels == component_id] = global_id
+
     updated = global_labels.clone() if copy_output else global_labels
     target = updated[box]
     target[writable_mask] = mapped[writable_mask]
@@ -575,26 +607,31 @@ def _request_fallback_context(
 ) -> dict[str, object]:
     old_crop = global_labels[box]
     protected_mask = ~writable_mask
-    local_ids = _positive_ids(local_labels[writable_mask])
+    component_labels = _label_writable_components(
+        local_labels, writable_mask
+    )
+    component_ids = torch.unique(component_labels)
+    component_ids = component_ids[component_ids > 0]
     conflicting_old_ids: list[int] = []
-    if reason == "local component touches multiple external labels":
+
+    if reason == "local component would merge existing labels":
+        owned_set = set(owned_label_ids)
+        for component_id_tensor in component_ids:
+            component = component_labels == int(component_id_tensor.item())
+            overlap = _positive_ids(old_crop[component])
+            unexpected = [
+                value for value in overlap if value not in owned_set
+            ]
+            if unexpected:
+                conflicting_old_ids = sorted(set(unexpected))
+                break
+    elif reason == "local component touches multiple external labels":
+        local_ids = _positive_ids(local_labels[writable_mask])
         for local_id in local_ids:
             component = local_labels == local_id
             owners = _positive_ids(old_crop[component & protected_mask])
             if len(owners) > 1:
                 conflicting_old_ids = owners
-                break
-    elif reason == "owned component touches protected external label":
-        owned_set = set(owned_label_ids)
-        for local_id in local_ids:
-            component = local_labels == local_id
-            protected = _positive_ids(old_crop[component & protected_mask])
-            owned = [
-                value for value in _positive_ids(old_crop[component & writable_mask])
-                if value in owned_set
-            ]
-            if protected and owned:
-                conflicting_old_ids = sorted(set([*protected, *owned]))
                 break
 
     shape = tuple(int(axis.stop) - int(axis.start) for axis in box)
@@ -603,9 +640,11 @@ def _request_fallback_context(
         "box_voxel_count": int(shape[0] * shape[1] * shape[2]),
         "core_voxel_count": int(core_mask.sum().item()),
         "writable_voxel_count": int(writable_mask.sum().item()),
-        "local_component_count": len(local_ids),
+        "local_component_count": int(component_ids.numel()),
         "old_core_label_count": len(_positive_ids(old_crop[core_mask])),
-        "old_shell_label_count": len(_positive_ids(old_crop[protected_mask])),
+        "old_shell_label_count": len(
+            _positive_ids(old_crop[protected_mask])
+        ),
         "conflicting_old_label_ids": conflicting_old_ids,
         "owned_label_ids": list(owned_label_ids),
         "request_kinds": list(request_kinds),
@@ -815,21 +854,20 @@ class LocalPartitionUpdater(nn.Module):
             else:
                 owned_mask = torch.zeros_like(old_crop, dtype=torch.bool)
 
-            # Seed writability with complete owned objects plus request-core
-            # background. After watershed, background belonging to those same
-            # affected local components is admitted throughout the bounded
-            # dependency box. This preserves connectivity for legal merges and
-            # boundary shifts without ever making another positive old label
-            # writable.
-            writable_seed = owned_mask | (core_mask & (old_crop == 0))
-            if not bool(writable_seed.any()):
+            # Only complete request-owned old supervoxels plus background
+            # inside the actual refined ROI are mutable. Background is not
+            # expanded merely because it shares a watershed basin ID.
+            writable_mask = owned_mask | (core_mask & (old_crop == 0))
+            if not bool(writable_mask.any()):
                 continue
 
             crop = self._geometry_crop(geometry, batch_index, box)
             local_padding = (
                 None
                 if padding_mask is None
-                else padding_mask[batch_index : batch_index + 1][(slice(None), *box)]
+                else padding_mask[
+                    batch_index : batch_index + 1
+                ][(slice(None), *box)]
             )
             local_labels = self.watershed(
                 crop,
@@ -837,20 +875,6 @@ class LocalPartitionUpdater(nn.Module):
                 dref_um[batch_index : batch_index + 1],
                 local_padding,
             )[0]
-
-            active_local_ids = torch.unique(local_labels[writable_seed])
-            active_local_ids = active_local_ids[active_local_ids > 0]
-            if active_local_ids.numel():
-                affected_background = (old_crop == 0) & torch.isin(
-                    local_labels, active_local_ids
-                )
-            else:
-                affected_background = torch.zeros_like(
-                    old_crop, dtype=torch.bool
-                )
-            writable_mask = owned_mask | affected_background
-            if not bool(writable_mask.any()):
-                continue
 
             next_label_id = max(int(labels.max().item()) for labels in output) + 1
             reconciled, reason = reconcile_request_local_labels(
