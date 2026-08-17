@@ -38,6 +38,7 @@ class LocalPartitionUpdateResult:
     fallback_conflicting_old_label_ids: List[int] | None = None
     updated_box_count: int = 0
     updated_boxes: List[tuple[int, tuple[slice, slice, slice]]] | None = None
+    updated_label_ids: List[Tensor] | None = None
     updated_voxel_count: int = 0
 
 
@@ -453,6 +454,48 @@ def _minimal_global_box(
     )
 
 
+def _actual_change_metadata(
+    before_writable: Tensor,
+    after_crop: Tensor,
+    writable_mask: Tensor,
+    parent_box: tuple[slice, slice, slice],
+) -> tuple[tuple[slice, slice, slice] | None, Tensor, int]:
+    """Return a tight box + exact positive IDs for assignments that really changed."""
+    if before_writable.ndim != 1:
+        before_writable = before_writable.reshape(-1)
+    writable_points = torch.nonzero(writable_mask, as_tuple=False)
+    after_writable = after_crop[writable_mask]
+    if before_writable.numel() != after_writable.numel():
+        raise ValueError("before/after writable values do not align")
+
+    changed = before_writable != after_writable
+    changed_count = int(changed.sum().item())
+    if changed_count == 0:
+        return None, after_crop.new_zeros((0,), dtype=torch.long), 0
+
+    changed_points = writable_points[changed]
+    lower = changed_points.amin(dim=0)
+    upper = changed_points.amax(dim=0) + 1
+    changed_box = tuple(
+        slice(
+            int(parent_box[axis].start) + int(lower[axis].item()),
+            int(parent_box[axis].start) + int(upper[axis].item()),
+        )
+        for axis in range(3)
+    )
+
+    changed_ids = torch.unique(
+        torch.cat(
+            [
+                before_writable[changed].long(),
+                after_writable[changed].long(),
+            ]
+        )
+    )
+    changed_ids = changed_ids[changed_ids > 0]
+    return changed_box, changed_ids, changed_count
+
+
 def _touches_nonvolume_box_boundary(
     component: Tensor,
     box: tuple[slice, slice, slice],
@@ -826,6 +869,7 @@ class LocalPartitionUpdater(nn.Module):
         clusters = _cluster_request_tasks(tasks)
         output = [labels.clone() for labels in initial_labels]
         updated_boxes: list[tuple[int, tuple[slice, slice, slice]]] = []
+        updated_label_ids: list[Tensor] = []
         updated_voxels = 0
 
         for cluster_index, cluster in enumerate(clusters):
@@ -876,6 +920,7 @@ class LocalPartitionUpdater(nn.Module):
                 local_padding,
             )[0]
 
+            before_writable = base[box][writable_mask].clone()
             next_label_id = max(int(labels.max().item()) for labels in output) + 1
             reconciled, reason = reconcile_request_local_labels(
                 base,
@@ -912,16 +957,23 @@ class LocalPartitionUpdater(nn.Module):
                 )
 
             output[batch_index] = reconciled
-            changed_box = _minimal_global_box(writable_mask, box)
+            changed_box, changed_ids, changed_count = _actual_change_metadata(
+                before_writable,
+                reconciled[box],
+                writable_mask,
+                box,
+            )
             if changed_box is not None:
                 updated_boxes.append((batch_index, changed_box))
-            updated_voxels += int(writable_mask.sum().item())
+                updated_label_ids.append(changed_ids)
+            updated_voxels += changed_count
 
         return LocalPartitionUpdateResult(
             supervoxel_labels=output,
             used_fallback=False,
             updated_box_count=len(updated_boxes),
             updated_boxes=updated_boxes,
+            updated_label_ids=updated_label_ids,
             updated_voxel_count=updated_voxels,
         )
 
