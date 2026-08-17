@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import List
 
 import torch
 from torch import Tensor, nn
@@ -11,7 +11,6 @@ from ..types import (
     GeometryLike,
     GeometryState,
     RefinedGeometryView,
-    SupervoxelStatistics,
     geometry_field_crop,
 )
 from .watershed import LearnedGeometryWatershed
@@ -157,11 +156,6 @@ def reconcile_local_labels(
 
 
 class LocalPartitionUpdater(nn.Module):
-    # Conservative local refinement with bounded regional retries before
-    # the trusted full-frame watershed fallback.
-    _COMPONENT_RETRY_MAX_VOLUME_FRACTION = 0.50
-    _COMPONENT_CLOSURE_STEPS = 2
-
     def __init__(
         self,
         watershed: LearnedGeometryWatershed,
@@ -170,114 +164,6 @@ class LocalPartitionUpdater(nn.Module):
         super().__init__()
         self.watershed = watershed
         self.cfg = cfg
-
-    @staticmethod
-    def _expand_box(
-        box: tuple[slice, slice, slice],
-        halo_voxels: Tensor,
-        shape: tuple[int, int, int],
-    ) -> tuple[slice, slice, slice]:
-        return tuple(
-            slice(
-                max(0, int(box[axis].start) - int(halo_voxels[axis])),
-                min(shape[axis], int(box[axis].stop) + int(halo_voxels[axis])),
-            )
-            for axis in range(3)
-        )
-
-    @staticmethod
-    def _box_volume(box: tuple[slice, slice, slice]) -> int:
-        return (
-            (int(box[0].stop) - int(box[0].start))
-            * (int(box[1].stop) - int(box[1].start))
-            * (int(box[2].stop) - int(box[2].start))
-        )
-
-    @staticmethod
-    def _same_box(
-        left: tuple[slice, slice, slice],
-        right: tuple[slice, slice, slice],
-    ) -> bool:
-        return all(
-            int(left[a].start) == int(right[a].start)
-            and int(left[a].stop) == int(right[a].stop)
-            for a in range(3)
-        )
-
-    @staticmethod
-    def _core_mask(
-        box: tuple[slice, slice, slice],
-        rois,
-        device: torch.device,
-    ) -> Tensor:
-        shape = tuple(int(axis.stop) - int(axis.start) for axis in box)
-        core_mask = torch.zeros(shape, device=device, dtype=torch.bool)
-        for roi in rois:
-            start = [
-                max(int(roi.slices_zyx[a].start), int(box[a].start))
-                for a in range(3)
-            ]
-            stop = [
-                min(int(roi.slices_zyx[a].stop), int(box[a].stop))
-                for a in range(3)
-            ]
-            if any(b <= a for a, b in zip(start, stop)):
-                continue
-            local = tuple(
-                slice(
-                    start[a] - int(box[a].start),
-                    stop[a] - int(box[a].start),
-                )
-                for a in range(3)
-            )
-            core_mask[local] = True
-        return core_mask
-
-    @staticmethod
-    def _component_retry_box(
-        base: Tensor,
-        seed_box: tuple[slice, slice, slice],
-        statistics: SupervoxelStatistics | None,
-        halo_voxels: Tensor,
-    ) -> tuple[slice, slice, slice] | None:
-        if statistics is None or statistics.counts.numel() == 0:
-            return None
-
-        full_shape = tuple(int(v) for v in base.shape)
-        candidate = seed_box
-        max_rows = int(statistics.counts.shape[0])
-
-        for _ in range(LocalPartitionUpdater._COMPONENT_CLOSURE_STEPS):
-            touched = torch.unique(base[candidate]).long()
-            touched = touched[(touched > 0) & (touched <= max_rows)]
-            if touched.numel() == 0:
-                return None
-
-            rows = touched - 1
-            rows = rows[statistics.counts[rows] > 0]
-            if rows.numel() == 0:
-                return None
-
-            lower = statistics.min_voxel[rows].amin(dim=0)
-            upper = statistics.max_voxel[rows].amax(dim=0) + 1
-
-            object_box = tuple(
-                slice(
-                    min(int(candidate[a].start), int(lower[a].item())),
-                    max(int(candidate[a].stop), int(upper[a].item())),
-                )
-                for a in range(3)
-            )
-            expanded = LocalPartitionUpdater._expand_box(
-                object_box,
-                halo_voxels,
-                full_shape,
-            )
-            if LocalPartitionUpdater._same_box(candidate, expanded):
-                break
-            candidate = expanded
-
-        return candidate
 
     def _fallback(
         self,
@@ -295,74 +181,6 @@ class LocalPartitionUpdater(nn.Module):
             fallback_reason=reason,
         )
 
-    def _attempt_box(
-        self,
-        updated: Tensor,
-        geometry: RefinedGeometryView,
-        batch_index: int,
-        box: tuple[slice, slice, slice],
-        rois,
-        spacing_um: Tensor,
-        dref_um: Tensor,
-        padding_mask: Tensor | None,
-        next_label_id: int,
-    ) -> tuple[Tensor | None, str, int, int]:
-        core_mask = self._core_mask(box, rois, updated.device)
-        if not bool(core_mask.any()):
-            return None, "regional retry contains no refinement core", 0, next_label_id
-
-        crop = GeometryState(
-            foreground_logits=geometry_field_crop(
-                geometry, "foreground_logits", batch_index, box
-            )[None],
-            surface_logits=geometry_field_crop(
-                geometry, "surface_logits", batch_index, box
-            )[None],
-            separator_logits=geometry_field_crop(
-                geometry, "separator_logits", batch_index, box
-            )[None],
-            sdf=geometry_field_crop(geometry, "sdf", batch_index, box)[None],
-            flow=geometry_field_crop(geometry, "flow", batch_index, box)[None],
-            centroid_offset=geometry_field_crop(
-                geometry, "centroid_offset", batch_index, box
-            )[None],
-            seed_logits=geometry_field_crop(
-                geometry, "seed_logits", batch_index, box
-            )[None],
-            features=None,
-        )
-        local_padding = (
-            None
-            if padding_mask is None
-            else padding_mask[batch_index : batch_index + 1][
-                (slice(None), *box)
-            ]
-        )
-        local_labels = self.watershed(
-            crop,
-            spacing_um[batch_index : batch_index + 1],
-            dref_um[batch_index : batch_index + 1],
-            local_padding,
-        )[0]
-
-        reconciled, reason = reconcile_local_labels(
-            updated,
-            local_labels,
-            box,
-            core_mask,
-            copy_output=False,
-            next_label_id=next_label_id,
-        )
-        if reconciled is None:
-            return None, reason, 0, next_label_id
-
-        changed_voxels = int(core_mask.sum().item())
-        next_label_id = max(
-            next_label_id,
-            int(reconciled[box].max().item()) + 1,
-        )
-        return reconciled, "", changed_voxels, next_label_id
-
     @torch.no_grad()
     def forward(
         self,
@@ -371,54 +189,35 @@ class LocalPartitionUpdater(nn.Module):
         spacing_um: Tensor,
         dref_um: Tensor,
         padding_mask: Tensor | None = None,
-        *,
-        statistics: Sequence[SupervoxelStatistics] | None = None,
     ) -> LocalPartitionUpdateResult:
         if not isinstance(geometry, RefinedGeometryView) or geometry.delta.is_empty:
             return self._fallback(
-                geometry,
-                spacing_um,
-                dref_um,
-                padding_mask,
-                "no sparse delta",
+                geometry, spacing_um, dref_um, padding_mask, "no sparse delta"
             )
-
         output = [labels.clone() for labels in initial_labels]
         total_boxes = 0
         updated_voxels = 0
-        updated_boxes: list[
-            tuple[int, tuple[slice, slice, slice]]
-        ] = []
-
+        updated_boxes: list[tuple[int, tuple[slice, slice, slice]]] = []
         for batch_index, base in enumerate(initial_labels):
             rois = [
-                roi
-                for roi in geometry.delta.rois
-                if roi.batch_index == batch_index
+                roi for roi in geometry.delta.rois if roi.batch_index == batch_index
             ]
             if not rois:
                 continue
-
             halo_voxels = torch.ceil(
                 self.cfg.partition_halo_dref
                 * dref_um[batch_index].float()
                 / spacing_um[batch_index].float().clamp_min(1e-6)
             ).long()
-
             boxes = []
             for roi in rois:
                 boxes.append(
                     tuple(
                         slice(
-                            max(
-                                0,
-                                int(roi.slices_zyx[axis].start)
-                                - int(halo_voxels[axis]),
-                            ),
+                            max(0, int(roi.slices_zyx[axis].start) - int(halo_voxels[axis])),
                             min(
                                 base.shape[axis],
-                                int(roi.slices_zyx[axis].stop)
-                                + int(halo_voxels[axis]),
+                                int(roi.slices_zyx[axis].stop) + int(halo_voxels[axis]),
                             ),
                         )
                         for axis in range(3)
@@ -426,116 +225,83 @@ class LocalPartitionUpdater(nn.Module):
                 )
             boxes = _merge_boxes(boxes)
             total_boxes += len(boxes)
-
+            updated_boxes.extend((batch_index, box) for box in boxes)
             updated = output[batch_index]
             next_label_id = int(base.max().item()) + 1
-            batch_stats = (
-                statistics[batch_index]
-                if statistics is not None
-                and batch_index < len(statistics)
-                else None
-            )
-            full_voxels = max(base.numel(), 1)
-
-            for base_box in boxes:
-                attempts = [base_box]
-
-                expanded_box = self._expand_box(
-                    base_box,
-                    halo_voxels,
-                    tuple(int(v) for v in base.shape),
+            for box in boxes:
+                shape = tuple(int(axis.stop) - int(axis.start) for axis in box)
+                core_mask = torch.zeros(shape, device=base.device, dtype=torch.bool)
+                for roi in rois:
+                    start = [
+                        max(int(roi.slices_zyx[a].start), int(box[a].start))
+                        for a in range(3)
+                    ]
+                    stop = [
+                        min(int(roi.slices_zyx[a].stop), int(box[a].stop))
+                        for a in range(3)
+                    ]
+                    if any(b <= a for a, b in zip(start, stop)):
+                        continue
+                    local = tuple(
+                        slice(start[a] - int(box[a].start), stop[a] - int(box[a].start))
+                        for a in range(3)
+                    )
+                    core_mask[local] = True
+                crop = GeometryState(
+                    foreground_logits=geometry_field_crop(
+                        geometry, "foreground_logits", batch_index, box
+                    )[None],
+                    surface_logits=geometry_field_crop(
+                        geometry, "surface_logits", batch_index, box
+                    )[None],
+                    separator_logits=geometry_field_crop(
+                        geometry, "separator_logits", batch_index, box
+                    )[None],
+                    sdf=geometry_field_crop(geometry, "sdf", batch_index, box)[None],
+                    flow=geometry_field_crop(geometry, "flow", batch_index, box)[None],
+                    centroid_offset=geometry_field_crop(
+                        geometry, "centroid_offset", batch_index, box
+                    )[None],
+                    seed_logits=geometry_field_crop(
+                        geometry, "seed_logits", batch_index, box
+                    )[None],
+                    features=None,
                 )
-                if not self._same_box(base_box, expanded_box):
-                    attempts.append(expanded_box)
-
-                last_reason = ""
-                succeeded = False
-                changed_voxels = 0
-
-                for attempt_box in attempts:
-                    (
-                        reconciled,
-                        reason,
-                        attempt_changed,
-                        next_after,
-                    ) = self._attempt_box(
-                        updated,
-                        geometry,
-                        batch_index,
-                        attempt_box,
-                        rois,
-                        spacing_um,
-                        dref_um,
-                        padding_mask,
-                        next_label_id,
-                    )
-                    if reconciled is not None:
-                        updated = reconciled
-                        next_label_id = next_after
-                        changed_voxels = attempt_changed
-                        succeeded = True
-                        break
-                    last_reason = reason
-
-                if not succeeded:
-                    seed_box = attempts[-1]
-                    component_box = self._component_retry_box(
-                        base,
-                        seed_box,
-                        batch_stats,
-                        halo_voxels,
-                    )
-                    if (
-                        component_box is not None
-                        and not self._same_box(component_box, seed_box)
-                        and (
-                            self._box_volume(component_box)
-                            / float(full_voxels)
-                        )
-                        <= self._COMPONENT_RETRY_MAX_VOLUME_FRACTION
-                    ):
-                        (
-                            reconciled,
-                            reason,
-                            attempt_changed,
-                            next_after,
-                        ) = self._attempt_box(
-                            updated,
-                            geometry,
-                            batch_index,
-                            component_box,
-                            rois,
-                            spacing_um,
-                            dref_um,
-                            padding_mask,
-                            next_label_id,
-                        )
-                        if reconciled is not None:
-                            updated = reconciled
-                            next_label_id = next_after
-                            changed_voxels = attempt_changed
-                            succeeded = True
-                        else:
-                            last_reason = reason
-
-                if not succeeded:
+                local_padding = (
+                    None
+                    if padding_mask is None
+                    else padding_mask[batch_index : batch_index + 1][
+                        (slice(None), *box)
+                    ]
+                )
+                local_labels = self.watershed(
+                    crop,
+                    spacing_um[batch_index : batch_index + 1],
+                    dref_um[batch_index : batch_index + 1],
+                    local_padding,
+                )[0]
+                reconciled, reason = reconcile_local_labels(
+                    updated,
+                    local_labels,
+                    box,
+                    core_mask,
+                    copy_output=False,
+                    next_label_id=next_label_id,
+                )
+                if reconciled is None:
                     return self._fallback(
                         geometry,
                         spacing_um,
                         dref_um,
                         padding_mask,
-                        (
-                            f"{last_reason}; regional retries exhausted"
-                            if last_reason
-                            else "regional retries exhausted"
-                        ),
+                        reason,
                     )
-
-                updated_boxes.append((batch_index, base_box))
-                updated_voxels += changed_voxels
-
+                updated = reconciled
+                updated_voxels += int(core_mask.sum().item())
+                next_label_id = max(
+                    next_label_id, int(updated[box].max().item()) + 1
+                )
             output[batch_index] = updated
-
         return LocalPartitionUpdateResult(
             supervoxel_labels=output,
             used_fallback=False,
