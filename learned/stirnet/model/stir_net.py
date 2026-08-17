@@ -639,6 +639,8 @@ class StirNet(nn.Module):
                                 geometry,
                                 spacing_um,
                                 dref_um,
+                                stage_profiler=stage_profiler,
+                                profile_prefix="refined_rag_local",
                             )
                         with _profile_stage(
                             stage_profiler, "refined_rag_network"
