@@ -20,44 +20,100 @@ def _profile(profiler, name: str):
 
 
 def _merge_tiny_regions(labels: np.ndarray, min_voxels: int) -> np.ndarray:
+    """Merge tiny watershed regions without repeated full-volume relabel scans.
+
+    Semantics are intentionally identical to the previous implementation:
+    tiny regions merge into the positive neighboring label with the largest
+    shared 6-connected interface, with the smallest target label breaking ties.
+    Surviving positive labels are then compacted in ascending old-label order.
+    """
     if min_voxels <= 1 or labels.max() <= 1:
         return labels
-    labels = labels.copy()
-    counts = np.bincount(labels.ravel())
+
+    labels = labels.astype(np.int32, copy=True)
+    max_label = int(labels.max())
+
+    counts = np.bincount(labels.ravel(), minlength=max_label + 1)
     tiny = np.flatnonzero((counts > 0) & (counts < min_voxels))
     tiny = tiny[tiny > 0]
+
     if tiny.size:
-        pair_chunks: list[np.ndarray] = []
+        # The old implementation materialized every directed positive-label
+        # interface in the full volume, although only interfaces whose source
+        # label is tiny can affect the remap. Restrict collection to those
+        # sources while preserving the exact directed interface counts.
+        is_tiny = np.zeros(max_label + 1, dtype=bool)
+        is_tiny[tiny] = True
+        packed_chunks: list[np.ndarray] = []
+        base = max_label + 1
+
         for axis in range(3):
             left_slice = [slice(None)] * 3
             right_slice = [slice(None)] * 3
             left_slice[axis] = slice(0, -1)
             right_slice[axis] = slice(1, None)
+
             left = labels[tuple(left_slice)]
             right = labels[tuple(right_slice)]
             valid = (left > 0) & (right > 0) & (left != right)
-            if valid.any():
-                pair_chunks.append(np.stack([left[valid], right[valid]], axis=-1))
-                pair_chunks.append(np.stack([right[valid], left[valid]], axis=-1))
-        if pair_chunks:
-            directed = np.concatenate(pair_chunks, axis=0)
-            packed = directed[:, 0].astype(np.int64) * (int(labels.max()) + 1) + directed[:, 1]
+
+            left_source = valid & is_tiny[left]
+            if left_source.any():
+                packed_chunks.append(
+                    left[left_source].astype(np.int64) * base
+                    + right[left_source].astype(np.int64)
+                )
+
+            right_source = valid & is_tiny[right]
+            if right_source.any():
+                packed_chunks.append(
+                    right[right_source].astype(np.int64) * base
+                    + left[right_source].astype(np.int64)
+                )
+
+        if packed_chunks:
+            packed = np.concatenate(packed_chunks)
             keys, interface_counts = np.unique(packed, return_counts=True)
-            source = keys // (int(labels.max()) + 1)
-            target = keys % (int(labels.max()) + 1)
-            remap = np.arange(int(labels.max()) + 1, dtype=np.int32)
+            source = keys // base
+            target = keys % base
+
+            remap = np.arange(base, dtype=np.int32)
             for region_id in tiny.tolist():
                 candidates = np.flatnonzero(source == region_id)
                 if candidates.size:
-                    best = candidates[np.lexsort((target[candidates], -interface_counts[candidates]))[0]]
+                    # Same tie-breaking as before:
+                    # 1) largest interface count
+                    # 2) smallest target label
+                    best = candidates[
+                        np.lexsort(
+                            (
+                                target[candidates],
+                                -interface_counts[candidates],
+                            )
+                        )[0]
+                    ]
                     remap[region_id] = int(target[best])
+
             labels = remap[labels]
-    unique = np.unique(labels)
-    unique = unique[unique > 0]
-    out = np.zeros_like(labels, dtype=np.int32)
-    for new_id, old_id in enumerate(unique, 1):
-        out[labels == old_id] = new_id
-    return out
+
+    # The previous code rescanned the whole volume once for every surviving
+    # label:
+    #
+    #   for new_id, old_id in enumerate(unique, 1):
+    #       out[labels == old_id] = new_id
+    #
+    # A lookup table gives the exact same ascending-label compaction in one
+    # indexed pass over the volume.
+    present_counts = np.bincount(labels.ravel())
+    present = np.flatnonzero(present_counts > 0)
+    present = present[present > 0]
+
+    if present.size == 0:
+        return np.zeros_like(labels, dtype=np.int32)
+
+    lut = np.zeros(int(labels.max()) + 1, dtype=np.int32)
+    lut[present] = np.arange(1, present.size + 1, dtype=np.int32)
+    return lut[labels]
 
 
 def _component_bounded_watershed(
