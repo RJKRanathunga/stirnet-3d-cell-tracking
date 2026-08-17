@@ -45,20 +45,27 @@ EXPERIMENT_ARGS = [
     "--stage",
     "refinement_joint",
     "--stage-steps",
-    "1",
+    "50",
+
     "--eval-every",
-    "1",
+    "10",
+
+    "--learning-rate",
+    "2e-4",
+
     "--amp-dtype",
     "bf16",
-    "--profile-memory",
+
     "--refinement-crop-shape",
     "32",
     "192",
     "192",
+
     "--refinement-crops-per-step",
     "1",
+
     "--hard-time-limit-seconds",
-    "3480",
+    "1320",
 ]
 
 # Optional: point this at a useful local checkpoint for the first cloud run.
@@ -188,6 +195,22 @@ def run_selected_experiment() -> dict:
         *EXPERIMENT_ARGS,
     ]
 
+    recovery_dir = None
+    if EXPERIMENT_SCRIPT == "31_spatial_first_overfit.py":
+        recovery_dir = (
+            Path(RUNS_MOUNT)
+            / "stirnet"
+            / "first_overfit"
+            / experiment_stem
+        )
+        command.extend(
+            [
+                "--recovery-dir",
+                str(recovery_dir),
+                "--auto-resume",
+            ]
+        )
+
     if LOCAL_WARM_START_CHECKPOINT is not None:
         command.extend(["--warm-start", REMOTE_WARM_START])
 
@@ -198,6 +221,8 @@ def run_selected_experiment() -> dict:
     print(f"Experiment        : {EXPERIMENT_SCRIPT}", flush=True)
     print(f"Data              : {DATA_DIR}", flush=True)
     print(f"Run directory     : {run_dir}", flush=True)
+    if recovery_dir is not None:
+        print(f"Recovery directory: {recovery_dir}", flush=True)
     print(f"Modal hard timeout: 3600 s", flush=True)
     print("Command:", flush=True)
     print(" ".join(command), flush=True)
@@ -234,8 +259,22 @@ def run_selected_experiment() -> dict:
     )
 
     assert process.stdout is not None
+    persist_markers = (
+        "[stirnet-step-persisted]",
+        "[stirnet-diagnostic-persisted]",
+        "[stirnet-completion-persisted]",
+    )
     for line in process.stdout:
         print(line, end="", flush=True)
+        if line.startswith(persist_markers):
+            # The child closes/fsyncs files before emitting the marker.
+            # Make that completed step durable before a later failure.
+            runs_volume.commit()
+            print(
+                "[stirnet-volume-committed] "
+                + line.strip(),
+                flush=True,
+            )
 
     return_code = process.wait()
 
@@ -249,6 +288,9 @@ def run_selected_experiment() -> dict:
         "run_dir": str(run_dir),
         "return_code": int(return_code),
         "gpu": GPU,
+        "recovery_dir": (
+            None if recovery_dir is None else str(recovery_dir)
+        ),
     }
 
     print("=" * 88, flush=True)
@@ -259,7 +301,8 @@ def run_selected_experiment() -> dict:
     if return_code != 0:
         raise RuntimeError(
             f"{EXPERIMENT_SCRIPT} failed with exit code {return_code}. "
-            f"Scalar failure diagnostics, if written, are in {run_dir}."
+            f"Per-step recovery state is in {recovery_dir}; "
+            f"attempt artifacts, if written, are in {run_dir}."
         )
 
     return report

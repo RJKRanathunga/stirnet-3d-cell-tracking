@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -167,7 +168,7 @@ def reduced_config() -> StirNetConfig:
     cfg.partition.node_feature_channels = 16
     cfg.partition.rag_hidden_dim = 48
     cfg.partition.rag_layers = 2
-    cfg.partition.max_supervoxels = 2048
+    cfg.partition.max_supervoxels = 4096
     cfg.instances.d_model = 64
     cfg.instances.pooled_feature_dim = 16
     cfg.history.hidden_channels = 16
@@ -330,6 +331,209 @@ def save_artifacts(run_dir: Path, batch: dict, output, history, scene, cfg, trai
         arrays["centers_um"] = _tensor(output.centers_um[0])
     np.savez_compressed(run_dir / "partitions_and_geometry.npz", **arrays)
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _atomic_write_json(path: Path, payload: dict | list) -> None:
+    _atomic_write_text(path, json.dumps(payload, indent=2))
+
+
+def _append_jsonl(path: Path, payload: dict) -> None:
+    """Append one complete JSON record and force it to the mounted filesystem."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _atomic_save_recovery_checkpoint(
+    recovery_dir: Path,
+    trainer: Trainer,
+    cfg,
+    train_cfg,
+    run_dir: Path,
+) -> Path:
+    """Replace checkpoint_latest.pt only after torch.save completes successfully."""
+    recovery_dir.mkdir(parents=True, exist_ok=True)
+    destination = recovery_dir / "checkpoint_latest.pt"
+    temporary = recovery_dir / f".checkpoint_latest.{os.getpid()}.tmp"
+    try:
+        save_checkpoint(
+            temporary,
+            model=trainer.model,
+            optimizer=trainer.optimizer,
+            scheduler=trainer.scheduler,
+            scaler=trainer.scaler,
+            step=trainer.global_step,
+            model_config=cfg,
+            training_config=train_cfg,
+            extra={
+                "experiment": "31_spatial_first_overfit",
+                "recovery_checkpoint": True,
+                "attempt_run_dir": str(run_dir),
+                **trainer.checkpoint_metadata(),
+            },
+        )
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return destination
+
+
+def _persist_recovery_step(
+    recovery_dir: Path,
+    trainer: Trainer,
+    cfg,
+    train_cfg,
+    run_dir: Path,
+    row: dict,
+    *,
+    target_global_step: int,
+) -> tuple[Path, float]:
+    """Persist optimizer state immediately after a successful train_step."""
+    started = time.perf_counter()
+    checkpoint = _atomic_save_recovery_checkpoint(
+        recovery_dir,
+        trainer,
+        cfg,
+        train_cfg,
+        run_dir,
+    )
+    _append_jsonl(
+        recovery_dir / "history.jsonl",
+        {"record": "step", **row},
+    )
+    _atomic_write_json(recovery_dir / "latest_metrics.json", row)
+    _atomic_write_json(
+        recovery_dir / "progress.json",
+        {
+            "experiment": "31_spatial_first_overfit",
+            "last_completed_step": int(trainer.global_step),
+            "target_global_step": int(target_global_step),
+            "stage": trainer.curriculum_stage.name,
+            "checkpoint": str(checkpoint),
+            "attempt_run_dir": str(run_dir),
+            "target_reached": bool(
+                trainer.global_step >= target_global_step
+            ),
+        },
+    )
+    return checkpoint, time.perf_counter() - started
+
+
+def _persist_recovery_diagnostic(
+    recovery_dir: Path,
+    row: dict,
+) -> None:
+    step = int(row["step"])
+    diagnostics_dir = recovery_dir / "diagnostics"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(
+        diagnostics_dir / f"step_{step:06d}.json",
+        row,
+    )
+    _atomic_write_json(
+        recovery_dir / "latest_metrics.json",
+        row,
+    )
+
+
+def _load_recovery_history(
+    recovery_dir: Path,
+    *,
+    max_step: int,
+) -> list[dict]:
+    """Load durable rows up to the checkpoint step, tolerating a partial tail."""
+    path = recovery_dir / "history.jsonl"
+    by_step: dict[int, dict] = {}
+    if path.exists():
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if row.get("record") != "step" or "step" not in row:
+                continue
+            step = int(row["step"])
+            if 0 < step <= max_step:
+                row = dict(row)
+                row.pop("record", None)
+                by_step[step] = row
+
+    diagnostics_dir = recovery_dir / "diagnostics"
+    for step in list(by_step):
+        diagnostic_path = diagnostics_dir / f"step_{step:06d}.json"
+        if not diagnostic_path.exists():
+            continue
+        try:
+            diagnostic = json.loads(
+                diagnostic_path.read_text(encoding="utf-8")
+            )
+        except json.JSONDecodeError:
+            continue
+        if int(diagnostic.get("step", -1)) == step:
+            by_step[step] = diagnostic
+
+    return [by_step[step] for step in sorted(by_step)]
+
+
+def _prepare_recovery_directory(
+    recovery_dir: Path,
+    *,
+    resume_from_recovery: bool,
+    scene: dict,
+    cfg,
+    train_cfg,
+    run_dir: Path,
+    resume_step: int,
+) -> None:
+    recovery_dir.mkdir(parents=True, exist_ok=True)
+
+    if not resume_from_recovery:
+        # Without a resumable checkpoint, stale scalar rows must not be mixed
+        # into a new optimizer trajectory.
+        for name in (
+            "history.jsonl",
+            "latest_metrics.json",
+            "progress.json",
+            "completion.json",
+        ):
+            path = recovery_dir / name
+            if path.exists():
+                path.unlink()
+        diagnostics = recovery_dir / "diagnostics"
+        if diagnostics.exists():
+            for item in diagnostics.glob("step_*.json"):
+                item.unlink()
+
+    _atomic_write_json(recovery_dir / "scene.json", scene)
+    _atomic_write_json(
+        recovery_dir / "config.json",
+        {
+            "model": cfg.to_dict(),
+            "training": train_cfg.to_dict(),
+        },
+    )
+    _append_jsonl(
+        recovery_dir / "attempts.jsonl",
+        {
+            "record": "attempt",
+            "attempt_run_dir": str(run_dir),
+            "resume_from_recovery": bool(resume_from_recovery),
+            "resume_step": int(resume_step),
+            "started_unix_seconds": time.time(),
+        },
+    )
+
 
 def parse_args():
     root = _repo_root(Path.cwd())
@@ -347,6 +551,16 @@ def parse_args():
     parser.add_argument("--runs-root", type=Path)
     parser.add_argument("--warm-start", type=Path)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--recovery-dir",
+        type=Path,
+        help="Stable directory for crash-safe per-step checkpoints and metrics.",
+    )
+    parser.add_argument(
+        "--auto-resume",
+        action="store_true",
+        help="Resume checkpoint_latest.pt from --recovery-dir when present.",
+    )
     parser.add_argument("--stage", choices=(*STAGES, "all"), default="all")
     parser.add_argument("--stage-steps", type=int, default=100)
     parser.add_argument("--eval-every", type=int, default=10)
@@ -521,6 +735,8 @@ def main() -> int:
         raise ValueError("stage-steps must be positive")
     if args.warm_start is not None and args.resume is not None:
         raise ValueError("choose either --warm-start or --resume, not both")
+    if args.auto_resume and args.recovery_dir is None:
+        raise ValueError("--auto-resume requires --recovery-dir")
     args.run_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(40266)
     np.random.seed(40266)
@@ -604,18 +820,60 @@ def main() -> int:
         train_cfg.curriculum.fixed_stage = args.stage
         total_steps = steps_per_stage
     trainer = Trainer(StirNet(cfg), train_cfg, device=args.device)
+
+    recovery_checkpoint = (
+        None
+        if args.recovery_dir is None
+        else args.recovery_dir / "checkpoint_latest.pt"
+    )
     checkpoint_path = args.resume if args.resume is not None else args.warm_start
+    resume_progress = args.resume is not None
+    resume_from_recovery = False
+    if (
+        checkpoint_path is None
+        and args.auto_resume
+        and recovery_checkpoint is not None
+        and recovery_checkpoint.exists()
+    ):
+        checkpoint_path = recovery_checkpoint
+        resume_progress = True
+        resume_from_recovery = True
+
     if checkpoint_path is not None:
         loaded = load_checkpoint(
             checkpoint_path,
             trainer.model,
             optimizer=trainer.optimizer,
+            scheduler=trainer.scheduler,
             scaler=trainer.scaler,
             map_location=trainer.device,
         )
         trainer.restore_training_progress(
-            loaded, resume=args.resume is not None
+            loaded,
+            resume=resume_progress,
         )
+        print(
+            "[stirnet-recovery-resume] "
+            + json.dumps(
+                {
+                    "checkpoint": str(checkpoint_path),
+                    "global_step": int(trainer.global_step),
+                    "refinement_stage_step": int(
+                        trainer.refinement_stage_step
+                    ),
+                    "from_recovery_dir": bool(
+                        resume_from_recovery
+                    ),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    if resume_progress:
+        target_global_step = int(total_steps)
+    else:
+        target_global_step = int(trainer.global_step + total_steps)
 
     fixed_gt_labels = gt_labels_from_batch(batch)
     target_started = time.perf_counter()
@@ -629,12 +887,36 @@ def main() -> int:
     )
     scene["geometry_targets_reused"] = True
 
-    history: list[dict] = []
+    if args.recovery_dir is not None:
+        _prepare_recovery_directory(
+            args.recovery_dir,
+            resume_from_recovery=resume_from_recovery,
+            scene=scene,
+            cfg=cfg,
+            train_cfg=train_cfg,
+            run_dir=args.run_dir,
+            resume_step=trainer.global_step,
+        )
+
+    history: list[dict] = (
+        _load_recovery_history(
+            args.recovery_dir,
+            max_step=trainer.global_step,
+        )
+        if args.recovery_dir is not None and resume_from_recovery
+        else []
+    )
     started = time.monotonic()
     output = None
-    for local_step in range(total_steps):
+    steps_remaining = max(
+        0,
+        target_global_step - int(trainer.global_step),
+    )
+
+    for _ in range(steps_remaining):
         if time.monotonic() - started > args.hard_time_limit_seconds - 30:
             break
+
         metrics = trainer.train_step(
             batch,
             gt_labels=fixed_gt_labels,
@@ -645,15 +927,78 @@ def main() -> int:
             "stage": trainer.curriculum_stage.name,
             **metrics,
         }
-        if local_step % max(args.eval_every, 1) == 0 or local_step + 1 == total_steps:
-            diagnostic, output = collect_diagnostics(trainer, batch, scene)
+
+        # Persist before optional diagnostics. A diagnostic crash therefore
+        # cannot lose a successfully completed optimizer update.
+        if args.recovery_dir is not None:
+            checkpoint, persist_seconds = _persist_recovery_step(
+                args.recovery_dir,
+                trainer,
+                cfg,
+                train_cfg,
+                args.run_dir,
+                row,
+                target_global_step=target_global_step,
+            )
+            print(
+                "[stirnet-step-persisted] "
+                + json.dumps(
+                    {
+                        "step": int(trainer.global_step),
+                        "checkpoint": str(checkpoint),
+                        "persist_seconds": persist_seconds,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
+        should_eval = (
+            trainer.global_step == 1
+            or trainer.global_step % max(args.eval_every, 1) == 0
+            or trainer.global_step >= target_global_step
+        )
+        if should_eval:
+            diagnostic, output = collect_diagnostics(
+                trainer,
+                batch,
+                scene,
+            )
             row.update(diagnostic)
+            if args.recovery_dir is not None:
+                _persist_recovery_diagnostic(
+                    args.recovery_dir,
+                    row,
+                )
+                print(
+                    "[stirnet-diagnostic-persisted] "
+                    + json.dumps(
+                        {"step": int(trainer.global_step)},
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+
         history.append(row)
         print(json.dumps(row), flush=True)
 
     diagnostic, output = collect_diagnostics(trainer, batch, scene)
-    history.append({"step": trainer.global_step, "final": True, **diagnostic})
-    save_artifacts(args.run_dir, batch, output, history, scene, cfg, train_cfg)
+    history.append(
+        {
+            "step": trainer.global_step,
+            "final": True,
+            **diagnostic,
+        }
+    )
+    save_artifacts(
+        args.run_dir,
+        batch,
+        output,
+        history,
+        scene,
+        cfg,
+        train_cfg,
+    )
     save_checkpoint(
         args.run_dir / "checkpoint_final.pt",
         model=trainer.model,
@@ -668,6 +1013,41 @@ def main() -> int:
             **trainer.checkpoint_metadata(),
         },
     )
+
+    if args.recovery_dir is not None:
+        _atomic_write_json(
+            args.recovery_dir / "completion.json",
+            {
+                "experiment": "31_spatial_first_overfit",
+                "completed_global_step": int(
+                    trainer.global_step
+                ),
+                "target_global_step": int(
+                    target_global_step
+                ),
+                "target_reached": bool(
+                    trainer.global_step >= target_global_step
+                ),
+                "attempt_run_dir": str(args.run_dir),
+                "final_checkpoint": str(
+                    args.run_dir / "checkpoint_final.pt"
+                ),
+            },
+        )
+        print(
+            "[stirnet-completion-persisted] "
+            + json.dumps(
+                {
+                    "step": int(trainer.global_step),
+                    "target_reached": bool(
+                        trainer.global_step >= target_global_step
+                    ),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
     print(f"Saved V2 experiment artifacts to {args.run_dir}")
     return 0
 
