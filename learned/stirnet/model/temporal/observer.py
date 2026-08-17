@@ -42,17 +42,64 @@ def _sample_explicit_geometry(
     )
     sampled_rows: list[Tensor] = []
     full_center = refs_um.new_tensor([(size - 1) * 0.5 for size in full_shape])
+    shape_tensor = torch.as_tensor(
+        full_shape,
+        device=refs_um.device,
+        dtype=torch.long,
+    )
+    max_voxel = shape_tensor - 1
+
     for row, ref_um in enumerate(refs_um):
         center_voxel = ref_um.float() / spacing_um.float() + full_center
-        halo = torch.ceil(radius_um[row].float() / spacing_um.float()).long() + 1
-        lower = (center_voxel.floor().long() - halo).clamp_min(0)
-        upper = torch.minimum(
-            center_voxel.ceil().long() + halo + 1,
-            torch.as_tensor(full_shape, device=refs_um.device),
+        halo = torch.ceil(
+            radius_um[row].float() / spacing_um.float()
+        ).long() + 1
+
+        # Use an in-volume anchor only to construct a valid crop.
+        # Keep the original (possibly out-of-FOV) center_voxel below so that
+        # _sample_local_grid preserves its border-clamping semantics.
+        anchor_voxel = torch.minimum(
+            torch.maximum(
+                center_voxel,
+                torch.zeros_like(center_voxel),
+            ),
+            max_voxel.to(center_voxel.dtype),
         )
-        crop = tuple(slice(int(lower[a]), int(upper[a])) for a in range(3))
-        crop_center = 0.5 * (lower.float() + upper.float() - 1)
-        local_ref = ((center_voxel - crop_center) * spacing_um.float())[None]
+
+        lower = (
+                anchor_voxel.floor().long() - halo
+        ).clamp_min(0)
+
+        upper = torch.minimum(
+            anchor_voxel.ceil().long() + halo + 1,
+            shape_tensor,
+        )
+
+        crop = tuple(
+            slice(int(lower[a]), int(upper[a]))
+            for a in range(3)
+        )
+
+        if any(int(upper[a]) <= int(lower[a]) for a in range(3)):
+            raise RuntimeError(
+                "Temporal observer produced an empty explicit-geometry crop: "
+                f"center_voxel={center_voxel.tolist()}, "
+                f"lower={lower.tolist()}, "
+                f"upper={upper.tolist()}, "
+                f"full_shape={full_shape}"
+            )
+
+        crop_center = 0.5 * (
+                lower.float() + upper.float() - 1
+        )
+
+        # IMPORTANT:
+        # use the ORIGINAL center_voxel here, not anchor_voxel.
+        # This preserves the behavior of references outside the field of view.
+        local_ref = (
+                (center_voxel - crop_center)
+                * spacing_um.float()
+        )[None]
         channels = []
         for name, probability in names:
             field = geometry_field_crop(geometry, name, batch_index, crop)
