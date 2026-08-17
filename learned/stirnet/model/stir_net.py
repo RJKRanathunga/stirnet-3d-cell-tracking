@@ -611,6 +611,9 @@ class StirNet(nn.Module):
                             spacing_um,
                             dref_um,
                             spatial_padding_mask,
+                            requests=refinement.requests,
+                            rag=initial_rag,
+                            instances=initial_instances,
                         )
                     if local_update.used_fallback:
                         rag, spatial_partition = self._rag_from_supervoxels(
