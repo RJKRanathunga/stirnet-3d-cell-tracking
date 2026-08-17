@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import List
 
 import numpy as np
@@ -9,8 +10,13 @@ from skimage.segmentation import watershed
 from torch import Tensor, nn
 
 from ..config import PartitionConfig
-from ..types import GeometryLike, geometry_field, geometry_probability
-from .seeds import build_markers
+from ..geometry.derived import build_geometry_derived_cache
+from ..types import GeometryDerivedCache, GeometryLike, geometry_field
+from .seeds import build_markers, build_markers_fast
+
+
+def _profile(profiler, name: str):
+    return nullcontext() if profiler is None else profiler.profile(name)
 
 
 def _merge_tiny_regions(labels: np.ndarray, min_voxels: int) -> np.ndarray:
@@ -18,23 +24,78 @@ def _merge_tiny_regions(labels: np.ndarray, min_voxels: int) -> np.ndarray:
         return labels
     labels = labels.copy()
     counts = np.bincount(labels.ravel())
-    tiny = [i for i in range(1, len(counts)) if 0 < counts[i] < min_voxels]
-    for region_id in tiny:
-        mask = labels == region_id
-        if not mask.any():
-            continue
-        dilated = ndi.binary_dilation(mask, iterations=1)
-        neighbors = labels[dilated & ~mask]
-        neighbors = neighbors[neighbors > 0]
-        if neighbors.size:
-            values, n = np.unique(neighbors, return_counts=True)
-            labels[mask] = values[np.argmax(n)]
+    tiny = np.flatnonzero((counts > 0) & (counts < min_voxels))
+    tiny = tiny[tiny > 0]
+    if tiny.size:
+        pair_chunks: list[np.ndarray] = []
+        for axis in range(3):
+            left_slice = [slice(None)] * 3
+            right_slice = [slice(None)] * 3
+            left_slice[axis] = slice(0, -1)
+            right_slice[axis] = slice(1, None)
+            left = labels[tuple(left_slice)]
+            right = labels[tuple(right_slice)]
+            valid = (left > 0) & (right > 0) & (left != right)
+            if valid.any():
+                pair_chunks.append(np.stack([left[valid], right[valid]], axis=-1))
+                pair_chunks.append(np.stack([right[valid], left[valid]], axis=-1))
+        if pair_chunks:
+            directed = np.concatenate(pair_chunks, axis=0)
+            packed = directed[:, 0].astype(np.int64) * (int(labels.max()) + 1) + directed[:, 1]
+            keys, interface_counts = np.unique(packed, return_counts=True)
+            source = keys // (int(labels.max()) + 1)
+            target = keys % (int(labels.max()) + 1)
+            remap = np.arange(int(labels.max()) + 1, dtype=np.int32)
+            for region_id in tiny.tolist():
+                candidates = np.flatnonzero(source == region_id)
+                if candidates.size:
+                    best = candidates[np.lexsort((target[candidates], -interface_counts[candidates]))[0]]
+                    remap[region_id] = int(target[best])
+            labels = remap[labels]
     unique = np.unique(labels)
     unique = unique[unique > 0]
     out = np.zeros_like(labels, dtype=np.int32)
     for new_id, old_id in enumerate(unique, 1):
         out[labels == old_id] = new_id
     return out
+
+
+def _component_bounded_watershed(
+    energy: np.ndarray,
+    markers: np.ndarray,
+    foreground: np.ndarray,
+    *,
+    halo: int,
+) -> np.ndarray:
+    components, count = ndi.label(foreground)
+    if count <= 1:
+        return watershed(energy, markers=markers, mask=foreground, connectivity=1).astype(np.int32)
+    output = np.zeros(foreground.shape, dtype=np.int32)
+    next_id = 1
+    objects = ndi.find_objects(components)
+    shape = foreground.shape
+    for component_id, raw_box in enumerate(objects, 1):
+        if raw_box is None:
+            continue
+        box = tuple(
+            slice(max(0, int(axis.start) - halo), min(shape[i], int(axis.stop) + halo))
+            for i, axis in enumerate(raw_box)
+        )
+        local_component = components[box] == component_id
+        local_markers = np.where(local_component, markers[box], 0)
+        local = watershed(
+            energy[box], markers=local_markers, mask=local_component, connectivity=1
+        ).astype(np.int32)
+        positive = local > 0
+        if positive.any():
+            unique = np.unique(local[positive])
+            mapping = np.zeros(int(local.max()) + 1, dtype=np.int32)
+            mapping[unique] = np.arange(next_id, next_id + unique.size, dtype=np.int32)
+            target = output[box]
+            target[positive] = mapping[local[positive]]
+            output[box] = target
+            next_id += unique.size
+    return output
 
 
 class LearnedGeometryWatershed(nn.Module):
@@ -56,77 +117,64 @@ class LearnedGeometryWatershed(nn.Module):
         spacing_um: Tensor,
         dref_um: Tensor,
         padding_mask: Tensor | None = None,
+        *,
+        derived_cache: GeometryDerivedCache | None = None,
+        stage_profiler=None,
+        profile_prefix: str = "watershed",
     ) -> List[Tensor]:
         results: List[Tensor] = []
-        base_field = geometry_field(geometry, "foreground_logits")
-        batch_size = base_field.shape[0]
-        del base_field
+        with _profile(stage_profiler, f"{profile_prefix}_geometry_probability_prepare"):
+            cache = derived_cache or build_geometry_derived_cache(
+                geometry,
+                self.cfg,
+                padding_mask=padding_mask,
+                stage_profiler=stage_profiler,
+                profile_prefix=profile_prefix,
+            )
+        batch_size = cache.foreground_prob.shape[0]
         for b in range(batch_size):
-            fg_prob = geometry_probability(geometry, "foreground")[
-                b, 0
-            ].float().cpu().numpy()
-            surface = geometry_probability(geometry, "surface")[
-                b, 0
-            ].float().cpu().numpy()
-            separator = geometry_probability(geometry, "separator")[
-                b, 0
-            ].float().cpu().numpy()
-            seed_head = geometry_probability(geometry, "seed")[
-                b, 0
-            ].float().cpu().numpy()
-            sdf_tensor = geometry_field(geometry, "sdf")
-            sdf = sdf_tensor[b, 0].float().cpu().numpy()
-            del sdf_tensor
-            fg = fg_prob >= self.cfg.foreground_threshold
-            if padding_mask is not None:
-                fg &= ~padding_mask[b].detach().cpu().numpy().astype(bool)
+            fg_tensor = cache.foreground_mask[b]
+            fg = fg_tensor.cpu().numpy()
             if not fg.any():
                 results.append(
-                    torch.zeros_like(
-                        geometry_field(geometry, "sdf")[b, 0], dtype=torch.long
-                    )
+                    torch.zeros_like(cache.sdf[b, 0], dtype=torch.long)
                 )
                 continue
-
-            sdf_pos = np.clip(sdf, 0.0, None)
-            sdf_norm = sdf_pos / max(float(sdf_pos[fg].max()), 1e-6)
-            # Separator evidence suppresses false seeds near an inter-cell
-            # interface; SDF and the learned marker head carry complementary
-            # medial-geometry information.
-            seed_score = (
-                self.cfg.seed_sdf_weight * sdf_norm
-                + self.cfg.seed_head_weight * seed_head
-            ) * (1.0 - separator)
             radius_um = (
                 self.cfg.seed_min_distance_dref * float(dref_um[b].item())
             )
-            markers = build_markers(
-                seed_score,
-                fg,
-                spacing_um[b].detach().cpu().numpy().astype(np.float32),
-                radius_um,
-                self.cfg.seed_threshold,
-                self.cfg.max_supervoxels,
-            )
-
-            # Low energy = object interior. Separator dominates because it is
-            # specifically trained on inter-instance interfaces; surface is a
-            # weaker term and positive SDF stabilizes basin interiors.
-            energy = (
-                self.cfg.watershed_separator_weight * separator
-                + self.cfg.watershed_surface_weight * surface
-                + self.cfg.watershed_sdf_weight * (1.0 - sdf_norm)
-            ).astype(np.float32)
-            labels = watershed(energy, markers=markers, mask=fg, connectivity=1)
-            labels = _merge_tiny_regions(labels.astype(np.int32), self.cfg.min_supervoxel_voxels)
+            with _profile(stage_profiler, f"{profile_prefix}_marker_nms"):
+                if self.cfg.watershed_backend == "fast":
+                    markers = build_markers_fast(
+                        cache.seed_score[b, 0], fg_tensor, spacing_um[b], radius_um,
+                        self.cfg.seed_threshold, self.cfg.max_supervoxels,
+                        stage_profiler=stage_profiler,
+                        profile_prefix=profile_prefix,
+                    )
+                else:
+                    markers = build_markers(
+                        cache.seed_score[b, 0].float().cpu().numpy(), fg,
+                        spacing_um[b].detach().cpu().numpy().astype(np.float32),
+                        radius_um, self.cfg.seed_threshold, self.cfg.max_supervoxels,
+                    )
+            with _profile(stage_profiler, f"{profile_prefix}_gpu_to_cpu_transfer"):
+                energy = cache.watershed_energy[b, 0].float().cpu().numpy()
+            with _profile(stage_profiler, f"{profile_prefix}_actual_watershed"):
+                if self.cfg.watershed_backend == "fast" and self.cfg.component_bounded_watershed:
+                    labels = _component_bounded_watershed(
+                        energy, markers, fg, halo=self.cfg.watershed_component_halo_voxels
+                    )
+                else:
+                    labels = watershed(energy, markers=markers, mask=fg, connectivity=1)
+            with _profile(stage_profiler, f"{profile_prefix}_tiny_region_cleanup"):
+                labels = _merge_tiny_regions(
+                    labels.astype(np.int32), self.cfg.min_supervoxel_voxels
+                )
             if int(labels.max()) > self.cfg.max_supervoxels:
                 raise RuntimeError(
                     f"Watershed created {int(labels.max())} supervoxels, exceeding "
                     f"max_supervoxels={self.cfg.max_supervoxels}."
                 )
-            results.append(
-                torch.from_numpy(labels).to(
-                    device=geometry_field(geometry, "sdf").device, dtype=torch.long
-                )
-            )
+            with _profile(stage_profiler, f"{profile_prefix}_cpu_to_gpu_transfer"):
+                results.append(torch.from_numpy(labels).to(device=cache.sdf.device, dtype=torch.long))
         return results

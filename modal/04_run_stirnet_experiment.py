@@ -51,6 +51,12 @@ EXPERIMENT_ARGS = [
     "--amp-dtype",
     "bf16",
     "--profile-memory",
+    "--refinement-crop-shape",
+    "32",
+    "192",
+    "192",
+    "--refinement-crops-per-step",
+    "1",
     "--hard-time-limit-seconds",
     "3480",
 ]
@@ -66,7 +72,7 @@ EXPERIMENT_ARGS = [
 # )
 LOCAL_WARM_START_CHECKPOINT: Path | None = None
 
-GPU = "A100-80GB"
+GPU = "L40S"
 
 
 # ===========================================================================

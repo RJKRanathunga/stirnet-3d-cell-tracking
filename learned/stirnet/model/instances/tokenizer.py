@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import List
 
 import torch
@@ -7,6 +8,7 @@ from torch import Tensor, nn
 
 from ..config import InstanceConfig, SpatialConfig
 from ..types import (
+    AggregatedRegionStatistics,
     GeometryLike,
     InstanceState,
     PartitionState,
@@ -15,6 +17,11 @@ from ..types import (
     geometry_field,
     geometry_probability,
 )
+from ..partition.statistics import NATIVE_FIELD_ORDER, aggregate_supervoxel_statistics
+
+
+def _profile(profiler, name: str):
+    return nullcontext() if profiler is None else profiler.profile(name)
 from ..utils.tensor_ops import (
     LabeledVoxelStats,
     pool_labeled_features,
@@ -76,6 +83,33 @@ def centers_from_labels(
     return result
 
 
+def centers_from_partition_statistics(
+    partition: PartitionState,
+    rag: RAGState,
+) -> List[Tensor]:
+    """Return max-SDF centers without revisiting the native voxel lattice."""
+    if rag.statistics is None:
+        raise ValueError("RAGState does not contain supervoxel statistics")
+    result: List[Tensor] = []
+    for batch_index, labels in enumerate(partition.labels):
+        count = int(labels.max().item())
+        start = int(rag.node_offsets[batch_index].item())
+        stop = int(rag.node_offsets[batch_index + 1].item())
+        aggregated = aggregate_supervoxel_statistics(
+            rag.statistics[batch_index],
+            partition.node_component[start:stop],
+            count,
+        )
+        result.append(
+            _physical_points_from_flat_indices(
+                aggregated.sdf_argmax_flat_index,
+                aggregated.volume_shape_zyx,
+                aggregated.spacing_um,
+            ).to(rag.node_features.dtype)
+        )
+    return result
+
+
 def _pad_pooled(pooled: Tensor, n: int) -> Tensor:
     if pooled.shape[0] == n:
         return pooled
@@ -117,6 +151,35 @@ def _shape_features(
             stats.field_means["separator"][:, None],
             stats.field_maxima["separator"][:, None],
             stats.field_means["foreground"][:, None],
+        ],
+        dim=-1,
+    )
+    return torch.where(positive[:, None], result, torch.zeros_like(result))
+
+
+def _shape_features_from_aggregate(
+    stats: AggregatedRegionStatistics,
+    dref_um: Tensor,
+) -> Tensor:
+    positive = stats.counts > 0
+    if not positive.any():
+        return stats.counts.new_zeros((stats.counts.shape[0], 12))
+    median_count = stats.counts[positive].median().clamp_min(1)
+    extent = (
+        (stats.max_voxel - stats.min_voxel).float()
+        * stats.spacing_um.float()[None]
+        / dref_um.float().clamp_min(1e-6)
+    )
+    result = torch.cat(
+        [
+            (torch.log1p(stats.counts) - torch.log1p(median_count))[:, None],
+            extent,
+            stats.variance_um2 / dref_um.float().square().clamp_min(1e-6),
+            stats.field_means("sdf")[:, None],
+            stats.field_maxima["sdf"][:, None],
+            stats.field_means("separator")[:, None],
+            stats.field_maxima["separator"][:, None],
+            stats.field_means("foreground")[:, None],
         ],
         dim=-1,
     )
@@ -205,6 +268,8 @@ class InstanceTokenizer(nn.Module):
         *,
         pooled_supervoxel_scales: tuple[List[Tensor], List[Tensor], List[Tensor]] | None = None,
         pooled_supervoxel_counts: tuple[List[Tensor], List[Tensor], List[Tensor]] | None = None,
+        stage_profiler=None,
+        profile_prefix: str = "tokenizer",
     ) -> InstanceState:
         tokens = []
         refs = []
@@ -215,6 +280,51 @@ class InstanceTokenizer(nn.Module):
             n = int(labels.max().item())
             if n == 0:
                 offsets.append(offsets[-1])
+                continue
+            if rag.statistics is not None:
+                start = int(rag.node_offsets[b].item())
+                stop = int(rag.node_offsets[b + 1].item())
+                with _profile(stage_profiler, f"{profile_prefix}_compact_aggregation"):
+                    compact = aggregate_supervoxel_statistics(
+                        rag.statistics[b], partition.node_component[start:stop], n
+                    )
+                pooled_scales = []
+                for scale_index, (scale, projection) in enumerate(
+                    zip(compact.scales, (self.proj_d0, self.proj_d1, self.proj_d2))
+                ):
+                    with _profile(stage_profiler, f"{profile_prefix}_D{scale_index}_pooling"):
+                        pooled_scales.append(
+                            project_pooled_mean_max(scale.mean_max, projection)
+                        )
+                with _profile(stage_profiler, f"{profile_prefix}_geometry_pooling"):
+                    geometry_names = NATIVE_FIELD_ORDER[1:]
+                    pooled_geometry = torch.cat(
+                        [
+                            torch.stack(
+                                [compact.field_means(name) for name in geometry_names], dim=-1
+                            ),
+                            torch.stack(
+                                [compact.field_maxima[name] for name in geometry_names], dim=-1
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                with _profile(stage_profiler, f"{profile_prefix}_shape_stats"):
+                    shape = _shape_features_from_aggregate(compact, dref_um[b])
+                with _profile(stage_profiler, f"{profile_prefix}_center_extraction"):
+                    refs.append(
+                        _physical_points_from_flat_indices(
+                            compact.sdf_argmax_flat_index,
+                            compact.volume_shape_zyx,
+                            spacing_um[b],
+                        ).to(spacing_um.dtype)
+                    )
+                feature = torch.cat([*pooled_scales, pooled_geometry, shape], dim=-1)
+                with _profile(stage_profiler, f"{profile_prefix}_compact_token_mlp"):
+                    tokens.append(self.token_mlp(feature))
+                batches.append(torch.full((n,), b, device=labels.device, dtype=torch.long))
+                local_ids.append(torch.arange(1, n + 1, device=labels.device, dtype=torch.long))
+                offsets.append(offsets[-1] + n)
                 continue
             pooled_scales = []
             if pooled_supervoxel_scales is None:

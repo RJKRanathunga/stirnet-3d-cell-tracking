@@ -23,6 +23,7 @@ class LocalPartitionUpdateResult:
     fallback_reason: str = ""
     updated_box_count: int = 0
     updated_boxes: List[tuple[int, tuple[slice, slice, slice]]] | None = None
+    updated_voxel_count: int = 0
 
 
 def _boxes_touch(
@@ -68,6 +69,9 @@ def reconcile_local_labels(
     local_labels: Tensor,
     box: tuple[slice, slice, slice],
     core_mask: Tensor,
+    *,
+    copy_output: bool = True,
+    next_label_id: int | None = None,
 ) -> tuple[Tensor | None, str]:
     """Conservatively reconcile one halo watershed into a global label field."""
     old_crop = global_labels[box]
@@ -78,7 +82,11 @@ def reconcile_local_labels(
     local_ids = local_ids[local_ids > 0]
     assignments: dict[int, int] = {}
     shell_owners: dict[int, set[int]] = {}
-    next_id = int(global_labels.max().item()) + 1
+    next_id = (
+        int(global_labels.max().item()) + 1
+        if next_label_id is None
+        else int(next_label_id)
+    )
 
     for local_id_tensor in local_ids:
         local_id = int(local_id_tensor.item())
@@ -140,7 +148,7 @@ def reconcile_local_labels(
     mapped = torch.zeros_like(local_labels)
     for local_id, global_id in assignments.items():
         mapped[local_labels == local_id] = global_id
-    updated = global_labels.clone()
+    updated = global_labels.clone() if copy_output else global_labels
     target = updated[box]
     target[core_mask] = mapped[core_mask]
     updated[box] = target
@@ -186,8 +194,9 @@ class LocalPartitionUpdater(nn.Module):
             return self._fallback(
                 geometry, spacing_um, dref_um, padding_mask, "no sparse delta"
             )
-        output = list(initial_labels)
+        output = [labels.clone() for labels in initial_labels]
         total_boxes = 0
+        updated_voxels = 0
         updated_boxes: list[tuple[int, tuple[slice, slice, slice]]] = []
         for batch_index, base in enumerate(initial_labels):
             rois = [
@@ -218,6 +227,7 @@ class LocalPartitionUpdater(nn.Module):
             total_boxes += len(boxes)
             updated_boxes.extend((batch_index, box) for box in boxes)
             updated = output[batch_index]
+            next_label_id = int(base.max().item()) + 1
             for box in boxes:
                 shape = tuple(int(axis.stop) - int(axis.start) for axis in box)
                 core_mask = torch.zeros(shape, device=base.device, dtype=torch.bool)
@@ -271,7 +281,12 @@ class LocalPartitionUpdater(nn.Module):
                     local_padding,
                 )[0]
                 reconciled, reason = reconcile_local_labels(
-                    updated, local_labels, box, core_mask
+                    updated,
+                    local_labels,
+                    box,
+                    core_mask,
+                    copy_output=False,
+                    next_label_id=next_label_id,
                 )
                 if reconciled is None:
                     return self._fallback(
@@ -282,12 +297,17 @@ class LocalPartitionUpdater(nn.Module):
                         reason,
                     )
                 updated = reconciled
+                updated_voxels += int(core_mask.sum().item())
+                next_label_id = max(
+                    next_label_id, int(updated[box].max().item()) + 1
+                )
             output[batch_index] = updated
         return LocalPartitionUpdateResult(
             supervoxel_labels=output,
             used_fallback=False,
             updated_box_count=total_boxes,
             updated_boxes=updated_boxes,
+            updated_voxel_count=updated_voxels,
         )
 
 

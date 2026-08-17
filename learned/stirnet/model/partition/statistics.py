@@ -1,0 +1,454 @@
+from __future__ import annotations
+
+from contextlib import nullcontext
+from typing import Mapping, Sequence
+
+import torch
+from torch import Tensor
+
+from ..types import (
+    AggregatedRegionStatistics,
+    GeometryDerivedCache,
+    GeometryLike,
+    ScaleFeatureStatistics,
+    SupervoxelStatistics,
+    geometry_field,
+    geometry_field_crop,
+)
+from ..utils.tensor_ops import pool_labeled_features, reduce_labeled_voxels, resize_labels_nearest
+
+
+NATIVE_FIELD_ORDER = (
+    "raw",
+    "foreground",
+    "surface",
+    "separator",
+    "sdf",
+    "flow_z",
+    "flow_y",
+    "flow_x",
+    "centroid_z",
+    "centroid_y",
+    "centroid_x",
+    "seed",
+)
+
+
+def _profile(profiler, name: str):
+    return nullcontext() if profiler is None else profiler.profile(name)
+
+
+def native_geometry_fields(
+    geometry: GeometryLike,
+    batch_index: int,
+    raw: Tensor,
+    *,
+    derived: GeometryDerivedCache | None = None,
+    crop: tuple[slice, slice, slice] | None = None,
+) -> dict[str, Tensor]:
+    if crop is None:
+        foreground = (
+            derived.foreground_prob[batch_index, 0]
+            if derived is not None
+            else geometry_field(geometry, "foreground_logits")[batch_index, 0].sigmoid()
+        )
+        surface = (
+            derived.surface_prob[batch_index, 0]
+            if derived is not None
+            else geometry_field(geometry, "surface_logits")[batch_index, 0].sigmoid()
+        )
+        separator = (
+            derived.separator_prob[batch_index, 0]
+            if derived is not None
+            else geometry_field(geometry, "separator_logits")[batch_index, 0].sigmoid()
+        )
+        seed = (
+            derived.seed_prob[batch_index, 0]
+            if derived is not None
+            else geometry_field(geometry, "seed_logits")[batch_index, 0].sigmoid()
+        )
+        sdf = derived.sdf[batch_index, 0] if derived is not None else geometry_field(geometry, "sdf")[batch_index, 0]
+        flow = geometry_field(geometry, "flow")[batch_index]
+        centroid = geometry_field(geometry, "centroid_offset")[batch_index]
+        raw_scalar = raw[batch_index, 0]
+    else:
+        foreground = geometry_field_crop(geometry, "foreground_logits", batch_index, crop)[0].sigmoid()
+        surface = geometry_field_crop(geometry, "surface_logits", batch_index, crop)[0].sigmoid()
+        separator = geometry_field_crop(geometry, "separator_logits", batch_index, crop)[0].sigmoid()
+        seed = geometry_field_crop(geometry, "seed_logits", batch_index, crop)[0].sigmoid()
+        sdf = geometry_field_crop(geometry, "sdf", batch_index, crop)[0]
+        flow = geometry_field_crop(geometry, "flow", batch_index, crop)
+        centroid = geometry_field_crop(geometry, "centroid_offset", batch_index, crop)
+        raw_scalar = raw[batch_index, 0, crop[0], crop[1], crop[2]]
+    return {
+        "raw": raw_scalar,
+        "foreground": foreground,
+        "surface": surface,
+        "separator": separator,
+        "sdf": sdf,
+        "flow_z": flow[0],
+        "flow_y": flow[1],
+        "flow_x": flow[2],
+        "centroid_z": centroid[0],
+        "centroid_y": centroid[1],
+        "centroid_x": centroid[2],
+        "seed": seed,
+    }
+
+
+def _scale_statistics(feature: Tensor, labels: Tensor) -> ScaleFeatureStatistics:
+    pooled, counts = pool_labeled_features(feature, labels)
+    means, maxima = pooled.chunk(2, dim=-1)
+    return ScaleFeatureStatistics(counts=counts, sums=means * counts[:, None], maxima=maxima)
+
+
+def _pad_rows(value: Tensor, rows: int, fill: float = 0.0) -> Tensor:
+    if value.shape[0] >= rows:
+        return value[:rows]
+    shape = (rows - value.shape[0], *value.shape[1:])
+    return torch.cat([value, value.new_full(shape, fill)], dim=0)
+
+
+def build_supervoxel_statistics(
+    labels_by_batch: Sequence[Tensor],
+    spatial_inputs: Tensor,
+    geometry: GeometryLike,
+    spacing_um: Tensor,
+    scale_features: tuple[Tensor, Tensor, Tensor] | None,
+    *,
+    derived: GeometryDerivedCache | None = None,
+    pooled_scales: tuple[Sequence[Tensor], Sequence[Tensor], Sequence[Tensor]] | None = None,
+    pooled_counts: tuple[Sequence[Tensor], Sequence[Tensor], Sequence[Tensor]] | None = None,
+    stage_profiler=None,
+) -> list[SupervoxelStatistics]:
+    """Make the single native-volume reduction shared by RAG and tokenizer."""
+    result: list[SupervoxelStatistics] = []
+    for batch_index, labels in enumerate(labels_by_batch):
+        fields = native_geometry_fields(
+            geometry, batch_index, spatial_inputs, derived=derived
+        )
+        with _profile(stage_profiler, "node_native_geometry_stats"):
+            reduced = reduce_labeled_voxels(
+                labels,
+                spacing_um[batch_index],
+                fields=fields,
+                argmax_field=fields["sdf"],
+                need_nearest_centroid=False,
+            )
+        n = reduced.counts.shape[0]
+        scales: list[ScaleFeatureStatistics] = []
+        for scale in range(3):
+            if pooled_scales is not None:
+                pooled = _pad_rows(pooled_scales[scale][batch_index], n)
+                counts = (
+                    _pad_rows(pooled_counts[scale][batch_index], n)
+                    if pooled_counts is not None
+                    else reduced.counts.to(pooled.dtype)
+                )
+                mean, maximum = pooled.chunk(2, dim=-1)
+                scales.append(
+                    ScaleFeatureStatistics(
+                        counts=counts,
+                        sums=mean * counts[:, None],
+                        maxima=maximum,
+                    )
+                )
+            elif scale_features is not None:
+                feature = scale_features[scale][batch_index]
+                scaled_labels = resize_labels_nearest(labels, tuple(feature.shape[-3:]))
+                with _profile(stage_profiler, f"node_D{scale}_stats"):
+                    scales.append(_scale_statistics(feature, scaled_labels))
+            else:
+                raise ValueError("scale_features or pooled_scales must be supplied")
+        if reduced.argmax_flat_index is None:
+            raise RuntimeError("SDF argmax statistics were not produced")
+        result.append(
+            SupervoxelStatistics(
+                volume_shape_zyx=tuple(labels.shape),
+                spacing_um=spacing_um[batch_index],
+                counts=reduced.counts,
+                coordinate_sums=reduced.coordinate_sums,
+                coordinate_square_sums=reduced.coordinate_square_sums,
+                min_voxel=reduced.min_voxel,
+                max_voxel=reduced.max_voxel,
+                field_sums=dict(reduced.field_sums),
+                field_maxima=dict(reduced.field_maxima),
+                sdf_argmax_flat_index=reduced.argmax_flat_index,
+                scales=tuple(scales),  # type: ignore[arg-type]
+            )
+        )
+    return result
+
+
+def _aggregate_sum(values: Tensor, component: Tensor, count: int) -> Tensor:
+    out = values.new_zeros((count, *values.shape[1:]))
+    if values.numel():
+        out.index_add_(0, component, values)
+    return out
+
+
+def _aggregate_extreme(
+    values: Tensor, component: Tensor, count: int, *, reduce: str, fill: float
+) -> Tensor:
+    out = values.new_full((count, *values.shape[1:]), fill)
+    if values.numel():
+        index = component.reshape((-1,) + (1,) * (values.ndim - 1)).expand_as(values)
+        out.scatter_reduce_(0, index, values, reduce=reduce, include_self=True)
+    return out
+
+
+def aggregate_supervoxel_statistics(
+    statistics: SupervoxelStatistics,
+    component: Tensor,
+    component_count: int,
+) -> AggregatedRegionStatistics:
+    """Exactly combine supervoxel rows into provisional/final instances."""
+    rows = min(component.numel(), statistics.counts.numel())
+    component = component[:rows].long()
+    valid = statistics.counts[:rows] > 0
+    component_valid = component[valid]
+    counts = _aggregate_sum(statistics.counts[:rows][valid], component_valid, component_count)
+    coordinate_sums = _aggregate_sum(
+        statistics.coordinate_sums[:rows][valid], component_valid, component_count
+    )
+    square_sums = _aggregate_sum(
+        statistics.coordinate_square_sums[:rows][valid], component_valid, component_count
+    )
+    minima = _aggregate_extreme(
+        statistics.min_voxel[:rows][valid], component_valid, component_count,
+        reduce="amin", fill=float(max(statistics.volume_shape_zyx)),
+    )
+    maxima = _aggregate_extreme(
+        statistics.max_voxel[:rows][valid], component_valid, component_count,
+        reduce="amax", fill=-1,
+    )
+    empty = counts <= 0
+    minima[empty] = 0
+    maxima[empty] = 0
+    field_sums = {
+        name: _aggregate_sum(value[:rows][valid], component_valid, component_count)
+        for name, value in statistics.field_sums.items()
+    }
+    field_maxima = {
+        name: _aggregate_extreme(
+            value[:rows][valid], component_valid, component_count,
+            reduce="amax", fill=-torch.inf,
+        )
+        for name, value in statistics.field_maxima.items()
+    }
+    for value in field_maxima.values():
+        value[empty] = 0
+
+    sdf_values = statistics.field_maxima["sdf"][:rows][valid]
+    sdf_max = _aggregate_extreme(
+        sdf_values, component_valid, component_count, reduce="amax", fill=-torch.inf
+    )
+    source_indices = statistics.sdf_argmax_flat_index[:rows][valid]
+    total_voxels = int(torch.tensor(statistics.volume_shape_zyx).prod().item())
+    candidates = torch.where(
+        sdf_values == sdf_max[component_valid],
+        source_indices,
+        torch.full_like(source_indices, total_voxels),
+    )
+    sdf_argmax = _aggregate_extreme(
+        candidates, component_valid, component_count, reduce="amin", fill=total_voxels
+    )
+    sdf_argmax[empty] = 0
+
+    scales: list[ScaleFeatureStatistics] = []
+    for scale in statistics.scales:
+        scale_rows = min(rows, scale.counts.numel())
+        scale_valid = scale.counts[:scale_rows] > 0
+        scale_component = component[:scale_rows][scale_valid]
+        scale_counts = _aggregate_sum(
+            scale.counts[:scale_rows][scale_valid], scale_component, component_count
+        )
+        scale_sums = _aggregate_sum(
+            scale.sums[:scale_rows][scale_valid], scale_component, component_count
+        )
+        scale_maxima = _aggregate_extreme(
+            scale.maxima[:scale_rows][scale_valid], scale_component, component_count,
+            reduce="amax", fill=-torch.inf,
+        )
+        scale_maxima[scale_counts <= 0] = 0
+        scales.append(ScaleFeatureStatistics(scale_counts, scale_sums, scale_maxima))
+    return AggregatedRegionStatistics(
+        counts=counts,
+        coordinate_sums=coordinate_sums,
+        coordinate_square_sums=square_sums,
+        min_voxel=minima,
+        max_voxel=maxima,
+        field_sums=field_sums,
+        field_maxima=field_maxima,
+        sdf_argmax_flat_index=sdf_argmax,
+        scales=tuple(scales),  # type: ignore[arg-type]
+        volume_shape_zyx=statistics.volume_shape_zyx,
+        spacing_um=statistics.spacing_um,
+    )
+
+
+def _scaled_crop(
+    labels: Tensor,
+    feature: Tensor,
+    source_box: tuple[slice, slice, slice],
+) -> tuple[Tensor, Tensor]:
+    source_shape = labels.shape
+    target_shape = feature.shape[-3:]
+    target_indices: list[Tensor] = []
+    target_slices: list[slice] = []
+    for axis, (source_size, target_size) in enumerate(zip(source_shape, target_shape)):
+        destination = torch.arange(target_size, device=labels.device)
+        source = torch.div(destination * source_size, target_size, rounding_mode="floor")
+        keep = (source >= int(source_box[axis].start)) & (source < int(source_box[axis].stop))
+        selected = torch.nonzero(keep, as_tuple=False).flatten()
+        if selected.numel() == 0:
+            selected = torch.tensor(
+                [min(target_size - 1, int(source_box[axis].start) * target_size // source_size)],
+                device=labels.device,
+            )
+        start = int(selected[0].item())
+        stop = int(selected[-1].item()) + 1
+        target_slices.append(slice(start, stop))
+        target_indices.append(source[start:stop])
+    scaled_labels = labels.index_select(0, target_indices[0])
+    scaled_labels = scaled_labels.index_select(1, target_indices[1])
+    scaled_labels = scaled_labels.index_select(2, target_indices[2])
+    feature_crop = feature[
+        :, target_slices[0], target_slices[1], target_slices[2]
+    ]
+    return feature_crop, scaled_labels
+
+
+def _replace_rows(base: Tensor, update: Tensor, rows: Tensor, total: int, *, fill: float = 0.0) -> Tensor:
+    output = _pad_rows(base, total, fill=fill).clone()
+    available = rows[rows < update.shape[0]]
+    if available.numel():
+        output[available] = update[available].to(output.dtype)
+    return output
+
+
+def update_supervoxel_statistics_local(
+    initial: Sequence[SupervoxelStatistics],
+    initial_labels: Sequence[Tensor],
+    labels_by_batch: Sequence[Tensor],
+    updated_boxes: Sequence[tuple[int, tuple[slice, slice, slice]]],
+    spatial_inputs: Tensor,
+    geometry: GeometryLike,
+    spacing_um: Tensor,
+    scale_features: tuple[Tensor, Tensor, Tensor] | None,
+    *,
+    pooled_scales: tuple[Sequence[Tensor], Sequence[Tensor], Sequence[Tensor]] | None = None,
+    pooled_counts: tuple[Sequence[Tensor], Sequence[Tensor], Sequence[Tensor]] | None = None,
+) -> tuple[list[SupervoxelStatistics], list[Tensor]]:
+    """Refresh affected rows using only object bounds plus edited boxes."""
+    boxes_by_batch: dict[int, list[tuple[slice, slice, slice]]] = {}
+    for batch_index, box in updated_boxes:
+        boxes_by_batch.setdefault(batch_index, []).append(box)
+    result: list[SupervoxelStatistics] = []
+    affected_by_batch: list[Tensor] = []
+    for batch_index, labels in enumerate(labels_by_batch):
+        previous = initial[batch_index]
+        boxes = boxes_by_batch.get(batch_index, [])
+        if not boxes:
+            result.append(previous)
+            affected_by_batch.append(labels.new_zeros((0,), dtype=torch.long))
+            continue
+        affected_chunks = []
+        for box in boxes:
+            affected_chunks.extend(
+                [torch.unique(labels[box]), torch.unique(initial_labels[batch_index][box])]
+            )
+        affected = torch.unique(torch.cat(affected_chunks)).long()
+        affected = affected[affected > 0]
+        affected_by_batch.append(affected)
+        rows = affected - 1
+        lower = torch.tensor(
+            [min(int(box[axis].start) for box in boxes) for axis in range(3)],
+            device=labels.device,
+            dtype=torch.long,
+        )
+        upper = torch.tensor(
+            [max(int(box[axis].stop) for box in boxes) for axis in range(3)],
+            device=labels.device,
+            dtype=torch.long,
+        )
+        old_rows = rows[rows < previous.counts.shape[0]]
+        old_rows = old_rows[previous.counts[old_rows] > 0]
+        if old_rows.numel():
+            lower = torch.minimum(lower, previous.min_voxel[old_rows].amin(dim=0))
+            upper = torch.maximum(upper, previous.max_voxel[old_rows].amax(dim=0) + 1)
+        box = tuple(slice(int(lower[a].item()), int(upper[a].item())) for a in range(3))
+        label_crop = labels[box]
+        fields = native_geometry_fields(
+            geometry, batch_index, spatial_inputs, crop=box
+        )
+        reduced = reduce_labeled_voxels(
+            label_crop,
+            spacing_um[batch_index],
+            fields=fields,
+            argmax_field=fields["sdf"],
+            need_nearest_centroid=False,
+            coordinate_offset_zyx=tuple(int(lower[a].item()) for a in range(3)),
+            coordinate_shape_zyx=tuple(labels.shape),
+        )
+        total = int(labels.max().item())
+        scales: list[ScaleFeatureStatistics] = []
+        for scale_index, old_scale in enumerate(previous.scales):
+            if scale_features is not None:
+                feature_crop, scaled_labels = _scaled_crop(
+                    labels, scale_features[scale_index][batch_index], box
+                )
+                local_scale = _scale_statistics(feature_crop, scaled_labels)
+                scales.append(
+                    ScaleFeatureStatistics(
+                        counts=_replace_rows(old_scale.counts, local_scale.counts, rows, total),
+                        sums=_replace_rows(old_scale.sums, local_scale.sums, rows, total),
+                        maxima=_replace_rows(old_scale.maxima, local_scale.maxima, rows, total),
+                    )
+                )
+            elif pooled_scales is not None and pooled_counts is not None:
+                pooled = _pad_rows(pooled_scales[scale_index][batch_index], total)
+                counts = _pad_rows(pooled_counts[scale_index][batch_index], total)
+                mean, maximum = pooled.chunk(2, dim=-1)
+                scales.append(
+                    ScaleFeatureStatistics(counts, mean * counts[:, None], maximum)
+                )
+            else:
+                raise ValueError("local statistics need scale features or pooled scale rows")
+        if reduced.argmax_flat_index is None:
+            raise RuntimeError("local SDF argmax statistics were not produced")
+        result.append(
+            SupervoxelStatistics(
+                volume_shape_zyx=tuple(labels.shape),
+                spacing_um=spacing_um[batch_index],
+                counts=_replace_rows(previous.counts, reduced.counts, rows, total),
+                coordinate_sums=_replace_rows(previous.coordinate_sums, reduced.coordinate_sums, rows, total),
+                coordinate_square_sums=_replace_rows(
+                    previous.coordinate_square_sums, reduced.coordinate_square_sums, rows, total
+                ),
+                min_voxel=_replace_rows(previous.min_voxel, reduced.min_voxel, rows, total),
+                max_voxel=_replace_rows(previous.max_voxel, reduced.max_voxel, rows, total),
+                field_sums={
+                    name: _replace_rows(previous.field_sums[name], reduced.field_sums[name], rows, total)
+                    for name in NATIVE_FIELD_ORDER
+                },
+                field_maxima={
+                    name: _replace_rows(previous.field_maxima[name], reduced.field_maxima[name], rows, total)
+                    for name in NATIVE_FIELD_ORDER
+                },
+                sdf_argmax_flat_index=_replace_rows(
+                    previous.sdf_argmax_flat_index, reduced.argmax_flat_index, rows, total
+                ),
+                scales=tuple(scales),  # type: ignore[arg-type]
+            )
+        )
+    return result, affected_by_batch
+
+
+__all__ = [
+    "NATIVE_FIELD_ORDER",
+    "aggregate_supervoxel_statistics",
+    "build_supervoxel_statistics",
+    "native_geometry_fields",
+    "update_supervoxel_statistics_local",
+]

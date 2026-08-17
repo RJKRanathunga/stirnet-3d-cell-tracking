@@ -17,6 +17,8 @@ class LabeledVoxelStats:
     """
 
     counts: Tensor
+    coordinate_sums: Tensor
+    coordinate_square_sums: Tensor
     centroid_voxel: Tensor
     centroid_um: Tensor
     variance_um2: Tensor
@@ -24,8 +26,9 @@ class LabeledVoxelStats:
     max_voxel: Tensor
     field_means: Mapping[str, Tensor]
     field_maxima: Mapping[str, Tensor]
+    field_sums: Mapping[str, Tensor]
     argmax_flat_index: Tensor | None
-    nearest_centroid_flat_index: Tensor
+    nearest_centroid_flat_index: Tensor | None
 
 
 def relabel_contiguous(labels: Tensor) -> Tensor:
@@ -149,6 +152,11 @@ def reduce_labeled_voxels(
     *,
     fields: Mapping[str, Tensor] | None = None,
     argmax_field: Tensor | None = None,
+    need_bbox: bool = True,
+    need_variance: bool = True,
+    need_nearest_centroid: bool = True,
+    coordinate_offset_zyx: tuple[int, int, int] = (0, 0, 0),
+    coordinate_shape_zyx: tuple[int, int, int] | None = None,
 ) -> LabeledVoxelStats:
     """Reduce a labeled voxel field in O(Nvoxels + Nlabels) work.
 
@@ -174,6 +182,8 @@ def reduce_labeled_voxels(
         empty_long = torch.zeros((0,), device=device, dtype=torch.long)
         return LabeledVoxelStats(
             counts=empty_scalar,
+            coordinate_sums=empty_vector,
+            coordinate_square_sums=empty_vector,
             centroid_voxel=empty_vector,
             centroid_um=empty_vector,
             variance_um2=empty_vector,
@@ -181,8 +191,9 @@ def reduce_labeled_voxels(
             max_voxel=empty_vector.long(),
             field_means={name: value.new_zeros((0,)) for name, value in fields.items()},
             field_maxima={name: value.new_zeros((0,)) for name, value in fields.items()},
+            field_sums={name: value.new_zeros((0,)) for name, value in fields.items()},
             argmax_flat_index=empty_long if argmax_field is not None else None,
-            nearest_centroid_flat_index=empty_long,
+            nearest_centroid_flat_index=empty_long if need_nearest_centroid else None,
         )
 
     flat_labels = labels.reshape(-1).long()
@@ -195,39 +206,44 @@ def reduce_labeled_voxels(
     remainder = flat_index % (y_size * x_size)
     y_index = torch.div(remainder, x_size, rounding_mode="floor")
     x_index = remainder % x_size
-    voxel_components = (z_index, y_index, x_index)
-
-    sums = []
-    square_sums = []
-    minima = []
-    maxima = []
-    for component, size in zip(voxel_components, labels.shape):
-        values = component.to(coordinate_dtype)
-        component_sum = torch.zeros(max_id, device=device, dtype=coordinate_dtype)
-        component_sum.index_add_(0, ids, values)
-        component_square_sum = torch.zeros_like(component_sum)
-        component_square_sum.index_add_(0, ids, values.square())
-        minimum = torch.full((max_id,), int(size), device=device, dtype=torch.long)
-        maximum = torch.full((max_id,), -1, device=device, dtype=torch.long)
-        minimum.scatter_reduce_(0, ids, component, reduce="amin", include_self=True)
-        maximum.scatter_reduce_(0, ids, component, reduce="amax", include_self=True)
-        sums.append(component_sum)
-        square_sums.append(component_square_sum)
-        minima.append(minimum)
-        maxima.append(maximum)
+    offset = torch.as_tensor(coordinate_offset_zyx, device=device, dtype=torch.long)
+    coordinates_long = torch.stack([z_index, y_index, x_index], dim=-1) + offset
+    coordinates = coordinates_long.to(coordinate_dtype)
+    coordinate_sums = torch.zeros((max_id, 3), device=device, dtype=coordinate_dtype)
+    coordinate_sums.index_add_(0, ids, coordinates)
+    coordinate_square_sums = torch.zeros_like(coordinate_sums)
+    if need_variance:
+        coordinate_square_sums.index_add_(0, ids, coordinates.square())
+    minima = torch.zeros((max_id, 3), device=device, dtype=torch.long)
+    maxima = torch.zeros((max_id, 3), device=device, dtype=torch.long)
+    if need_bbox:
+        full_shape = coordinate_shape_zyx or tuple(
+            int(size + coordinate_offset_zyx[axis])
+            for axis, size in enumerate(labels.shape)
+        )
+        minima = torch.as_tensor(full_shape, device=device)[None].expand(max_id, -1).clone()
+        maxima.fill_(-1)
+        expanded_ids = ids[:, None].expand(-1, 3)
+        minima.scatter_reduce_(0, expanded_ids, coordinates_long, reduce="amin", include_self=True)
+        maxima.scatter_reduce_(0, expanded_ids, coordinates_long, reduce="amax", include_self=True)
 
     safe_counts = counts.clamp_min(1)
-    centroid_voxel = torch.stack(sums, dim=-1) / safe_counts[:, None]
-    second_moment = torch.stack(square_sums, dim=-1) / safe_counts[:, None]
-    variance_voxel = (second_moment - centroid_voxel.square()).clamp_min(0)
+    centroid_voxel = coordinate_sums / safe_counts[:, None]
+    second_moment = coordinate_square_sums / safe_counts[:, None]
+    variance_voxel = (
+        (second_moment - centroid_voxel.square()).clamp_min(0)
+        if need_variance
+        else torch.zeros_like(centroid_voxel)
+    )
     spacing = spacing_um.to(device=device, dtype=coordinate_dtype)
+    coordinate_shape = coordinate_shape_zyx or tuple(labels.shape)
     volume_center = 0.5 * (
-        torch.as_tensor(labels.shape, device=device, dtype=coordinate_dtype) - 1
+        torch.as_tensor(coordinate_shape, device=device, dtype=coordinate_dtype) - 1
     )
     centroid_um = (centroid_voxel - volume_center) * spacing
     variance_um2 = variance_voxel * spacing.square()
-    min_voxel = torch.stack(minima, dim=-1)
-    max_voxel = torch.stack(maxima, dim=-1)
+    min_voxel = minima
+    max_voxel = maxima
     empty = counts_long == 0
     min_voxel[empty] = 0
     max_voxel[empty] = 0
@@ -237,51 +253,70 @@ def reduce_labeled_voxels(
 
     field_means: dict[str, Tensor] = {}
     field_maxima: dict[str, Tensor] = {}
-    for name, field in fields.items():
-        values = field.reshape(-1)[flat_index]
-        field_sum = field.new_zeros((max_id,))
-        field_sum.index_add_(0, ids, values)
-        field_mean = field_sum / counts.to(field.dtype).clamp_min(1)
-        field_max = field.new_full((max_id,), -torch.inf)
-        field_max.scatter_reduce_(0, ids, values, reduce="amax", include_self=True)
-        field_means[name] = torch.where(empty, torch.zeros_like(field_mean), field_mean)
-        field_maxima[name] = torch.where(empty, torch.zeros_like(field_max), field_max)
+    field_sums: dict[str, Tensor] = {}
+    if fields:
+        names = list(fields)
+        values = torch.stack(
+            [fields[name].reshape(-1)[flat_index] for name in names], dim=-1
+        )
+        reduced_sums = values.new_zeros((max_id, len(names)))
+        reduced_sums.index_add_(0, ids, values)
+        reduced_maxima = values.new_full((max_id, len(names)), -torch.inf)
+        reduced_maxima.scatter_reduce_(
+            0, ids[:, None].expand(-1, len(names)), values,
+            reduce="amax", include_self=True,
+        )
+        reduced_means = reduced_sums / counts.to(values.dtype).clamp_min(1)[:, None]
+        for column, name in enumerate(names):
+            field_sums[name] = reduced_sums[:, column]
+            field_means[name] = torch.where(
+                empty, torch.zeros_like(reduced_means[:, column]), reduced_means[:, column]
+            )
+            field_maxima[name] = torch.where(
+                empty, torch.zeros_like(reduced_maxima[:, column]), reduced_maxima[:, column]
+            )
 
-    delta_z = z_index.to(coordinate_dtype) - centroid_voxel[ids, 0]
-    delta_y = y_index.to(coordinate_dtype) - centroid_voxel[ids, 1]
-    delta_x = x_index.to(coordinate_dtype) - centroid_voxel[ids, 2]
-    distance2 = delta_z.square() + delta_y.square() + delta_x.square()
-    nearest_distance = torch.full(
-        (max_id,), torch.inf, device=device, dtype=coordinate_dtype
-    )
-    nearest_distance.scatter_reduce_(
-        0, ids, distance2, reduce="amin", include_self=True
-    )
-    nearest_candidates = torch.where(
-        distance2 == nearest_distance[ids],
-        flat_index,
-        torch.full_like(flat_index, labels.numel()),
-    )
-    nearest_index = torch.full(
-        (max_id,), labels.numel(), device=device, dtype=torch.long
-    )
-    nearest_index.scatter_reduce_(
-        0, ids, nearest_candidates, reduce="amin", include_self=True
-    )
-    nearest_index[empty] = 0
+    nearest_index: Tensor | None = None
+    if need_nearest_centroid:
+        distance2 = (coordinates - centroid_voxel[ids]).square().sum(dim=-1)
+        nearest_distance = torch.full(
+            (max_id,), torch.inf, device=device, dtype=coordinate_dtype
+        )
+        nearest_distance.scatter_reduce_(0, ids, distance2, reduce="amin", include_self=True)
+        global_flat_index = (
+            coordinates_long[:, 0] * coordinate_shape[1] * coordinate_shape[2]
+            + coordinates_long[:, 1] * coordinate_shape[2]
+            + coordinates_long[:, 2]
+        )
+        nearest_candidates = torch.where(
+            distance2 == nearest_distance[ids],
+            global_flat_index,
+            torch.full_like(global_flat_index, int(torch.tensor(coordinate_shape).prod().item())),
+        )
+        nearest_index = torch.full(
+            (max_id,), int(torch.tensor(coordinate_shape).prod().item()), device=device, dtype=torch.long
+        )
+        nearest_index.scatter_reduce_(0, ids, nearest_candidates, reduce="amin", include_self=True)
+        nearest_index[empty] = 0
 
     argmax_index: Tensor | None = None
     if argmax_field is not None:
         arg_values = argmax_field.reshape(-1)[flat_index]
         arg_max = argmax_field.new_full((max_id,), -torch.inf)
         arg_max.scatter_reduce_(0, ids, arg_values, reduce="amax", include_self=True)
+        global_flat_index = (
+            coordinates_long[:, 0] * coordinate_shape[1] * coordinate_shape[2]
+            + coordinates_long[:, 1] * coordinate_shape[2]
+            + coordinates_long[:, 2]
+        )
+        total_coordinate_voxels = int(torch.tensor(coordinate_shape).prod().item())
         candidates = torch.where(
             arg_values == arg_max[ids],
-            flat_index,
-            torch.full_like(flat_index, labels.numel()),
+            global_flat_index,
+            torch.full_like(global_flat_index, total_coordinate_voxels),
         )
         argmax_index = torch.full(
-            (max_id,), labels.numel(), device=device, dtype=torch.long
+            (max_id,), total_coordinate_voxels, device=device, dtype=torch.long
         )
         argmax_index.scatter_reduce_(
             0, ids, candidates, reduce="amin", include_self=True
@@ -290,6 +325,8 @@ def reduce_labeled_voxels(
 
     return LabeledVoxelStats(
         counts=counts,
+        coordinate_sums=coordinate_sums,
+        coordinate_square_sums=coordinate_square_sums,
         centroid_voxel=centroid_voxel,
         centroid_um=centroid_um,
         variance_um2=variance_um2,
@@ -297,6 +334,7 @@ def reduce_labeled_voxels(
         max_voxel=max_voxel,
         field_means=field_means,
         field_maxima=field_maxima,
+        field_sums=field_sums,
         argmax_flat_index=argmax_index,
         nearest_centroid_flat_index=nearest_index,
     )

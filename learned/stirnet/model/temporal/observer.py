@@ -9,12 +9,63 @@ from ..config import GeometryConfig, SpatialConfig, TemporalConfig
 from ..types import (
     GeometryLike,
     GeometryState,
+    RefinedGeometryView,
     SpatialDecodeState,
     SpatialObservationCache,
     TemporalState,
     geometry_field,
+    geometry_field_crop,
     geometry_probability,
 )
+
+
+def _sample_explicit_geometry(
+    geometry: GeometryLike,
+    batch_index: int,
+    refs_um: Tensor,
+    spacing_um: Tensor,
+    radius_um: Tensor,
+) -> Tensor:
+    names = (
+        ("foreground_logits", True),
+        ("surface_logits", True),
+        ("separator_logits", True),
+        ("sdf", False),
+        ("flow", False),
+        ("centroid_offset", False),
+        ("seed_logits", True),
+    )
+    full_shape = (
+        geometry.base.sdf.shape[-3:]
+        if isinstance(geometry, RefinedGeometryView)
+        else geometry.sdf.shape[-3:]
+    )
+    sampled_rows: list[Tensor] = []
+    full_center = refs_um.new_tensor([(size - 1) * 0.5 for size in full_shape])
+    for row, ref_um in enumerate(refs_um):
+        center_voxel = ref_um.float() / spacing_um.float() + full_center
+        halo = torch.ceil(radius_um[row].float() / spacing_um.float()).long() + 1
+        lower = (center_voxel.floor().long() - halo).clamp_min(0)
+        upper = torch.minimum(
+            center_voxel.ceil().long() + halo + 1,
+            torch.as_tensor(full_shape, device=refs_um.device),
+        )
+        crop = tuple(slice(int(lower[a]), int(upper[a])) for a in range(3))
+        crop_center = 0.5 * (lower.float() + upper.float() - 1)
+        local_ref = ((center_voxel - crop_center) * spacing_um.float())[None]
+        channels = []
+        for name, probability in names:
+            field = geometry_field_crop(geometry, name, batch_index, crop)
+            channels.append(
+                _sample_local_grid(
+                    field.sigmoid() if probability else field,
+                    local_ref,
+                    spacing_um,
+                    radius_um[row : row + 1],
+                )
+            )
+        sampled_rows.append(torch.cat(channels, dim=-1))
+    return torch.cat(sampled_rows, dim=0) if sampled_rows else refs_um.new_zeros((0, 11))
 
 
 def _sample_local_grid(
@@ -181,11 +232,13 @@ class TemporalSpatialObserver(nn.Module):
         d1_projected = temporal.tokens.new_zeros((count, width))
         d2_projected = temporal.tokens.new_zeros((count, width))
         hidden_projected = temporal.tokens.new_zeros((count, width))
+        explicit_projected = temporal.tokens.new_zeros((count, width))
         if temporal.is_empty:
             return SpatialObservationCache(
                 d1_projected=d1_projected,
                 d2_projected=d2_projected,
                 hidden_geometry_projected=hidden_projected,
+                explicit_geometry_projected=explicit_projected,
             )
         if geometry.features is None:
             raise ValueError(
@@ -217,10 +270,17 @@ class TemporalSpatialObserver(nn.Module):
             hidden_projected[idx] = self.geometry_proj(
                 hidden_geometry_local
             ).to(hidden_projected.dtype)
+            explicit = _sample_explicit_geometry(
+                geometry, b, refs, spacing_um[b], radius_vec
+            )
+            explicit_projected[idx] = self.geometry_field_proj(explicit).to(
+                explicit_projected.dtype
+            )
         return SpatialObservationCache(
             d1_projected=d1_projected,
             d2_projected=d2_projected,
             hidden_geometry_projected=hidden_projected,
+            explicit_geometry_projected=explicit_projected,
         )
 
     def forward(
@@ -254,58 +314,21 @@ class TemporalSpatialObserver(nn.Module):
             refs = temporal.ref_um[idx]
             radius = dref_um[b] * self.cfg.observation_radius_dref
             radius_vec = radius.expand(len(idx))
-            explicit_geometry_local = torch.cat(
-                [
-                    _sample_local_grid(
-                        geometry_probability(geometry, "foreground")[b],
-                        refs,
-                        spacing_um[b],
-                        radius_vec,
-                    ),
-                    _sample_local_grid(
-                        geometry_probability(geometry, "surface")[b],
-                        refs,
-                        spacing_um[b],
-                        radius_vec,
-                    ),
-                    _sample_local_grid(
-                        geometry_probability(geometry, "separator")[b],
-                        refs,
-                        spacing_um[b],
-                        radius_vec,
-                    ),
-                    _sample_local_grid(
-                        geometry_field(geometry, "sdf")[b],
-                        refs,
-                        spacing_um[b],
-                        radius_vec,
-                    ),
-                    _sample_local_grid(
-                        geometry_field(geometry, "flow")[b],
-                        refs,
-                        spacing_um[b],
-                        radius_vec,
-                    ),
-                    _sample_local_grid(
-                        geometry_field(geometry, "centroid_offset")[b],
-                        refs,
-                        spacing_um[b],
-                        radius_vec,
-                    ),
-                    _sample_local_grid(
-                        geometry_probability(geometry, "seed")[b],
-                        refs,
-                        spacing_um[b],
-                        radius_vec,
-                    ),
-                ],
-                dim=-1,
-            ).to(cache.hidden_geometry_projected.dtype)
             p1 = cache.d1_projected[idx]
             p2 = cache.d2_projected[idx]
-            pg = cache.hidden_geometry_projected[idx] + self.geometry_field_proj(
-                explicit_geometry_local
-            )
+            if isinstance(geometry, RefinedGeometryView):
+                explicit_geometry_local = _sample_explicit_geometry(
+                    geometry, b, refs, spacing_um[b], radius_vec
+                ).to(cache.hidden_geometry_projected.dtype)
+                explicit_projected = self.geometry_field_proj(explicit_geometry_local)
+            elif cache.explicit_geometry_projected is not None:
+                explicit_projected = cache.explicit_geometry_projected[idx]
+            else:
+                explicit_geometry_local = _sample_explicit_geometry(
+                    geometry, b, refs, spacing_um[b], radius_vec
+                ).to(cache.hidden_geometry_projected.dtype)
+                explicit_projected = self.geometry_field_proj(explicit_geometry_local)
+            pg = cache.hidden_geometry_projected[idx] + explicit_projected
             local_message = self.message(torch.cat([p1, p2, pg], dim=-1))
             messages[idx] = local_message.to(messages.dtype)
         gate = self.gate(

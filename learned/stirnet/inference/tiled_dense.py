@@ -23,7 +23,15 @@ from ..model.types import (
     RefinementState,
     geometry_field,
 )
-from ..model.instances.tokenizer import centers_from_labels
+from ..model.instances.tokenizer import (
+    centers_from_labels,
+    centers_from_partition_statistics,
+)
+from ..model.geometry.derived import build_geometry_derived_cache
+from ..model.partition.statistics import (
+    build_supervoxel_statistics,
+    update_supervoxel_statistics_local,
+)
 from ..model.refinement.requests import build_refinement_requests
 
 
@@ -456,11 +464,15 @@ def tiled_spatial_inference(
         config=config,
         spatial_padding_mask=spatial_padding_mask,
     )
+    derived = build_geometry_derived_cache(
+        dense.geometry, model.cfg.partition, padding_mask=spatial_padding_mask
+    )
     supervoxels = model.watershed(
         dense.geometry,
         spacing_um,
         dref_um,
         spatial_padding_mask,
+        derived_cache=derived,
     )
     stats = stream_tiled_label_feature_stats(
         model,
@@ -486,6 +498,17 @@ def tiled_spatial_inference(
         spacing_um,
         dref_um,
         pooled_d0_by_batch=stats.pooled_scales[0],
+        statistics_by_batch=build_supervoxel_statistics(
+            supervoxels,
+            spatial_inputs,
+            dense.geometry,
+            spacing_um,
+            None,
+            derived=derived,
+            pooled_scales=stats.pooled_scales,
+            pooled_counts=stats.counts_scales,
+        ),
+        derived_cache=derived,
     )
     rag = model.rag_network(rag)
     partition = model.partitioner(
@@ -541,6 +564,7 @@ def stream_tiled_observation_cache(
         d1_projected=temporal.tokens.new_zeros((count, width)),
         d2_projected=temporal.tokens.new_zeros((count, width)),
         hidden_geometry_projected=temporal.tokens.new_zeros((count, width)),
+        explicit_geometry_projected=temporal.tokens.new_zeros((count, width)),
     )
     if temporal.is_empty:
         return cache
@@ -635,6 +659,10 @@ def stream_tiled_observation_cache(
         cache.hidden_geometry_projected[row_index] = (
             local_cache.hidden_geometry_projected
         )
+        if local_cache.explicit_geometry_projected is not None:
+            cache.explicit_geometry_projected[row_index] = (
+                local_cache.explicit_geometry_projected
+            )
     return cache
 
 
@@ -646,8 +674,34 @@ def _spatial_from_streamed_stats(
     geometry,
     supervoxels: List[Tensor],
     stats: StreamedLabelFeatureStats,
+    *,
+    initial_rag: RAGState | None = None,
+    updated_boxes: list[tuple[int, tuple[slice, slice, slice]]] | None = None,
 ) -> tuple[RAGState, PartitionState, InstanceState, SpatialDecodeState]:
     dummy = _dummy_decoded(model, spatial_inputs)
+    if initial_rag is not None and initial_rag.statistics is not None and updated_boxes is not None:
+        statistics, _ = update_supervoxel_statistics_local(
+            initial_rag.statistics,
+            initial_rag.supervoxel_labels,
+            supervoxels,
+            updated_boxes,
+            spatial_inputs,
+            geometry,
+            spacing_um,
+            None,
+            pooled_scales=stats.pooled_scales,
+            pooled_counts=stats.counts_scales,
+        )
+    else:
+        statistics = build_supervoxel_statistics(
+            supervoxels,
+            spatial_inputs,
+            geometry,
+            spacing_um,
+            None,
+            pooled_scales=stats.pooled_scales,
+            pooled_counts=stats.counts_scales,
+        )
     rag = model.rag_builder(
         supervoxels,
         dummy.d0,
@@ -656,6 +710,7 @@ def _spatial_from_streamed_stats(
         spacing_um,
         dref_um,
         pooled_d0_by_batch=stats.pooled_scales[0],
+        statistics_by_batch=statistics,
     )
     rag = model.rag_network(rag)
     partition = model.partitioner(
@@ -817,6 +872,11 @@ def tiled_temporal_inference(
                     partition_update="local",
                     partition_fallback=update.used_fallback,
                     partition_fallback_reason=update.fallback_reason,
+                    local_update_box_count=update.updated_box_count,
+                    local_update_voxel_fraction=(
+                        update.updated_voxel_count
+                        / max(sum(labels.numel() for labels in spatial.supervoxel_labels), 1)
+                    ),
                 )
             else:
                 supervoxels = model.watershed(
@@ -840,6 +900,8 @@ def tiled_temporal_inference(
                 geometry,
                 supervoxels,
                 refined_stats,
+                initial_rag=(spatial.rag if model.cfg.refinement.partition_update == "local" and not update.used_fallback else None),
+                updated_boxes=(update.updated_boxes or [] if model.cfg.refinement.partition_update == "local" and not update.used_fallback else None),
             )
             temporal = model.temporal_observer(
                 temporal_base,
@@ -859,8 +921,9 @@ def tiled_temporal_inference(
         reasoning.final_edge_logits,
         model.cfg.partition.final_merge_threshold,
     )
+    existence_scores = None
     if apply_existence_filter:
-        final_labels, _ = model._filter_by_existence(
+        final_labels, existence_scores = model._filter_by_existence(
             final_partition,
             rag,
             instances,
@@ -869,9 +932,20 @@ def tiled_temporal_inference(
         )
     else:
         final_labels = final_partition.labels
-    centers = centers_from_labels(
-        final_labels, spacing_um, geometry_field(geometry, "sdf")
-    )
+    if rag.statistics is not None:
+        all_centers = centers_from_partition_statistics(final_partition, rag)
+        centers = (
+            [
+                batch_centers[(scores >= model.cfg.instances.exist_threshold)]
+                for batch_centers, scores in zip(all_centers, existence_scores)
+            ]
+            if existence_scores is not None
+            else all_centers
+        )
+    else:
+        centers = centers_from_labels(
+            final_labels, spacing_um, geometry_field(geometry, "sdf")
+        )
     return TiledTemporalResult(
         spatial=spatial,
         geometry=geometry,

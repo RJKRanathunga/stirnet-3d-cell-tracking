@@ -431,6 +431,16 @@ def _run_inference_benchmark(
                         int(labels.max().item())
                         for labels in output.final_labels
                     )
+                    supervoxel_count = sum(
+                        int(labels.max().item()) for labels in output.rag.supervoxel_labels
+                    )
+                    local_update_box_count = (
+                        0 if output.refinement is None else output.refinement.local_update_box_count
+                    )
+                    fallback_count = int(
+                        output.refinement is not None
+                        and output.refinement.partition_fallback
+                    )
                     path = "full_global_pipeline"
                 else:
                     tiled = tiled_temporal_inference(
@@ -450,6 +460,16 @@ def _run_inference_benchmark(
                         int(labels.max().item())
                         for labels in tiled.final_labels
                     )
+                    supervoxel_count = sum(
+                        int(labels.max().item()) for labels in tiled.rag.supervoxel_labels
+                    )
+                    local_update_box_count = (
+                        0 if tiled.refinement is None else tiled.refinement.local_update_box_count
+                    )
+                    fallback_count = int(
+                        tiled.refinement is not None
+                        and tiled.refinement.partition_fallback
+                    )
                     path = "tiled_global_pipeline_streamed_features"
     if trainer.device.type == "cuda":
         torch.cuda.synchronize(trainer.device)
@@ -458,8 +478,15 @@ def _run_inference_benchmark(
         "benchmark": "inference_only",
         "path": path,
         "shape_zyx": output_shape,
+        "voxel_count": int(torch.tensor(output_shape).prod().item()),
+        "backend": trainer.model.cfg.partition.watershed_backend,
         "wall_seconds": elapsed,
+        "total_forward_seconds": elapsed,
         "proposal_count": instance_count,
+        "supervoxel_count": supervoxel_count,
+        "final_instance_count": instance_count,
+        "local_update_box_count": local_update_box_count,
+        "fallback_count": fallback_count,
         "amp_dtype": trainer.training_config.amp_dtype,
         "peak_allocated_mb": 0.0,
         "peak_reserved_mb": 0.0,
@@ -471,6 +498,20 @@ def _run_inference_benchmark(
         result["peak_reserved_mb"] = torch.cuda.max_memory_reserved(
             trainer.device
         ) / (1024**2)
+    summary = trainer.stage_profiler.summary()
+    for output_name, fragments in {
+        "watershed_seconds": ("watershed",),
+        "region_stats_seconds": ("region_stats",),
+        "rag_seconds": ("rag_build", "rag_network"),
+        "tokenizer_seconds": ("tokenizer",),
+        "temporal_seconds": ("temporal",),
+        "refinement_seconds": ("refinement", "refined_"),
+    }.items():
+        result[output_name] = sum(
+            row["elapsed_seconds"]
+            for name, row in summary.items()
+            if any(fragment in name for fragment in fragments)
+        )
     return result
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 from typing import Dict, List, Tuple
 
 import torch
@@ -10,8 +11,11 @@ import torch.nn.functional as F
 from ..config import PartitionConfig, SpatialConfig
 from ..types import (
     GeometryLike,
+    GeometryDerivedCache,
     GeometryState,
     RAGState,
+    SpatialDecodeState,
+    SupervoxelStatistics,
     geometry_field,
     geometry_field_crop,
     geometry_probability,
@@ -23,17 +27,43 @@ from ..utils.tensor_ops import (
     resize_labels_nearest,
 )
 from ..utils.contingency import label_contingency
+from .statistics import (
+    NATIVE_FIELD_ORDER,
+    update_supervoxel_statistics_local,
+)
+
+
+def _profile(profiler, name: str):
+    return nullcontext() if profiler is None else profiler.profile(name)
 
 
 def _adjacent_pairs_and_stats(
     labels: Tensor,
     geometry: GeometryLike,
     batch_index: int,
+    *,
+    derived_cache: GeometryDerivedCache | None = None,
+    stage_profiler=None,
+    profile_prefix: str = "rag",
 ) -> tuple[Tensor, Tensor]:
     """Extract undirected RAG edges and 8 interface features on-device."""
+    with _profile(stage_profiler, f"{profile_prefix}_adjacency_field_gather"):
+        if derived_cache is None:
+            separator_field = geometry_probability(geometry, "separator")[batch_index, 0]
+            surface_field = geometry_probability(geometry, "surface")[batch_index, 0]
+            foreground_field = geometry_probability(geometry, "foreground")[batch_index, 0]
+            sdf_field = geometry_field(geometry, "sdf")[batch_index, 0]
+        else:
+            separator_field = derived_cache.separator_prob[batch_index, 0]
+            surface_field = derived_cache.surface_prob[batch_index, 0]
+            foreground_field = derived_cache.foreground_prob[batch_index, 0]
+            sdf_field = derived_cache.sdf[batch_index, 0]
+        flow_field = geometry_field(geometry, "flow")[batch_index]
+        centroid_field = geometry_field(geometry, "centroid_offset")[batch_index]
     pair_chunks = []
     stat_chunks = []
-    for axis, dim in enumerate((0, 1, 2)):
+    with _profile(stage_profiler, f"{profile_prefix}_adjacency_pair_extract"):
+      for axis, dim in enumerate((0, 1, 2)):
         a_slice = [slice(None)] * 3
         b_slice = [slice(None)] * 3
         a_slice[dim] = slice(0, -1)
@@ -54,29 +84,17 @@ def _adjacent_pairs_and_stats(
             xb = x[tuple(b_slice)][valid]
             return 0.5 * (xa + xb)
 
-        sep = pair_scalar(
-            geometry_probability(geometry, "separator")[batch_index, 0]
-        )
-        surf = pair_scalar(
-            geometry_probability(geometry, "surface")[batch_index, 0]
-        )
-        fg = pair_scalar(
-            geometry_probability(geometry, "foreground")[batch_index, 0]
-        )
-        sdf_abs = pair_scalar(
-            geometry_field(geometry, "sdf")[batch_index, 0].abs()
-        )
+        sep = pair_scalar(separator_field)
+        surf = pair_scalar(surface_field)
+        fg = pair_scalar(foreground_field)
+        sdf_abs = pair_scalar(sdf_field.abs())
 
-        flow = geometry_field(geometry, "flow")[batch_index]
-        fa = flow[:, tuple(a_slice)[0], tuple(a_slice)[1], tuple(a_slice)[2]][:, valid].T
-        fb = flow[:, tuple(b_slice)[0], tuple(b_slice)[1], tuple(b_slice)[2]][:, valid].T
+        fa = flow_field[:, tuple(a_slice)[0], tuple(a_slice)[1], tuple(a_slice)[2]][:, valid].T
+        fb = flow_field[:, tuple(b_slice)[0], tuple(b_slice)[1], tuple(b_slice)[2]][:, valid].T
         flow_disagree = 1.0 - F.cosine_similarity(fa, fb, dim=-1, eps=1e-6)
-        del flow
-        centroid_offset = geometry_field(geometry, "centroid_offset")[batch_index]
-        oa = centroid_offset[:, tuple(a_slice)[0], tuple(a_slice)[1], tuple(a_slice)[2]][:, valid].T
-        ob = centroid_offset[:, tuple(b_slice)[0], tuple(b_slice)[1], tuple(b_slice)[2]][:, valid].T
+        oa = centroid_field[:, tuple(a_slice)[0], tuple(a_slice)[1], tuple(a_slice)[2]][:, valid].T
+        ob = centroid_field[:, tuple(b_slice)[0], tuple(b_slice)[1], tuple(b_slice)[2]][:, valid].T
         offset_disagree = torch.linalg.vector_norm(oa - ob, dim=-1)
-        del centroid_offset
         # Duplicate sep/surface values are aggregated as mean and max later.
         stat_chunks.append(
             torch.stack(
@@ -90,21 +108,23 @@ def _adjacent_pairs_and_stats(
     stats = torch.cat(stat_chunks, dim=0)
     n_nodes = int(labels.max().item())
     packed = pairs[:, 0] * max(n_nodes, 1) + pairs[:, 1]
-    unique, inverse = torch.unique(packed, sorted=True, return_inverse=True)
+    with _profile(stage_profiler, f"{profile_prefix}_edge_pair_unique_or_sort"):
+        order = torch.argsort(packed)
+        packed = packed[order]
+        stats = stats[order]
+        unique, inverse = torch.unique_consecutive(packed, return_inverse=True)
     edge_count = len(unique)
-    means = stats.new_zeros((edge_count, stats.shape[1]))
-    counts = stats.new_zeros((edge_count,))
-    means.index_add_(0, inverse, stats)
-    counts.index_add_(0, inverse, torch.ones_like(inverse, dtype=stats.dtype))
-    means = means / counts.clamp_min(1)[:, None]
-    maxima = stats.new_full((edge_count, 2), -torch.inf)
-    maxima.scatter_reduce_(
-        0,
-        inverse[:, None].expand(-1, 2),
-        stats[:, :2],
-        reduce="amax",
-        include_self=True,
-    )
+    with _profile(stage_profiler, f"{profile_prefix}_edge_reduce"):
+        means = stats.new_zeros((edge_count, stats.shape[1]))
+        counts = stats.new_zeros((edge_count,))
+        means.index_add_(0, inverse, stats)
+        counts.index_add_(0, inverse, torch.ones_like(inverse, dtype=stats.dtype))
+        means = means / counts.clamp_min(1)[:, None]
+        maxima = stats.new_full((edge_count, 2), -torch.inf)
+        maxima.scatter_reduce_(
+            0, inverse[:, None].expand(-1, 2), stats[:, :2],
+            reduce="amax", include_self=True,
+        )
     lo = torch.div(unique, max(n_nodes, 1), rounding_mode="floor")
     hi = unique % max(n_nodes, 1)
     edges = torch.stack([lo, hi], dim=0)
@@ -184,18 +204,190 @@ class RAGBuilder(nn.Module):
             for start, stop in zip(lower.tolist(), upper.tolist())
         )  # type: ignore[return-value]
 
+    def _node_rows_from_statistics(
+        self,
+        statistics: SupervoxelStatistics,
+        reference: Tensor,
+        dref_um: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        counts = statistics.counts.to(reference.dtype)
+        pooled_d0 = project_pooled_mean_max(
+            statistics.scales[0].mean_max, self.node_projection
+        )
+        dense = torch.cat(
+            [
+                torch.stack(
+                    [statistics.field_means(name) for name in NATIVE_FIELD_ORDER], dim=-1
+                ),
+                torch.stack(
+                    [statistics.field_maxima[name] for name in NATIVE_FIELD_ORDER], dim=-1
+                ),
+            ],
+            dim=-1,
+        )
+        centroids = statistics.centroid_um.to(reference.dtype)
+        positive = counts > 0
+        median = counts[positive].median().clamp_min(1) if positive.any() else counts.new_tensor(1)
+        volume = (torch.log1p(counts) - torch.log1p(median))[:, None]
+        nodes = torch.cat(
+            [pooled_d0, dense, centroids / dref_um.clamp_min(1e-6), volume], dim=-1
+        )
+        nodes = torch.where(positive[:, None], nodes, torch.zeros_like(nodes))
+        return nodes, centroids, counts
+
+    def _update_local_cached(
+        self,
+        initial_rag: RAGState,
+        supervoxel_labels: List[Tensor],
+        updated_boxes: List[tuple[int, tuple[slice, slice, slice]]],
+        decoded: SpatialDecodeState,
+        spatial_inputs: Tensor,
+        geometry: GeometryLike,
+        spacing_um: Tensor,
+        dref_um: Tensor,
+    ) -> RAGState:
+        if initial_rag.statistics is None:
+            raise ValueError("cached local update requires initial statistics")
+        statistics, affected_by_batch = update_supervoxel_statistics_local(
+            initial_rag.statistics,
+            initial_rag.supervoxel_labels,
+            supervoxel_labels,
+            updated_boxes,
+            spatial_inputs,
+            geometry,
+            spacing_um,
+            (decoded.d0, decoded.d1, decoded.d2),
+        )
+        boxes_by_batch: dict[int, list[tuple[slice, slice, slice]]] = {}
+        for batch_index, box in updated_boxes:
+            boxes_by_batch.setdefault(batch_index, []).append(box)
+        all_nodes: list[Tensor] = []
+        all_centroids: list[Tensor] = []
+        all_volumes: list[Tensor] = []
+        all_node_batch: list[Tensor] = []
+        all_node_ids: list[Tensor] = []
+        all_edges: list[Tensor] = []
+        all_edge_features: list[Tensor] = []
+        all_edge_batch: list[Tensor] = []
+        offsets = [0]
+        for b, (labels, stats, affected) in enumerate(
+            zip(supervoxel_labels, statistics, affected_by_batch)
+        ):
+            nodes, centroids, volumes = self._node_rows_from_statistics(
+                stats, decoded.d0, dref_um[b]
+            )
+            n = nodes.shape[0]
+            old_start = int(initial_rag.node_offsets[b].item())
+            old_edges = torch.nonzero(initial_rag.edge_batch == b, as_tuple=False).flatten()
+            if old_edges.numel():
+                old_local = initial_rag.edge_index[:, old_edges] - old_start
+                keep = (
+                    (old_local[0] < n)
+                    & (old_local[1] < n)
+                    & ~torch.isin(old_local[0] + 1, affected)
+                    & ~torch.isin(old_local[1] + 1, affected)
+                )
+                edges = old_local[:, keep]
+                edge_features = initial_rag.edge_features[old_edges[keep]]
+            else:
+                edges = labels.new_zeros((2, 0))
+                edge_features = decoded.d0.new_zeros((0, self.edge_feature_dim))
+            if affected.numel():
+                boxes = boxes_by_batch.get(b, [])
+                valid_rows = affected[affected <= stats.counts.shape[0]] - 1
+                valid_rows = valid_rows[stats.counts[valid_rows] > 0]
+                lower = torch.tensor(
+                    [min(int(box[a].start) for box in boxes) for a in range(3)],
+                    device=labels.device,
+                )
+                upper = torch.tensor(
+                    [max(int(box[a].stop) for box in boxes) for a in range(3)],
+                    device=labels.device,
+                )
+                if valid_rows.numel():
+                    lower = torch.minimum(lower, stats.min_voxel[valid_rows].amin(dim=0))
+                    upper = torch.maximum(upper, stats.max_voxel[valid_rows].amax(dim=0) + 1)
+                lower = (lower - 1).clamp_min(0)
+                upper = torch.minimum(
+                    upper + 1, torch.as_tensor(labels.shape, device=labels.device)
+                )
+                box = tuple(slice(int(lower[a]), int(upper[a])) for a in range(3))
+                edge_geometry = GeometryState(
+                    foreground_logits=geometry_field_crop(geometry, "foreground_logits", b, box)[None],
+                    surface_logits=geometry_field_crop(geometry, "surface_logits", b, box)[None],
+                    separator_logits=geometry_field_crop(geometry, "separator_logits", b, box)[None],
+                    sdf=geometry_field_crop(geometry, "sdf", b, box)[None],
+                    flow=geometry_field_crop(geometry, "flow", b, box)[None],
+                    centroid_offset=geometry_field_crop(geometry, "centroid_offset", b, box)[None],
+                    seed_logits=geometry_field_crop(geometry, "seed_logits", b, box)[None],
+                    features=None,
+                )
+                candidate_edges, candidate_features = _adjacent_pairs_and_stats(
+                    labels[box], edge_geometry, 0
+                )
+                incident = (
+                    torch.isin(candidate_edges[0] + 1, affected)
+                    | torch.isin(candidate_edges[1] + 1, affected)
+                )
+                edges = torch.cat([edges, candidate_edges[:, incident]], dim=1)
+                edge_features = torch.cat([edge_features, candidate_features[incident]], dim=0)
+            offset = offsets[-1]
+            if edges.shape[1]:
+                all_edges.append(edges + offset)
+                all_edge_features.append(edge_features)
+                all_edge_batch.append(torch.full((edges.shape[1],), b, device=labels.device, dtype=torch.long))
+            all_nodes.append(nodes)
+            all_centroids.append(centroids)
+            all_volumes.append(volumes)
+            all_node_batch.append(torch.full((n,), b, device=labels.device, dtype=torch.long))
+            all_node_ids.append(torch.arange(1, n + 1, device=labels.device))
+            offsets.append(offset + n)
+        node_features = torch.cat(all_nodes) if all_nodes else decoded.d0.new_zeros((0, self.node_feature_dim))
+        edge_features = torch.cat(all_edge_features) if all_edge_features else decoded.d0.new_zeros((0, self.edge_feature_dim))
+        edge_index = torch.cat(all_edges, dim=1) if all_edges else torch.zeros((2, 0), device=decoded.d0.device, dtype=torch.long)
+        edge_batch = torch.cat(all_edge_batch) if all_edge_batch else torch.zeros((0,), device=decoded.d0.device, dtype=torch.long)
+        return RAGState(
+            node_features=node_features,
+            node_embeddings=decoded.d0.new_zeros((node_features.shape[0], self.cfg.rag_hidden_dim)),
+            node_batch=torch.cat(all_node_batch) if all_node_batch else torch.zeros((0,), device=decoded.d0.device, dtype=torch.long),
+            node_supervoxel_id=torch.cat(all_node_ids) if all_node_ids else torch.zeros((0,), device=decoded.d0.device, dtype=torch.long),
+            node_centroid_um=torch.cat(all_centroids) if all_centroids else decoded.d0.new_zeros((0, 3)),
+            node_volume_voxels=torch.cat(all_volumes) if all_volumes else decoded.d0.new_zeros((0,)),
+            edge_index=edge_index,
+            edge_features=edge_features,
+            edge_embeddings=decoded.d0.new_zeros((edge_features.shape[0], self.cfg.rag_hidden_dim)),
+            spatial_edge_logits=decoded.d0.new_zeros((edge_features.shape[0],)),
+            edge_batch=edge_batch,
+            supervoxel_labels=supervoxel_labels,
+            node_offsets=torch.tensor(offsets, device=decoded.d0.device, dtype=torch.long),
+            statistics=statistics,
+        )
+
     def update_local(
         self,
         initial_rag: RAGState,
         supervoxel_labels: List[Tensor],
         updated_boxes: List[tuple[int, tuple[slice, slice, slice]]],
-        d0: Tensor,
+        d0: Tensor | SpatialDecodeState,
         spatial_inputs: Tensor,
         geometry: GeometryLike,
         spacing_um: Tensor,
         dref_um: Tensor,
     ) -> RAGState:
         """Refresh only nodes/edges incident to locally changed supervoxels."""
+        if initial_rag.statistics is not None and isinstance(d0, SpatialDecodeState):
+            return self._update_local_cached(
+                initial_rag,
+                supervoxel_labels,
+                updated_boxes,
+                d0,
+                spatial_inputs,
+                geometry,
+                spacing_um,
+                dref_um,
+            )
+        if isinstance(d0, SpatialDecodeState):
+            d0 = d0.d0
         boxes_by_batch: dict[int, list[tuple[slice, slice, slice]]] = {}
         for batch_index, box in updated_boxes:
             boxes_by_batch.setdefault(batch_index, []).append(box)
@@ -450,6 +642,10 @@ class RAGBuilder(nn.Module):
         spacing_um: Tensor,
         dref_um: Tensor,
         pooled_d0_by_batch: List[Tensor] | None = None,
+        statistics_by_batch: List[SupervoxelStatistics] | None = None,
+        derived_cache: GeometryDerivedCache | None = None,
+        stage_profiler=None,
+        profile_prefix: str = "rag",
     ) -> RAGState:
         all_nodes = []
         all_centroids = []
@@ -466,7 +662,12 @@ class RAGBuilder(nn.Module):
             if n == 0:
                 node_offsets.append(node_offsets[-1])
                 continue
-            if pooled_d0_by_batch is None:
+            cached_stats = (
+                None if statistics_by_batch is None else statistics_by_batch[b]
+            )
+            if cached_stats is not None:
+                pooled_raw_d0 = cached_stats.scales[0].mean_max
+            elif pooled_d0_by_batch is None:
                 labels_d0 = resize_labels_nearest(labels, tuple(d0.shape[-3:]))
                 pooled_raw_d0, _ = pool_labeled_features(d0[b], labels_d0)
             else:
@@ -481,8 +682,15 @@ class RAGBuilder(nn.Module):
                     ],
                     dim=0,
                 )
-            label_stats = reduce_labeled_voxels(labels, spacing_um[b])
-            counts = label_stats.counts.to(d0.dtype)
+            label_stats = (
+                None if cached_stats is not None
+                else reduce_labeled_voxels(labels, spacing_um[b], need_nearest_centroid=False)
+            )
+            counts = (
+                cached_stats.counts.to(d0.dtype)
+                if cached_stats is not None
+                else label_stats.counts.to(d0.dtype)
+            )
             pooled_d0 = project_pooled_mean_max(
                 pooled_raw_d0, self.node_projection
             )
@@ -495,23 +703,39 @@ class RAGBuilder(nn.Module):
                 pooled_means.append(mean)
                 pooled_maxima.append(maximum)
 
-            append_pooled(spatial_inputs[b, :1])
-            append_pooled(geometry_probability(geometry, "foreground")[b])
-            append_pooled(geometry_probability(geometry, "surface")[b])
-            append_pooled(geometry_probability(geometry, "separator")[b])
-            append_pooled(geometry_field(geometry, "sdf")[b])
-            append_pooled(geometry_field(geometry, "flow")[b])
-            append_pooled(geometry_field(geometry, "centroid_offset")[b])
-            append_pooled(geometry_probability(geometry, "seed")[b])
-            pooled_dense = torch.cat([*pooled_means, *pooled_maxima], dim=-1)
-            pooled_coords = label_stats.centroid_um.to(d0.dtype)
-            volume_feature = torch.log1p(counts)[:, None] - torch.log1p(
-                counts.median().clamp_min(1)
-            )
-            node_feat = torch.cat(
-                [pooled_d0, pooled_dense, pooled_coords / dref_um[b].clamp_min(1e-6), volume_feature],
-                dim=-1,
-            )
+            if cached_stats is not None:
+                pooled_dense = torch.stack(
+                    [cached_stats.field_means(name) for name in NATIVE_FIELD_ORDER], dim=-1
+                )
+                pooled_dense = torch.cat(
+                    [
+                        pooled_dense,
+                        torch.stack(
+                            [cached_stats.field_maxima[name] for name in NATIVE_FIELD_ORDER], dim=-1
+                        ),
+                    ],
+                    dim=-1,
+                )
+                pooled_coords = cached_stats.centroid_um.to(d0.dtype)
+            else:
+                append_pooled(spatial_inputs[b, :1])
+                append_pooled(geometry_probability(geometry, "foreground")[b])
+                append_pooled(geometry_probability(geometry, "surface")[b])
+                append_pooled(geometry_probability(geometry, "separator")[b])
+                append_pooled(geometry_field(geometry, "sdf")[b])
+                append_pooled(geometry_field(geometry, "flow")[b])
+                append_pooled(geometry_field(geometry, "centroid_offset")[b])
+                append_pooled(geometry_probability(geometry, "seed")[b])
+                pooled_dense = torch.cat([*pooled_means, *pooled_maxima], dim=-1)
+                pooled_coords = label_stats.centroid_um.to(d0.dtype)
+            with _profile(stage_profiler, f"{profile_prefix}_node_feature_assembly"):
+                volume_feature = torch.log1p(counts)[:, None] - torch.log1p(
+                    counts.median().clamp_min(1)
+                )
+                node_feat = torch.cat(
+                    [pooled_d0, pooled_dense, pooled_coords / dref_um[b].clamp_min(1e-6), volume_feature],
+                    dim=-1,
+                )
             all_nodes.append(node_feat)
             all_centroids.append(pooled_coords)
             all_volumes.append(counts)
@@ -524,6 +748,9 @@ class RAGBuilder(nn.Module):
                 labels,
                 geometry,
                 b,
+                derived_cache=derived_cache,
+                stage_profiler=stage_profiler,
+                profile_prefix=profile_prefix,
             )
             offset = node_offsets[-1]
             if edge_local.shape[1]:
@@ -583,6 +810,7 @@ class RAGBuilder(nn.Module):
             edge_batch=edge_batch,
             supervoxel_labels=supervoxel_labels,
             node_offsets=torch.tensor(node_offsets, device=device, dtype=torch.long),
+            statistics=statistics_by_batch,
         )
 
 

@@ -9,11 +9,17 @@ from torch import Tensor, nn
 
 from .config import ModelConfig
 from .geometry.decoder import DenseGeometryDecoder
-from .instances.tokenizer import InstanceTokenizer, centers_from_labels
+from .instances.tokenizer import (
+    InstanceTokenizer,
+    centers_from_labels,
+    centers_from_partition_statistics,
+)
+from .geometry.derived import build_geometry_derived_cache
 from .partition.graph_net import SpatialRAGNetwork
 from .partition.local_update import LocalPartitionUpdater
 from .partition.partitioner import GraphPartitioner
 from .partition.rag import RAGBuilder
+from .partition.statistics import build_supervoxel_statistics
 from .partition.watershed import LearnedGeometryWatershed
 from .refinement.local_refiner import LocalGeometryRefiner
 from .refinement.requests import (
@@ -42,6 +48,7 @@ def _profile_stage(stage_profiler, name: str):
     )
 from .types import (
     GeometryState,
+    GeometryDerivedCache,
     GeometryLike,
     GeometryForwardOutput,
     InstanceState,
@@ -189,9 +196,25 @@ class StirNet(nn.Module):
         stage_profiler=None,
         profile_prefix: str = "initial",
     ) -> tuple[RAGState, PartitionState]:
+        with _profile_stage(
+            stage_profiler, f"{profile_prefix}_geometry_probability_prepare"
+        ):
+            derived_cache = build_geometry_derived_cache(
+                geometry,
+                self.cfg.partition,
+                padding_mask=spatial_padding_mask,
+                stage_profiler=stage_profiler,
+                profile_prefix=f"{profile_prefix}_watershed",
+            )
         with _profile_stage(stage_profiler, f"{profile_prefix}_watershed"):
             supervoxels = self.watershed(
-                geometry, spacing_um, dref_um, spatial_padding_mask
+                geometry,
+                spacing_um,
+                dref_um,
+                spatial_padding_mask,
+                derived_cache=derived_cache,
+                stage_profiler=stage_profiler,
+                profile_prefix=f"{profile_prefix}_watershed",
             )
         return self._rag_from_supervoxels(
             supervoxels,
@@ -202,6 +225,7 @@ class StirNet(nn.Module):
             dref_um,
             stage_profiler=stage_profiler,
             profile_prefix=profile_prefix,
+            derived_cache=derived_cache,
         )
 
     def _rag_from_supervoxels(
@@ -215,7 +239,18 @@ class StirNet(nn.Module):
         *,
         stage_profiler=None,
         profile_prefix: str = "initial",
+        derived_cache: GeometryDerivedCache | None = None,
     ) -> tuple[RAGState, PartitionState]:
+        with _profile_stage(stage_profiler, f"{profile_prefix}_region_stats"):
+            statistics = build_supervoxel_statistics(
+                supervoxels,
+                spatial_inputs,
+                geometry,
+                spacing_um,
+                (decoded.d0, decoded.d1, decoded.d2),
+                derived=derived_cache,
+                stage_profiler=stage_profiler,
+            )
         with _profile_stage(stage_profiler, f"{profile_prefix}_rag_build"):
             rag = self.rag_builder(
                 supervoxels,
@@ -224,6 +259,10 @@ class StirNet(nn.Module):
                 geometry,
                 spacing_um,
                 dref_um,
+                statistics_by_batch=statistics,
+                derived_cache=derived_cache,
+                stage_profiler=stage_profiler,
+                profile_prefix=f"{profile_prefix}_rag",
             )
         with _profile_stage(stage_profiler, f"{profile_prefix}_rag_network"):
             rag = self.rag_network(rag)
@@ -467,6 +506,8 @@ class StirNet(nn.Module):
                 initial_geometry,
                 spacing_um,
                 dref_um,
+                stage_profiler=stage_profiler,
+                profile_prefix="initial_tokenizer",
             )
         temporal_data = self._coerce_temporal_input(
             temporal_input,
@@ -590,7 +631,7 @@ class StirNet(nn.Module):
                                 initial_rag,
                                 local_update.supervoxel_labels,
                                 local_update.updated_boxes or [],
-                                decoded.d0,
+                                decoded,
                                 spatial_inputs,
                                 geometry,
                                 spacing_um,
@@ -610,6 +651,11 @@ class StirNet(nn.Module):
                         partition_update="local",
                         partition_fallback=local_update.used_fallback,
                         partition_fallback_reason=local_update.fallback_reason,
+                        local_update_box_count=local_update.updated_box_count,
+                        local_update_voxel_fraction=(
+                            local_update.updated_voxel_count
+                            / max(sum(labels.numel() for labels in initial_rag.supervoxel_labels), 1)
+                        ),
                     )
                 else:
                     with _profile_stage(
@@ -637,6 +683,8 @@ class StirNet(nn.Module):
                         geometry,
                         spacing_um,
                         dref_um,
+                        stage_profiler=stage_profiler,
+                        profile_prefix="refined_tokenizer",
                     )
                 with _profile_stage(
                     stage_profiler, "refined_temporal_observer"
@@ -685,7 +733,18 @@ class StirNet(nn.Module):
                 for label in final_labels
             ]
 
-        centers = centers_from_labels(final_labels, spacing_um, geometry.sdf)
+        if rag.statistics is not None:
+            all_centers = centers_from_partition_statistics(final_partition, rag)
+            centers = (
+                [
+                    batch_centers[(scores >= self.cfg.instances.exist_threshold)]
+                    for batch_centers, scores in zip(all_centers, existence_scores)
+                ]
+                if use_exist
+                else all_centers
+            )
+        else:
+            centers = centers_from_labels(final_labels, spacing_um, geometry.sdf)
         debug: dict[str, Any] | None = None
         if return_debug:
             debug = {
@@ -694,6 +753,12 @@ class StirNet(nn.Module):
                     "supervoxel_partition": "PlantSeg-style learned geometry + RAG",
                     "temporal_fusion": "spatial-read-only then gated RAG/ROI residuals",
                 },
+                "watershed_backend": self.cfg.partition.watershed_backend,
+                "region_stats_backend": "torch",
+                "post_statistics_full_geometry_scan_count": 0,
+                "refined_full_geometry_scan_count": int(
+                    refinement is not None and refinement.partition_fallback
+                ),
                 "initial_supervoxel_count": [
                     int(x.max().item()) for x in initial_rag.supervoxel_labels
                 ],
@@ -726,6 +791,15 @@ class StirNet(nn.Module):
                 ),
                 "refinement_partition_fallback_reason": (
                     "" if refinement is None else refinement.partition_fallback_reason
+                ),
+                "local_update_box_count": (
+                    0 if refinement is None else refinement.local_update_box_count
+                ),
+                "local_update_voxel_fraction": (
+                    0.0 if refinement is None else refinement.local_update_voxel_fraction
+                ),
+                "local_update_fallback_count": int(
+                    refinement is not None and refinement.partition_fallback
                 ),
             }
 

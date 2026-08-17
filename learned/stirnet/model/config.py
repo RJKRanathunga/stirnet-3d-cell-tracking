@@ -72,6 +72,10 @@ class PartitionConfig:
     # This keeps mostly-background supervoxels out of edge supervision while
     # still tolerating imperfect proposal boundaries during early training.
     rag_min_node_gt_support: float = 0.50
+    watershed_backend: str = "fast"
+    region_stats_backend: str = "auto"
+    component_bounded_watershed: bool = True
+    watershed_component_halo_voxels: int = 1
 
 
 @dataclass
@@ -126,7 +130,7 @@ class RefinementConfig:
     recovery_threshold: float = 0.60
     ambiguity_logit_abs_max: float = 0.85
     residual_scale: float = 0.75
-    partition_update: str = "full"
+    partition_update: str = "local"
     partition_halo_dref: float = 1.0
 
 
@@ -173,6 +177,12 @@ class ModelConfig:
             raise ValueError("foreground_threshold must be in (0, 1)")
         if self.partition.max_supervoxels < 1:
             raise ValueError("max_supervoxels must be positive")
+        if self.partition.watershed_backend not in {"reference", "fast"}:
+            raise ValueError("partition.watershed_backend must be 'reference' or 'fast'")
+        if self.partition.region_stats_backend not in {"torch", "auto"}:
+            raise ValueError("partition.region_stats_backend must be 'torch' or 'auto'")
+        if self.partition.watershed_component_halo_voxels < 0:
+            raise ValueError("watershed_component_halo_voxels cannot be negative")
         if self.geometry.sdf_clip_dref <= 0:
             raise ValueError("sdf_clip_dref must be positive")
         if self.geometry.sdf_supervision_radius_dref <= 0:

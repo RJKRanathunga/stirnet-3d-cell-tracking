@@ -60,6 +60,112 @@ class GeometryState:
         }
 
 
+@dataclass(frozen=True)
+class GeometryDerivedCache:
+    """Forward-scoped, non-parameter geometry used by spatial partitioning."""
+
+    foreground_prob: Tensor
+    surface_prob: Tensor
+    separator_prob: Tensor
+    seed_prob: Tensor
+    sdf: Tensor
+    sdf_normalized: Tensor
+    foreground_mask: Tensor
+    seed_score: Tensor
+    watershed_energy: Tensor
+
+
+@dataclass(frozen=True)
+class ScaleFeatureStatistics:
+    counts: Tensor
+    sums: Tensor
+    maxima: Tensor
+
+    @property
+    def means(self) -> Tensor:
+        return self.sums / self.counts.clamp_min(1)[:, None]
+
+    @property
+    def mean_max(self) -> Tensor:
+        return torch.cat([self.means, self.maxima], dim=-1)
+
+
+@dataclass(frozen=True)
+class SupervoxelStatistics:
+    """Sufficient statistics for one batch item's positive supervoxels."""
+
+    volume_shape_zyx: tuple[int, int, int]
+    spacing_um: Tensor
+    counts: Tensor
+    coordinate_sums: Tensor
+    coordinate_square_sums: Tensor
+    min_voxel: Tensor
+    max_voxel: Tensor
+    field_sums: Dict[str, Tensor]
+    field_maxima: Dict[str, Tensor]
+    sdf_argmax_flat_index: Tensor
+    scales: tuple[ScaleFeatureStatistics, ScaleFeatureStatistics, ScaleFeatureStatistics]
+
+    @property
+    def centroid_voxel(self) -> Tensor:
+        return self.coordinate_sums / self.counts.clamp_min(1)[:, None]
+
+    @property
+    def centroid_um(self) -> Tensor:
+        center = 0.5 * (
+            torch.as_tensor(
+                self.volume_shape_zyx,
+                device=self.counts.device,
+                dtype=torch.float32,
+            )
+            - 1
+        )
+        return (self.centroid_voxel - center) * self.spacing_um.float()[None]
+
+    @property
+    def variance_um2(self) -> Tensor:
+        mean = self.centroid_voxel
+        second = self.coordinate_square_sums / self.counts.clamp_min(1)[:, None]
+        return (second - mean.square()).clamp_min(0) * self.spacing_um.float().square()[None]
+
+    def field_means(self, name: str) -> Tensor:
+        return self.field_sums[name] / self.counts.to(self.field_sums[name].dtype).clamp_min(1)
+
+
+@dataclass(frozen=True)
+class AggregatedRegionStatistics:
+    counts: Tensor
+    coordinate_sums: Tensor
+    coordinate_square_sums: Tensor
+    min_voxel: Tensor
+    max_voxel: Tensor
+    field_sums: Dict[str, Tensor]
+    field_maxima: Dict[str, Tensor]
+    sdf_argmax_flat_index: Tensor
+    scales: tuple[ScaleFeatureStatistics, ScaleFeatureStatistics, ScaleFeatureStatistics]
+    volume_shape_zyx: tuple[int, int, int]
+    spacing_um: Tensor
+
+    @property
+    def centroid_voxel(self) -> Tensor:
+        return self.coordinate_sums / self.counts.clamp_min(1)[:, None]
+
+    @property
+    def centroid_um(self) -> Tensor:
+        center = 0.5 * (
+            torch.as_tensor(self.volume_shape_zyx, device=self.counts.device, dtype=torch.float32) - 1
+        )
+        return (self.centroid_voxel - center) * self.spacing_um.float()[None]
+
+    @property
+    def variance_um2(self) -> Tensor:
+        second = self.coordinate_square_sums / self.counts.clamp_min(1)[:, None]
+        return (second - self.centroid_voxel.square()).clamp_min(0) * self.spacing_um.float().square()[None]
+
+    def field_means(self, name: str) -> Tensor:
+        return self.field_sums[name] / self.counts.to(self.field_sums[name].dtype).clamp_min(1)
+
+
 _GEOMETRY_DELTA_CHANNELS = {
     "foreground_logits": slice(0, 1),
     "surface_logits": slice(1, 2),
@@ -258,6 +364,7 @@ class RAGState:
     edge_batch: Tensor
     supervoxel_labels: List[Tensor]
     node_offsets: Tensor
+    statistics: Optional[List[SupervoxelStatistics]] = None
 
     @property
     def is_empty(self) -> bool:
@@ -324,6 +431,7 @@ class SpatialObservationCache:
     d1_projected: Tensor
     d2_projected: Tensor
     hidden_geometry_projected: Tensor
+    explicit_geometry_projected: Optional[Tensor] = None
 
 
 @dataclass
@@ -362,6 +470,8 @@ class RefinementState:
     partition_update: str = "none"
     partition_fallback: bool = False
     partition_fallback_reason: str = ""
+    local_update_box_count: int = 0
+    local_update_voxel_fraction: float = 0.0
 
 
 @dataclass
