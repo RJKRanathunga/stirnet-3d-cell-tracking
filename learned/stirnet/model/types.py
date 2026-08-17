@@ -470,6 +470,18 @@ class RefinementState:
     partition_update: str = "none"
     partition_fallback: bool = False
     partition_fallback_reason: str = ""
+    partition_fallback_reason_code: int = 0
+    partition_fallback_batch_index: int = -1
+    partition_fallback_box_index: int = -1
+    partition_fallback_box_shape_zyx: tuple[int, int, int] | None = None
+    partition_fallback_box_voxel_count: int = 0
+    partition_fallback_core_voxel_count: int = 0
+    partition_fallback_local_component_count: int = 0
+    partition_fallback_old_core_label_count: int = 0
+    partition_fallback_old_shell_label_count: int = 0
+    partition_fallback_conflicting_old_label_ids: List[int] = field(
+        default_factory=list
+    )
     local_update_box_count: int = 0
     local_update_voxel_fraction: float = 0.0
 

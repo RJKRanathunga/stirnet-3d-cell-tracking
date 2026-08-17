@@ -145,6 +145,63 @@ def _group_gradient_norms(model: StirNet) -> dict[str, float]:
     return result
 
 
+def _refinement_fallback_metrics(output, reference: torch.Tensor) -> dict[str, torch.Tensor]:
+    refinement = getattr(output, "refinement", None)
+    if refinement is None:
+        values = {
+            "refinement_partition_fallback": 0.0,
+            "refinement_partition_fallback_reason_code": 0.0,
+            "refinement_partition_fallback_batch_index": -1.0,
+            "refinement_partition_fallback_box_index": -1.0,
+            "refinement_partition_fallback_box_voxels": 0.0,
+            "refinement_partition_fallback_core_voxels": 0.0,
+            "refinement_partition_fallback_local_components": 0.0,
+            "refinement_partition_fallback_old_core_labels": 0.0,
+            "refinement_partition_fallback_old_shell_labels": 0.0,
+            "refinement_partition_fallback_conflicting_old_labels": 0.0,
+            "refinement_local_update_box_count": 0.0,
+            "refinement_local_update_voxel_fraction": 0.0,
+        }
+    else:
+        values = {
+            "refinement_partition_fallback": float(refinement.partition_fallback),
+            "refinement_partition_fallback_reason_code": float(
+                refinement.partition_fallback_reason_code
+            ),
+            "refinement_partition_fallback_batch_index": float(
+                refinement.partition_fallback_batch_index
+            ),
+            "refinement_partition_fallback_box_index": float(
+                refinement.partition_fallback_box_index
+            ),
+            "refinement_partition_fallback_box_voxels": float(
+                refinement.partition_fallback_box_voxel_count
+            ),
+            "refinement_partition_fallback_core_voxels": float(
+                refinement.partition_fallback_core_voxel_count
+            ),
+            "refinement_partition_fallback_local_components": float(
+                refinement.partition_fallback_local_component_count
+            ),
+            "refinement_partition_fallback_old_core_labels": float(
+                refinement.partition_fallback_old_core_label_count
+            ),
+            "refinement_partition_fallback_old_shell_labels": float(
+                refinement.partition_fallback_old_shell_label_count
+            ),
+            "refinement_partition_fallback_conflicting_old_labels": float(
+                len(refinement.partition_fallback_conflicting_old_label_ids)
+            ),
+            "refinement_local_update_box_count": float(
+                refinement.local_update_box_count
+            ),
+            "refinement_local_update_voxel_fraction": float(
+                refinement.local_update_voxel_fraction
+            ),
+        }
+    return {key: reference.new_tensor(value) for key, value in values.items()}
+
+
 class Trainer:
     def __init__(
         self,
@@ -479,6 +536,9 @@ class Trainer:
         monolithic_reference = phase_b_metrics["loss"].detach()
         reported = {key: value for key, value in phase_b_metrics.items()}
         reported.update(
+            _refinement_fallback_metrics(refined_output, phase_b_loss.detach())
+        )
+        reported.update(
             {
                 "loss": combined,
                 "split_phase_a_loss": phase_a_loss.detach(),
@@ -800,6 +860,7 @@ class Trainer:
         reported["phase_b_refined_local_geometry_loss"] = metrics[
             "geometry_loss"
         ].detach()
+        reported.update(_refinement_fallback_metrics(output, loss.detach()))
         del output, metrics, local_geometry
         return reported, {
             "phase_b_forward_seconds": forward_seconds,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import List
 
 import torch
@@ -21,9 +22,87 @@ class LocalPartitionUpdateResult:
     supervoxel_labels: List[Tensor]
     used_fallback: bool
     fallback_reason: str = ""
+    fallback_reason_code: int = 0
+    fallback_batch_index: int = -1
+    fallback_box_index: int = -1
+    fallback_box_shape_zyx: tuple[int, int, int] | None = None
+    fallback_box_voxel_count: int = 0
+    fallback_core_voxel_count: int = 0
+    fallback_local_component_count: int = 0
+    fallback_old_core_label_count: int = 0
+    fallback_old_shell_label_count: int = 0
+    fallback_conflicting_old_label_ids: List[int] | None = None
     updated_box_count: int = 0
     updated_boxes: List[tuple[int, tuple[slice, slice, slice]]] | None = None
     updated_voxel_count: int = 0
+
+
+_FALLBACK_REASON_CODES = {
+    "": 0,
+    "no sparse delta": 1,
+    "local component touches multiple external labels": 2,
+    "unowned component touches halo boundary": 3,
+    "local component would merge existing labels": 4,
+    "split components reconnect through an external label": 5,
+}
+
+
+def _positive_ids(value: Tensor) -> list[int]:
+    ids = torch.unique(value)
+    ids = ids[ids > 0]
+    return [int(item) for item in ids.detach().cpu().tolist()]
+
+
+def _fallback_context(
+    global_labels: Tensor,
+    local_labels: Tensor,
+    box: tuple[slice, slice, slice],
+    core_mask: Tensor,
+    reason: str,
+) -> dict[str, object]:
+    old_crop = global_labels[box]
+    shell = ~core_mask
+    local_ids = _positive_ids(local_labels[core_mask])
+    old_core_ids = _positive_ids(old_crop[core_mask])
+    old_shell_ids = _positive_ids(old_crop[shell])
+
+    conflicting_old_ids: list[int] = []
+    if reason == "local component touches multiple external labels":
+        for local_id in local_ids:
+            component = local_labels == local_id
+            owners = _positive_ids(old_crop[component & shell])
+            if len(owners) > 1:
+                conflicting_old_ids = owners
+                break
+    elif reason == "local component would merge existing labels":
+        for local_id in local_ids:
+            component = local_labels == local_id
+            owners = _positive_ids(old_crop[component & core_mask])
+            if len(owners) > 1:
+                conflicting_old_ids = owners
+                break
+    elif reason == "split components reconnect through an external label":
+        owner_to_local: dict[int, list[int]] = {}
+        for local_id in local_ids:
+            component = local_labels == local_id
+            owners = _positive_ids(old_crop[component & shell])
+            if len(owners) == 1:
+                owner_to_local.setdefault(owners[0], []).append(local_id)
+        for owner, members in owner_to_local.items():
+            if len(members) > 1:
+                conflicting_old_ids = [owner]
+                break
+
+    box_shape = tuple(int(axis.stop) - int(axis.start) for axis in box)
+    return {
+        "box_shape_zyx": box_shape,
+        "box_voxel_count": int(box_shape[0] * box_shape[1] * box_shape[2]),
+        "core_voxel_count": int(core_mask.sum().item()),
+        "local_component_count": len(local_ids),
+        "old_core_label_count": len(old_core_ids),
+        "old_shell_label_count": len(old_shell_ids),
+        "conflicting_old_label_ids": conflicting_old_ids,
+    }
 
 
 def _boxes_touch(
@@ -172,13 +251,62 @@ class LocalPartitionUpdater(nn.Module):
         dref_um: Tensor,
         padding_mask: Tensor | None,
         reason: str,
+        *,
+        batch_index: int = -1,
+        box_index: int = -1,
+        context: dict[str, object] | None = None,
+        updated_box_count: int = 0,
+        updated_voxel_count: int = 0,
     ) -> LocalPartitionUpdateResult:
+        context = {} if context is None else context
+        reason_code = _FALLBACK_REASON_CODES.get(reason, 99)
+        event = {
+            "event": "local_partition_fallback",
+            "reason": reason,
+            "reason_code": reason_code,
+            "batch_index": int(batch_index),
+            "box_index": int(box_index),
+            "box_shape_zyx": context.get("box_shape_zyx"),
+            "box_voxel_count": int(context.get("box_voxel_count", 0)),
+            "core_voxel_count": int(context.get("core_voxel_count", 0)),
+            "local_component_count": int(context.get("local_component_count", 0)),
+            "old_core_label_count": int(context.get("old_core_label_count", 0)),
+            "old_shell_label_count": int(context.get("old_shell_label_count", 0)),
+            "conflicting_old_label_ids": list(
+                context.get("conflicting_old_label_ids", [])
+            ),
+        }
+        print(
+            "[stirnet-local-partition-fallback] "
+            + json.dumps(event, sort_keys=True),
+            flush=True,
+        )
         return LocalPartitionUpdateResult(
             supervoxel_labels=self.watershed(
                 geometry, spacing_um, dref_um, padding_mask
             ),
             used_fallback=True,
             fallback_reason=reason,
+            fallback_reason_code=reason_code,
+            fallback_batch_index=int(batch_index),
+            fallback_box_index=int(box_index),
+            fallback_box_shape_zyx=context.get("box_shape_zyx"),
+            fallback_box_voxel_count=int(context.get("box_voxel_count", 0)),
+            fallback_core_voxel_count=int(context.get("core_voxel_count", 0)),
+            fallback_local_component_count=int(
+                context.get("local_component_count", 0)
+            ),
+            fallback_old_core_label_count=int(
+                context.get("old_core_label_count", 0)
+            ),
+            fallback_old_shell_label_count=int(
+                context.get("old_shell_label_count", 0)
+            ),
+            fallback_conflicting_old_label_ids=list(
+                context.get("conflicting_old_label_ids", [])
+            ),
+            updated_box_count=int(updated_box_count),
+            updated_voxel_count=int(updated_voxel_count),
         )
 
     @torch.no_grad()
@@ -228,7 +356,7 @@ class LocalPartitionUpdater(nn.Module):
             updated_boxes.extend((batch_index, box) for box in boxes)
             updated = output[batch_index]
             next_label_id = int(base.max().item()) + 1
-            for box in boxes:
+            for box_index, box in enumerate(boxes):
                 shape = tuple(int(axis.stop) - int(axis.start) for axis in box)
                 core_mask = torch.zeros(shape, device=base.device, dtype=torch.bool)
                 for roi in rois:
@@ -289,12 +417,24 @@ class LocalPartitionUpdater(nn.Module):
                     next_label_id=next_label_id,
                 )
                 if reconciled is None:
+                    context = _fallback_context(
+                        updated,
+                        local_labels,
+                        box,
+                        core_mask,
+                        reason,
+                    )
                     return self._fallback(
                         geometry,
                         spacing_um,
                         dref_um,
                         padding_mask,
                         reason,
+                        batch_index=batch_index,
+                        box_index=box_index,
+                        context=context,
+                        updated_box_count=total_boxes,
+                        updated_voxel_count=updated_voxels,
                     )
                 updated = reconciled
                 updated_voxels += int(core_mask.sum().item())

@@ -651,6 +651,36 @@ class StirNet(nn.Module):
                         partition_update="local",
                         partition_fallback=local_update.used_fallback,
                         partition_fallback_reason=local_update.fallback_reason,
+                        partition_fallback_reason_code=(
+                            local_update.fallback_reason_code
+                        ),
+                        partition_fallback_batch_index=(
+                            local_update.fallback_batch_index
+                        ),
+                        partition_fallback_box_index=(
+                            local_update.fallback_box_index
+                        ),
+                        partition_fallback_box_shape_zyx=(
+                            local_update.fallback_box_shape_zyx
+                        ),
+                        partition_fallback_box_voxel_count=(
+                            local_update.fallback_box_voxel_count
+                        ),
+                        partition_fallback_core_voxel_count=(
+                            local_update.fallback_core_voxel_count
+                        ),
+                        partition_fallback_local_component_count=(
+                            local_update.fallback_local_component_count
+                        ),
+                        partition_fallback_old_core_label_count=(
+                            local_update.fallback_old_core_label_count
+                        ),
+                        partition_fallback_old_shell_label_count=(
+                            local_update.fallback_old_shell_label_count
+                        ),
+                        partition_fallback_conflicting_old_label_ids=(
+                            local_update.fallback_conflicting_old_label_ids or []
+                        ),
                         local_update_box_count=local_update.updated_box_count,
                         local_update_voxel_fraction=(
                             local_update.updated_voxel_count
