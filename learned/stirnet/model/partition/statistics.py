@@ -109,6 +109,177 @@ def _pad_rows(value: Tensor, rows: int, fill: float = 0.0) -> Tensor:
     return torch.cat([value, value.new_full(shape, fill)], dim=0)
 
 
+# Adaptive exact region-local pooling for large feature maps.
+# The existing dense scatter reducer is retained as a fallback.
+_BBOX_POOL_MAX_REGIONS = 512
+_BBOX_POOL_MAX_VOLUME_RATIO = 16.0
+
+
+def _active_region_boxes(
+    counts: Tensor,
+    min_voxel: Tensor,
+    max_voxel: Tensor,
+) -> list[tuple[int, tuple[int, int, int], tuple[int, int, int]]]:
+    if counts.numel() == 0:
+        return []
+    counts_cpu = counts.detach().cpu().tolist()
+    bounds_cpu = torch.cat([min_voxel, max_voxel], dim=-1).detach().cpu().tolist()
+    result = []
+    for row, count in enumerate(counts_cpu):
+        if float(count) <= 0.0:
+            continue
+        values = bounds_cpu[row]
+        result.append(
+            (
+                row,
+                (int(values[0]), int(values[1]), int(values[2])),
+                (int(values[3]), int(values[4]), int(values[5])),
+            )
+        )
+    return result
+
+
+def _map_region_boxes_to_scale(
+    native_boxes: Sequence[
+        tuple[int, tuple[int, int, int], tuple[int, int, int]]
+    ],
+    source_shape: tuple[int, int, int],
+    target_shape: tuple[int, int, int],
+) -> tuple[
+    list[tuple[int, tuple[int, int, int], tuple[int, int, int]]],
+    float,
+]:
+    # PyTorch nearest resize maps target index j to floor(j*S/T).
+    # For native source interval [lo, hi], the exact target half-open interval is
+    # [ceil(lo*T/S), ceil((hi+1)*T/S)).
+    mapped = []
+    total_bbox_voxels = 0
+    for row, native_lower, native_upper in native_boxes:
+        starts = []
+        stops = []
+        valid = True
+        for axis in range(3):
+            source_size = int(source_shape[axis])
+            target_size = int(target_shape[axis])
+            lo = int(native_lower[axis])
+            hi = int(native_upper[axis])
+            start = (lo * target_size + source_size - 1) // source_size
+            stop = ((hi + 1) * target_size + source_size - 1) // source_size
+            start = max(0, min(start, target_size))
+            stop = max(0, min(stop, target_size))
+            if stop <= start:
+                valid = False
+                break
+            starts.append(start)
+            stops.append(stop)
+        if not valid:
+            continue
+        lower = (starts[0], starts[1], starts[2])
+        upper = (stops[0], stops[1], stops[2])
+        total_bbox_voxels += (
+            (upper[0] - lower[0])
+            * (upper[1] - lower[1])
+            * (upper[2] - lower[2])
+        )
+        mapped.append((row, lower, upper))
+
+    target_voxels = max(
+        int(target_shape[0]) * int(target_shape[1]) * int(target_shape[2]), 1
+    )
+    return mapped, float(total_bbox_voxels) / float(target_voxels)
+
+
+def _scale_statistics_bounded(
+    feature: Tensor,
+    labels: Tensor,
+    rows: int,
+    mapped_boxes: Sequence[
+        tuple[int, tuple[int, int, int], tuple[int, int, int]]
+    ],
+    *,
+    known_counts: Tensor | None = None,
+) -> ScaleFeatureStatistics:
+    if feature.ndim != 4 or labels.ndim != 3:
+        raise ValueError('feature must be [C,Z,Y,X] and labels [Z,Y,X]')
+    if tuple(feature.shape[-3:]) != tuple(labels.shape):
+        raise ValueError('feature and labels must have matching spatial shapes')
+
+    channels = int(feature.shape[0])
+    counts = feature.new_zeros((rows,))
+    sums = feature.new_zeros((rows, channels))
+    maxima = feature.new_full((rows, channels), -torch.inf)
+
+    if known_counts is not None:
+        copy_rows = min(rows, int(known_counts.shape[0]))
+        counts[:copy_rows] = known_counts[:copy_rows].to(
+            device=feature.device, dtype=feature.dtype
+        )
+
+    for row, lower, upper in mapped_boxes:
+        z0, y0, x0 = lower
+        z1, y1, x1 = upper
+        label_crop = labels[z0:z1, y0:y1, x0:x1]
+        feature_crop = feature[:, z0:z1, y0:y1, x0:x1]
+        mask = label_crop == (row + 1)
+        mask4 = mask.unsqueeze(0)
+
+        if known_counts is None:
+            counts[row] = mask.sum().to(feature.dtype)
+
+        sums[row] = (
+            feature_crop.masked_fill(~mask4, 0)
+            .sum(dim=(1, 2, 3), dtype=torch.float32)
+            .to(feature.dtype)
+        )
+        maxima[row] = feature_crop.masked_fill(~mask4, -torch.inf).amax(
+            dim=(1, 2, 3)
+        )
+
+    maxima = torch.where(torch.isfinite(maxima), maxima, torch.zeros_like(maxima))
+    return ScaleFeatureStatistics(counts=counts, sums=sums, maxima=maxima)
+
+
+def _scale_statistics_adaptive(
+    feature: Tensor,
+    labels: Tensor,
+    rows: int,
+    native_boxes: Sequence[
+        tuple[int, tuple[int, int, int], tuple[int, int, int]]
+    ],
+    source_shape: tuple[int, int, int],
+    *,
+    native_counts: Tensor | None = None,
+) -> ScaleFeatureStatistics:
+    target_shape = tuple(int(v) for v in feature.shape[-3:])
+    mapped_boxes, bbox_ratio = _map_region_boxes_to_scale(
+        native_boxes, source_shape, target_shape
+    )
+
+    use_bounded = (
+        len(native_boxes) <= _BBOX_POOL_MAX_REGIONS
+        and bbox_ratio <= _BBOX_POOL_MAX_VOLUME_RATIO
+    )
+    if use_bounded:
+        return _scale_statistics_bounded(
+            feature,
+            labels,
+            rows,
+            mapped_boxes,
+            known_counts=(
+                native_counts
+                if target_shape == source_shape and native_counts is not None
+                else None
+            ),
+        )
+
+    dense = _scale_statistics(feature, labels)
+    return ScaleFeatureStatistics(
+        counts=_pad_rows(dense.counts, rows),
+        sums=_pad_rows(dense.sums, rows),
+        maxima=_pad_rows(dense.maxima, rows),
+    )
+
+
 def build_supervoxel_statistics(
     labels_by_batch: Sequence[Tensor],
     spatial_inputs: Tensor,
@@ -136,6 +307,10 @@ def build_supervoxel_statistics(
                 need_nearest_centroid=False,
             )
         n = reduced.counts.shape[0]
+        native_boxes = _active_region_boxes(
+            reduced.counts, reduced.min_voxel, reduced.max_voxel
+        )
+        source_shape = tuple(int(v) for v in labels.shape)
         scales: list[ScaleFeatureStatistics] = []
         for scale in range(3):
             if pooled_scales is not None:
@@ -155,9 +330,20 @@ def build_supervoxel_statistics(
                 )
             elif scale_features is not None:
                 feature = scale_features[scale][batch_index]
-                scaled_labels = resize_labels_nearest(labels, tuple(feature.shape[-3:]))
+                scaled_labels = resize_labels_nearest(
+                    labels, tuple(feature.shape[-3:])
+                )
                 with _profile(stage_profiler, f"node_D{scale}_stats"):
-                    scales.append(_scale_statistics(feature, scaled_labels))
+                    scales.append(
+                        _scale_statistics_adaptive(
+                            feature,
+                            scaled_labels,
+                            n,
+                            native_boxes,
+                            source_shape,
+                            native_counts=reduced.counts,
+                        )
+                    )
             else:
                 raise ValueError("scale_features or pooled_scales must be supplied")
         if reduced.argmax_flat_index is None:
