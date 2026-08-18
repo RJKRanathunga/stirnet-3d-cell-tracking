@@ -41,6 +41,11 @@ class GeometryConfig:
     separator_pos_weight: float = 10.0
     surface_target_sigma_um: float = 0.75
     separator_target_sigma_um: float = 0.50
+    # GT defines object identity; current/noisy instances define where an
+    # under-segmentation correction sheet is required.
+    separator_source_conditioned: bool = True
+    separator_source_min_overlap_voxels: int = 8
+    separator_source_min_gt_fraction: float = 0.05
     surface_dice_weight: float = 1.0
     separator_dice_weight: float = 1.0
     seed_pos_weight: float = 4.0
@@ -191,6 +196,14 @@ class ModelConfig:
             raise ValueError("surface_target_sigma_um must be positive")
         if self.geometry.separator_target_sigma_um <= 0:
             raise ValueError("separator_target_sigma_um must be positive")
+        if self.geometry.separator_source_min_overlap_voxels < 1:
+            raise ValueError(
+                "separator_source_min_overlap_voxels must be positive"
+            )
+        if not 0.0 <= self.geometry.separator_source_min_gt_fraction <= 1.0:
+            raise ValueError(
+                "separator_source_min_gt_fraction must be in [0, 1]"
+            )
         if not 0.0 <= self.partition.rag_min_node_purity <= 1.0:
             raise ValueError("rag_min_node_purity must be in [0, 1]")
         if not 0.0 <= self.partition.rag_min_node_gt_support <= 1.0:

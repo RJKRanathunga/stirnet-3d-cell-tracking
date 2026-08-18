@@ -303,6 +303,7 @@ class Trainer:
                 labels,
                 batch["spacing_um"],
                 batch["dref_um"],
+                current_labels=batch.get("instance_labels"),
                 device=torch.device("cpu"),
             )
 
@@ -365,6 +366,7 @@ class Trainer:
                 batch["spacing_um"],
                 batch["dref_um"],
                 stage=self.curriculum_stage.name,
+                current_labels=batch.get("instance_labels"),
                 precomputed_geometry_targets=precomputed_geometry_targets,
                 precomputed_discrete_targets=(
                     discrete_target_cache if discrete_target_cache else None
@@ -424,6 +426,7 @@ class Trainer:
                     batch["spacing_um"],
                     batch["dref_um"],
                     stage="refinement_joint",
+                    current_labels=batch.get("instance_labels"),
                     precomputed_geometry_targets=precomputed_geometry_targets,
                 )
             phase_a_loss = self.criterion.refinement_phase_a_objective(
@@ -505,6 +508,7 @@ class Trainer:
                     batch["spacing_um"],
                     batch["dref_um"],
                     stage="refinement_joint",
+                    current_labels=batch.get("instance_labels"),
                     precomputed_geometry_targets=precomputed_geometry_targets,
                     precomputed_discrete_targets=(
                         discrete_target_cache if discrete_target_cache else None

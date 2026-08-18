@@ -342,6 +342,7 @@ class StirNetCriterion(nn.Module):
         spacing_um: Tensor,
         dref_um: Tensor,
         *,
+        current_labels: Tensor | None = None,
         device: torch.device | None = None,
     ) -> GeometryTargets:
         geometry_cfg = self.model_config.geometry
@@ -349,10 +350,22 @@ class StirNetCriterion(nn.Module):
             gt_labels.detach().cpu().long(),
             spacing_um.detach().cpu(),
             dref_um.detach().cpu(),
+            current_labels=(
+                None
+                if current_labels is None
+                else current_labels.detach().cpu().long()
+            ),
             sdf_clip_dref=geometry_cfg.sdf_clip_dref,
             sdf_supervision_radius_dref=geometry_cfg.sdf_supervision_radius_dref,
             surface_target_sigma_um=geometry_cfg.surface_target_sigma_um,
             separator_target_sigma_um=geometry_cfg.separator_target_sigma_um,
+            separator_source_conditioned=geometry_cfg.separator_source_conditioned,
+            separator_source_min_overlap_voxels=(
+                geometry_cfg.separator_source_min_overlap_voxels
+            ),
+            separator_source_min_gt_fraction=(
+                geometry_cfg.separator_source_min_gt_fraction
+            ),
             device=device,
         )
 
@@ -508,6 +521,7 @@ class StirNetCriterion(nn.Module):
         dref_um: Tensor,
         *,
         stage: str = "refinement_joint",
+        current_labels: Tensor | None = None,
         precomputed_geometry_targets: GeometryTargets | None = None,
         precomputed_discrete_targets: dict[str, object] | None = None,
         geometry_losses_override: dict[str, Tensor] | None = None,
@@ -530,7 +544,11 @@ class StirNetCriterion(nn.Module):
         if geometry_losses_override is None:
             geometry_target = (
                 self.build_geometry_targets(
-                    gt_labels, spacing_um, dref_um, device=device
+                    gt_labels,
+                    spacing_um,
+                    dref_um,
+                    current_labels=current_labels,
+                    device=device,
                 )
                 if precomputed_geometry_targets is None
                 else precomputed_geometry_targets.to(device)

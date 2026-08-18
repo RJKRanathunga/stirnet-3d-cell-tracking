@@ -6,7 +6,10 @@ from typing import Dict, List
 import torch
 from torch import Tensor
 
-from ..model.geometry.targets import GeometryTargets
+from ..model.geometry.targets import (
+    GeometryTargets,
+    build_source_conditioned_separator_interface,
+)
 from ..model.utils.tensor_ops import reduce_labeled_voxels
 
 
@@ -75,6 +78,28 @@ def _interface_candidates(labels: Tensor) -> Tensor:
             # low-side bias while retaining integer crop centres.
             points[1::2, axis] += 1
             rows.append(points)
+    if not rows:
+        return labels.new_zeros((0, 3)).cpu()
+    return _bounded_candidates(torch.cat(rows, dim=0))
+
+
+
+def _source_conditioned_interface_candidates(
+    labels: Tensor,
+    current_labels: Tensor,
+    spacing_um: Tensor,
+) -> Tensor:
+    """Sample both direct GT contacts and current-source corrective sheets."""
+    direct = _interface_candidates(labels)
+    corrective_mask = build_source_conditioned_separator_interface(
+        labels.detach().cpu().numpy(),
+        current_labels.detach().cpu().numpy(),
+        spacing_um.detach().cpu().numpy(),
+    )
+    corrective = torch.nonzero(
+        torch.from_numpy(corrective_mask), as_tuple=False
+    ).long()
+    rows = [row for row in (direct, corrective) if row.numel()]
     if not rows:
         return labels.new_zeros((0, 3)).cpu()
     return _bounded_candidates(torch.cat(rows, dim=0))
@@ -212,7 +237,11 @@ def build_crop_candidate_cache(
             spacing_um[batch_index],
             dref_um[batch_index],
         )
-        rows["separator"] = _interface_candidates(gt)
+        rows["separator"] = _source_conditioned_interface_candidates(
+            gt,
+            current,
+            spacing_um[batch_index],
+        )
         rows["disagreement"] = _disagreement_candidates(gt, current)
         rows["background"] = _background_candidates(gt)
         rows["random"] = gt.new_zeros((0, 3)).cpu()
