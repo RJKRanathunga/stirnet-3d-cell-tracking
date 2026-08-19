@@ -57,8 +57,25 @@ class GeometryConfig:
     # Explicitly supervise the norm of the foreground EDT-gradient flow.
     flow_magnitude_weight: float = 1.0
 
+    """
+    Cross-geometry regularizers are intentionally disabled for the current
+    STIR-Net training objective.
+
+    Stage-02 diagnostics showed that prediction-to-prediction flow/SDF
+    consistency caused severe shared-trunk interference and catastrophic
+    degradation of otherwise well-learned dense geometry.
+
+    Eikonal regularization was stable in isolation, but did not demonstrate
+    a clear net benefit over direct joint supervision: it improved surface
+    Dice while slightly degrading several other geometry outputs despite
+    additional optimization steps.
+
+    The implementations are retained so these regularizers can be revisited
+    later if downstream watershed, partitioning, or generalization results
+    show a concrete need for them.
+    """
     consistency_weight: float = 0.0
-    eikonal_weight: float = 0.10
+    eikonal_weight: float = 0.0
 
 
 @dataclass
