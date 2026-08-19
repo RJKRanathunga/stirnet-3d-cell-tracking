@@ -87,9 +87,11 @@ PASS_THRESHOLDS = {
         "sdf_sign_accuracy_min": 0.98,
     },
     "flow": {
-        "flow_cosine_min": 0.90,
-        "flow_angle_median_deg_max": 25.0,
-        "flow_l1_max": 0.16,
+        "flow_cosine_min": 0.97,
+        "flow_angle_median_deg_max": 10.0,
+        "flow_angle_p90_deg_max": 20.0,
+        "flow_l1_max": 0.10,
+        "flow_magnitude_mae_max": 0.10,
     },
     "center": {
         "centroid_endpoint_median_um_max": 1.50,
@@ -515,6 +517,43 @@ def collect_metrics(pred, target: dict[str, Tensor], dref_um: Tensor) -> dict[st
     m["flow_angle_p90_deg"] = float(torch.quantile(angle, 0.90).item())
     m["flow_l1"] = float((pred.flow[fg3] - target["flow"][fg3]).abs().mean().item())
 
+    # Flow-magnitude fidelity. Cosine similarity alone cannot detect a
+    # prediction that points in the right direction but is too short/long.
+    pred_mag = torch.linalg.vector_norm(
+        pred.flow.float(),
+        dim=1,
+        keepdim=True,
+    )
+    target_mag = torch.linalg.vector_norm(
+        target["flow"].float(),
+        dim=1,
+        keepdim=True,
+    )
+
+    valid_mag = fg & (target_mag > 0.1)
+
+    if valid_mag.any():
+        m["flow_magnitude_mae"] = float(
+            (
+                pred_mag[valid_mag]
+                - target_mag[valid_mag]
+            )
+            .abs()
+            .mean()
+            .item()
+        )
+
+        m["flow_magnitude_mean_pred"] = float(
+            pred_mag[valid_mag].mean().item()
+        )
+        m["flow_magnitude_mean_target"] = float(
+            target_mag[valid_mag].mean().item()
+        )
+    else:
+        m["flow_magnitude_mae"] = float("nan")
+        m["flow_magnitude_mean_pred"] = float("nan")
+        m["flow_magnitude_mean_target"] = float("nan")
+
     endpoint_um = torch.linalg.vector_norm(
         pred.centroid_offset.float() - target["centroid_offset"].float(),
         dim=1,
@@ -556,7 +595,15 @@ _STAGE_METRICS = {
         "separator_dice", "separator_soft_dice", "separator_precision", "separator_recall",
     ),
     "sdf": ("sdf_mae", "sdf_rmse", "sdf_corr", "sdf_sign_accuracy"),
-    "flow": ("flow_cosine", "flow_angle_median_deg", "flow_angle_p90_deg", "flow_l1"),
+    "flow": (
+        "flow_cosine",
+        "flow_angle_median_deg",
+        "flow_angle_p90_deg",
+        "flow_l1",
+        "flow_magnitude_mae",
+        "flow_magnitude_mean_pred",
+        "flow_magnitude_mean_target",
+    ),
     "center": (
         "centroid_endpoint_mean_um", "centroid_endpoint_median_um", "centroid_endpoint_p95_um",
         "seed_mae_foreground", "seed_corr_foreground",
@@ -1046,8 +1093,36 @@ def visualize_latest(mode: str, sample_path: Path, result_dir: Path) -> None:
         pd = pf / np.maximum(pn[None], 1e-6)
         angle = np.rad2deg(np.arccos(np.clip(np.sum(td * pd, axis=0), -1, 1)))
         angle[~fg] = 0
-        viewer.add_image(tn, name="30 Target — flow magnitude", colormap="viridis", scale=scale, visible=False)
-        viewer.add_image(pn, name="31 Pred — flow magnitude", colormap="viridis", scale=scale, visible=False)
+        viewer.add_image(
+            tn,
+            name="30 Target — flow magnitude",
+            colormap="viridis",
+            contrast_limits=(0.0, 1.0),
+            scale=scale,
+            visible=False,
+        )
+
+        viewer.add_image(
+            pn,
+            name="31 Pred — flow magnitude",
+            colormap="viridis",
+            contrast_limits=(0.0, 1.0),
+            scale=scale,
+            visible=False,
+        )
+
+        magnitude_error = np.abs(pn - tn)
+        magnitude_error[~fg] = 0.0
+
+        viewer.add_image(
+            magnitude_error,
+            name="32 Error — flow magnitude",
+            colormap="magma",
+            contrast_limits=(0.0, 0.5),
+            scale=scale,
+            visible=False,
+        )
+
         viewer.add_image(angle, name="32 Error — flow angle (deg)", colormap="magma", contrast_limits=(0, 180), scale=scale, visible=(mode == "flow"))
         tv = sample_vectors(tf, fg, spacing, physical_scale_um=4.0, normalize_direction=True)
         pv = sample_vectors(pf, fg, spacing, physical_scale_um=4.0, normalize_direction=True)
