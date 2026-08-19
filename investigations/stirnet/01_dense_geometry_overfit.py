@@ -282,8 +282,12 @@ def soft_dice_loss(logits: Tensor, target: Tensor, eps: float = 1e-6) -> Tensor:
 
 
 def weighted_bce(logits: Tensor, target: Tensor, pos_weight: float) -> Tensor:
+    voxel_weight = 1.0 + (float(pos_weight) - 1.0) * target.detach()
+
     return F.binary_cross_entropy_with_logits(
-        logits, target, pos_weight=logits.new_tensor([float(pos_weight)])
+        logits,
+        target,
+        weight=voxel_weight,
     )
 
 
