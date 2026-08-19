@@ -76,6 +76,28 @@ class GeometryCriterion(nn.Module):
             losses["flow_l1"] = F.smooth_l1_loss(
                 pred.flow[fg3], target.flow[fg3]
             )
+
+            # Cosine similarity ignores vector length, while component-wise
+            # Smooth-L1 is weak for ~0.1-scale errors. Regress the foreground
+            # flow norm explicitly with L1.
+            pred_magnitude = torch.linalg.vector_norm(
+                pred.flow.float(), dim=1, keepdim=True
+            )
+            target_magnitude = torch.linalg.vector_norm(
+                target.flow.float(), dim=1, keepdim=True
+            )
+            magnitude_valid = (fg > 0.5) & (target_magnitude > 0.1)
+            if magnitude_valid.any():
+                losses["flow_magnitude"] = (
+                    self.cfg.flow_magnitude_weight
+                    * F.l1_loss(
+                        pred_magnitude[magnitude_valid],
+                        target_magnitude[magnitude_valid],
+                    )
+                )
+            else:
+                losses["flow_magnitude"] = pred.flow.sum() * 0
+
             off_mask = fg.expand_as(pred.centroid_offset) > 0.5
             losses["centroid_offset"] = F.smooth_l1_loss(
                 pred.centroid_offset[off_mask], target.centroid_offset[off_mask]
@@ -84,6 +106,7 @@ class GeometryCriterion(nn.Module):
             zero = pred.sdf.sum() * 0
             losses["flow_direction"] = zero
             losses["flow_l1"] = zero
+            losses["flow_magnitude"] = zero
             losses["centroid_offset"] = zero
 
         # The direct flow losses supervise foreground only. Penalize flow
@@ -93,14 +116,16 @@ class GeometryCriterion(nn.Module):
             (fg < 0.5)
             & (target.surface > self.cfg.flow_background_surface_threshold)
         )
-        near_background3 = near_background.expand_as(pred.flow)
-        if near_background3.any():
+        if near_background.any():
+            background_magnitude = torch.linalg.vector_norm(
+                pred.flow.float(),
+                dim=1,
+                keepdim=True,
+            )
+
             losses["flow_background"] = (
-                self.cfg.flow_background_weight
-                * F.smooth_l1_loss(
-                    pred.flow[near_background3],
-                    torch.zeros_like(pred.flow[near_background3]),
-                )
+                    self.cfg.flow_background_weight
+                    * background_magnitude[near_background].mean()
             )
         else:
             losses["flow_background"] = pred.flow.sum() * 0

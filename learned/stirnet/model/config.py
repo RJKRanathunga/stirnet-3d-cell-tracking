@@ -54,6 +54,9 @@ class GeometryConfig:
     flow_background_weight: float = 1.0
     flow_background_surface_threshold: float = 0.05
 
+    # Explicitly supervise the norm of the foreground EDT-gradient flow.
+    flow_magnitude_weight: float = 1.0
+
     consistency_weight: float = 0.25
     eikonal_weight: float = 0.10
 
@@ -211,6 +214,8 @@ class ModelConfig:
             )
         if self.geometry.flow_background_weight < 0:
             raise ValueError("flow_background_weight cannot be negative")
+        if self.geometry.flow_magnitude_weight < 0:
+            raise ValueError("flow_magnitude_weight cannot be negative")
         if not 0.0 <= self.geometry.flow_background_surface_threshold <= 1.0:
             raise ValueError(
                 "flow_background_surface_threshold must be in [0, 1]"

@@ -71,3 +71,99 @@ def test_weighted_bce_preserves_soft_target_optimum() -> None:
     weighted_bce(logits, target, pos_weight=6.0).backward()
     assert logits.grad is not None
     assert float(logits.grad.abs().max()) < 1e-6
+
+def test_flow_magnitude_penalizes_short_foreground_vectors() -> None:
+    criterion = GeometryCriterion(
+        GeometryConfig(
+            flow_magnitude_weight=1.0,
+            flow_background_weight=0.0,
+        )
+    )
+
+    shape = (5, 5, 5)
+    fg = torch.zeros((1, 1, *shape), dtype=torch.float32)
+    fg[:, :, 2, 2, 2] = 1.0
+    scalar = torch.zeros_like(fg)
+
+    target_flow = torch.zeros((1, 3, *shape), dtype=torch.float32)
+    target_flow[:, 0, 2, 2, 2] = 1.0
+    target = GeometryTargets(
+        foreground=fg,
+        surface=scalar.clone(),
+        separator=scalar.clone(),
+        sdf=scalar.clone(),
+        sdf_valid=torch.ones_like(fg),
+        flow=target_flow,
+        centroid_offset=torch.zeros_like(target_flow),
+        seed=scalar.clone(),
+    )
+
+    short_flow = torch.zeros_like(target_flow)
+    short_flow[:, 0, 2, 2, 2] = 0.5
+    losses = criterion(
+        _state(short_flow),
+        target,
+        torch.tensor([[1.0, 1.0, 1.0]]),
+        torch.tensor([1.0]),
+    )
+    assert "flow_magnitude" in losses
+    assert math.isclose(
+        float(losses["flow_magnitude"]),
+        0.5,
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    )
+
+    exact_losses = criterion(
+        _state(target_flow.clone()),
+        target,
+        torch.tensor([[1.0, 1.0, 1.0]]),
+        torch.tensor([1.0]),
+    )
+    assert math.isclose(
+        float(exact_losses["flow_magnitude"]),
+        0.0,
+        abs_tol=1e-8,
+    )
+
+
+def test_flow_magnitude_weight_scales_loss() -> None:
+    shape = (5, 5, 5)
+    fg = torch.zeros((1, 1, *shape), dtype=torch.float32)
+    fg[:, :, 2, 2, 2] = 1.0
+    scalar = torch.zeros_like(fg)
+    target_flow = torch.zeros((1, 3, *shape), dtype=torch.float32)
+    target_flow[:, 0, 2, 2, 2] = 1.0
+    pred_flow = torch.zeros_like(target_flow)
+    pred_flow[:, 0, 2, 2, 2] = 0.5
+    target = GeometryTargets(
+        foreground=fg,
+        surface=scalar.clone(),
+        separator=scalar.clone(),
+        sdf=scalar.clone(),
+        sdf_valid=torch.ones_like(fg),
+        flow=target_flow,
+        centroid_offset=torch.zeros_like(target_flow),
+        seed=scalar.clone(),
+    )
+
+    def magnitude_loss(weight: float) -> float:
+        criterion = GeometryCriterion(
+            GeometryConfig(
+                flow_magnitude_weight=weight,
+                flow_background_weight=0.0,
+            )
+        )
+        losses = criterion(
+            _state(pred_flow.clone()),
+            target,
+            torch.tensor([[1.0, 1.0, 1.0]]),
+            torch.tensor([1.0]),
+        )
+        return float(losses["flow_magnitude"])
+
+    loss_1 = magnitude_loss(1.0)
+    loss_2 = magnitude_loss(2.0)
+    assert math.isclose(
+        loss_2, 2.0 * loss_1, rel_tol=1e-6, abs_tol=1e-6
+    )

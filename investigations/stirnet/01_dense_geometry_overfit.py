@@ -343,7 +343,9 @@ def geometry_loss_terms(
             else pred.sdf.sum() * 0
         )
 
-    need_flow_direct = bool({"flow_direction", "flow_l1"} & requested)
+    need_flow_direct = bool(
+        {"flow_direction", "flow_l1", "flow_magnitude"} & requested
+    )
     need_offset = "centroid_offset" in requested
     if need_flow_direct or need_offset:
         fg3 = fg.expand_as(pred.flow) > 0.5
@@ -359,6 +361,28 @@ def geometry_loss_terms(
                 losses["flow_l1"] = F.smooth_l1_loss(
                     pred.flow[fg3], target["flow"][fg3]
                 )
+
+            if "flow_magnitude" in requested:
+                pred_magnitude = torch.linalg.vector_norm(
+                    pred.flow.float(), dim=1, keepdim=True
+                )
+                target_magnitude = torch.linalg.vector_norm(
+                    target["flow"].float(), dim=1, keepdim=True
+                )
+                magnitude_valid = (
+                    (fg > 0.5) & (target_magnitude > 0.1)
+                )
+                if magnitude_valid.any():
+                    losses["flow_magnitude"] = (
+                        gcfg.flow_magnitude_weight
+                        * F.l1_loss(
+                            pred_magnitude[magnitude_valid],
+                            target_magnitude[magnitude_valid],
+                        )
+                    )
+                else:
+                    losses["flow_magnitude"] = pred.flow.sum() * 0
+
             if need_offset:
                 off_mask = fg.expand_as(pred.centroid_offset) > 0.5
                 losses["centroid_offset"] = F.smooth_l1_loss(
@@ -371,22 +395,27 @@ def geometry_loss_terms(
                 losses["flow_direction"] = zero
             if "flow_l1" in requested:
                 losses["flow_l1"] = zero
+            if "flow_magnitude" in requested:
+                losses["flow_magnitude"] = zero
             if need_offset:
                 losses["centroid_offset"] = zero
 
     if "flow_background" in requested:
         near_background = (
-            (fg < 0.5)
-            & (target["surface"] > gcfg.flow_background_surface_threshold)
+                (fg < 0.5)
+                & (target["surface"] > gcfg.flow_background_surface_threshold)
         )
-        near_background3 = near_background.expand_as(pred.flow)
-        if near_background3.any():
+
+        if near_background.any():
+            background_magnitude = torch.linalg.vector_norm(
+                pred.flow.float(),
+                dim=1,
+                keepdim=True,
+            )
+
             losses["flow_background"] = (
-                gcfg.flow_background_weight
-                * F.smooth_l1_loss(
-                    pred.flow[near_background3],
-                    torch.zeros_like(pred.flow[near_background3]),
-                )
+                    gcfg.flow_background_weight
+                    * background_magnitude[near_background].mean()
             )
         else:
             losses["flow_background"] = pred.flow.sum() * 0
@@ -424,16 +453,16 @@ _STAGE_LOSS_NAMES = {
         "separator_bce", "separator_dice",
     ),
     "sdf": ("sdf",),
-    "flow": ("flow_direction", "flow_l1", "flow_background"),
+    "flow": ("flow_direction", "flow_l1", "flow_magnitude", "flow_background"),
     "center": ("centroid_offset", "seed"),
     "joint": (
         "foreground_bce", "foreground_dice", "surface_bce", "surface_dice",
-        "separator_bce", "separator_dice", "sdf", "flow_direction", "flow_l1", "flow_background",
+        "separator_bce", "separator_dice", "sdf", "flow_direction", "flow_l1", "flow_magnitude", "flow_background",
         "centroid_offset", "seed",
     ),
     "full": (
         "foreground_bce", "foreground_dice", "surface_bce", "surface_dice",
-        "separator_bce", "separator_dice", "sdf", "flow_direction", "flow_l1", "flow_background",
+        "separator_bce", "separator_dice", "sdf", "flow_direction", "flow_l1", "flow_magnitude", "flow_background",
         "centroid_offset", "seed", "flow_sdf_consistency", "eikonal",
     ),
 }

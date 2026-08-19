@@ -418,6 +418,7 @@ class StirNetCriterion(nn.Module):
                 "sdf",
                 "flow_direction",
                 "flow_l1",
+                "flow_magnitude",
                 "flow_background",
                 "centroid_offset",
                 "seed",
