@@ -92,6 +92,8 @@ PASS_THRESHOLDS = {
         "flow_angle_p90_deg_max": 20.0,
         "flow_l1_max": 0.10,
         "flow_magnitude_mae_max": 0.10,
+        "flow_magnitude_mae_reliable_max": 0.06,
+        "flow_background_magnitude_mean_max": 0.08,
     },
     "center": {
         "centroid_endpoint_median_um_max": 1.50,
@@ -372,11 +374,26 @@ def geometry_loss_terms(
             if need_offset:
                 losses["centroid_offset"] = zero
 
+    if "flow_background" in requested:
+        near_background = (
+            (fg < 0.5)
+            & (target["surface"] > gcfg.flow_background_surface_threshold)
+        )
+        near_background3 = near_background.expand_as(pred.flow)
+        if near_background3.any():
+            losses["flow_background"] = (
+                gcfg.flow_background_weight
+                * F.smooth_l1_loss(
+                    pred.flow[near_background3],
+                    torch.zeros_like(pred.flow[near_background3]),
+                )
+            )
+        else:
+            losses["flow_background"] = pred.flow.sum() * 0
+
     if "seed" in requested:
-        losses["seed"] = F.binary_cross_entropy_with_logits(
-            pred.seed_logits,
-            target["seed"],
-            pos_weight=pred.seed_logits.new_tensor([gcfg.seed_pos_weight]),
+        losses["seed"] = weighted_bce(
+            pred.seed_logits, target["seed"], gcfg.seed_pos_weight
         )
 
     if {"flow_sdf_consistency", "eikonal"} & requested:
@@ -407,16 +424,16 @@ _STAGE_LOSS_NAMES = {
         "separator_bce", "separator_dice",
     ),
     "sdf": ("sdf",),
-    "flow": ("flow_direction", "flow_l1"),
+    "flow": ("flow_direction", "flow_l1", "flow_background"),
     "center": ("centroid_offset", "seed"),
     "joint": (
         "foreground_bce", "foreground_dice", "surface_bce", "surface_dice",
-        "separator_bce", "separator_dice", "sdf", "flow_direction", "flow_l1",
+        "separator_bce", "separator_dice", "sdf", "flow_direction", "flow_l1", "flow_background",
         "centroid_offset", "seed",
     ),
     "full": (
         "foreground_bce", "foreground_dice", "surface_bce", "surface_dice",
-        "separator_bce", "separator_dice", "sdf", "flow_direction", "flow_l1",
+        "separator_bce", "separator_dice", "sdf", "flow_direction", "flow_l1", "flow_background",
         "centroid_offset", "seed", "flow_sdf_consistency", "eikonal",
     ),
 }
@@ -517,42 +534,38 @@ def collect_metrics(pred, target: dict[str, Tensor], dref_um: Tensor) -> dict[st
     m["flow_angle_p90_deg"] = float(torch.quantile(angle, 0.90).item())
     m["flow_l1"] = float((pred.flow[fg3] - target["flow"][fg3]).abs().mean().item())
 
-    # Flow-magnitude fidelity. Cosine similarity alone cannot detect a
-    # prediction that points in the right direction but is too short/long.
-    pred_mag = torch.linalg.vector_norm(
-        pred.flow.float(),
-        dim=1,
-        keepdim=True,
-    )
-    target_mag = torch.linalg.vector_norm(
-        target["flow"].float(),
-        dim=1,
-        keepdim=True,
-    )
+    pred_mag = torch.linalg.vector_norm(pred.flow.float(), dim=1, keepdim=True)
+    target_mag = torch.linalg.vector_norm(target["flow"].float(), dim=1, keepdim=True)
 
     valid_mag = fg & (target_mag > 0.1)
-
     if valid_mag.any():
         m["flow_magnitude_mae"] = float(
-            (
-                pred_mag[valid_mag]
-                - target_mag[valid_mag]
-            )
-            .abs()
-            .mean()
-            .item()
+            (pred_mag[valid_mag] - target_mag[valid_mag]).abs().mean().item()
         )
-
-        m["flow_magnitude_mean_pred"] = float(
-            pred_mag[valid_mag].mean().item()
-        )
-        m["flow_magnitude_mean_target"] = float(
-            target_mag[valid_mag].mean().item()
-        )
+        m["flow_magnitude_mean_pred"] = float(pred_mag[valid_mag].mean().item())
+        m["flow_magnitude_mean_target"] = float(target_mag[valid_mag].mean().item())
     else:
         m["flow_magnitude_mae"] = float("nan")
         m["flow_magnitude_mean_pred"] = float("nan")
         m["flow_magnitude_mean_target"] = float("nan")
+
+    # The normalized EDT gradient is least stable at deep medial maxima.
+    reliable_flow = fg & (target["seed"] < 0.85) & (target_mag > 0.1)
+    if reliable_flow.any():
+        m["flow_magnitude_mae_reliable"] = float(
+            (pred_mag[reliable_flow] - target_mag[reliable_flow]).abs().mean().item()
+        )
+    else:
+        m["flow_magnitude_mae_reliable"] = float("nan")
+
+    # Mirrors GeometryConfig.flow_background_surface_threshold (=0.05 by default).
+    near_background = (~fg) & (target["surface"] > 0.05)
+    if near_background.any():
+        m["flow_background_magnitude_mean"] = float(
+            pred_mag[near_background].mean().item()
+        )
+    else:
+        m["flow_background_magnitude_mean"] = float("nan")
 
     endpoint_um = torch.linalg.vector_norm(
         pred.centroid_offset.float() - target["centroid_offset"].float(),
@@ -603,6 +616,8 @@ _STAGE_METRICS = {
         "flow_magnitude_mae",
         "flow_magnitude_mean_pred",
         "flow_magnitude_mean_target",
+        "flow_magnitude_mae_reliable",
+        "flow_background_magnitude_mean",
     ),
     "center": (
         "centroid_endpoint_mean_um", "centroid_endpoint_median_um", "centroid_endpoint_p95_um",
@@ -1093,43 +1108,40 @@ def visualize_latest(mode: str, sample_path: Path, result_dir: Path) -> None:
         pd = pf / np.maximum(pn[None], 1e-6)
         angle = np.rad2deg(np.arccos(np.clip(np.sum(td * pd, axis=0), -1, 1)))
         angle[~fg] = 0
-        viewer.add_image(
-            tn,
-            name="30 Target — flow magnitude",
-            colormap="viridis",
-            contrast_limits=(0.0, 1.0),
-            scale=scale,
-            visible=False,
-        )
-
-        viewer.add_image(
-            pn,
-            name="31 Pred — flow magnitude",
-            colormap="viridis",
-            contrast_limits=(0.0, 1.0),
-            scale=scale,
-            visible=False,
-        )
 
         magnitude_error = np.abs(pn - tn)
-        magnitude_error[~fg] = 0.0
+        magnitude_error[~fg] = 0
+        near_background = (~fg) & (target["surface"] > 0.05)
+        leakage = np.zeros_like(pn)
+        leakage[near_background] = pn[near_background]
 
         viewer.add_image(
-            magnitude_error,
-            name="32 Error — flow magnitude",
-            colormap="magma",
-            contrast_limits=(0.0, 0.5),
-            scale=scale,
-            visible=False,
+            tn, name="30 Target — flow magnitude", colormap="viridis",
+            contrast_limits=(0.0, 1.0), scale=scale, visible=False,
+        )
+        viewer.add_image(
+            pn, name="31 Pred — flow magnitude", colormap="viridis",
+            contrast_limits=(0.0, 1.0), scale=scale, visible=False,
+        )
+        viewer.add_image(
+            magnitude_error, name="32 Error — flow magnitude", colormap="magma",
+            contrast_limits=(0.0, 0.5), scale=scale, visible=False,
+        )
+        viewer.add_image(
+            angle, name="33 Error — flow angle (deg)", colormap="magma",
+            contrast_limits=(0.0, 180.0), scale=scale, visible=(mode == "flow"),
+        )
+        viewer.add_image(
+            leakage, name="34 Pred — near-background flow leakage", colormap="magma",
+            contrast_limits=(0.0, 0.25), scale=scale, visible=False,
         )
 
-        viewer.add_image(angle, name="32 Error — flow angle (deg)", colormap="magma", contrast_limits=(0, 180), scale=scale, visible=(mode == "flow"))
         tv = sample_vectors(tf, fg, spacing, physical_scale_um=4.0, normalize_direction=True)
         pv = sample_vectors(pf, fg, spacing, physical_scale_um=4.0, normalize_direction=True)
         if len(tv):
-            viewer.add_vectors(tv, name="33 Target — flow vectors", scale=scale, visible=False)
+            viewer.add_vectors(tv, name="35 Target — flow vectors", scale=scale, visible=False)
         if len(pv):
-            viewer.add_vectors(pv, name="34 Pred — flow vectors", scale=scale, visible=False)
+            viewer.add_vectors(pv, name="36 Pred — flow vectors", scale=scale, visible=False)
 
     if show_center:
         to = target["centroid_offset"]

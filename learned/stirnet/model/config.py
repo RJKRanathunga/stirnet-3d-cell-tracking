@@ -49,6 +49,11 @@ class GeometryConfig:
     surface_dice_weight: float = 1.0
     separator_dice_weight: float = 1.0
     seed_pos_weight: float = 4.0
+
+    # Suppress learned flow only in the narrow exterior surface band.
+    flow_background_weight: float = 1.0
+    flow_background_surface_threshold: float = 0.05
+
     consistency_weight: float = 0.25
     eikonal_weight: float = 0.10
 
@@ -203,6 +208,12 @@ class ModelConfig:
         if not 0.0 <= self.geometry.separator_source_min_gt_fraction <= 1.0:
             raise ValueError(
                 "separator_source_min_gt_fraction must be in [0, 1]"
+            )
+        if self.geometry.flow_background_weight < 0:
+            raise ValueError("flow_background_weight cannot be negative")
+        if not 0.0 <= self.geometry.flow_background_surface_threshold <= 1.0:
+            raise ValueError(
+                "flow_background_surface_threshold must be in [0, 1]"
             )
         if not 0.0 <= self.partition.rag_min_node_purity <= 1.0:
             raise ValueError("rag_min_node_purity must be in [0, 1]")

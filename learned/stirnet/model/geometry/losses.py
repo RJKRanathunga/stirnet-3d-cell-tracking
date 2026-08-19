@@ -86,11 +86,29 @@ class GeometryCriterion(nn.Module):
             losses["flow_l1"] = zero
             losses["centroid_offset"] = zero
 
+        # The direct flow losses supervise foreground only. Penalize flow
+        # leakage in the narrow exterior surface band so the field terminates
+        # sharply without letting distant background dominate training.
+        near_background = (
+            (fg < 0.5)
+            & (target.surface > self.cfg.flow_background_surface_threshold)
+        )
+        near_background3 = near_background.expand_as(pred.flow)
+        if near_background3.any():
+            losses["flow_background"] = (
+                self.cfg.flow_background_weight
+                * F.smooth_l1_loss(
+                    pred.flow[near_background3],
+                    torch.zeros_like(pred.flow[near_background3]),
+                )
+            )
+        else:
+            losses["flow_background"] = pred.flow.sum() * 0
+
         # A soft marker map is regression-supervised; it should track the
         # medial structure rather than only a single chosen centroid voxel.
-        losses["seed"] = F.binary_cross_entropy_with_logits(
-            pred.seed_logits, target.seed,
-            pos_weight=pred.seed_logits.new_tensor([self.cfg.seed_pos_weight]),
+        losses["seed"] = weighted_bce(
+            pred.seed_logits, target.seed, self.cfg.seed_pos_weight
         )
 
         # End-to-end geometric consistency: the predicted flow should agree
