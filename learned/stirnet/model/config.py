@@ -57,7 +57,7 @@ class GeometryConfig:
     # Explicitly supervise the norm of the foreground EDT-gradient flow.
     flow_magnitude_weight: float = 1.0
 
-    consistency_weight: float = 0.25
+    consistency_weight: float = 0.0
     eikonal_weight: float = 0.10
 
 
