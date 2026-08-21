@@ -13,6 +13,7 @@ from ..config import PartitionConfig
 from ..geometry.derived import build_geometry_derived_cache
 from ..types import GeometryDerivedCache, GeometryLike, geometry_field
 from .seeds import build_markers, build_markers_fast
+from .supervoxel_guard import SupervoxelSafetyGuard
 
 
 def _profile(profiler, name: str):
@@ -165,6 +166,7 @@ class LearnedGeometryWatershed(nn.Module):
     def __init__(self, cfg: PartitionConfig):
         super().__init__()
         self.cfg = cfg
+        self.safety_guard = SupervoxelSafetyGuard(cfg)
 
     @torch.no_grad()
     def forward(
@@ -225,6 +227,18 @@ class LearnedGeometryWatershed(nn.Module):
             with _profile(stage_profiler, f"{profile_prefix}_tiny_region_cleanup"):
                 labels = _merge_tiny_regions(
                     labels.astype(np.int32), self.cfg.min_supervoxel_voxels
+                )
+            # Final proposal safety step: preserve or split only. Nothing after
+            # this point may merge a guarded fragment back across dense geometry
+            # that indicates distinct cell identity.
+            with _profile(stage_profiler, f"{profile_prefix}_supervoxel_safety_guard"):
+                labels = self.safety_guard(
+                    labels,
+                    geometry,
+                    cache,
+                    b,
+                    spacing_um[b],
+                    dref_um[b],
                 )
             if int(labels.max()) > self.cfg.max_supervoxels:
                 raise RuntimeError(
