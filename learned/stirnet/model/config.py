@@ -83,14 +83,34 @@ class PartitionConfig:
     """Learned-geometry watershed followed by a learned RAG partition."""
 
     foreground_threshold: float = 0.45
-    seed_threshold: float = 0.40
-    seed_min_distance_dref: float = 0.35
+
+    # Stage-05 oracle calibration deliberately biases the proposal layer toward
+    # oversegmentation. Extra supervoxels are recoverable by the RAG; a
+    # cross-cell atomic supervoxel is not.
+    seed_threshold: float = 0.25
+    seed_min_distance_dref: float = 0.20
     seed_sdf_weight: float = 0.55
     seed_head_weight: float = 0.45
-    watershed_separator_weight: float = 0.65
-    watershed_surface_weight: float = 0.15
-    watershed_sdf_weight: float = 0.20
-    min_supervoxel_voxels: int = 4
+    watershed_separator_weight: float = 0.75
+    watershed_surface_weight: float = 0.10
+    watershed_sdf_weight: float = 0.15
+    min_supervoxel_voxels: int = 1
+
+    # Post-watershed safety guard. Separator is the primary cannot-cross cue;
+    # centroid-vote, flow, seed, and SDF evidence can harden ambiguous regions.
+    supervoxel_guard_enabled: bool = True
+    supervoxel_guard_separator_high: float = 0.60
+    supervoxel_guard_separator_low: float = 0.30
+    supervoxel_guard_centroid_disagreement_dref: float = 0.30
+    supervoxel_guard_centroid_strong_disagreement_dref: float = 0.70
+    supervoxel_guard_flow_disagreement: float = 0.70
+    supervoxel_guard_flow_min_norm: float = 0.10
+    supervoxel_guard_seed_valley_max: float = 0.55
+    supervoxel_guard_sdf_valley_max: float = 0.45
+    supervoxel_guard_min_fragment_voxels: int = 4
+    supervoxel_guard_min_fragment_fraction: float = 0.002
+    supervoxel_guard_max_fragments: int = 8
+    supervoxel_guard_closing_iterations: int = 1
     node_feature_channels: int = 24
     rag_hidden_dim: int = 96
     rag_layers: int = 2
@@ -102,7 +122,9 @@ class PartitionConfig:
     # This keeps mostly-background supervoxels out of edge supervision while
     # still tolerating imperfect proposal boundaries during early training.
     rag_min_node_gt_support: float = 0.50
-    watershed_backend: str = "fast"
+    # The ellipsoidal reference NMS was safer in Stage-05 at the calibrated
+    # physical radius than the rectangular fast backend.
+    watershed_backend: str = "reference"
     region_stats_backend: str = "auto"
     component_bounded_watershed: bool = True
     watershed_component_halo_voxels: int = 1
@@ -213,6 +235,58 @@ class ModelConfig:
             raise ValueError("partition.region_stats_backend must be 'torch' or 'auto'")
         if self.partition.watershed_component_halo_voxels < 0:
             raise ValueError("watershed_component_halo_voxels cannot be negative")
+        if not (
+            0.0
+            <= self.partition.supervoxel_guard_separator_low
+            <= self.partition.supervoxel_guard_separator_high
+            <= 1.0
+        ):
+            raise ValueError(
+                "supervoxel guard separator thresholds must satisfy "
+                "0 <= low <= high <= 1"
+            )
+        if self.partition.supervoxel_guard_centroid_disagreement_dref < 0:
+            raise ValueError(
+                "supervoxel_guard_centroid_disagreement_dref cannot be negative"
+            )
+        if (
+            self.partition.supervoxel_guard_centroid_strong_disagreement_dref
+            < self.partition.supervoxel_guard_centroid_disagreement_dref
+        ):
+            raise ValueError(
+                "strong centroid disagreement threshold must be >= the "
+                "ordinary centroid disagreement threshold"
+            )
+        if not 0.0 <= self.partition.supervoxel_guard_flow_disagreement <= 2.0:
+            raise ValueError(
+                "supervoxel_guard_flow_disagreement must be in [0, 2]"
+            )
+        if self.partition.supervoxel_guard_flow_min_norm < 0:
+            raise ValueError("supervoxel_guard_flow_min_norm cannot be negative")
+        if not 0.0 <= self.partition.supervoxel_guard_seed_valley_max <= 1.0:
+            raise ValueError(
+                "supervoxel_guard_seed_valley_max must be in [0, 1]"
+            )
+        if not 0.0 <= self.partition.supervoxel_guard_sdf_valley_max <= 1.0:
+            raise ValueError(
+                "supervoxel_guard_sdf_valley_max must be in [0, 1]"
+            )
+        if self.partition.supervoxel_guard_min_fragment_voxels < 1:
+            raise ValueError(
+                "supervoxel_guard_min_fragment_voxels must be positive"
+            )
+        if not 0.0 <= self.partition.supervoxel_guard_min_fragment_fraction < 1.0:
+            raise ValueError(
+                "supervoxel_guard_min_fragment_fraction must be in [0, 1)"
+            )
+        if self.partition.supervoxel_guard_max_fragments < 2:
+            raise ValueError(
+                "supervoxel_guard_max_fragments must be at least 2"
+            )
+        if self.partition.supervoxel_guard_closing_iterations < 0:
+            raise ValueError(
+                "supervoxel_guard_closing_iterations cannot be negative"
+            )
         if self.geometry.sdf_clip_dref <= 0:
             raise ValueError("sdf_clip_dref must be positive")
         if self.geometry.sdf_supervision_radius_dref <= 0:
