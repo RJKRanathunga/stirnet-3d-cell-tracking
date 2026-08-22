@@ -4,8 +4,11 @@ from .partitioner import GraphPartitioner
 from .rag import RAGBuilder, RAGCriterion, RAGTargets
 from .watershed import LearnedGeometryWatershed
 from .supervoxel_guard import (
+    FaceArrays,
     SupervoxelGuardDiagnostics,
     SupervoxelSafetyGuard,
+    build_supervoxel_face_cuts,
+    face_cuts_to_voxel_proxy,
     build_supervoxel_barrier,
     split_preliminary_supervoxels,
 )
@@ -17,8 +20,11 @@ from .statistics import (
 
 __all__ = [
     "LearnedGeometryWatershed",
+    "FaceArrays",
     "SupervoxelGuardDiagnostics",
     "SupervoxelSafetyGuard",
+    "build_supervoxel_face_cuts",
+    "face_cuts_to_voxel_proxy",
     "build_supervoxel_barrier",
     "split_preliminary_supervoxels",
     "RAGBuilder",

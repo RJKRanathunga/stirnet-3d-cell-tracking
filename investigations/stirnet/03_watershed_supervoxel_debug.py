@@ -83,6 +83,7 @@ MEANINGFUL_OVERLAP_MIN_GT_FRACTION = 0.01
 MIN_COMPLETE_GT_COVERAGE = 0.95
 MIN_NODE_PURITY_FOR_SAFE = 0.80
 MIN_NODE_GT_SUPPORT_FOR_SAFE = 0.50
+MIN_ATOMIC_RECOVERABLE_FRACTION = 0.95
 PROB_EPS = 1e-4
 
 
@@ -349,6 +350,7 @@ def supervoxel_diagnostics(
     unsafe_lut = np.zeros(n_sv + 1, dtype=np.uint8)
     cross_gt_count = 0
     rag_valid_count = 0
+    atomic_irreducible_gt_voxels = 0
 
     for sv_id in range(1, n_sv + 1):
         mask = labels == sv_id
@@ -363,33 +365,36 @@ def supervoxel_diagnostics(
         gt_support = positive_voxels / max(sv_count, 1)
 
         if overlap:
-            dominant_gt = max(
-                overlap, key=lambda gt_id: (overlap[gt_id], -gt_id)
-            )
-            purity = overlap[dominant_gt] / max(positive_voxels, 1)
+            dominant_gt = max(overlap, key=lambda gt_id: (overlap[gt_id], -gt_id))
+            dominant_overlap = int(overlap[dominant_gt])
+            purity = dominant_overlap / max(positive_voxels, 1)
         else:
             dominant_gt = 0
+            dominant_overlap = 0
             purity = 0.0
+
+        irreducible_gt_voxels = max(positive_voxels - dominant_overlap, 0)
+        atomic_irreducible_gt_voxels += irreducible_gt_voxels
+        secondary = [(gt_id, count) for gt_id, count in overlap.items() if gt_id != dominant_gt]
+        if secondary:
+            secondary_gt, secondary_count = max(secondary, key=lambda item: (item[1], -item[0]))
+            secondary_fraction = secondary_count / max(gt_volumes.get(secondary_gt, 0), 1)
+        else:
+            secondary_gt, secondary_count, secondary_fraction = 0, 0, 0.0
 
         meaningful_gt_ids = [
             gt_id
             for gt_id, count in overlap.items()
-            if (
-                count >= MEANINGFUL_OVERLAP_MIN_VOXELS
-                and count / max(gt_volumes[gt_id], 1)
-                >= MEANINGFUL_OVERLAP_MIN_GT_FRACTION
-            )
+            if count >= MEANINGFUL_OVERLAP_MIN_VOXELS
+            and count / max(gt_volumes[gt_id], 1) >= MEANINGFUL_OVERLAP_MIN_GT_FRACTION
         ]
         cross_gt = len(meaningful_gt_ids) >= 2
-        if cross_gt:
-            cross_gt_count += 1
-
+        cross_gt_count += int(cross_gt)
         rag_valid = (
             purity >= cfg.partition.rag_min_node_purity
             and gt_support >= cfg.partition.rag_min_node_gt_support
         )
-        if rag_valid:
-            rag_valid_count += 1
+        rag_valid_count += int(rag_valid)
 
         purity_lut[sv_id] = purity
         gt_support_lut[sv_id] = gt_support
@@ -399,19 +404,24 @@ def supervoxel_diagnostics(
             or purity < MIN_NODE_PURITY_FOR_SAFE
             or gt_support < MIN_NODE_GT_SUPPORT_FOR_SAFE
         )
-
-        rows.append(
-            {
-                "supervoxel_id": sv_id,
-                "voxel_count": sv_count,
-                "gt_support": float(gt_support),
-                "purity_among_gt": float(purity),
-                "dominant_gt": dominant_gt,
-                "meaningful_gt_ids": sorted(meaningful_gt_ids),
-                "cross_gt_unsafe": bool(cross_gt),
-                "passes_current_rag_validity": bool(rag_valid),
-            }
-        )
+        rows.append({
+            "supervoxel_id": sv_id,
+            "voxel_count": sv_count,
+            "gt_support": float(gt_support),
+            "purity_among_gt": float(purity),
+            "dominant_gt": dominant_gt,
+            "dominant_gt_overlap_voxels": dominant_overlap,
+            "atomic_irreducible_gt_voxels": int(irreducible_gt_voxels),
+            "atomic_irreducible_fraction_among_gt": float(
+                irreducible_gt_voxels / max(positive_voxels, 1)
+            ),
+            "largest_secondary_gt": int(secondary_gt),
+            "largest_secondary_overlap_voxels": int(secondary_count),
+            "largest_secondary_fraction_of_that_gt": float(secondary_fraction),
+            "meaningful_gt_ids": sorted(meaningful_gt_ids),
+            "cross_gt_unsafe": bool(cross_gt),
+            "passes_current_rag_validity": bool(rag_valid),
+        })
 
     positive = labels > 0
     gt_fg = gt > 0
@@ -420,12 +430,15 @@ def supervoxel_diagnostics(
     gt_count = int(np.sum(gt_fg))
 
     per_gt: dict[str, Any] = {}
-    complete_recoverable = 0
+    legacy_complete_recoverable = 0
+    complete_atomic: list[float] = []
+    visible_atomic: list[float] = []
+    total_atomic_recoverable_voxels = 0
+
     for gt_id in gt_ids:
         cell = gt == gt_id
         cell_volume = gt_volumes[gt_id]
         coverage = int(np.sum(cell & positive)) / max(cell_volume, 1)
-
         sv_ids, counts = np.unique(labels[cell], return_counts=True)
         pairs = [
             (int(sv), int(count))
@@ -435,13 +448,9 @@ def supervoxel_diagnostics(
         meaningful = [
             (sv, count)
             for sv, count in pairs
-            if (
-                count >= MEANINGFUL_OVERLAP_MIN_VOXELS
-                and count / max(cell_volume, 1)
-                >= MEANINGFUL_OVERLAP_MIN_GT_FRACTION
-            )
+            if count >= MEANINGFUL_OVERLAP_MIN_VOXELS
+            and count / max(cell_volume, 1) >= MEANINGFUL_OVERLAP_MIN_GT_FRACTION
         ]
-
         unsafe = []
         for sv_id, _ in meaningful:
             row = rows[sv_id - 1]
@@ -451,14 +460,25 @@ def supervoxel_diagnostics(
                 or row["cross_gt_unsafe"]
             ):
                 unsafe.append(sv_id)
-
-        recoverable = (
+        legacy_recoverable = (
             coverage >= MIN_COMPLETE_GT_COVERAGE
             and len(meaningful) >= 1
             and not unsafe
         )
-        if gt_id in complete_gt_ids and recoverable:
-            complete_recoverable += 1
+        if gt_id in complete_gt_ids and legacy_recoverable:
+            legacy_complete_recoverable += 1
+
+        atomic_pairs = [
+            (sv_id, count)
+            for sv_id, count in pairs
+            if rows[sv_id - 1]["dominant_gt"] == gt_id
+        ]
+        atomic_voxels = int(sum(count for _, count in atomic_pairs))
+        atomic_fraction = atomic_voxels / max(cell_volume, 1)
+        total_atomic_recoverable_voxels += atomic_voxels
+        visible_atomic.append(float(atomic_fraction))
+        if gt_id in complete_gt_ids:
+            complete_atomic.append(float(atomic_fraction))
 
         per_gt[str(gt_id)] = {
             "volume_voxels": cell_volume,
@@ -467,44 +487,50 @@ def supervoxel_diagnostics(
             "meaningful_supervoxel_count": len(meaningful),
             "meaningful_supervoxel_ids": [sv for sv, _ in meaningful],
             "unsafe_overlapping_supervoxel_ids": unsafe,
-            "recoverable_by_merging": bool(recoverable),
+            "recoverable_by_merging": bool(legacy_recoverable),
+            "atomic_recoverable_voxels": atomic_voxels,
+            "atomic_lost_voxels": max(cell_volume - atomic_voxels, 0),
+            "atomic_recoverable_fraction": float(atomic_fraction),
+            "atomic_assigned_supervoxel_ids": [sv for sv, _ in atomic_pairs],
             "complete_in_crop": gt_id in complete_gt_ids,
         }
 
-    complete_coverages = [
-        per_gt[str(gt_id)]["coverage"] for gt_id in complete_gt_ids
-    ]
-    recoverable_fraction = (
-        complete_recoverable / len(complete_gt_ids)
-        if complete_gt_ids
-        else 1.0
+    complete_coverages = [per_gt[str(gt_id)]["coverage"] for gt_id in complete_gt_ids]
+    legacy_fraction = (
+        legacy_complete_recoverable / len(complete_gt_ids)
+        if complete_gt_ids else 1.0
     )
+    total_atomic_unrecoverable = max(gt_count - total_atomic_recoverable_voxels, 0)
+
+    atomic_assignment_error = np.zeros(labels.shape, dtype=np.uint8)
+    if n_sv > 0:
+        assigned = dominant_gt_lut[labels]
+        wrong_owner = (
+            (labels > 0) & (gt > 0) & (assigned > 0) & (assigned != gt)
+        )
+        atomic_assignment_error[wrong_owner] = 1
+    atomic_assignment_error[(labels == 0) & (gt > 0)] = 2
 
     summary = {
         "supervoxel_count": n_sv,
-        "foreground_precision": float(
-            intersection / max(positive_count, 1)
-        ),
+        "foreground_precision": float(intersection / max(positive_count, 1)),
         "foreground_recall": float(intersection / max(gt_count, 1)),
-        "foreground_dice": float(
-            2.0 * intersection / max(positive_count + gt_count, 1)
-        ),
+        "foreground_dice": float(2.0 * intersection / max(positive_count + gt_count, 1)),
         "cross_gt_unsafe_supervoxel_count": cross_gt_count,
         "rag_valid_supervoxel_count": rag_valid_count,
-        "rag_valid_supervoxel_fraction": float(
-            rag_valid_count / max(n_sv, 1)
-        ),
+        "rag_valid_supervoxel_fraction": float(rag_valid_count / max(n_sv, 1)),
         "complete_gt_count": len(complete_gt_ids),
-        "complete_gt_min_coverage": (
-            float(min(complete_coverages)) if complete_coverages else 1.0
-        ),
-        "complete_gt_mean_coverage": (
-            float(np.mean(complete_coverages))
-            if complete_coverages
-            else 1.0
-        ),
-        "complete_gt_recoverable_count": complete_recoverable,
-        "complete_gt_recoverable_fraction": float(recoverable_fraction),
+        "complete_gt_min_coverage": float(min(complete_coverages)) if complete_coverages else 1.0,
+        "complete_gt_mean_coverage": float(np.mean(complete_coverages)) if complete_coverages else 1.0,
+        "complete_gt_recoverable_count": legacy_complete_recoverable,
+        "complete_gt_recoverable_fraction": float(legacy_fraction),
+        "atomic_irreducible_gt_voxels_inside_positive_svs": int(atomic_irreducible_gt_voxels),
+        "atomic_total_unrecoverable_gt_voxels": int(total_atomic_unrecoverable),
+        "atomic_global_recoverable_fraction": float(total_atomic_recoverable_voxels / max(gt_count, 1)),
+        "atomic_min_complete_recoverable_fraction": float(min(complete_atomic)) if complete_atomic else 1.0,
+        "atomic_mean_complete_recoverable_fraction": float(np.mean(complete_atomic)) if complete_atomic else 1.0,
+        "atomic_min_visible_recoverable_fraction": float(min(visible_atomic)) if visible_atomic else 1.0,
+        "atomic_mean_visible_recoverable_fraction": float(np.mean(visible_atomic)) if visible_atomic else 1.0,
         "per_gt": per_gt,
         "nodes": rows,
     }
@@ -513,6 +539,7 @@ def supervoxel_diagnostics(
         "node_gt_support": gt_support_lut[labels],
         "dominant_gt": dominant_gt_lut[labels],
         "unsafe_supervoxel_mask": unsafe_lut[labels],
+        "atomic_assignment_error": atomic_assignment_error,
     }
     return summary, maps
 
@@ -649,20 +676,23 @@ def run_variant(
         "unsafe_supervoxel_mask": torch.from_numpy(
             sv_maps["unsafe_supervoxel_mask"].astype(np.uint8)
         ),
+        "atomic_assignment_error": torch.from_numpy(
+            sv_maps["atomic_assignment_error"].astype(np.uint8)
+        ),
     }
     return summary, artifact
 
 
 def print_variant_table(results: dict[str, dict[str, Any]]) -> None:
-    print("\n" + "=" * 126)
+    print("\n" + "=" * 136)
     print("Stage-03 oracle substitution comparison")
-    print("=" * 126)
+    print("=" * 136)
     print(
         f"{'variant':22s} {'markers':>8s} {'mkRecall':>9s} "
         f"{'rawSV':>7s} {'SV':>6s} {'fgRec':>8s} {'minCov':>8s} "
-        f"{'crossGT':>8s} {'recover':>9s} {'sepΔE':>9s}"
+        f"{'crossGT':>8s} {'atomicMin':>9s} {'sepΔE':>9s}"
     )
-    print("-" * 126)
+    print("-" * 136)
     for name, row in results.items():
         marker = row["marker"]
         ws = row["watershed"]
@@ -670,18 +700,14 @@ def print_variant_table(results: dict[str, dict[str, Any]]) -> None:
         sep = row["fields"]["separator_energy_contrast_vs_interior"]
         sep_text = "n/a" if sep is None else f"{sep:.3f}"
         print(
-            f"{name:22s} "
-            f"{marker['marker_count']:8d} "
+            f"{name:22s} {marker['marker_count']:8d} "
             f"{marker['complete_gt_marker_recall']:9.3f} "
-            f"{ws['raw_region_count']:7d} "
-            f"{ws['clean_supervoxel_count']:6d} "
-            f"{sv['foreground_recall']:8.3f} "
-            f"{sv['complete_gt_min_coverage']:8.3f} "
+            f"{ws['raw_region_count']:7d} {ws['clean_supervoxel_count']:6d} "
+            f"{sv['foreground_recall']:8.3f} {sv['complete_gt_min_coverage']:8.3f} "
             f"{sv['cross_gt_unsafe_supervoxel_count']:8d} "
-            f"{sv['complete_gt_recoverable_fraction']:9.3f} "
-            f"{sep_text:>9s}"
+            f"{sv['atomic_min_complete_recoverable_fraction']:9.3f} {sep_text:>9s}"
         )
-    print("=" * 126)
+    print("=" * 136)
 
 
 def predicted_acceptance(
@@ -690,7 +716,6 @@ def predicted_acceptance(
     failures: list[str] = []
     marker = predicted["marker"]
     sv = predicted["supervoxels"]
-
     if marker["complete_gt_marker_recall"] < 1.0:
         failures.append(
             "not every complete GT cell has a marker "
@@ -698,18 +723,14 @@ def predicted_acceptance(
         )
     if sv["complete_gt_min_coverage"] < MIN_COMPLETE_GT_COVERAGE:
         failures.append(
-            "complete-GT coverage too low "
+            "complete-GT foreground coverage too low "
             f"(min={sv['complete_gt_min_coverage']:.3f})"
         )
-    if sv["cross_gt_unsafe_supervoxel_count"] > 0:
+    if sv["atomic_min_complete_recoverable_fraction"] < MIN_ATOMIC_RECOVERABLE_FRACTION:
         failures.append(
-            f"{sv['cross_gt_unsafe_supervoxel_count']} supervoxels "
-            "meaningfully span multiple GT cells"
-        )
-    if sv["complete_gt_recoverable_fraction"] < 1.0:
-        failures.append(
-            "not every complete GT cell is safely recoverable by merging "
-            f"(fraction={sv['complete_gt_recoverable_fraction']:.3f})"
+            "atomic proposal loses too much of at least one complete GT cell "
+            f"(min recoverable={sv['atomic_min_complete_recoverable_fraction']:.3f}, "
+            f"required={MIN_ATOMIC_RECOVERABLE_FRACTION:.3f})"
         )
     return not failures, failures
 

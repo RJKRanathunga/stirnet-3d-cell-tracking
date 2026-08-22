@@ -9,7 +9,7 @@ from scipy import ndimage as ndi
 from skimage.segmentation import watershed
 from torch import Tensor, nn
 
-from ..config import PartitionConfig
+from ..config import GeometryConfig, PartitionConfig
 from ..geometry.derived import build_geometry_derived_cache
 from ..types import GeometryDerivedCache, GeometryLike, geometry_field
 from .seeds import build_markers, build_markers_fast
@@ -163,10 +163,18 @@ class LearnedGeometryWatershed(nn.Module):
     watershed basins with a region-adjacency graph.
     """
 
-    def __init__(self, cfg: PartitionConfig):
+    def __init__(
+        self,
+        cfg: PartitionConfig,
+        geometry_cfg: GeometryConfig | None = None,
+    ):
         super().__init__()
         self.cfg = cfg
-        self.safety_guard = SupervoxelSafetyGuard(cfg)
+        self.geometry_cfg = geometry_cfg or GeometryConfig()
+        self.safety_guard = SupervoxelSafetyGuard(
+            cfg,
+            separator_sigma_um=self.geometry_cfg.separator_target_sigma_um,
+        )
 
     @torch.no_grad()
     def forward(

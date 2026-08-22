@@ -89,7 +89,10 @@ class StirNet(nn.Module):
             self.cfg.geometry, self.cfg.spatial
         )
 
-        self.watershed = LearnedGeometryWatershed(self.cfg.partition)
+        self.watershed = LearnedGeometryWatershed(
+            self.cfg.partition,
+            self.cfg.geometry,
+        )
         self.local_partition_updater = LocalPartitionUpdater(
             self.watershed, self.cfg.refinement
         )
