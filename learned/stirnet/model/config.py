@@ -156,19 +156,24 @@ class HistoryConfig:
 
 @dataclass
 class TemporalConfig:
-    """Compatibility-oriented temporal encoder for the existing STIR-Net preprocessing."""
+    """Temporal detection + tracklet-hypothesis reasoning configuration."""
 
     node_dim: int = 32
     edge_dim: int = 15
+    # graph_builder.HYPOTHESIS_EDGE_DIM. Kept explicit so model/config.py
+    # does not depend on the data package at import time.
+    hypothesis_edge_dim: int = 22
     status_dim: int = 10
     d_model: int = 128
     graph_layers: int = 2
+    hypothesis_layers: int = 2
     graph_hidden_dim: int = 256
     dropout: float = 0.10
     observation_radius_dref: float = 1.75
     instance_match_radius_dref: float = 2.50
     cross_heads: int = 4
-    temporal_residual_scale: float = 2.0
+    # Scale of the bounded temporal candidate edge logit.
+    temporal_residual_scale: float = 4.0
     reliability_floor: float = 0.05
 
 
@@ -228,6 +233,12 @@ class ModelConfig:
             raise ValueError("Instance and temporal d_model must match")
         if self.temporal.d_model % self.temporal.cross_heads:
             raise ValueError("temporal.d_model must be divisible by temporal.cross_heads")
+        if self.temporal.hypothesis_edge_dim < 1:
+            raise ValueError("temporal.hypothesis_edge_dim must be positive")
+        if self.temporal.hypothesis_layers < 0:
+            raise ValueError("temporal.hypothesis_layers cannot be negative")
+        if self.temporal.temporal_residual_scale <= 0:
+            raise ValueError("temporal.temporal_residual_scale must be positive")
         if not 0.0 < self.partition.foreground_threshold < 1.0:
             raise ValueError("foreground_threshold must be in (0, 1)")
         if self.partition.max_supervoxels < 1:

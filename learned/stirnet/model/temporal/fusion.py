@@ -249,7 +249,17 @@ class InstanceTemporalReasoner(nn.Module):
                     dim=-1,
                 )
             ).squeeze(-1)
-            delta = self.temporal_cfg.temporal_residual_scale * torch.tanh(raw_delta)
+            # Predict a bounded temporal CANDIDATE logit and interpolate from
+            # the spatial decision toward it. Unlike a bounded additive
+            # residual, reliable temporal evidence can therefore overturn an
+            # arbitrarily confident wrong spatial edge. With zero temporal
+            # support the gate below is exactly zero and spatial logits are
+            # preserved exactly.
+            temporal_candidate = (
+                self.temporal_cfg.temporal_residual_scale
+                * torch.tanh(raw_delta)
+            )
+            delta = temporal_candidate - rag.spatial_edge_logits
             uncertainty = torch.exp(-rag.spatial_edge_logits.abs())
             s_left = node_support[src, 0]
             s_right = node_support[dst, 0]

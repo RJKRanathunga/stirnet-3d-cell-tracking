@@ -134,6 +134,8 @@ class StirNet(nn.Module):
         graph_x: Tensor | None,
         graph_edge_index: Tensor | None,
         graph_edge_attr: Tensor | None,
+        hypothesis_edge_index: Tensor | None,
+        hypothesis_edge_attr: Tensor | None,
         tracklet_id: Tensor | None,
         temporal_ref_um: Tensor | None,
         temporal_status: Tensor | None,
@@ -148,6 +150,8 @@ class StirNet(nn.Module):
                     graph_x,
                     graph_edge_index,
                     graph_edge_attr,
+                    hypothesis_edge_index,
+                    hypothesis_edge_attr,
                     tracklet_id,
                     temporal_ref_um,
                     temporal_status,
@@ -174,10 +178,17 @@ class StirNet(nn.Module):
                 raise ValueError(
                     "Legacy temporal input is incomplete: " + ", ".join(missing)
                 )
+            if (hypothesis_edge_index is None) != (hypothesis_edge_attr is None):
+                raise ValueError(
+                    "hypothesis_edge_index and hypothesis_edge_attr must be "
+                    "provided together"
+                )
             data = TemporalInput(
                 graph_x=graph_x,
                 graph_edge_index=graph_edge_index,  # type: ignore[arg-type]
                 graph_edge_attr=graph_edge_attr,  # type: ignore[arg-type]
+                hypothesis_edge_index=hypothesis_edge_index,
+                hypothesis_edge_attr=hypothesis_edge_attr,
                 tracklet_id=tracklet_id,  # type: ignore[arg-type]
                 temporal_ref_um=temporal_ref_um,  # type: ignore[arg-type]
                 temporal_status=temporal_status,  # type: ignore[arg-type]
@@ -370,6 +381,8 @@ class StirNet(nn.Module):
         graph_x: Tensor | None = None,
         graph_edge_index: Tensor | None = None,
         graph_edge_attr: Tensor | None = None,
+        hypothesis_edge_index: Tensor | None = None,
+        hypothesis_edge_attr: Tensor | None = None,
         tracklet_id: Tensor | None = None,
         temporal_ref_um: Tensor | None = None,
         temporal_status: Tensor | None = None,
@@ -517,6 +530,8 @@ class StirNet(nn.Module):
             graph_x=graph_x,
             graph_edge_index=graph_edge_index,
             graph_edge_attr=graph_edge_attr,
+            hypothesis_edge_index=hypothesis_edge_index,
+            hypothesis_edge_attr=hypothesis_edge_attr,
             tracklet_id=tracklet_id,
             temporal_ref_um=temporal_ref_um,
             temporal_status=temporal_status,
