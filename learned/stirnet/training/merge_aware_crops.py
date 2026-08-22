@@ -1,0 +1,255 @@
+from __future__ import annotations
+
+"""Spacing-aware, merge-first greedy crop planning for STIR-Net training."""
+
+from dataclasses import dataclass
+from typing import Iterable
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
+import torch
+from torch import Tensor
+from .crops import CropSpec
+
+
+@dataclass(frozen=True)
+class MergeAwareCropRecord:
+    batch_index: int
+    slices_zyx: tuple[slice, slice, slice]
+    complete_cell_ids: tuple[int, ...]
+    partial_cell_ids: tuple[int, ...]
+    true_boundary_cell_ids: tuple[int, ...]
+    merge_source_ids: tuple[int, ...] = ()
+    merge_gt_ids: tuple[int, ...] = ()
+    candidate_type: str = 'coverage'
+
+    @property
+    def covered_cell_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(set(self.complete_cell_ids) | set(self.true_boundary_cell_ids)))
+
+
+@dataclass(frozen=True)
+class MergeAwareCropManifest:
+    records: tuple[tuple[MergeAwareCropRecord, ...], ...]
+    crop_shape_zyx: tuple[int, int, int]
+    min_complete_cells: int
+    preferred_complete_cells: int
+    views_per_cell: int
+    context_um: float
+    merge_min_overlap_voxels: int
+    merge_min_gt_fraction: float
+    uncoverable_cell_ids: tuple[tuple[int, ...], ...]
+    uncoverable_merge_source_ids: tuple[tuple[int, ...], ...]
+    source_signature: tuple
+
+
+@dataclass(frozen=True)
+class _Box:
+    cell_id: int
+    low: np.ndarray
+    high: np.ndarray
+    boundary: bool
+    @property
+    def center(self) -> np.ndarray:
+        return 0.5 * (self.low + self.high - 1)
+
+
+def source_signature(gt: Tensor, current: Tensor | None, spacing: Tensor | None) -> tuple:
+    return (
+        tuple(gt.shape), int(gt.data_ptr()),
+        None if current is None else tuple(current.shape),
+        -1 if current is None else int(current.data_ptr()),
+        () if spacing is None else tuple(float(x) for x in torch.as_tensor(spacing).detach().cpu().reshape(-1).tolist()),
+    )
+
+
+def _boxes(labels: np.ndarray) -> dict[int, _Box]:
+    shape = np.asarray(labels.shape)
+    out = {}
+    for cell_id, bbox in enumerate(ndi.find_objects(labels), 1):
+        if bbox is None: continue
+        low = np.asarray([int(s.start) for s in bbox], dtype=np.int64)
+        high = np.asarray([int(s.stop) for s in bbox], dtype=np.int64)
+        out[cell_id] = _Box(cell_id, low, high, bool(np.any(low == 0) or np.any(high == shape)))
+    return out
+
+
+def _fit(low, high, full_shape, crop_shape, spacing, context_um):
+    full = np.asarray(full_shape, dtype=np.int64)
+    size = np.minimum(full, np.asarray(crop_shape, dtype=np.int64))
+    for context in (float(context_um), 0.0):
+        margin = np.ceil(context / np.maximum(spacing, 1e-6)).astype(np.int64)
+        lo = np.maximum(low - margin, 0)
+        hi = np.minimum(high + margin, full)
+        if np.any(hi - lo > size):
+            continue
+        min_start = np.maximum(hi - size, 0)
+        max_start = np.minimum(lo, full - size)
+        if np.any(min_start > max_start):
+            continue
+        desired = np.rint(0.5 * (lo + hi) - 0.5 * size).astype(np.int64)
+        start = np.minimum(np.maximum(desired, min_start), max_start)
+        return tuple(slice(int(a), int(b)) for a, b in zip(start, start + size))
+    return None
+
+
+def _record(batch_index, crop, boxes, *, kind='coverage', merge_sources=(), merge_gt=()):
+    lo = np.asarray([int(s.start) for s in crop])
+    hi = np.asarray([int(s.stop) for s in crop])
+    complete, partial, boundary = [], [], []
+    for cell_id, box in boxes.items():
+        if not (np.all(box.high > lo) and np.all(box.low < hi)): continue
+        contained = bool(np.all(box.low >= lo) and np.all(box.high <= hi))
+        if box.boundary and contained: boundary.append(cell_id)
+        elif contained: complete.append(cell_id)
+        else: partial.append(cell_id)
+    return MergeAwareCropRecord(
+        batch_index, crop, tuple(sorted(complete)), tuple(sorted(partial)),
+        tuple(sorted(boundary)), tuple(sorted(set(merge_sources))),
+        tuple(sorted(set(merge_gt))), kind,
+    )
+
+
+def _union(rows: Iterable[_Box]):
+    rows = list(rows)
+    return np.min(np.stack([r.low for r in rows]), 0), np.max(np.stack([r.high for r in rows]), 0)
+
+
+def _merge_rows(batch_index, gt, current, boxes, full_shape, crop_shape, spacing, context_um, min_overlap, min_gt_fraction):
+    if current is None or not np.any(current > 0): return [], ()
+    pos = gt[gt > 0]
+    ids, counts = np.unique(pos, return_counts=True) if pos.size else (np.asarray([]), np.asarray([]))
+    gt_count = {int(i): int(n) for i, n in zip(ids.tolist(), counts.tolist())}
+    rows, unfit = [], []
+    for source_id, bbox in enumerate(ndi.find_objects(current), 1):
+        if bbox is None: continue
+        mask = current[bbox] == source_id
+        overlap = gt[bbox][mask]
+        overlap = overlap[overlap > 0]
+        if not overlap.size: continue
+        gids, nums = np.unique(overlap, return_counts=True)
+        meaningful = [int(g) for g, n in zip(gids.tolist(), nums.tolist())
+                      if int(n) >= min_overlap and float(n) / max(gt_count.get(int(g), 0), 1) >= min_gt_fraction]
+        if len(meaningful) < 2: continue
+        low = np.asarray([int(s.start) for s in bbox]); high = np.asarray([int(s.stop) for s in bbox])
+        for gid in meaningful:
+            if gid in boxes:
+                low = np.minimum(low, boxes[gid].low); high = np.maximum(high, boxes[gid].high)
+        crop = _fit(low, high, full_shape, crop_shape, spacing, context_um)
+        if crop is None:
+            unfit.append(source_id); continue
+        rows.append(_record(batch_index, crop, boxes, kind='merge', merge_sources=(source_id,), merge_gt=tuple(meaningful)))
+    return rows, tuple(sorted(unfit))
+
+
+def _coverage_rows(batch_index, boxes, full_shape, crop_shape, spacing, context_um, min_cells, preferred_cells):
+    if not boxes: return []
+    ordered = [boxes[i] for i in sorted(boxes)]
+    centers = np.stack([b.center * spacing for b in ordered])
+    k = min(len(ordered), max(preferred_cells + 2, min_cells, 1))
+    tree = cKDTree(centers)
+    _, nbr = tree.query(centers, k=k)
+    if k == 1: nbr = np.asarray(nbr)[:, None]
+    rows = []
+    for anchor in range(len(ordered)):
+        order = [int(v) for v in np.asarray(nbr[anchor]).reshape(-1).tolist()]
+        for n in range(1, len(order) + 1):
+            low, high = _union(ordered[j] for j in order[:n])
+            crop = _fit(low, high, full_shape, crop_shape, spacing, context_um)
+            if crop is not None: rows.append(_record(batch_index, crop, boxes))
+    return rows
+
+
+def _key(row):
+    return tuple((int(s.start), int(s.stop)) for s in row.slices_zyx)
+
+
+def _dedupe(rows):
+    out = {}
+    for row in rows:
+        key = _key(row)
+        if key not in out: out[key] = row; continue
+        old = out[key]
+        ms = tuple(sorted(set(old.merge_source_ids) | set(row.merge_source_ids)))
+        mg = tuple(sorted(set(old.merge_gt_ids) | set(row.merge_gt_ids)))
+        out[key] = MergeAwareCropRecord(old.batch_index, old.slices_zyx, old.complete_cell_ids,
+            old.partial_cell_ids, old.true_boundary_cell_ids, ms, mg, 'merge' if ms else old.candidate_type)
+    return [out[k] for k in sorted(out)]
+
+
+def _select(candidates, target_ids, boundary_ids, min_cells, preferred_cells, views):
+    remaining = {i: views for i in target_ids}; selected = []; used = set()
+    merge = sorted((r for r in candidates if r.merge_source_ids), key=lambda r: (-len(r.merge_gt_ids), -len(r.complete_cell_ids), len(r.partial_cell_ids), _key(r)))
+    for row in merge:
+        if _key(row) in used: continue
+        selected.append(row); used.add(_key(row))
+        for i in row.covered_cell_ids:
+            if remaining.get(i, 0) > 0: remaining[i] -= 1
+    pool = [r for r in candidates if _key(r) not in used]
+    interior_count = len(target_ids - boundary_ids)
+    while any(v > 0 for v in remaining.values()):
+        needed = {i for i, v in remaining.items() if v > 0}
+        gain = lambda r: sum(remaining.get(i, 0) > 0 for i in r.covered_cell_ids)
+        useful = [r for r in pool if gain(r) > 0]
+        if not useful: break
+        preferred = [r for r in useful if len(r.complete_cell_ids) >= preferred_cells]
+        minimum = [r for r in useful if len(r.complete_cell_ids) >= min_cells]
+        boundary = [r for r in useful if set(r.true_boundary_cell_ids) & needed]
+        eligible = preferred or minimum or boundary or (useful if interior_count < min_cells else [])
+        if not eligible: break
+        best = max(eligible, key=lambda r: (gain(r), len(r.complete_cell_ids), -len(r.partial_cell_ids), tuple(-int(s.start) for s in r.slices_zyx)))
+        selected.append(best); pool.remove(best)
+        for i in best.covered_cell_ids:
+            if remaining.get(i, 0) > 0: remaining[i] -= 1
+    return selected, tuple(sorted(i for i, v in remaining.items() if v > 0))
+
+
+def build_merge_aware_crop_manifest(gt_labels: Tensor, *, current_labels: Tensor | None = None, spacing_um: Tensor | None = None,
+        crop_shape_zyx=(32, 192, 192), min_complete_cells=3, preferred_complete_cells=4, views_per_cell=1,
+        context_um=4.0, merge_min_overlap_voxels=8, merge_min_gt_fraction=0.05):
+    gt = torch.as_tensor(gt_labels).detach().cpu().long()
+    if gt.ndim != 4: raise ValueError('GT must be [B,Z,Y,X]')
+    current = None if current_labels is None else torch.as_tensor(current_labels).detach().cpu().long()
+    if current is not None and current.shape != gt.shape: raise ValueError('current_labels must align with GT')
+    spacing = torch.ones((gt.shape[0], 3)) if spacing_um is None else torch.as_tensor(spacing_um).detach().cpu().float()
+    if spacing.ndim == 1: spacing = spacing[None].expand(gt.shape[0], -1)
+    if spacing.shape != (gt.shape[0], 3) or bool((spacing <= 0).any()): raise ValueError('spacing_um must be positive [B,3]')
+    if min_complete_cells < 1 or preferred_complete_cells < min_complete_cells: raise ValueError('invalid complete-cell thresholds')
+    full_shape = tuple(int(v) for v in gt.shape[-3:])
+    records, uncells, unmerges = [], [], []
+    for b in range(gt.shape[0]):
+        g = gt[b].numpy(); c = None if current is None else current[b].numpy(); boxes = _boxes(g); sp = spacing[b].numpy().astype(np.float64)
+        merge_rows, unfit = _merge_rows(b, g, c, boxes, full_shape, crop_shape_zyx, sp, context_um, merge_min_overlap_voxels, merge_min_gt_fraction)
+        cover_rows = _coverage_rows(b, boxes, full_shape, crop_shape_zyx, sp, context_um, min_complete_cells, preferred_complete_cells)
+        candidates = _dedupe([*merge_rows, *cover_rows])
+        boundary_ids = {i for i, box in boxes.items() if box.boundary}
+        chosen, missing = _select(candidates, set(boxes), boundary_ids, min_complete_cells, preferred_complete_cells, views_per_cell)
+        if not chosen:
+            size = np.minimum(np.asarray(full_shape), np.asarray(crop_shape_zyx)); start = (np.asarray(full_shape) - size) // 2
+            crop = tuple(slice(int(a), int(bb)) for a, bb in zip(start, start + size))
+            chosen = [_record(b, crop, boxes, kind='background')]
+        records.append(tuple(chosen)); uncells.append(missing); unmerges.append(unfit)
+    return MergeAwareCropManifest(tuple(records), tuple(crop_shape_zyx), min_complete_cells, preferred_complete_cells,
+        views_per_cell, float(context_um), merge_min_overlap_voxels, float(merge_min_gt_fraction), tuple(uncells), tuple(unmerges),
+        source_signature(gt_labels, current_labels, spacing_um))
+
+
+def sample_merge_aware_crop_specs(gt_labels: Tensor, spacing_um: Tensor, manifest: MergeAwareCropManifest, *, crops_per_step: int, global_step: int):
+    spacing = torch.as_tensor(spacing_um).detach().cpu().float(); labels = torch.as_tensor(gt_labels)
+    if spacing.ndim == 1: spacing = spacing[None]
+    full_shape = tuple(int(v) for v in labels.shape[-3:]); rounds = []
+    for crop_round in range(crops_per_step):
+        specs = []
+        for b, rows in enumerate(manifest.records):
+            if not rows: continue
+            row = rows[(global_step * crops_per_step + crop_round) % len(rows)]
+            lower = torch.tensor([s.start for s in row.slices_zyx], dtype=torch.float32)
+            size = torch.tensor([s.stop - s.start for s in row.slices_zyx], dtype=torch.float32)
+            shift = (lower + 0.5 * (size - 1) - 0.5 * (torch.tensor(full_shape).float() - 1)) * spacing[b]
+            specs.append(CropSpec(b, row.slices_zyx, full_shape, shift, row.candidate_type,
+                row.complete_cell_ids, row.partial_cell_ids, row.true_boundary_cell_ids, row.merge_source_ids))
+        rounds.append(specs)
+    return rounds
+
+
+__all__ = ['MergeAwareCropManifest', 'MergeAwareCropRecord', 'build_merge_aware_crop_manifest', 'sample_merge_aware_crop_specs', 'source_signature']

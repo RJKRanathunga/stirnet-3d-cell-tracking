@@ -5,6 +5,7 @@ from typing import Dict, List
 
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 
 from ..model.geometry.targets import (
     GeometryTargets,
@@ -32,6 +33,10 @@ class CropSpec:
     full_shape_zyx: tuple[int, int, int]
     center_shift_um: Tensor
     candidate_type: str
+    complete_cell_ids: tuple[int, ...] = ()
+    partial_cell_ids: tuple[int, ...] = ()
+    true_boundary_cell_ids: tuple[int, ...] = ()
+    merge_source_ids: tuple[int, ...] = ()
 
     @property
     def shape_zyx(self) -> tuple[int, int, int]:
@@ -400,12 +405,22 @@ def crop_geometry_targets(
     return GeometryTargets(**rows)
 
 
+def _crop_supervision_valid_mask(gt_crop: Tensor, spec: CropSpec, spacing_um: Tensor, *, margin_um: float, device: torch.device) -> Tensor:
+    if not spec.partial_cell_ids: return torch.ones(gt_crop.shape, device=device, dtype=torch.bool)
+    ids=torch.tensor(spec.partial_cell_ids,device=gt_crop.device,dtype=gt_crop.dtype); ignored=torch.isin(gt_crop,ids).to(device)
+    if margin_um > 0 and bool(ignored.any()):
+        spacing=spacing_um.detach().cpu().float().clamp_min(1e-6); radii=torch.ceil(float(margin_um)/spacing).long(); kernel=tuple(int(2*r.item()+1) for r in radii); pad=tuple(int(r.item()) for r in radii)
+        ignored=F.max_pool3d(ignored[None,None].float(),kernel_size=kernel,stride=1,padding=pad)[0,0]>0
+    return ~ignored
+
+
 def prepare_crop_batch(
     batch: dict,
     gt_labels: Tensor,
     specs: List[CropSpec],
     *,
     geometry_targets: GeometryTargets | None = None,
+    partial_ignore_margin_um: float = 0.0,
 ) -> CropBatch:
     """Crop aligned model inputs, current labels, GT, and dense targets."""
     cropped = {
@@ -446,6 +461,10 @@ def prepare_crop_batch(
     cropped_gt = torch.stack(
         [gt_labels[spec.batch_index][spec.slices_zyx] for spec in specs]
     )
+    cropped["supervision_valid_mask"] = torch.stack([
+        _crop_supervision_valid_mask(cropped_gt[row], spec, cropped["spacing_um"][row], margin_um=float(partial_ignore_margin_um), device=cropped["spatial_inputs"].device)
+        for row, spec in enumerate(specs)
+    ])
     cropped_targets = (
         None
         if geometry_targets is None

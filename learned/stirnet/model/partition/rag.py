@@ -1069,7 +1069,7 @@ class RAGCriterion(nn.Module):
         super().__init__()
         self.cfg = cfg or PartitionConfig()
 
-    def build_targets(self, rag: RAGState, gt_labels: Tensor) -> RAGTargets:
+    def build_targets(self, rag: RAGState, gt_labels: Tensor, *, valid_mask: Tensor | None = None) -> RAGTargets:
         dominant = torch.zeros(
             rag.node_features.shape[0], device=rag.node_features.device, dtype=torch.long
         )
@@ -1077,8 +1077,10 @@ class RAGCriterion(nn.Module):
         support = rag.node_features.new_zeros((rag.node_features.shape[0],))
         for b, supervox in enumerate(rag.supervoxel_labels):
             gt = gt_labels[b].to(supervox.device).long()
+            valid = None if valid_mask is None else torch.as_tensor(valid_mask[b], device=supervox.device).bool()
+            if valid is not None and valid.ndim == 4 and valid.shape[0] == 1: valid = valid[0]
             start = int(rag.node_offsets[b].item())
-            table = label_contingency(supervox, gt)
+            table = label_contingency(supervox, gt, valid_mask=valid)
             if not table.row_ids.numel():
                 continue
             foreground_overlap = table.intersections.sum(dim=1)

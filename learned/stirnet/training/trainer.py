@@ -36,11 +36,13 @@ from .prepared_geometry import (
     compose_source_conditioned_geometry_targets,
     geometry_targets_from_mapping,
 )
-from .coverage_crops import (
-    CoverageCropManifest,
-    build_coverage_crop_manifest,
-    sample_coverage_crop_specs,
+from .merge_aware_crops import (
+    MergeAwareCropManifest,
+    build_merge_aware_crop_manifest,
+    sample_merge_aware_crop_specs,
+    source_signature as merge_crop_source_signature,
 )
+from .source_corruption import apply_source_instance_dropout
 
 
 MODEL_INPUT_KEYS = frozenset(
@@ -268,7 +270,7 @@ class Trainer:
             output_path=self.training_config.memory_profile_path,
         )
         self._crop_candidate_cache: CropCandidateCache | None = None
-        self._coverage_crop_manifest: CoverageCropManifest | None = None
+        self._coverage_crop_manifest: MergeAwareCropManifest | None = None
 
     def checkpoint_metadata(self) -> dict[str, int | str]:
         """Return the stage-local progress required for an exact resume."""
@@ -662,22 +664,30 @@ class Trainer:
             )
         return self._crop_candidate_cache
 
-    def _coverage_manifest(self, labels: torch.Tensor) -> CoverageCropManifest:
+    def _coverage_manifest(self, batch: dict, labels: torch.Tensor) -> MergeAwareCropManifest:
         cfg = self.training_config.curriculum
-        signature = (tuple(labels.shape), int(labels.data_ptr()))
+        current_labels = batch.get("instance_labels")
+        signature = merge_crop_source_signature(labels, current_labels, batch["spacing_um"])
         current = self._coverage_crop_manifest
         if (
-            current is None
-            or current.source_signature != signature
+            current is None or current.source_signature != signature
             or current.crop_shape_zyx != tuple(cfg.refinement_crop_shape_zyx)
             or current.min_complete_cells != int(cfg.refinement_crop_min_complete_cells)
+            or current.preferred_complete_cells != int(cfg.refinement_crop_preferred_complete_cells)
             or current.views_per_cell != int(cfg.refinement_crop_views_per_cell)
+            or current.context_um != float(cfg.refinement_crop_context_um)
+            or current.merge_min_overlap_voxels != int(cfg.refinement_crop_merge_min_overlap_voxels)
+            or current.merge_min_gt_fraction != float(cfg.refinement_crop_merge_min_gt_fraction)
         ):
-            current = build_coverage_crop_manifest(
-                labels,
+            current = build_merge_aware_crop_manifest(
+                labels, current_labels=current_labels, spacing_um=batch["spacing_um"],
                 crop_shape_zyx=tuple(cfg.refinement_crop_shape_zyx),
                 min_complete_cells=int(cfg.refinement_crop_min_complete_cells),
+                preferred_complete_cells=int(cfg.refinement_crop_preferred_complete_cells),
                 views_per_cell=int(cfg.refinement_crop_views_per_cell),
+                context_um=float(cfg.refinement_crop_context_um),
+                merge_min_overlap_voxels=int(cfg.refinement_crop_merge_min_overlap_voxels),
+                merge_min_gt_fraction=float(cfg.refinement_crop_merge_min_gt_fraction),
             )
             self._coverage_crop_manifest = current
         return current
@@ -714,12 +724,13 @@ class Trainer:
         target_seconds = 0.0
         backward_seconds = 0.0
         candidate_types: list[str] = []
+        source_dropout_count = 0
 
         with self.stage_profiler.phase_scope(profile_phase):
             with self.stage_profiler.profile("crop_select"):
                 if cfg.refinement_crop_sampling == "coverage":
-                    manifest = self._coverage_manifest(labels)
-                    crop_rounds = sample_coverage_crop_specs(
+                    manifest = self._coverage_manifest(batch, labels)
+                    crop_rounds = sample_merge_aware_crop_specs(
                         labels,
                         batch["spacing_um"],
                         manifest,
@@ -753,11 +764,15 @@ class Trainer:
                     },
                 ):
                     crop = prepare_crop_batch(
-                        batch,
-                        labels,
-                        specs,
-                        geometry_targets=geometry_targets,
+                        batch, labels, specs, geometry_targets=geometry_targets,
+                        partial_ignore_margin_um=cfg.refinement_crop_partial_ignore_margin_um,
                     )
+                    crop = apply_source_instance_dropout(
+                        crop, probability=cfg.refinement_crop_source_dropout_probability,
+                        max_instances=cfg.refinement_crop_source_dropout_max_instances,
+                        seed=cfg.refinement_crop_seed + 1_000_003 * self.global_step + 97 * crop_index,
+                    )
+                    source_dropout_count += sum(len(row) for row in crop.batch.get("source_dropout_ids", ()))
                 started = time.perf_counter()
                 with self._autocast():
                     output = model_forward_from_batch(
@@ -781,6 +796,7 @@ class Trainer:
                             crop.batch["dref_um"],
                             stage=criterion_stage,
                             precomputed_geometry_targets=crop.geometry_targets,
+                            supervision_valid_mask=crop.batch.get("supervision_valid_mask"),
                         )
                     if rag_scale:
                         with self.stage_profiler.profile("rag"):
@@ -830,6 +846,7 @@ class Trainer:
                 "phase_a_crop_target_seconds": target_seconds,
                 "phase_a_crop_backward_seconds": backward_seconds,
                 "phase_a_crop_candidate_count": float(len(candidate_types)),
+                "phase_a_source_dropout_count": float(source_dropout_count),
             },
         )
 

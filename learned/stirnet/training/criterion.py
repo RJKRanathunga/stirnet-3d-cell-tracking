@@ -528,6 +528,7 @@ class StirNetCriterion(nn.Module):
         precomputed_discrete_targets: dict[str, object] | None = None,
         geometry_losses_override: dict[str, Tensor] | None = None,
         geometry_valid_fraction_override: Tensor | None = None,
+        supervision_valid_mask: Tensor | None = None,
     ) -> dict[str, Tensor]:
         if stage not in {
             "geometry_bootstrap",
@@ -556,9 +557,16 @@ class StirNetCriterion(nn.Module):
                 else precomputed_geometry_targets.to(device)
             )
             geometry_losses = self.geometry(
-                output.geometry, geometry_target, spacing_um, dref_um
+                output.geometry, geometry_target, spacing_um, dref_um,
+                valid_mask=supervision_valid_mask,
             )
-            sdf_valid_fraction = geometry_target.sdf_valid.float().mean().detach()
+            if supervision_valid_mask is None:
+                sdf_valid_fraction = geometry_target.sdf_valid.float().mean().detach()
+            else:
+                valid = torch.as_tensor(supervision_valid_mask, device=geometry_target.sdf_valid.device).bool()
+                if valid.ndim == 4: valid = valid[:, None]
+                valid = valid.expand_as(geometry_target.sdf_valid)
+                sdf_valid_fraction = ((geometry_target.sdf_valid.bool() & valid).float().sum() / valid.float().sum().clamp_min(1)).detach()
         else:
             geometry_losses = geometry_losses_override
             sdf_valid_fraction = (
@@ -588,7 +596,7 @@ class StirNetCriterion(nn.Module):
         spatial_targets = (
             cached_rag_targets
             if cached_rag_targets is not None and can_reuse_initial
-            else self.rag.build_targets(output.rag, gt_labels)
+            else self.rag.build_targets(output.rag, gt_labels, valid_mask=supervision_valid_mask)
         )
         spatial_rag = self.rag(
             output.rag, gt_labels, targets=spatial_targets

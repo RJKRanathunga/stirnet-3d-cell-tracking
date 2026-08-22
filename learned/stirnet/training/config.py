@@ -34,16 +34,23 @@ class CurriculumConfig:
     refinement_crop_enabled: bool = True
     refinement_crop_shape_zyx: Tuple[int, int, int] = (32, 192, 192)
     refinement_crops_per_step: int = 1
-    refinement_crop_sampling: str = "mixed"
+    refinement_crop_sampling: str = "coverage"
     refinement_crop_min_foreground_fraction: float = 0.001
-    refinement_crop_min_complete_cells: int = 10
+    refinement_crop_min_complete_cells: int = 3
+    refinement_crop_preferred_complete_cells: int = 4
     refinement_crop_views_per_cell: int = 1
+    refinement_crop_context_um: float = 4.0
+    refinement_crop_partial_ignore_margin_um: float = 1.0
+    refinement_crop_merge_min_overlap_voxels: int = 8
+    refinement_crop_merge_min_gt_fraction: float = 0.05
+    refinement_crop_source_dropout_probability: float = 0.15
+    refinement_crop_source_dropout_max_instances: int = 1
     refinement_crop_geometry_weight: float = 1.0
     refinement_crop_rag_weight: float = 0.0
     refinement_crop_seed: int = 40_266
     full_frame_spatial_grad: bool = False
-    geometry_bootstrap_crop_enabled: bool = False
-    spatial_partition_crop_enabled: bool = False
+    geometry_bootstrap_crop_enabled: bool = True
+    spatial_partition_crop_enabled: bool = True
     instance_temporal_detached_spatial: bool = False
 
 
@@ -97,8 +104,20 @@ class TrainingConfig:
             raise ValueError("refinement_crop_sampling must be mixed or coverage")
         if self.curriculum.refinement_crop_min_complete_cells < 1:
             raise ValueError("refinement_crop_min_complete_cells must be positive")
+        if self.curriculum.refinement_crop_preferred_complete_cells < self.curriculum.refinement_crop_min_complete_cells:
+            raise ValueError("refinement_crop_preferred_complete_cells must be >= minimum")
         if self.curriculum.refinement_crop_views_per_cell < 1:
             raise ValueError("refinement_crop_views_per_cell must be positive")
+        if self.curriculum.refinement_crop_context_um < 0 or self.curriculum.refinement_crop_partial_ignore_margin_um < 0:
+            raise ValueError("crop physical margins cannot be negative")
+        if self.curriculum.refinement_crop_merge_min_overlap_voxels < 1:
+            raise ValueError("refinement_crop_merge_min_overlap_voxels must be positive")
+        if not 0.0 <= self.curriculum.refinement_crop_merge_min_gt_fraction <= 1.0:
+            raise ValueError("refinement_crop_merge_min_gt_fraction must be in [0,1]")
+        if not 0.0 <= self.curriculum.refinement_crop_source_dropout_probability <= 1.0:
+            raise ValueError("refinement_crop_source_dropout_probability must be in [0,1]")
+        if self.curriculum.refinement_crop_source_dropout_max_instances < 0:
+            raise ValueError("refinement_crop_source_dropout_max_instances cannot be negative")
         if not 0.0 <= self.curriculum.refinement_crop_min_foreground_fraction <= 1.0:
             raise ValueError(
                 "refinement_crop_min_foreground_fraction must be in [0, 1]"
