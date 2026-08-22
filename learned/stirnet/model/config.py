@@ -125,9 +125,11 @@ class PartitionConfig:
     # This keeps mostly-background supervoxels out of edge supervision while
     # still tolerating imperfect proposal boundaries during early training.
     rag_min_node_gt_support: float = 0.50
-    # The ellipsoidal reference NMS was safer in Stage-05 at the calibrated
-    # physical radius than the rectangular fast backend.
-    watershed_backend: str = "reference"
+    # The fast rectangular physical-NMS backend is the production default.
+    # Stage-11 showed comparable proposal safety/recoverability with much lower
+    # runtime and substantially fewer supervoxels than candidate physical NMS.
+    # The post-watershed face-level safety guard preserves atomic cell separability.
+    watershed_backend: str = "fast"
     region_stats_backend: str = "auto"
     component_bounded_watershed: bool = True
     watershed_component_halo_voxels: int = 1
