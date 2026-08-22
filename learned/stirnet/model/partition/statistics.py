@@ -409,21 +409,30 @@ def aggregate_supervoxel_statistics(
         reduce="amax", fill=-1,
     )
     empty = counts <= 0
-    minima[empty] = 0
-    maxima[empty] = 0
+    minima = torch.where(
+        empty[:, None], torch.zeros_like(minima), minima
+    )
+    maxima = torch.where(
+        empty[:, None], torch.zeros_like(maxima), maxima
+    )
     field_sums = {
         name: _aggregate_sum(value[:rows][valid], component_valid, component_count)
         for name, value in statistics.field_sums.items()
     }
-    field_maxima = {
-        name: _aggregate_extreme(
-            value[:rows][valid], component_valid, component_count,
-            reduce="amax", fill=-torch.inf,
+    field_maxima = {}
+    for name, value in statistics.field_maxima.items():
+        reduced = _aggregate_extreme(
+            value[:rows][valid],
+            component_valid,
+            component_count,
+            reduce="amax",
+            fill=-torch.inf,
         )
-        for name, value in statistics.field_maxima.items()
-    }
-    for value in field_maxima.values():
-        value[empty] = 0
+        field_maxima[name] = torch.where(
+            empty,
+            torch.zeros_like(reduced),
+            reduced,
+        )
 
     sdf_values = statistics.field_maxima["sdf"][:rows][valid]
     sdf_max = _aggregate_extreme(
@@ -453,11 +462,20 @@ def aggregate_supervoxel_statistics(
             scale.sums[:scale_rows][scale_valid], scale_component, component_count
         )
         scale_maxima = _aggregate_extreme(
-            scale.maxima[:scale_rows][scale_valid], scale_component, component_count,
-            reduce="amax", fill=-torch.inf,
+            scale.maxima[:scale_rows][scale_valid],
+            scale_component,
+            component_count,
+            reduce="amax",
+            fill=-torch.inf,
         )
-        scale_maxima[scale_counts <= 0] = 0
-        scales.append(ScaleFeatureStatistics(scale_counts, scale_sums, scale_maxima))
+        scale_maxima = torch.where(
+            (scale_counts <= 0)[:, None],
+            torch.zeros_like(scale_maxima),
+            scale_maxima,
+        )
+        scales.append(
+            ScaleFeatureStatistics(scale_counts, scale_sums, scale_maxima)
+        )
     return AggregatedRegionStatistics(
         counts=counts,
         coordinate_sums=coordinate_sums,
