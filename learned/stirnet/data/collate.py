@@ -43,6 +43,12 @@ def stirnet_collate(samples:list[dict])->dict:
         "dref_um":torch.stack([torch.as_tensor(s["dref_um"]).float() for s in samples]),
         "targets":[s["target"] for s in samples],
     }
+    if all(isinstance(s.get("geometry_targets_static"), dict) for s in samples):
+        field_names = tuple(samples[0]["geometry_targets_static"].keys())
+        batch["geometry_targets_static"] = {
+            name: torch.stack([torch.as_tensor(s["geometry_targets_static"][name]) for s in samples])
+            for name in field_names
+        }
     # instances
     inst_feats=[];inst_ids=[];inst_cent=[];inst_batch=[]
     for b,s in enumerate(samples):

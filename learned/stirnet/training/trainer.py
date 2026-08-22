@@ -30,6 +30,17 @@ from .curriculum import (
     optimizer_parameter_groups,
 )
 from .profiler import StageProfiler
+from .prepared_geometry import (
+    build_prepared_geometry_targets,
+    build_static_geometry_targets,
+    compose_source_conditioned_geometry_targets,
+    geometry_targets_from_mapping,
+)
+from .coverage_crops import (
+    CoverageCropManifest,
+    build_coverage_crop_manifest,
+    sample_coverage_crop_specs,
+)
 
 
 MODEL_INPUT_KEYS = frozenset(
@@ -257,6 +268,7 @@ class Trainer:
             output_path=self.training_config.memory_profile_path,
         )
         self._crop_candidate_cache: CropCandidateCache | None = None
+        self._coverage_crop_manifest: CoverageCropManifest | None = None
 
     def checkpoint_metadata(self) -> dict[str, int | str]:
         """Return the stage-local progress required for an exact resume."""
@@ -293,6 +305,49 @@ class Trainer:
         )
         return torch.autocast(device_type="cuda", dtype=dtype)
 
+    def prepare_static_geometry_targets(
+        self,
+        batch: dict,
+        *,
+        gt_labels: torch.Tensor | None = None,
+    ) -> GeometryTargets:
+        """Build reusable GT-only geometry for many source corruptions."""
+        labels = gt_labels_from_batch(batch) if gt_labels is None else gt_labels
+        with self.stage_profiler.profile(
+            "geometry_targets_static_prepare", qualify=False
+        ):
+            return build_static_geometry_targets(
+                labels,
+                batch["spacing_um"],
+                batch["dref_um"],
+                geometry_config=self.model.cfg.geometry,
+                backend=self.training_config.geometry_target_backend,
+                gpu_min_voxels=self.training_config.geometry_target_gpu_min_voxels,
+                device=torch.device("cpu"),
+            )
+
+    def compose_static_geometry_targets(
+        self,
+        static_targets: GeometryTargets,
+        batch: dict,
+        *,
+        gt_labels: torch.Tensor | None = None,
+    ) -> GeometryTargets:
+        """Rebuild only the source-conditioned separator for this source state."""
+        labels = gt_labels_from_batch(batch) if gt_labels is None else gt_labels
+        with self.stage_profiler.profile(
+            "geometry_targets_corrective_separator", qualify=False
+        ):
+            return compose_source_conditioned_geometry_targets(
+                static_targets,
+                labels,
+                batch.get("instance_labels"),
+                batch["spacing_um"],
+                geometry_config=self.model.cfg.geometry,
+                backend=self.training_config.geometry_target_backend,
+                gpu_min_voxels=self.training_config.geometry_target_gpu_min_voxels,
+            )
+
     def prepare_geometry_targets(
         self,
         batch: dict,
@@ -303,11 +358,14 @@ class Trainer:
         with self.stage_profiler.profile(
             "geometry_targets_prepare", qualify=False
         ):
-            return self.criterion.build_geometry_targets(
+            return build_prepared_geometry_targets(
                 labels,
                 batch["spacing_um"],
                 batch["dref_um"],
                 current_labels=batch.get("instance_labels"),
+                geometry_config=self.model.cfg.geometry,
+                backend=self.training_config.geometry_target_backend,
+                gpu_min_voxels=self.training_config.geometry_target_gpu_min_voxels,
                 device=torch.device("cpu"),
             )
 
@@ -604,6 +662,26 @@ class Trainer:
             )
         return self._crop_candidate_cache
 
+    def _coverage_manifest(self, labels: torch.Tensor) -> CoverageCropManifest:
+        cfg = self.training_config.curriculum
+        signature = (tuple(labels.shape), int(labels.data_ptr()))
+        current = self._coverage_crop_manifest
+        if (
+            current is None
+            or current.source_signature != signature
+            or current.crop_shape_zyx != tuple(cfg.refinement_crop_shape_zyx)
+            or current.min_complete_cells != int(cfg.refinement_crop_min_complete_cells)
+            or current.views_per_cell != int(cfg.refinement_crop_views_per_cell)
+        ):
+            current = build_coverage_crop_manifest(
+                labels,
+                crop_shape_zyx=tuple(cfg.refinement_crop_shape_zyx),
+                min_complete_cells=int(cfg.refinement_crop_min_complete_cells),
+                views_per_cell=int(cfg.refinement_crop_views_per_cell),
+            )
+            self._coverage_crop_manifest = current
+        return current
+
     def _crop_phase_a_backward(
         self,
         batch: dict,
@@ -639,19 +717,29 @@ class Trainer:
 
         with self.stage_profiler.phase_scope(profile_phase):
             with self.stage_profiler.profile("crop_select"):
-                cache = self._crop_cache(batch, labels)
-                crop_rounds = sample_mixed_crop_specs(
-                    labels,
-                    batch["spacing_um"],
-                    cache,
-                    crop_shape_zyx=cfg.refinement_crop_shape_zyx,
-                    crops_per_step=cfg.refinement_crops_per_step,
-                    global_step=self.global_step,
-                    seed=cfg.refinement_crop_seed,
-                    min_foreground_fraction=(
-                        cfg.refinement_crop_min_foreground_fraction
-                    ),
-                )
+                if cfg.refinement_crop_sampling == "coverage":
+                    manifest = self._coverage_manifest(labels)
+                    crop_rounds = sample_coverage_crop_specs(
+                        labels,
+                        batch["spacing_um"],
+                        manifest,
+                        crops_per_step=cfg.refinement_crops_per_step,
+                        global_step=self.global_step,
+                    )
+                else:
+                    cache = self._crop_cache(batch, labels)
+                    crop_rounds = sample_mixed_crop_specs(
+                        labels,
+                        batch["spacing_um"],
+                        cache,
+                        crop_shape_zyx=cfg.refinement_crop_shape_zyx,
+                        crops_per_step=cfg.refinement_crops_per_step,
+                        global_step=self.global_step,
+                        seed=cfg.refinement_crop_seed,
+                        min_foreground_fraction=(
+                            cfg.refinement_crop_min_foreground_fraction
+                        ),
+                    )
             for crop_index, specs in enumerate(crop_rounds):
                 candidate_types.extend(spec.candidate_type for spec in specs)
                 with self.stage_profiler.profile(
@@ -1014,6 +1102,7 @@ class Trainer:
         *,
         gt_labels: torch.Tensor | None = None,
         precomputed_geometry_targets: GeometryTargets | None = None,
+        precomputed_static_geometry_targets: GeometryTargets | None = None,
     ) -> dict[str, float]:
         total_started = time.perf_counter()
         self.curriculum_stage = self.curriculum.apply(self.global_step)
@@ -1030,6 +1119,19 @@ class Trainer:
             torch.cuda.reset_peak_memory_stats(self.device)
         with self.stage_profiler.profile("batch_to_device", qualify=False):
             moved = move_batch_to_device(batch, self.device)
+        if precomputed_static_geometry_targets is None:
+            static_mapping = moved.get("geometry_targets_static")
+            if isinstance(static_mapping, dict):
+                precomputed_static_geometry_targets = geometry_targets_from_mapping(
+                    static_mapping
+                )
+        if precomputed_geometry_targets is None and precomputed_static_geometry_targets is not None:
+            target_labels = gt_labels_from_batch(moved) if gt_labels is None else gt_labels
+            precomputed_geometry_targets = self.compose_static_geometry_targets(
+                precomputed_static_geometry_targets,
+                moved,
+                gt_labels=target_labels,
+            )
         self.optimizer.zero_grad(set_to_none=True)
         if self.curriculum_stage.name == "refinement_joint":
             if (
@@ -1200,12 +1302,14 @@ class Trainer:
         *,
         gt_labels: torch.Tensor | None = None,
         precomputed_geometry_targets: GeometryTargets | None = None,
+        precomputed_static_geometry_targets: GeometryTargets | None = None,
     ) -> dict[str, float]:
         try:
             return self._train_step_impl(
                 batch,
                 gt_labels=gt_labels,
                 precomputed_geometry_targets=precomputed_geometry_targets,
+                precomputed_static_geometry_targets=precomputed_static_geometry_targets,
             )
         except BaseException as error:
             is_oom = isinstance(error, torch.OutOfMemoryError) or (

@@ -36,6 +36,8 @@ class CurriculumConfig:
     refinement_crops_per_step: int = 1
     refinement_crop_sampling: str = "mixed"
     refinement_crop_min_foreground_fraction: float = 0.001
+    refinement_crop_min_complete_cells: int = 10
+    refinement_crop_views_per_cell: int = 1
     refinement_crop_geometry_weight: float = 1.0
     refinement_crop_rag_weight: float = 0.0
     refinement_crop_seed: int = 40_266
@@ -53,6 +55,8 @@ class TrainingConfig:
     amp_dtype: str = "bf16"
     profile_memory: bool = False
     memory_profile_path: str | None = None
+    geometry_target_backend: str = "auto"
+    geometry_target_gpu_min_voxels: int = 262_144
     refinement_teacher_forcing_start: float = 1.0
     refinement_teacher_forcing_end: float = 0.0
     refinement_teacher_forcing_decay_steps: int = 2_000
@@ -68,6 +72,10 @@ class TrainingConfig:
             raise ValueError("max_grad_norm must be positive")
         if self.amp_dtype not in {"fp16", "bf16", "fp32"}:
             raise ValueError("amp_dtype must be fp16, bf16, or fp32")
+        if self.geometry_target_backend not in {"auto", "scipy", "cupy"}:
+            raise ValueError("geometry_target_backend must be auto, scipy, or cupy")
+        if self.geometry_target_gpu_min_voxels < 1:
+            raise ValueError("geometry_target_gpu_min_voxels must be positive")
         if not 0.0 <= self.refinement_teacher_forcing_start <= 1.0:
             raise ValueError("refinement_teacher_forcing_start must be in [0, 1]")
         if not 0.0 <= self.refinement_teacher_forcing_end <= 1.0:
@@ -85,8 +93,12 @@ class TrainingConfig:
             raise ValueError("refinement crop dimensions must be positive")
         if self.curriculum.refinement_crops_per_step < 1:
             raise ValueError("refinement_crops_per_step must be positive")
-        if self.curriculum.refinement_crop_sampling != "mixed":
-            raise ValueError("only mixed refinement crop sampling is supported")
+        if self.curriculum.refinement_crop_sampling not in {"mixed", "coverage"}:
+            raise ValueError("refinement_crop_sampling must be mixed or coverage")
+        if self.curriculum.refinement_crop_min_complete_cells < 1:
+            raise ValueError("refinement_crop_min_complete_cells must be positive")
+        if self.curriculum.refinement_crop_views_per_cell < 1:
+            raise ValueError("refinement_crop_views_per_cell must be positive")
         if not 0.0 <= self.curriculum.refinement_crop_min_foreground_fraction <= 1.0:
             raise ValueError(
                 "refinement_crop_min_foreground_fraction must be in [0, 1]"

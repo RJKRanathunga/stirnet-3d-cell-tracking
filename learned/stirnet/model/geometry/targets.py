@@ -7,6 +7,8 @@ import torch
 from scipy import ndimage as ndi
 from torch import Tensor
 
+from .edt_backend import distance_transform_edt as target_distance_transform_edt
+
 
 @dataclass
 class GeometryTargets:
@@ -55,7 +57,7 @@ def _soft_interface_target(
     """Turn a one-voxel interface into a physically isotropic soft band."""
     if not interface.any():
         return np.zeros(interface.shape, dtype=np.float32)
-    distance_um = ndi.distance_transform_edt(
+    distance_um = target_distance_transform_edt(
         ~interface, sampling=spacing_um
     ).astype(np.float32)
     return np.exp(-0.5 * np.square(distance_um / max(sigma_um, 1e-6))).astype(
@@ -103,7 +105,7 @@ def _face_centered_soft_interface_target(
         face_grid[tuple(face_index)] = faces
         half_spacing = spacing_um.copy()
         half_spacing[axis] *= 0.5
-        distance_half = ndi.distance_transform_edt(
+        distance_half = target_distance_transform_edt(
             ~face_grid, sampling=half_spacing
         ).astype(np.float32)
         center_index = [slice(None)] * 3
@@ -271,7 +273,7 @@ def _source_conditioned_territories(
             if not np.any(seed_labels > 0):
                 continue
 
-            _, nearest_indices = ndi.distance_transform_edt(
+            _, nearest_indices = target_distance_transform_edt(
                 seed_labels == 0,
                 sampling=spacing_um,
                 return_indices=True,
@@ -358,7 +360,7 @@ def _face_centered_soft_partition_target(
 
         half_spacing = spacing_um.copy()
         half_spacing[axis] *= 0.5
-        distance_half = ndi.distance_transform_edt(
+        distance_half = target_distance_transform_edt(
             ~face_grid, sampling=half_spacing
         ).astype(np.float32)
 
@@ -495,7 +497,7 @@ def _single_volume_targets(
     # makes zero a true object surface. Clip locally to avoid background scale
     # dominating the target.
     if (~fg).any():
-        bg_dist = ndi.distance_transform_edt(~fg, sampling=spacing_um).astype(np.float32)
+        bg_dist = target_distance_transform_edt(~fg, sampling=spacing_um).astype(np.float32)
         sdf_um[~fg] = -bg_dist[~fg]
 
     # ``find_objects`` locates each cell once. All per-cell EDT, gradient, and
@@ -517,7 +519,7 @@ def _single_volume_targets(
         # native neighbor wherever the scene permits, so local gradients match
         # the full-volume field at object voxels.
         padded_mask = np.pad(local_mask, 1, mode="constant", constant_values=False)
-        padded_dist = ndi.distance_transform_edt(
+        padded_dist = target_distance_transform_edt(
             padded_mask, sampling=spacing_um
         ).astype(np.float32)
         inner = tuple(slice(1, -1) for _ in range(3))
