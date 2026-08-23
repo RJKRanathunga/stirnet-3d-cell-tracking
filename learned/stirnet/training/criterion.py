@@ -599,7 +599,8 @@ class StirNetCriterion(nn.Module):
             else self.rag.build_targets(output.rag, gt_labels, valid_mask=supervision_valid_mask)
         )
         spatial_rag = self.rag(
-            output.rag, gt_labels, targets=spatial_targets
+            output.rag, gt_labels, targets=spatial_targets,
+            batch_balanced=self.cfg.rag_balance_across_batch,
         )
         metrics.update(
             {
@@ -629,6 +630,7 @@ class StirNetCriterion(nn.Module):
             gt_labels,
             logits=output.reasoning.final_edge_logits,
             targets=spatial_targets,
+            batch_balanced=self.cfg.rag_balance_across_batch,
         )
         refinement_applied = bool(
             output.refinement is not None and output.refinement.applied_count
@@ -642,13 +644,15 @@ class StirNetCriterion(nn.Module):
                 else self.rag.build_targets(output.initial_rag, gt_labels)
             )
             initial_spatial = self.rag(
-                output.initial_rag, gt_labels, targets=initial_targets
+                output.initial_rag, gt_labels, targets=initial_targets,
+                batch_balanced=self.cfg.rag_balance_across_batch,
             )
             initial_final = self.rag(
                 output.initial_rag,
                 gt_labels,
                 logits=output.initial_reasoning.final_edge_logits,
                 targets=initial_targets,
+                batch_balanced=self.cfg.rag_balance_across_batch,
             )
             spatial_rag_loss = 0.5 * (
                 spatial_rag["rag_bce"] + initial_spatial["rag_bce"]

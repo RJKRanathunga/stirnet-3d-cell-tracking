@@ -234,22 +234,69 @@ def build_merge_aware_crop_manifest(gt_labels: Tensor, *, current_labels: Tensor
         source_signature(gt_labels, current_labels, spacing_um))
 
 
-def sample_merge_aware_crop_specs(gt_labels: Tensor, spacing_um: Tensor, manifest: MergeAwareCropManifest, *, crops_per_step: int, global_step: int):
+def _crop_spec_from_record(row: MergeAwareCropRecord, *, batch_index: int,
+        full_shape: tuple[int, int, int], spacing: Tensor) -> CropSpec:
+    lower = torch.tensor([s.start for s in row.slices_zyx], dtype=torch.float32)
+    size = torch.tensor([s.stop - s.start for s in row.slices_zyx], dtype=torch.float32)
+    shift = (lower + 0.5 * (size - 1) - 0.5 * (torch.tensor(full_shape).float() - 1)) * spacing
+    return CropSpec(batch_index, row.slices_zyx, full_shape, shift, row.candidate_type,
+        row.complete_cell_ids, row.partial_cell_ids, row.true_boundary_cell_ids, row.merge_source_ids)
+
+
+def _take_unique_cyclic(rows, *, count: int, start: int, used: set[tuple]):
+    chosen = []
+    if count <= 0 or not rows: return chosen
+    for offset in range(len(rows)):
+        row = rows[(start + offset) % len(rows)]; key = _key(row)
+        if key in used: continue
+        chosen.append(row); used.add(key)
+        if len(chosen) >= count: break
+    return chosen
+
+
+def _balanced_batch_rows(rows, *, crop_batch_size: int, merge_fraction: float, iteration: int):
+    if crop_batch_size < 1: raise ValueError('crop_batch_size must be positive')
+    if not 0.0 <= merge_fraction <= 1.0: raise ValueError('merge_fraction must be in [0,1]')
+    if not rows: return []
+    # Exact historical cycling for B=1.
+    if crop_batch_size == 1: return [rows[iteration % len(rows)]]
+    merge_rows = [r for r in rows if r.merge_source_ids]
+    coverage_rows = [r for r in rows if not r.merge_source_ids]
+    merge_target = min(crop_batch_size, max(0, int(crop_batch_size * merge_fraction + 0.5)))
+    coverage_target = crop_batch_size - merge_target
+    used = set(); chosen = []
+    chosen += _take_unique_cyclic(merge_rows, count=merge_target,
+        start=(iteration * max(merge_target, 1)) % max(len(merge_rows), 1), used=used)
+    chosen += _take_unique_cyclic(coverage_rows, count=coverage_target,
+        start=(iteration * max(coverage_target, 1)) % max(len(coverage_rows), 1), used=used)
+    all_rows = list(rows); fill_start = (iteration * crop_batch_size) % len(all_rows)
+    chosen += _take_unique_cyclic(all_rows, count=crop_batch_size-len(chosen),
+        start=fill_start, used=used)
+    # Duplicate only if the whole manifest has fewer unique rows than requested B.
+    offset = 0
+    while len(chosen) < crop_batch_size:
+        chosen.append(all_rows[(fill_start + offset) % len(all_rows)]); offset += 1
+    return chosen
+
+
+def sample_merge_aware_crop_specs(gt_labels: Tensor, spacing_um: Tensor,
+        manifest: MergeAwareCropManifest, *, crops_per_step: int, global_step: int,
+        crop_batch_size: int = 1, merge_fraction: float = 0.5):
+    """Return deterministic true crop-batch rounds with merge/coverage balance."""
     spacing = torch.as_tensor(spacing_um).detach().cpu().float(); labels = torch.as_tensor(gt_labels)
     if spacing.ndim == 1: spacing = spacing[None]
     full_shape = tuple(int(v) for v in labels.shape[-3:]); rounds = []
     for crop_round in range(crops_per_step):
-        specs = []
+        specs = []; iteration = global_step * crops_per_step + crop_round
         for b, rows in enumerate(manifest.records):
-            if not rows: continue
-            row = rows[(global_step * crops_per_step + crop_round) % len(rows)]
-            lower = torch.tensor([s.start for s in row.slices_zyx], dtype=torch.float32)
-            size = torch.tensor([s.stop - s.start for s in row.slices_zyx], dtype=torch.float32)
-            shift = (lower + 0.5 * (size - 1) - 0.5 * (torch.tensor(full_shape).float() - 1)) * spacing[b]
-            specs.append(CropSpec(b, row.slices_zyx, full_shape, shift, row.candidate_type,
-                row.complete_cell_ids, row.partial_cell_ids, row.true_boundary_cell_ids, row.merge_source_ids))
+            for row in _balanced_batch_rows(rows, crop_batch_size=crop_batch_size,
+                    merge_fraction=merge_fraction, iteration=iteration):
+                specs.append(_crop_spec_from_record(row, batch_index=b,
+                    full_shape=full_shape, spacing=spacing[b]))
         rounds.append(specs)
     return rounds
+
+
 
 
 __all__ = ['MergeAwareCropManifest', 'MergeAwareCropRecord', 'build_merge_aware_crop_manifest', 'sample_merge_aware_crop_specs', 'source_signature']

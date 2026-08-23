@@ -1141,6 +1141,7 @@ class RAGCriterion(nn.Module):
         *,
         logits: Tensor | None = None,
         targets: RAGTargets | None = None,
+        batch_balanced: bool = False,
     ) -> Dict[str, Tensor]:
         targets = self.build_targets(rag, gt_labels) if targets is None else targets
         target = targets.target
@@ -1185,12 +1186,28 @@ class RAGCriterion(nn.Module):
             }
         selected_target = target[valid]
         selected_predictions = predictions[valid]
-        positives = selected_target.sum()
-        negatives = selected_target.numel() - positives
-        pos_weight = (negatives / positives.clamp_min(1)).clamp(0.5, 20.0)
-        loss = F.binary_cross_entropy_with_logits(
-            selected_predictions, selected_target, pos_weight=pos_weight
-        )
+        if batch_balanced:
+            # Each crop with valid RAG supervision contributes one scalar loss,
+            # regardless of how many valid edges that crop generated.
+            per_batch_losses: list[Tensor] = []
+            for batch_index in torch.unique(rag.edge_batch[valid]):
+                row_valid = valid & (rag.edge_batch == batch_index)
+                row_target = target[row_valid]
+                row_predictions = predictions[row_valid]
+                positives = row_target.sum()
+                negatives = row_target.numel() - positives
+                pos_weight = (negatives / positives.clamp_min(1)).clamp(0.5, 20.0)
+                per_batch_losses.append(F.binary_cross_entropy_with_logits(
+                    row_predictions, row_target, pos_weight=pos_weight
+                ))
+            loss = torch.stack(per_batch_losses).mean()
+        else:
+            positives = selected_target.sum()
+            negatives = selected_target.numel() - positives
+            pos_weight = (negatives / positives.clamp_min(1)).clamp(0.5, 20.0)
+            loss = F.binary_cross_entropy_with_logits(
+                selected_predictions, selected_target, pos_weight=pos_weight
+            )
         accuracy = (
             (selected_predictions.sigmoid() >= 0.5) == selected_target.bool()
         ).float().mean()

@@ -78,10 +78,18 @@ def move_to_device(value: Any, device: torch.device | str):
     return value
 
 
-def move_batch_to_device(batch: dict, device: torch.device) -> dict:
-    """Move only V2 model inputs; noisy labels and large GT maps remain on CPU."""
+def move_batch_to_device(
+    batch: dict,
+    device: torch.device,
+    *,
+    include_spatial_inputs: bool = True,
+) -> dict:
+    """Move model inputs, optionally keeping full dense spatial data on CPU."""
     moved = dict(batch)
-    for key in MODEL_INPUT_KEYS:
+    skipped = frozenset() if include_spatial_inputs else frozenset({
+        "spatial_inputs", "spatial_padding_mask"
+    })
+    for key in MODEL_INPUT_KEYS - skipped:
         if key in batch and batch[key] is not None:
             moved[key] = move_to_device(batch[key], device)
     return moved
@@ -93,6 +101,18 @@ def gt_labels_from_batch(batch: dict) -> torch.Tensor:
         raise ValueError("V2 training requires batch['targets'][b]['label_map']")
     labels = [torch.as_tensor(target["label_map"]).long() for target in targets]
     return torch.stack(labels)
+
+
+def _pack_mixed_crop_rounds(rounds: list[list], *, crop_batch_size: int) -> list[list]:
+    if crop_batch_size < 1: raise ValueError("crop_batch_size must be positive")
+    if crop_batch_size == 1: return rounds
+    if len(rounds) % crop_batch_size: raise ValueError("mixed crop rounds do not divide into true batches")
+    packed = []
+    for start in range(0, len(rounds), crop_batch_size):
+        rows = []
+        for round_specs in rounds[start:start + crop_batch_size]: rows.extend(round_specs)
+        packed.append(rows)
+    return packed
 
 
 def model_forward_from_batch(
@@ -697,7 +717,7 @@ class Trainer:
         batch: dict,
         *,
         labels: torch.Tensor,
-        geometry_targets: GeometryTargets,
+        geometry_targets: GeometryTargets | None,
         stage: str,
         profile_phase: str = "phase_a",
         geometry_scale: float | None = None,
@@ -717,14 +737,17 @@ class Trainer:
         )
         execution_stage = "spatial" if rag_scale > 0 else "geometry"
         criterion_stage = "spatial_partition" if rag_scale > 0 else "geometry_bootstrap"
-        phase_loss = batch["spatial_inputs"].new_zeros(())
-        geometry_report = batch["spatial_inputs"].new_zeros(())
-        rag_report = batch["spatial_inputs"].new_zeros(())
+        phase_loss = batch["dref_um"].new_zeros(())
+        geometry_report = batch["dref_um"].new_zeros(())
+        rag_report = batch["dref_um"].new_zeros(())
         forward_seconds = 0.0
         target_seconds = 0.0
         backward_seconds = 0.0
         candidate_types: list[str] = []
         source_dropout_count = 0
+        crop_target_prepare_seconds = 0.0
+        merge_crop_count = 0
+        coverage_crop_count = 0
 
         with self.stage_profiler.phase_scope(profile_phase):
             with self.stage_profiler.profile("crop_select"):
@@ -736,31 +759,35 @@ class Trainer:
                         manifest,
                         crops_per_step=cfg.refinement_crops_per_step,
                         global_step=self.global_step,
+                        crop_batch_size=cfg.refinement_crop_batch_size,
+                        merge_fraction=cfg.refinement_crop_merge_fraction,
                     )
                 else:
                     cache = self._crop_cache(batch, labels)
-                    crop_rounds = sample_mixed_crop_specs(
+                    mixed_rounds = sample_mixed_crop_specs(
                         labels,
                         batch["spacing_um"],
                         cache,
                         crop_shape_zyx=cfg.refinement_crop_shape_zyx,
-                        crops_per_step=cfg.refinement_crops_per_step,
+                        crops_per_step=(cfg.refinement_crops_per_step * cfg.refinement_crop_batch_size),
                         global_step=self.global_step,
                         seed=cfg.refinement_crop_seed,
-                        min_foreground_fraction=(
-                            cfg.refinement_crop_min_foreground_fraction
-                        ),
+                        min_foreground_fraction=(cfg.refinement_crop_min_foreground_fraction),
+                    )
+                    crop_rounds = _pack_mixed_crop_rounds(
+                        mixed_rounds, crop_batch_size=cfg.refinement_crop_batch_size
                     )
             for crop_index, specs in enumerate(crop_rounds):
                 candidate_types.extend(spec.candidate_type for spec in specs)
+                merge_crop_count += sum(bool(spec.merge_source_ids) for spec in specs)
+                coverage_crop_count += sum(not bool(spec.merge_source_ids) for spec in specs)
                 with self.stage_profiler.profile(
                     "crop_prepare",
                     metadata={
                         "crop_index": crop_index,
                         "crop_shape_zyx": list(specs[0].shape_zyx),
-                        "candidate_types": [
-                            spec.candidate_type for spec in specs
-                        ],
+                        "candidate_types": [spec.candidate_type for spec in specs],
+                        "true_crop_batch_size": len(specs),
                     },
                 ):
                     crop = prepare_crop_batch(
@@ -772,12 +799,29 @@ class Trainer:
                         max_instances=cfg.refinement_crop_source_dropout_max_instances,
                         seed=cfg.refinement_crop_seed + 1_000_003 * self.global_step + 97 * crop_index,
                     )
-                    source_dropout_count += sum(len(row) for row in crop.batch.get("source_dropout_ids", ()))
+                    dropped_this_batch = sum(len(row) for row in crop.batch.get("source_dropout_ids", ()))
+                    source_dropout_count += dropped_this_batch
+                    crop_geometry_targets = crop.geometry_targets
+                    if crop_geometry_targets is None or dropped_this_batch:
+                        target_prepare_started = time.perf_counter()
+                        with self.stage_profiler.profile("crop_geometry_targets_prepare"):
+                            crop_geometry_targets = build_prepared_geometry_targets(
+                                crop.gt_labels,
+                                crop.batch["spacing_um"],
+                                crop.batch["dref_um"],
+                                current_labels=crop.batch.get("instance_labels"),
+                                geometry_config=self.model.cfg.geometry,
+                                backend=self.training_config.geometry_target_backend,
+                                gpu_min_voxels=self.training_config.geometry_target_gpu_min_voxels,
+                                device=torch.device("cpu"),
+                            )
+                        crop_target_prepare_seconds += time.perf_counter() - target_prepare_started
+                    model_crop_batch = move_batch_to_device(crop.batch, self.device)
                 started = time.perf_counter()
                 with self._autocast():
                     output = model_forward_from_batch(
                         self.model,
-                        crop.batch,
+                        model_crop_batch,
                         use_temporal=False,
                         execution_stage=execution_stage,
                         apply_existence_filter=False,
@@ -792,10 +836,10 @@ class Trainer:
                         metrics = self.criterion(
                             output,
                             crop.gt_labels,
-                            crop.batch["spacing_um"],
-                            crop.batch["dref_um"],
+                            model_crop_batch["spacing_um"],
+                            model_crop_batch["dref_um"],
                             stage=criterion_stage,
-                            precomputed_geometry_targets=crop.geometry_targets,
+                            precomputed_geometry_targets=crop_geometry_targets,
                             supervision_valid_mask=crop.batch.get("supervision_valid_mask"),
                         )
                     if rag_scale:
@@ -828,7 +872,7 @@ class Trainer:
                 rag_report = rag_report + (
                     crop_rag.detach() / len(crop_rounds)
                 )
-                del output, metrics, loss, crop
+                del output, metrics, loss, crop, crop_geometry_targets, model_crop_batch
             with self.stage_profiler.profile("release"):
                 del crop_rounds
 
@@ -838,14 +882,23 @@ class Trainer:
                 "crop_geometry_loss": geometry_report,
                 "crop_spatial_rag_bce": rag_report,
                 "crop_count": phase_loss.new_tensor(
-                    cfg.refinement_crops_per_step * labels.shape[0]
+                    cfg.refinement_crops_per_step * cfg.refinement_crop_batch_size * labels.shape[0]
                 ),
+                "crop_true_batch_size": phase_loss.new_tensor(
+                    cfg.refinement_crop_batch_size * labels.shape[0]
+                ),
+                "crop_merge_count": phase_loss.new_tensor(merge_crop_count),
+                "crop_coverage_count": phase_loss.new_tensor(coverage_crop_count),
             },
             {
                 "phase_a_crop_forward_seconds": forward_seconds,
                 "phase_a_crop_target_seconds": target_seconds,
+                "phase_a_crop_geometry_target_prepare_seconds": crop_target_prepare_seconds,
                 "phase_a_crop_backward_seconds": backward_seconds,
                 "phase_a_crop_candidate_count": float(len(candidate_types)),
+                "phase_a_crop_effective_batch_size": float(cfg.refinement_crop_batch_size * labels.shape[0]),
+                "phase_a_crop_merge_count": float(merge_crop_count),
+                "phase_a_crop_coverage_count": float(coverage_crop_count),
                 "phase_a_source_dropout_count": float(source_dropout_count),
             },
         )
@@ -1134,8 +1187,14 @@ class Trainer:
         )
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
+        early_crop_training = (
+            (self.curriculum_stage.name == "geometry_bootstrap" and self.training_config.curriculum.geometry_bootstrap_crop_enabled)
+            or (self.curriculum_stage.name == "spatial_partition" and self.training_config.curriculum.spatial_partition_crop_enabled)
+        )
         with self.stage_profiler.profile("batch_to_device", qualify=False):
-            moved = move_batch_to_device(batch, self.device)
+            moved = move_batch_to_device(
+                batch, self.device, include_spatial_inputs=not early_crop_training
+            )
         if precomputed_static_geometry_targets is None:
             static_mapping = moved.get("geometry_targets_static")
             if isinstance(static_mapping, dict):
@@ -1175,9 +1234,9 @@ class Trainer:
             and self.training_config.curriculum.spatial_partition_crop_enabled
         ):
             labels = gt_labels_from_batch(moved) if gt_labels is None else gt_labels
-            geometry_targets = self._geometry_targets_for_step(
-                moved, labels, precomputed_geometry_targets
-            )
+            # Crop-enabled early stages build targets after selection, unless
+            # the caller explicitly supplied a full-frame prepared target.
+            geometry_targets = precomputed_geometry_targets
             rag_scale = float(
                 self.curriculum_stage.name == "spatial_partition"
             )

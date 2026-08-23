@@ -12,6 +12,8 @@ class LossConfig:
     existence_weight: float = 0.50
     split_weight: float = 0.50
     recovery_weight: float = 0.25
+    # Average RAG losses per crop row instead of pooling every edge in B.
+    rag_balance_across_batch: bool = True
 
     existence_min_precision: float = 0.25
     existence_min_gt_coverage: float = 0.10
@@ -33,7 +35,13 @@ class CurriculumConfig:
     spatial_lr_scale_refinement: float = 0.10
     refinement_crop_enabled: bool = True
     refinement_crop_shape_zyx: Tuple[int, int, int] = (32, 192, 192)
+    # Number of true crop-batch rounds accumulated before one optimizer step.
     refinement_crops_per_step: int = 1
+    # Crops from each source row processed together in one [B,C,Z,Y,X] pass.
+    # Hardware-specific training scripts can set this to 4 for L40S.
+    refinement_crop_batch_size: int = 1
+    # Target merge/error share of each merge-aware true crop batch.
+    refinement_crop_merge_fraction: float = 0.50
     refinement_crop_sampling: str = "coverage"
     refinement_crop_min_foreground_fraction: float = 0.001
     refinement_crop_min_complete_cells: int = 3
@@ -100,6 +108,10 @@ class TrainingConfig:
             raise ValueError("refinement crop dimensions must be positive")
         if self.curriculum.refinement_crops_per_step < 1:
             raise ValueError("refinement_crops_per_step must be positive")
+        if self.curriculum.refinement_crop_batch_size < 1:
+            raise ValueError("refinement_crop_batch_size must be positive")
+        if not 0.0 <= self.curriculum.refinement_crop_merge_fraction <= 1.0:
+            raise ValueError("refinement_crop_merge_fraction must be in [0,1]")
         if self.curriculum.refinement_crop_sampling not in {"mixed", "coverage"}:
             raise ValueError("refinement_crop_sampling must be mixed or coverage")
         if self.curriculum.refinement_crop_min_complete_cells < 1:
