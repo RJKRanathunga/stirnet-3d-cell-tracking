@@ -9,9 +9,9 @@ putting them into the model/trainer.
 
 What it does
 ------------
-* Runs on Modal L40S, 4 CPU cores, 16 GiB host RAM.
+* Runs on Modal L40S, 4 CPU cores, 8 GiB host RAM.
 * Loads NIS3D TIFF volumes from the existing `stirnet-data` Modal volume.
-* Parses physical voxel spacing strictly from Info.txt.
+* Uses Info.txt spacing by default, with an explicit --spacing-xyz effective-spacing override.
 * Uses ConfidenceScore==1 as undefined/unreliable supervision.
 * Drops any GT object touched by an undefined region so a truncated annotation
   is never treated as a complete cell.
@@ -49,6 +49,14 @@ Local 1-step smoke: same production 32x192x192 crop, B=1
 
 `modal run ...` remains supported for native Modal CLI use.
 
+Drosophila_1 + Drosophila_2 with the effective geometry selected by the data
+investigations (spacing argument is X,Y,Z):
+    python experiments/stirnet/training/01_nis3d_spatial_training.py \
+        --samples Drosophila_1,Drosophila_2 \
+        --data-dir external/NIS3D/NIS3D \
+        --spacing-xyz 0.20312639,0.20312639,0.79099447 \
+        --run-name drosophila_12_spatial
+
 5-step smoke:
     modal run experiments/stirnet/training/01_nis3d_spatial_training.py \
         --max-steps 5 --samples Zebrafish_2 --run-name smoke_zebra_5
@@ -68,6 +76,7 @@ Resume the long run:
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -318,6 +327,144 @@ def _discover_nis3d_root(
     )
 
 
+# PATCH: configurable NIS3D data root / effective spacing
+def _parse_triplet_text(value: str, *, name: str, cast=float):
+    """Parse one comma/whitespace-delimited three-value CLI argument."""
+    tokens = [
+        token
+        for token in re.split(r"[,\s]+", str(value).strip())
+        if token
+    ]
+    if len(tokens) != 3:
+        raise ValueError(
+            f"{name} must contain exactly 3 values; got {value!r}. "
+            "Example: 0.203,0.203,0.791"
+        )
+    try:
+        return tuple(cast(token) for token in tokens)
+    except Exception as exc:
+        raise ValueError(
+            f"{name} contains an invalid value: {value!r}"
+        ) from exc
+
+
+def _parse_spacing_xyz_override(
+    spacing_xyz: str | None,
+) -> tuple[float, float, float] | None:
+    """Return optional effective spacing in STIR-Net order Z,Y,X.
+
+    The CLI is X,Y,Z because NIS3D metadata describes Resolution in XYZ order.
+    """
+    if spacing_xyz is None or not str(spacing_xyz).strip():
+        return None
+
+    x, y, z = _parse_triplet_text(
+        spacing_xyz,
+        name="--spacing-xyz",
+        cast=float,
+    )
+    xyz = (float(x), float(y), float(z))
+    if any(not math.isfinite(v) or v <= 0 for v in xyz):
+        raise ValueError(
+            "--spacing-xyz values must be finite and > 0 micrometres"
+        )
+    return (xyz[2], xyz[1], xyz[0])
+
+
+def _parse_crop_shape_zyx(crop_shape_zyx: str) -> tuple[int, int, int]:
+    z, y, x = _parse_triplet_text(
+        crop_shape_zyx,
+        name="--crop-shape-zyx",
+        cast=int,
+    )
+    shape = (int(z), int(y), int(x))
+    if any(v < 8 for v in shape):
+        raise ValueError(
+            "--crop-shape-zyx values must each be >= 8 voxels"
+        )
+    return shape
+
+
+def _resolve_training_data_root(
+    sample_names: tuple[str, ...],
+    *,
+    data_dir: str | None,
+    execution_mode: str,
+) -> Path:
+    """Resolve an optional dataset root inside the active environment."""
+    value = "" if data_dir is None else str(data_dir).strip()
+
+    if not value:
+        if execution_mode == "local":
+            return _discover_nis3d_root(
+                sample_names,
+                root_candidates=LOCAL_NIS3D_ROOT_CANDIDATES,
+                search_root=LOCAL_REPO_ROOT / "data",
+            )
+        return _discover_nis3d_root(sample_names)
+
+    if execution_mode == "modal" and re.match(r"^[A-Za-z]:[\\/]", value):
+        raise ValueError(
+            "--data-dir is a Windows path but execution=modal. "
+            "For Modal pass a path relative to the mounted data root, e.g. "
+            "'external/NIS3D/NIS3D', or an absolute container path below "
+            f"{DATA_MOUNT}."
+        )
+
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        base = (
+            LOCAL_REPO_ROOT / "data"
+            if execution_mode == "local"
+            else Path(DATA_MOUNT)
+        )
+        candidate = base / candidate
+
+    root = candidate.resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"Requested --data-dir does not exist in {execution_mode} "
+            f"execution: {root}"
+        )
+
+    missing = [
+        sample for sample in sample_names
+        if not (root / sample).is_dir()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"Dataset root {root} does not contain requested sample "
+            f"directories: {missing}"
+        )
+    return root
+
+
+def _training_data_signature(
+    *,
+    nis3d_root: Path,
+    samples: tuple[str, ...],
+    spacing_override_zyx_um: tuple[float, float, float] | None,
+    confidence_ignore_margin_um: float,
+) -> str:
+    """Stable namespace for caches/recovery affected by data geometry."""
+    payload = {
+        "root": str(nis3d_root),
+        "samples": list(samples),
+        "spacing_override_zyx_um": (
+            None
+            if spacing_override_zyx_um is None
+            else [float(v) for v in spacing_override_zyx_um]
+        ),
+        "confidence_ignore_margin_um": float(confidence_ignore_margin_um),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
 _FLOAT = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 
 
@@ -422,9 +569,7 @@ def _load_nis3d_arrays(sample_dir: Path):
 
         NIS3D TIFFs may be compressed/tiled, in which case tifffile.memmap()
         correctly refuses them because their image bytes are not one contiguous
-        memory-mappable block.  These volumes are still modest relative to the
-        16 GiB host-RAM request, so decoding them into RAM is the correct robust
-        fallback.
+        memory-mappable block.
         """
         try:
             array = tifffile.memmap(path)
@@ -599,14 +744,33 @@ def _prepare_sample_batch(
     sample_name: str,
     *,
     cache_root: Path,
+    cache_namespace: str,
     confidence_ignore_margin_um: float,
+    spacing_override_zyx_um: tuple[float, float, float] | None,
 ):
     import torch
 
     from learned.stirnet.training import prepare_raw_training_batch
 
     sample_dir = nis3d_root / sample_name
-    raw, gt, confidence, spacing, info_text = _load_nis3d_arrays(sample_dir)
+    (
+        raw,
+        gt,
+        confidence,
+        native_spacing,
+        info_text,
+    ) = _load_nis3d_arrays(sample_dir)
+
+    spacing = (
+        native_spacing
+        if spacing_override_zyx_um is None
+        else tuple(float(v) for v in spacing_override_zyx_um)
+    )
+    spacing_source = (
+        "Info.txt"
+        if spacing_override_zyx_um is None
+        else "--spacing-xyz override"
+    )
 
     clean_gt, valid_mask, confidence_report = _prepare_nis3d_gt(
         gt,
@@ -615,14 +779,17 @@ def _prepare_sample_batch(
         ignore_margin_um=confidence_ignore_margin_um,
     )
 
-    source_cache_path = cache_root / "source" / f"{sample_name}.pt"
+    source_cache_path = (
+        cache_root / "source" / cache_namespace / f"{sample_name}.pt"
+    )
+    source_cache_path.parent.mkdir(parents=True, exist_ok=True)
 
     started = time.perf_counter()
     batch = prepare_raw_training_batch(
         raw,
         clean_gt,
         spacing,
-        source_id=f"NIS3D/{sample_name}",
+        source_id=f"NIS3D/{sample_name}@{cache_namespace}",
         source_cache_path=source_cache_path,
     )
     prepare_seconds = time.perf_counter() - started
@@ -638,7 +805,9 @@ def _prepare_sample_batch(
         "raw_dtype": str(raw.dtype),
         "gt_dtype": str(gt.dtype),
         "confidence_dtype": str(confidence.dtype),
+        "native_spacing_zyx_um": [float(v) for v in native_spacing],
         "spacing_zyx_um": [float(v) for v in spacing],
+        "spacing_source": spacing_source,
         "source_prepare_seconds": float(prepare_seconds),
         "source_cache_hit": bool(metadata.get("source_cache_hit", False)),
         "current_instance_count": int(
@@ -701,6 +870,7 @@ def _save_recovery_checkpoint(
     training_config,
     run_dir: Path,
     samples: tuple[str, ...],
+    data_signature: str,
     commit_to_modal: bool,
 ) -> Path:
     step = int(trainer.global_step)
@@ -709,6 +879,7 @@ def _save_recovery_checkpoint(
         "experiment": "01_nis3d_spatial_training",
         "run_dir": str(run_dir),
         "samples": list(samples),
+        "data_signature": str(data_signature),
         **trainer.checkpoint_metadata(),
     }
     _atomic_checkpoint(
@@ -729,6 +900,7 @@ def _save_recovery_checkpoint(
             "updated_utc": datetime.now(timezone.utc).isoformat(),
             "run_dir": str(run_dir),
             "samples": list(samples),
+            "data_signature": str(data_signature),
         },
     )
 
@@ -796,6 +968,9 @@ def _print_header(
     *,
     samples,
     nis3d_root,
+    data_dir_arg: str,
+    spacing_override_zyx_um,
+    data_signature: str,
     max_steps,
     checkpoint_every,
     model_cfg,
@@ -831,6 +1006,26 @@ def _print_header(
         print("Host memory               : local machine (paging allowed)", flush=True)
         print(f"Results directory         : {results_root}", flush=True)
     print(f"NIS3D root               : {nis3d_root}", flush=True)
+    print(
+        f"Data-dir argument          : "
+        f"{data_dir_arg if data_dir_arg else '<auto-discover>'}",
+        flush=True,
+    )
+    if spacing_override_zyx_um is None:
+        print("Effective spacing          : Info.txt per sample", flush=True)
+    else:
+        z, y, x = spacing_override_zyx_um
+        print(
+            "Effective spacing XYZ um   : "
+            f"({x:.8g}, {y:.8g}, {z:.8g}) [OVERRIDE]",
+            flush=True,
+        )
+        print(
+            "Effective spacing ZYX um   : "
+            f"({z:.8g}, {y:.8g}, {x:.8g}) [model order]",
+            flush=True,
+        )
+    print(f"Data signature            : {data_signature}", flush=True)
     print(f"Samples                   : {list(samples)}", flush=True)
     print(f"Maximum optimizer steps   : {max_steps}", flush=True)
     print(f"Checkpoint interval       : {checkpoint_every} successful steps", flush=True)
@@ -871,6 +1066,9 @@ def _train_nis3d_impl(
     learning_rate: float = 2e-4,
     crop_batch_size: int = 4,
     confidence_ignore_margin_um: float = 1.0,
+    data_dir: str = "",
+    spacing_xyz: str = "",
+    crop_shape_zyx: str = "32,192,192",
     execution_mode: str = "modal",
 ) -> dict[str, Any]:
     import numpy as np
@@ -900,6 +1098,11 @@ def _train_nis3d_impl(
         )
     if crop_batch_size < 1:
         raise ValueError("crop_batch_size must be positive")
+    if confidence_ignore_margin_um < 0:
+        raise ValueError("confidence_ignore_margin_um must be >= 0")
+
+    spacing_override_zyx_um = _parse_spacing_xyz_override(spacing_xyz)
+    crop_shape = _parse_crop_shape_zyx(crop_shape_zyx)
 
     samples = tuple(
         token.strip()
@@ -909,43 +1112,38 @@ def _train_nis3d_impl(
     if not samples:
         raise ValueError("At least one NIS3D sample is required")
 
-    allowed_training_samples = {
-        "Drosophila_2",
-        "MusMusculus_2",
-        "Zebrafish_2",
-    }
-    unknown = sorted(set(samples) - allowed_training_samples)
-    if unknown:
-        raise ValueError(
-            "Training 01 uses only the official *_2 NIS3D training volumes. "
-            f"Unsupported requested samples: {unknown}"
-        )
-
     np.random.seed(230525)
     torch.manual_seed(230525)
     torch.cuda.manual_seed_all(230525)
 
     _install_dataset_validity_patch()
 
-    if execution_mode == "local":
-        nis3d_root = _discover_nis3d_root(
-            samples,
-            root_candidates=LOCAL_NIS3D_ROOT_CANDIDATES,
-            search_root=LOCAL_REPO_ROOT / "data",
-        )
-        results_mount = LOCAL_REPO_ROOT / "runs"
-    else:
-        nis3d_root = _discover_nis3d_root(samples)
-        results_mount = Path(RUNS_MOUNT)
+    nis3d_root = _resolve_training_data_root(
+        samples,
+        data_dir=data_dir,
+        execution_mode=execution_mode,
+    )
+    results_mount = (
+        LOCAL_REPO_ROOT / "runs"
+        if execution_mode == "local"
+        else Path(RUNS_MOUNT)
+    )
+
+    data_signature = _training_data_signature(
+        nis3d_root=nis3d_root,
+        samples=samples,
+        spacing_override_zyx_um=spacing_override_zyx_um,
+        confidence_ignore_margin_um=confidence_ignore_margin_um,
+    )
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     experiment_root = (
         results_mount / "stirnet" / "training" / "01_nis3d_spatial_training"
     )
     run_dir = experiment_root / "attempts" / f"{timestamp}_{run_name}"
-    recovery_dir = experiment_root / "recovery" / run_name
+    recovery_dir = experiment_root / "recovery" / run_name / data_signature
     cache_root = experiment_root / "cache"
-    static_cache_dir = cache_root / "static_gt"
+    static_cache_dir = cache_root / "static_gt" / data_signature
 
     run_dir.mkdir(parents=True, exist_ok=True)
     recovery_dir.mkdir(parents=True, exist_ok=True)
@@ -955,7 +1153,7 @@ def _train_nis3d_impl(
         geometry_steps=geometry_steps,
         spatial_steps=spatial_steps,
         crop_batch_size=crop_batch_size,
-        crop_shape_zyx=(32, 192, 192),
+        crop_shape_zyx=crop_shape,
         learning_rate=learning_rate,
         static_cache_dir=static_cache_dir,
         amp_dtype=amp_dtype,
@@ -964,6 +1162,9 @@ def _train_nis3d_impl(
     _print_header(
         samples=samples,
         nis3d_root=nis3d_root,
+        data_dir_arg=data_dir,
+        spacing_override_zyx_um=spacing_override_zyx_um,
+        data_signature=data_signature,
         max_steps=max_steps,
         checkpoint_every=checkpoint_every,
         model_cfg=model_cfg,
@@ -972,10 +1173,6 @@ def _train_nis3d_impl(
         results_root=experiment_root,
     )
 
-    # Load/prepare requested source volumes once.  With the three NIS3D *_2
-    # volumes this stays within the requested 16 GiB host memory, while the
-    # expensive raw->current preprocessing becomes a persistent cache hit on
-    # subsequent runs.
     prepared_batches: dict[str, dict] = {}
     sample_reports: dict[str, dict] = {}
     for sample in samples:
@@ -984,7 +1181,9 @@ def _train_nis3d_impl(
             nis3d_root,
             sample,
             cache_root=cache_root,
+            cache_namespace=data_signature,
             confidence_ignore_margin_um=confidence_ignore_margin_um,
+            spacing_override_zyx_um=spacing_override_zyx_um,
         )
         prepared_batches[sample] = batch
         sample_reports[sample] = report
@@ -1010,6 +1209,24 @@ def _train_nis3d_impl(
             "checkpoint_every": int(checkpoint_every),
             "samples": list(samples),
             "run_name": run_name,
+            "data_dir_argument": str(data_dir),
+            "resolved_nis3d_root": str(nis3d_root),
+            "data_signature": str(data_signature),
+            "spacing_override_xyz_um": (
+                None
+                if spacing_override_zyx_um is None
+                else [
+                    float(spacing_override_zyx_um[2]),
+                    float(spacing_override_zyx_um[1]),
+                    float(spacing_override_zyx_um[0]),
+                ]
+            ),
+            "spacing_override_zyx_um": (
+                None
+                if spacing_override_zyx_um is None
+                else [float(v) for v in spacing_override_zyx_um]
+            ),
+            "crop_shape_zyx": [int(v) for v in crop_shape],
             "confidence_ignore_margin_um": float(confidence_ignore_margin_um),
             "startup_note": (
                 "Modal source/cache writes are committed at checkpoint/final "
@@ -1075,6 +1292,18 @@ def _train_nis3d_impl(
                 map_location="cpu",
                 strict=True,
             )
+            checkpoint_signature = checkpoint.get("extra", {}).get(
+                "data_signature"
+            )
+            if (
+                checkpoint_signature is not None
+                and checkpoint_signature != data_signature
+            ):
+                raise ValueError(
+                    "Refusing to resume a checkpoint from a different "
+                    "dataset/spacing signature: "
+                    f"{checkpoint_signature} != {data_signature}"
+                )
             trainer.restore_training_progress(checkpoint, resume=True)
             resumed_from = str(checkpoint_path)
             print(
@@ -1225,6 +1454,7 @@ def _train_nis3d_impl(
                     training_config=train_cfg,
                     run_dir=run_dir,
                     samples=samples,
+                    data_signature=data_signature,
                     commit_to_modal=(execution_mode == "modal"),
                 )
                 last_checkpoint_step = int(trainer.global_step)
@@ -1315,6 +1545,9 @@ def train_nis3d(
     learning_rate: float = 2e-4,
     crop_batch_size: int = 4,
     confidence_ignore_margin_um: float = 1.0,
+    data_dir: str = "",
+    spacing_xyz: str = "",
+    crop_shape_zyx: str = "32,192,192",
 ) -> dict[str, Any]:
     return _train_nis3d_impl(
         max_steps=max_steps,
@@ -1327,6 +1560,9 @@ def train_nis3d(
         learning_rate=learning_rate,
         crop_batch_size=crop_batch_size,
         confidence_ignore_margin_um=confidence_ignore_margin_um,
+        data_dir=data_dir,
+        spacing_xyz=spacing_xyz,
+        crop_shape_zyx=crop_shape_zyx,
         execution_mode="modal",
     )
 
@@ -1347,6 +1583,9 @@ def main(
     learning_rate: float = 2e-4,
     crop_batch_size: int = 4,
     confidence_ignore_margin_um: float = 1.0,
+    data_dir: str = "",
+    spacing_xyz: str = "",
+    crop_shape_zyx: str = "32,192,192",
 ) -> None:
     result = train_nis3d.remote(
         max_steps=max_steps,
@@ -1359,6 +1598,9 @@ def main(
         learning_rate=learning_rate,
         crop_batch_size=crop_batch_size,
         confidence_ignore_margin_um=confidence_ignore_margin_um,
+        data_dir=data_dir,
+        spacing_xyz=spacing_xyz,
+        crop_shape_zyx=crop_shape_zyx,
     )
     print(json.dumps(result, indent=2))
 
@@ -1385,6 +1627,29 @@ def _python_cli_main() -> None:
     )
     parser.add_argument("--max-steps", type=int, default=5)
     parser.add_argument("--samples", default="Zebrafish_2")
+    parser.add_argument(
+        "--data-dir",
+        default="",
+        help=(
+            "Dataset root containing sample directories. Relative paths are "
+            "resolved below <repo>/data locally and below the Modal data mount "
+            "remotely. Example: external/NIS3D/NIS3D"
+        ),
+    )
+    parser.add_argument(
+        "--spacing-xyz",
+        default="",
+        help=(
+            "Optional effective spacing override in X,Y,Z micrometres as one "
+            "comma-delimited value. Example: "
+            "0.20312639,0.20312639,0.79099447. Empty means Info.txt."
+        ),
+    )
+    parser.add_argument(
+        "--crop-shape-zyx",
+        default="32,192,192",
+        help="Training crop shape in Z,Y,X voxels. Default: 32,192,192.",
+    )
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--checkpoint-every", type=int, default=50)
@@ -1397,7 +1662,7 @@ def _python_cli_main() -> None:
         default=None,
         help=(
             "Override true crop batch size. Defaults to 4 on Modal and 1 "
-            "locally. Crop SHAPE remains 32x192x192 in both modes."
+            "locally. Crop shape is controlled by --crop-shape-zyx."
         ),
     )
     parser.add_argument(
@@ -1430,6 +1695,9 @@ def _python_cli_main() -> None:
             learning_rate=args.learning_rate,
             crop_batch_size=crop_batch_size,
             confidence_ignore_margin_um=args.confidence_ignore_margin_um,
+            data_dir=args.data_dir,
+            spacing_xyz=args.spacing_xyz,
+            crop_shape_zyx=args.crop_shape_zyx,
             execution_mode="local",
         )
         print(json.dumps(result, indent=2))
@@ -1470,7 +1738,13 @@ def _python_cli_main() -> None:
         str(crop_batch_size),
         "--confidence-ignore-margin-um",
         str(args.confidence_ignore_margin_um),
+        "--crop-shape-zyx",
+        args.crop_shape_zyx,
     ]
+    if args.data_dir:
+        command.extend(["--data-dir", args.data_dir])
+    if args.spacing_xyz:
+        command.extend(["--spacing-xyz", args.spacing_xyz])
     if args.resume:
         command.append("--resume")
 
