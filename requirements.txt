@@ -1,11 +1,33 @@
+# Core numerical / image processing
+numpy==2.4.6
+scipy==1.17.1
+scikit-image==0.26.0
+pandas==3.0.5
+networkx==3.6.1
+tifffile==2026.3.3
+imagecodecs==2026.3.6
 
-scikit-image
-numpy
-pandas
-scipy>=1.9.0
-tqdm
-zarr
-dask[array]
-ipywidgets
-matplotlib
-pytest~=9.1.1
+# Deep learning / CUDA target preprocessing
+torch==2.13.0
+cupy-cuda13x[ctk]==14.2.0
+
+# Cell tracking
+trackastra==0.5.5
+
+# Data formats / larger-volume processing
+zarr==3.1.6
+numcodecs==0.15.1
+dask[array]==2026.7.1
+tqdm==4.69.0
+
+# Visualization / investigations
+matplotlib==3.11.1
+napari==0.8.0
+ipywidgets==8.1.8
+
+# Cloud execution / runtime utilities
+modal==1.5.4
+psutil==7.2.2
+
+# Tests
+pytest==9.1.1
