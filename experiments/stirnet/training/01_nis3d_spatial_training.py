@@ -1097,15 +1097,20 @@ def _train_nis3d_impl(
         f"[train] starting optimizer loop at step {trainer.global_step}/{max_steps} ...",
         flush=True,
     )
+    GREEN = "\033[32m"
+    RESET = "\033[0m"
+
     progress = tqdm(
         total=max_steps,
         initial=int(trainer.global_step),
-        desc="STIR-Net",
+        desc=f"{GREEN}STIR-Net{RESET}",
         unit="step",
         dynamic_ncols=True,
         smoothing=0.10,
         mininterval=0.5,
         leave=True,
+        colour="green",
+        file=sys.stdout,
     )
 
     try:

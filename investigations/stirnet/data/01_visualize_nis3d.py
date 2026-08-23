@@ -3,11 +3,11 @@ Visualize the six canonical NIS3D datasets in Napari.
 
 Run from project root:
 
-    python investigations/stirnet/data/visualize_nis3d.py
+    python investigations/stirnet/data/01_visualize_nis3d.py
 
 One dataset only:
 
-    python investigations/stirnet/data/visualize_nis3d.py \
+    python investigations/stirnet/data/01_visualize_nis3d.py \
         --sample Zebrafish_2
 """
 

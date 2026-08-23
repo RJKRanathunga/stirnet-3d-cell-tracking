@@ -11,14 +11,14 @@ a duplicated approximation.
 
 Run from the project root:
 
-    python investigations/stirnet/data/visualize_nis3d_preprocessing.py
+    python investigations/stirnet/data/02_visualize_nis3d_preprocessing.py
 
 Default sample:
     Zebrafish_2
 
 Choose another sample:
 
-    python investigations/stirnet/data/visualize_nis3d_preprocessing.py \
+    python investigations/stirnet/data/02_visualize_nis3d_preprocessing.py \
         --sample Zebrafish_1
 
 By default the same production preprocessing parameters are used, but
@@ -26,7 +26,7 @@ with the physical voxel spacing read from NIS3D Info.txt.
 
 To deliberately reproduce the exact Biohub default voxel spacing:
 
-    python investigations/stirnet/data/visualize_nis3d_preprocessing.py \
+    python investigations/stirnet/data/02_visualize_nis3d_preprocessing.py \
         --sample Zebrafish_2 \
         --spacing-mode biohub
 """
