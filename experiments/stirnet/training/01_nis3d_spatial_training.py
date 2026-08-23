@@ -25,8 +25,9 @@ What it does
 * Uses synthetic X/Y reflection augmentation (p=0.5 independently per axis)
   after crop/source preparation, covering identity/X/Y/XY orientations.
 * Uses exact static GT crop caching and the existing CuPy EDT path.
-* Keeps normalized raw + source EDT for each prepared volume in host RAM,
-  then derives cheap foreground/boundary/marker priors per crop.
+* Keeps aligned full-volume normalized raw + source EDT/boundary/marker
+  priors in host RAM; every crop directly slices identical Z/Y/X coordinates.
+  Foreground remains a cheap on-demand labels>0 operation.
 * Trains geometry_bootstrap -> spatial_partition only; no temporal stage.
 * Writes one durable scalar record after every successful optimizer step.
 * Saves a recoverable checkpoint every N successful steps (default 50) and at
@@ -1059,7 +1060,7 @@ def _print_header(
     print(f"Data signature            : {data_signature}", flush=True)
     print(
         "Source RAM cache          : " + (
-            "ON (normalized raw + source EDT; raw uint16 released)"
+            "ON (aligned raw + EDT + boundary + marker; raw uint16 released)"
             if source_ram_cache
             else "OFF (legacy per-crop source materialization)"
         ),

@@ -230,19 +230,18 @@ def _expanded_slices(core, full_shape, spacing_um, halo_um: float):
 # Full-volume RAM acceleration cache
 # ======================================================================================
 
-SOURCE_RAM_CACHE_VERSION = 1
+SOURCE_RAM_CACHE_VERSION = 2
 
 
-def _build_source_edt_prior_and_bboxes(
+def _build_full_volume_source_priors(
     instance_labels: np.ndarray,
     spacing_um,
     dref_um: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build the exact uncorrupted source EDT once for the full source volume.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build source EDT, boundary and marker once on the complete volume.
 
-    The EDT definition intentionally matches ``build_source_prior_channels``:
-    each source instance is transformed independently inside its own padded
-    bounding box, then normalized by dref.
+    These are acquisition/source fields, not crop-defined fields. Training crops
+    later slice exactly the same Z/Y/X coordinates from every cached volume.
     """
     from scipy import ndimage as ndi
 
@@ -253,10 +252,8 @@ def _build_source_edt_prior_and_bboxes(
     if spacing.shape != (3,) or np.any(spacing <= 0):
         raise ValueError("spacing_um must contain three positive values")
 
-    max_label = int(labels.max()) if labels.size else 0
     edt = np.zeros(labels.shape, dtype=np.float32)
-    # [label, z0, y0, x0, z1, y1, x1]. -1 means absent.
-    bboxes = np.full((max_label + 1, 6), -1, dtype=np.int32)
+    marker = np.zeros(labels.shape, dtype=np.uint8)
 
     for label, bbox in enumerate(ndi.find_objects(labels), 1):
         if bbox is None:
@@ -265,28 +262,35 @@ def _build_source_edt_prior_and_bboxes(
         if not local.any():
             continue
 
-        bboxes[label] = np.asarray(
-            [
-                int(bbox[0].start),
-                int(bbox[1].start),
-                int(bbox[2].start),
-                int(bbox[0].stop),
-                int(bbox[1].stop),
-                int(bbox[2].stop),
-            ],
-            dtype=np.int32,
-        )
-
         padded = np.pad(local, 1, mode="constant", constant_values=False)
         distance = ndi.distance_transform_edt(
             padded,
             sampling=spacing,
         )[tuple(slice(1, -1) for _ in range(3))].astype(np.float32)
 
-        view = edt[bbox]
-        view[local] = distance[local] / max(float(dref_um), 1e-6)
+        edt_view = edt[bbox]
+        edt_view[local] = distance[local] / max(float(dref_um), 1e-6)
 
-    return edt, bboxes
+        # One marker per complete source instance. This is intentionally a
+        # full-volume marker: crop placement must not move the source marker.
+        score = np.where(local, distance, -np.inf)
+        local_pos = np.unravel_index(int(np.argmax(score)), score.shape)
+        global_pos = tuple(
+            int(bbox[axis].start) + int(local_pos[axis])
+            for axis in range(3)
+        )
+        marker[global_pos] = 1
+
+    boundary = make_instance_boundary(labels).astype(np.uint8, copy=False)
+    return edt, boundary, marker
+
+
+def _stack_rows_without_copy_when_single(rows: list[torch.Tensor]) -> torch.Tensor:
+    if not rows:
+        raise ValueError("cannot stack an empty source cache")
+    if len(rows) == 1:
+        return rows[0].unsqueeze(0)
+    return torch.stack(rows, dim=0)
 
 
 def prepare_raw_source_volume_cache(
@@ -294,20 +298,21 @@ def prepare_raw_source_volume_cache(
     *,
     release_raw_volume: bool = True,
 ) -> dict:
-    """Cache only expensive reusable full-volume source fields in host RAM.
+    """Materialize aligned full-volume source fields once in host RAM.
 
-    Cached:
+    Cached full-volume fields:
       * normalized raw, float32
-      * per-instance source EDT prior, float32
-      * tiny per-instance bounding-box table
+      * source EDT prior, float32
+      * source boundary prior, uint8
+      * source marker prior, uint8
 
-    Deliberately not cached:
-      * foreground (cheap ``labels > 0``)
-      * boundary (cheap local differencing)
-      * marker (cheap argmax once EDT exists)
+    Foreground is deliberately not cached because ``labels > 0`` is trivial.
 
-    The original uint16 raw tensor may be released after normalization to reduce
-    the net RAM increase. The source cache on disk remains unchanged and small.
+    The cache changes the *definition* of source priors from crop-local to
+    full-volume-aligned: every training crop is now a direct slice of the same
+    complete source fields. This removes repeated per-crop EDT/marker searching
+    and makes crop placement a memory-management choice rather than a geometry
+    transformation.
     """
     full_raw = source_batch.get("raw_volume")
     if full_raw is None:
@@ -319,7 +324,9 @@ def prepare_raw_source_volume_cache(
 
     raw_tensor = torch.as_tensor(full_raw).detach().cpu()
     current_tensor = torch.as_tensor(source_batch["instance_labels"]).detach().cpu()
-    bounds = torch.as_tensor(source_batch["raw_normalization_bounds"]).detach().cpu().float()
+    bounds = torch.as_tensor(
+        source_batch["raw_normalization_bounds"]
+    ).detach().cpu().float()
     spacing = torch.as_tensor(source_batch["spacing_um"]).detach().cpu().float()
     dref = torch.as_tensor(source_batch["dref_um"]).detach().cpu().float()
 
@@ -331,7 +338,8 @@ def prepare_raw_source_volume_cache(
     started = time.perf_counter()
     normalized_rows: list[torch.Tensor] = []
     edt_rows: list[torch.Tensor] = []
-    bbox_rows: list[torch.Tensor] = []
+    boundary_rows: list[torch.Tensor] = []
+    marker_rows: list[torch.Tensor] = []
 
     for batch_index in range(raw_tensor.shape[0]):
         raw_np = raw_tensor[batch_index].numpy()
@@ -342,7 +350,7 @@ def prepare_raw_source_volume_cache(
             float(bounds[batch_index, 0]),
             float(bounds[batch_index, 1]),
         )
-        edt, bboxes = _build_source_edt_prior_and_bboxes(
+        edt, boundary, marker = _build_full_volume_source_priors(
             current_np,
             spacing[batch_index].numpy(),
             float(dref[batch_index]),
@@ -352,16 +360,26 @@ def prepare_raw_source_volume_cache(
             torch.from_numpy(np.ascontiguousarray(normalized))
         )
         edt_rows.append(torch.from_numpy(np.ascontiguousarray(edt)))
-        bbox_rows.append(torch.from_numpy(np.ascontiguousarray(bboxes)))
+        boundary_rows.append(
+            torch.from_numpy(np.ascontiguousarray(boundary))
+        )
+        marker_rows.append(torch.from_numpy(np.ascontiguousarray(marker)))
 
-    normalized_volume = torch.stack(normalized_rows).float()
-    edt_volume = torch.stack(edt_rows).float()
+    normalized_volume = _stack_rows_without_copy_when_single(normalized_rows).float()
+    edt_volume = _stack_rows_without_copy_when_single(edt_rows).float()
+    boundary_volume = _stack_rows_without_copy_when_single(boundary_rows).to(torch.uint8)
+    marker_volume = _stack_rows_without_copy_when_single(marker_rows).to(torch.uint8)
     elapsed = time.perf_counter() - started
 
-    gross_cache_bytes = (
-        normalized_volume.numel() * normalized_volume.element_size()
-        + edt_volume.numel() * edt_volume.element_size()
-        + sum(row.numel() * row.element_size() for row in bbox_rows)
+    cache_tensors = (
+        normalized_volume,
+        edt_volume,
+        boundary_volume,
+        marker_volume,
+    )
+    gross_cache_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in cache_tensors
     )
     released_raw_bytes = (
         raw_tensor.numel() * raw_tensor.element_size()
@@ -372,10 +390,12 @@ def prepare_raw_source_volume_cache(
     result = dict(source_batch)
     result["raw_normalized_volume"] = normalized_volume
     result["source_edt_prior_volume"] = edt_volume
-    result["source_instance_bboxes_zyx"] = tuple(bbox_rows)
+    result["source_boundary_prior_volume"] = boundary_volume
+    result["source_marker_prior_volume"] = marker_volume
     result["source_ram_cache_metadata"] = {
         "format_version": SOURCE_RAM_CACHE_VERSION,
         "enabled": True,
+        "semantics": "aligned_full_volume_fields",
         "prepare_seconds": float(elapsed),
         "gross_cache_bytes": int(gross_cache_bytes),
         "released_raw_bytes": int(released_raw_bytes),
@@ -383,7 +403,8 @@ def prepare_raw_source_volume_cache(
         "cached_fields": (
             "raw_normalized_volume",
             "source_edt_prior_volume",
-            "source_instance_bboxes_zyx",
+            "source_boundary_prior_volume",
+            "source_marker_prior_volume",
         ),
     }
     if release_raw_volume:
@@ -391,143 +412,57 @@ def prepare_raw_source_volume_cache(
     return result
 
 
-def _bbox_is_inside_halo(
-    bbox_row: np.ndarray,
-    halo: tuple[slice, slice, slice],
-) -> bool:
-    if bbox_row.shape != (6,) or int(bbox_row[0]) < 0:
-        return False
-    starts = bbox_row[:3]
-    stops = bbox_row[3:]
-    return all(
-        int(starts[axis]) >= int(halo[axis].start)
-        and int(stops[axis]) <= int(halo[axis].stop)
-        for axis in range(3)
-    )
+def _one_voxel_context_slices(
+    core: tuple[slice, slice, slice],
+    full_shape: tuple[int, int, int],
+) -> tuple[tuple[slice, slice, slice], tuple[slice, slice, slice]]:
+    """Return one-voxel context plus the core relative to that context.
 
-
-def _recompute_one_label_edt_in_halo(
-    labels_halo: np.ndarray,
-    source_id: int,
-    spacing_um,
-    dref_um: float,
-) -> tuple[tuple[slice, slice, slice], np.ndarray] | None:
-    """Recompute one clipped source instance exactly as the legacy path."""
-    from scipy import ndimage as ndi
-
-    mask = labels_halo == int(source_id)
-    if not mask.any():
-        return None
-
-    coords = np.argwhere(mask)
-    low = coords.min(axis=0)
-    high = coords.max(axis=0) + 1
-    bbox = tuple(
-        slice(int(low[axis]), int(high[axis]))
-        for axis in range(3)
-    )
-    local = mask[bbox]
-    padded = np.pad(local, 1, mode="constant", constant_values=False)
-    distance = ndi.distance_transform_edt(
-        padded,
-        sampling=np.asarray(spacing_um, dtype=np.float64),
-    )[tuple(slice(1, -1) for _ in range(3))].astype(np.float32)
-    normalized = distance / max(float(dref_um), 1e-6)
-    return bbox, normalized
-
-
-def _materialize_cached_source_core(
-    *,
-    raw_norm_halo: np.ndarray,
-    current_halo: np.ndarray,
-    cached_edt_halo: np.ndarray,
-    bbox_table: np.ndarray,
-    halo: tuple[slice, slice, slice],
-    core_relative: tuple[slice, slice, slice],
-    spacing_um,
-    dref_um: float,
-) -> tuple[np.ndarray, int]:
-    """Build exact five-channel core using cached EDT plus rare label repair.
-
-    A source object fully contained by the physical halo has exactly the same
-    EDT as the historical per-crop computation, so its cached values are reused.
-
-    If a core-visible source object extends beyond the halo, only that object's
-    EDT is recomputed with the historical cropped-halo definition. This keeps
-    the model input exact while avoiding a full per-crop EDT rebuild.
+    Boundary is the only source prior that needs neighboring labels after a
+    synthetic source deletion. A one-voxel stencil is sufficient; no instance
+    search, bbox lookup or EDT rebuild is involved.
     """
-    current_core = current_halo[core_relative]
-    core_ids = np.unique(current_core)
-    core_ids = core_ids[core_ids > 0]
-
-    edt_work = np.asarray(cached_edt_halo, dtype=np.float32)
-    owns_edt_copy = False
-    recomputed_labels = 0
-
-    for source_id_value in core_ids.tolist():
-        source_id = int(source_id_value)
-        bbox_row = (
-            bbox_table[source_id]
-            if 0 <= source_id < len(bbox_table)
-            else np.full((6,), -1, dtype=np.int32)
+    context = []
+    relative = []
+    for axis in range(3):
+        start = max(0, int(core[axis].start) - 1)
+        stop = min(int(full_shape[axis]), int(core[axis].stop) + 1)
+        context.append(slice(start, stop))
+        relative.append(
+            slice(
+                int(core[axis].start) - start,
+                int(core[axis].stop) - start,
+            )
         )
-        if _bbox_is_inside_halo(np.asarray(bbox_row), halo):
-            continue
+    return tuple(context), tuple(relative)
 
-        repaired = _recompute_one_label_edt_in_halo(
-            current_halo,
-            source_id,
-            spacing_um,
-            dref_um,
-        )
-        if repaired is None:
-            continue
-        if not owns_edt_copy:
-            edt_work = np.array(edt_work, dtype=np.float32, copy=True)
-            owns_edt_copy = True
 
-        local_bbox, normalized = repaired
-        local_mask = current_halo[local_bbox] == source_id
-        view = edt_work[local_bbox]
-        view[local_mask] = normalized[local_mask]
-        recomputed_labels += 1
-
-    # Marker semantics remain the same as the legacy halo implementation:
-    # one EDT maximum per source object, with NumPy's deterministic first-argmax
-    # tie-breaking. We only need labels that appear in the returned core.
-    marker_halo = np.zeros(current_halo.shape, dtype=np.float32)
-    for source_id_value in core_ids.tolist():
-        source_id = int(source_id_value)
-        local = current_halo == source_id
-        if not local.any():
-            continue
-        score = np.where(local, edt_work, -np.inf)
-        pos = np.unravel_index(int(np.argmax(score)), score.shape)
-        marker_halo[pos] = 1.0
-
-    edt_core = np.array(
-        edt_work[core_relative],
-        dtype=np.float32,
-        copy=True,
+def _boundary_core_after_dropout(
+    full_current: torch.Tensor,
+    spec,
+    selected_ids: tuple[int, ...],
+) -> torch.Tensor:
+    """Rebuild only boundary for a dropout crop using a 1-voxel stencil."""
+    context, relative = _one_voxel_context_slices(
+        spec.slices_zyx,
+        spec.full_shape_zyx,
     )
-    # Synthetic source dropout leaves cached EDT values behind at deleted
-    # voxels. Masking by the post-dropout labels is exact because source EDTs
-    # are instance-local and independent.
-    edt_core[current_core <= 0] = 0.0
+    labels = full_current[int(spec.batch_index)][context].clone()
+    for source_id in selected_ids:
+        labels[labels == int(source_id)] = 0
 
-    boundary_halo = make_instance_boundary(current_halo)
-
-    spatial_core = np.stack(
-        [
-            np.asarray(raw_norm_halo[core_relative], dtype=np.float32),
-            (current_core > 0).astype(np.float32),
-            edt_core,
-            boundary_halo[core_relative].astype(np.float32),
-            marker_halo[core_relative],
-        ],
-        axis=0,
-    )
-    return spatial_core, recomputed_labels
+    boundary = torch.zeros_like(labels, dtype=torch.bool)
+    for axis in range(3):
+        sl1 = [slice(None)] * 3
+        sl2 = [slice(None)] * 3
+        sl1[axis] = slice(1, None)
+        sl2[axis] = slice(None, -1)
+        a = labels[tuple(sl1)]
+        b = labels[tuple(sl2)]
+        diff = (a != b) & ((a > 0) | (b > 0))
+        boundary[tuple(sl1)] |= diff
+        boundary[tuple(sl2)] |= diff
+    return boundary[relative]
 
 
 def materialize_raw_source_crop_batch(
@@ -541,17 +476,26 @@ def materialize_raw_source_crop_batch(
     dropout_min_purity: float,
     dropout_min_gt_coverage: float,
 ) -> CropBatch:
-    """Apply missing-cell corruption, then build all five model channels.
+    """Apply source dropout and materialize aligned five-channel crop inputs.
 
-    If ``prepare_raw_source_volume_cache`` was called, normalized raw and source
-    EDT are sliced from host RAM. Cheap priors are derived on demand. Rare source
-    objects clipped by the physical halo get an exact per-label EDT repair, so
-    the accelerated path preserves the historical model inputs.
+    RAM-cache path:
+      * no physical halo
+      * no bbox search
+      * no per-crop EDT
+      * no per-crop marker search
+      * identical Z/Y/X crop slices for raw/EDT/boundary/marker/current labels
+
+    The legacy path remains available when the full-volume cache is disabled.
+    ``source_halo_um`` is therefore retained in the public signature.
     """
-    has_ram_cache = (
-        source_batch.get("raw_normalized_volume") is not None
-        and source_batch.get("source_edt_prior_volume") is not None
-        and source_batch.get("source_instance_bboxes_zyx") is not None
+    has_ram_cache = all(
+        source_batch.get(name) is not None
+        for name in (
+            "raw_normalized_volume",
+            "source_edt_prior_volume",
+            "source_boundary_prior_volume",
+            "source_marker_prior_volume",
+        )
     )
     if not has_ram_cache and source_batch.get("raw_volume") is None:
         raise ValueError(
@@ -570,36 +514,84 @@ def materialize_raw_source_crop_batch(
     )
     changed = apply_selected_source_dropout_labels(crop, selected)
 
-    full_current = torch.as_tensor(source_batch["instance_labels"])
-    bounds = (
-        None
-        if source_batch.get("raw_normalization_bounds") is None
-        else torch.as_tensor(source_batch["raw_normalization_bounds"]).float()
-    )
-    full_raw = (
-        None
-        if source_batch.get("raw_volume") is None
-        else torch.as_tensor(source_batch["raw_volume"])
-    )
-    full_normalized = (
-        None
-        if not has_ram_cache
-        else torch.as_tensor(source_batch["raw_normalized_volume"])
-    )
-    full_edt = (
-        None
-        if not has_ram_cache
-        else torch.as_tensor(source_batch["source_edt_prior_volume"])
-    )
-    bbox_rows = (
-        None
-        if not has_ram_cache
-        else source_batch["source_instance_bboxes_zyx"]
-    )
-
-    spatial_rows, current_rows = [], []
+    full_current = torch.as_tensor(source_batch["instance_labels"]).detach().cpu()
+    spatial_rows: list[torch.Tensor] = []
     materialization_modes: list[str] = []
-    recomputed_edt_label_counts: list[int] = []
+
+    if has_ram_cache:
+        full_normalized = torch.as_tensor(
+            source_batch["raw_normalized_volume"]
+        ).detach().cpu()
+        full_edt = torch.as_tensor(
+            source_batch["source_edt_prior_volume"]
+        ).detach().cpu()
+        full_boundary = torch.as_tensor(
+            source_batch["source_boundary_prior_volume"]
+        ).detach().cpu()
+        full_marker = torch.as_tensor(
+            source_batch["source_marker_prior_volume"]
+        ).detach().cpu()
+
+        changed_current = torch.as_tensor(
+            changed.batch["instance_labels"]
+        ).detach().cpu()
+
+        for row, spec in enumerate(changed.specs):
+            batch_index = int(spec.batch_index)
+            core = spec.slices_zyx
+            current_core = changed_current[row]
+            foreground = current_core > 0
+
+            raw_core = full_normalized[batch_index][core]
+            edt_core = full_edt[batch_index][core] * foreground.to(full_edt.dtype)
+            marker_core = (
+                full_marker[batch_index][core].bool() & foreground
+            )
+
+            if selected[row]:
+                boundary_core = _boundary_core_after_dropout(
+                    full_current,
+                    spec,
+                    selected[row],
+                )
+            else:
+                boundary_core = full_boundary[batch_index][core].bool()
+
+            spatial_rows.append(
+                torch.stack(
+                    (
+                        raw_core.float(),
+                        foreground.float(),
+                        edt_core.float(),
+                        boundary_core.float(),
+                        marker_core.float(),
+                    ),
+                    dim=0,
+                )
+            )
+            materialization_modes.append("ram_cache")
+
+        batch = dict(changed.batch)
+        batch["spatial_inputs"] = torch.stack(spatial_rows, dim=0)
+        batch["instance_labels"] = changed_current.to(full_current.dtype)
+        batch["source_dropout_ids"] = selected
+        batch["source_materialization_modes"] = tuple(materialization_modes)
+        # Retain the existing timing/diagnostic contract so before/after smoke
+        # runs are directly comparable. Aligned slicing never rebuilds EDT.
+        batch["source_ram_cache_recomputed_edt_label_counts"] = tuple(
+            0 for _ in changed.specs
+        )
+        return CropBatch(
+            batch=batch,
+            gt_labels=changed.gt_labels,
+            geometry_targets=changed.geometry_targets,
+            specs=changed.specs,
+        )
+
+    # Historical per-crop source materialization, kept as an opt-out/reference.
+    full_raw = torch.as_tensor(source_batch["raw_volume"])
+    bounds = torch.as_tensor(source_batch["raw_normalization_bounds"]).float()
+    current_rows: list[torch.Tensor] = []
 
     for row, spec in enumerate(changed.specs):
         batch_index = int(spec.batch_index)
@@ -609,7 +601,7 @@ def materialize_raw_source_crop_batch(
             source_batch["spacing_um"][batch_index],
             source_halo_um,
         )
-
+        raw_halo = full_raw[batch_index][halo].detach().cpu().numpy()
         current_halo = (
             full_current[batch_index][halo]
             .detach()
@@ -620,75 +612,27 @@ def materialize_raw_source_crop_batch(
         for source_id in selected[row]:
             current_halo[current_halo == int(source_id)] = 0
 
-        if has_ram_cache:
-            raw_norm_halo = (
-                full_normalized[batch_index][halo]
-                .detach()
-                .cpu()
-                .numpy()
-            )
-            cached_edt_halo = (
-                full_edt[batch_index][halo]
-                .detach()
-                .cpu()
-                .numpy()
-            )
-            bbox_table = (
-                torch.as_tensor(bbox_rows[batch_index])
-                .detach()
-                .cpu()
-                .numpy()
-            )
-
-            spatial_core, recomputed_count = _materialize_cached_source_core(
-                raw_norm_halo=raw_norm_halo,
-                current_halo=current_halo,
-                cached_edt_halo=cached_edt_halo,
-                bbox_table=bbox_table,
-                halo=halo,
-                core_relative=core_relative,
-                spacing_um=source_batch["spacing_um"][batch_index]
-                .detach()
-                .cpu()
-                .numpy(),
-                dref_um=float(
-                    source_batch["dref_um"][batch_index].detach().cpu()
-                ),
-            )
-            materialization_modes.append("ram_cache")
-            recomputed_edt_label_counts.append(int(recomputed_count))
-        else:
-            assert full_raw is not None and bounds is not None
-            raw_halo = (
-                full_raw[batch_index][halo]
-                .detach()
-                .cpu()
-                .numpy()
-            )
-            raw_norm = normalize_with_percentiles(
-                raw_halo,
-                float(bounds[batch_index, 0]),
-                float(bounds[batch_index, 1]),
-            )
-            spatial_halo = build_spatial_channels(
-                raw_norm,
-                current_halo,
-                source_batch["spacing_um"][batch_index]
-                .detach()
-                .cpu()
-                .numpy(),
-                float(source_batch["dref_um"][batch_index].detach().cpu()),
-                derive_marker=True,
-            )
-            spatial_core = spatial_halo[
-                :,
-                core_relative[0],
-                core_relative[1],
-                core_relative[2],
-            ]
-            materialization_modes.append("legacy")
-            recomputed_edt_label_counts.append(0)
-
+        raw_norm = normalize_with_percentiles(
+            raw_halo,
+            float(bounds[batch_index, 0]),
+            float(bounds[batch_index, 1]),
+        )
+        spatial_halo = build_spatial_channels(
+            raw_norm,
+            current_halo,
+            source_batch["spacing_um"][batch_index]
+            .detach()
+            .cpu()
+            .numpy(),
+            float(source_batch["dref_um"][batch_index].detach().cpu()),
+            derive_marker=True,
+        )
+        spatial_core = spatial_halo[
+            :,
+            core_relative[0],
+            core_relative[1],
+            core_relative[2],
+        ]
         current_core = current_halo[core_relative]
         spatial_rows.append(
             torch.from_numpy(np.ascontiguousarray(spatial_core))
@@ -696,6 +640,7 @@ def materialize_raw_source_crop_batch(
         current_rows.append(
             torch.from_numpy(np.ascontiguousarray(current_core))
         )
+        materialization_modes.append("legacy")
 
     batch = dict(changed.batch)
     batch["spatial_inputs"] = torch.stack(spatial_rows).float()
@@ -703,7 +648,7 @@ def materialize_raw_source_crop_batch(
     batch["source_dropout_ids"] = selected
     batch["source_materialization_modes"] = tuple(materialization_modes)
     batch["source_ram_cache_recomputed_edt_label_counts"] = tuple(
-        recomputed_edt_label_counts
+        0 for _ in changed.specs
     )
     return CropBatch(
         batch=batch,

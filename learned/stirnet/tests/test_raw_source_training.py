@@ -146,7 +146,7 @@ def _materialize_for_test(batch, spec, *, dropout_probability: float, seed: int 
     )
 
 
-def test_source_ram_cache_preserves_exact_channels_without_dropout():
+def test_source_ram_cache_preserves_exact_full_volume_channels_without_dropout():
     baseline_batch = _manual_raw_batch()
     cached_batch = prepare_raw_source_volume_cache(
         baseline_batch,
@@ -178,9 +178,14 @@ def test_source_ram_cache_preserves_exact_channels_without_dropout():
     assert cached_batch["raw_volume"] is None
     assert "raw_normalized_volume" in cached_batch
     assert "source_edt_prior_volume" in cached_batch
-    assert "current_foreground_prior" not in cached_batch
-    assert "current_boundary_prior" not in cached_batch
-    assert "current_marker_prior" not in cached_batch
+    assert "source_boundary_prior_volume" in cached_batch
+    assert "source_marker_prior_volume" in cached_batch
+    assert "source_instance_bboxes_zyx" not in cached_batch
+    assert cached_batch["source_ram_cache_metadata"]["format_version"] == 2
+    assert (
+        cached_batch["source_ram_cache_metadata"]["semantics"]
+        == "aligned_full_volume_fields"
+    )
     assert accelerated.batch["source_materialization_modes"] == ("ram_cache",)
     assert accelerated.batch["source_ram_cache_recomputed_edt_label_counts"] == (0,)
     assert torch.equal(
@@ -193,7 +198,7 @@ def test_source_ram_cache_preserves_exact_channels_without_dropout():
     )
 
 
-def test_source_ram_cache_preserves_exact_channels_with_missing_cell_dropout():
+def test_source_ram_cache_preserves_full_volume_missing_cell_dropout():
     baseline_batch = _manual_raw_batch()
     cached_batch = prepare_raw_source_volume_cache(
         baseline_batch,
@@ -235,15 +240,14 @@ def test_source_ram_cache_preserves_exact_channels_with_missing_cell_dropout():
     )
 
 
-def test_source_ram_cache_exactly_repairs_cell_clipped_by_halo():
-    baseline_batch = _manual_raw_batch()
+def test_source_ram_cache_partial_crop_is_directly_aligned_to_full_volume_fields():
     cached_batch = prepare_raw_source_volume_cache(
-        baseline_batch,
+        _manual_raw_batch(),
         release_raw_volume=True,
     )
-    # This crop cuts source instance 1 in Y/X. With a zero halo, its cached
-    # full-volume EDT must not be used blindly; the accelerated path repairs
-    # just that source instance using the historical cropped-halo definition.
+    # The crop intentionally cuts source instance 1. The new semantics do NOT
+    # search for the instance or redefine its EDT/marker inside the crop. Every
+    # channel is a direct slice of the complete source representation.
     spec = CropSpec(
         0,
         (slice(2, 6), slice(5, 8), slice(5, 8)),
@@ -255,30 +259,50 @@ def test_source_ram_cache_exactly_repairs_cell_clipped_by_halo():
         (),
         (),
     )
-
-    baseline = _materialize_for_test(
-        baseline_batch,
-        spec,
-        dropout_probability=0.0,
-    )
     accelerated = _materialize_for_test(
         cached_batch,
         spec,
         dropout_probability=0.0,
     )
 
-    assert accelerated.batch["source_materialization_modes"] == ("ram_cache",)
-    assert accelerated.batch["source_ram_cache_recomputed_edt_label_counts"][0] >= 1
-    assert torch.equal(
-        baseline.batch["spatial_inputs"],
-        accelerated.batch["spatial_inputs"],
-    )
-    assert torch.equal(
-        baseline.batch["instance_labels"],
-        accelerated.batch["instance_labels"],
-    )
+    spatial = accelerated.batch["spatial_inputs"][0]
+    current = accelerated.batch["instance_labels"][0]
+    foreground = current > 0
+    core = spec.slices_zyx
 
-
+    torch.testing.assert_close(
+        spatial[0],
+        cached_batch["raw_normalized_volume"][0][core],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        spatial[1],
+        foreground.float(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        spatial[2],
+        cached_batch["source_edt_prior_volume"][0][core]
+        * foreground.float(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        spatial[3],
+        cached_batch["source_boundary_prior_volume"][0][core].float(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        spatial[4],
+        cached_batch["source_marker_prior_volume"][0][core].float()
+        * foreground.float(),
+        rtol=0,
+        atol=0,
+    )
+    assert accelerated.batch["source_ram_cache_recomputed_edt_label_counts"] == (0,)
 
 
 def test_static_gt_crop_cache_is_independent_of_source_state(tmp_path):
