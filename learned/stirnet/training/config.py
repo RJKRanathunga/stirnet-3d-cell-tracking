@@ -57,6 +57,12 @@ class CurriculumConfig:
     # Real natural merge/error crops are never synthetically corrupted.
     refinement_crop_source_dropout_min_purity: float = 0.80
     refinement_crop_source_dropout_min_gt_coverage: float = 0.50
+
+    # Synthetic lateral reflection augmentation. X and Y are sampled
+    # independently after source corruption/target construction; p=0.5 gives
+    # identity/X/Y/XY with equal expected frequency.
+    refinement_crop_xy_flip_probability: float = 0.50
+
     # Build source priors / static GT targets with physical context and
     # retain only the requested model crop core.
     refinement_crop_source_halo_um: float = 4.0
@@ -148,6 +154,8 @@ class TrainingConfig:
             raise ValueError("refinement_crop_source_dropout_min_purity must be in [0,1]")
         if not 0.0 <= self.curriculum.refinement_crop_source_dropout_min_gt_coverage <= 1.0:
             raise ValueError("refinement_crop_source_dropout_min_gt_coverage must be in [0,1]")
+        if not 0.0 <= self.curriculum.refinement_crop_xy_flip_probability <= 1.0:
+            raise ValueError("refinement_crop_xy_flip_probability must be in [0,1]")
         if self.curriculum.refinement_crop_source_halo_um < 0:
             raise ValueError("refinement_crop_source_halo_um cannot be negative")
         if self.curriculum.refinement_crop_target_halo_um < 0:

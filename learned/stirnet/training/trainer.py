@@ -45,6 +45,7 @@ from .merge_aware_crops import (
 from .source_corruption import apply_source_instance_dropout
 from .crop_target_cache import StaticCropTargetCache
 from .raw_source import materialize_raw_source_crop_batch
+from .spatial_augmentation import apply_xy_flip_augmentation
 
 
 MODEL_INPUT_KEYS = frozenset(
@@ -810,6 +811,10 @@ class Trainer:
         static_target_misses = 0
         merge_crop_count = 0
         coverage_crop_count = 0
+        xy_flip_identity_count = 0
+        xy_flip_x_count = 0
+        xy_flip_y_count = 0
+        xy_flip_xy_count = 0
 
         with self.stage_profiler.phase_scope(profile_phase):
             with self.stage_profiler.profile("crop_select"):
@@ -915,6 +920,31 @@ class Trainer:
                                 gpu_min_voxels=self.training_config.geometry_target_gpu_min_voxels,
                             )
                         crop_target_prepare_seconds += time.perf_counter() - target_prepare_started
+
+                    # Synthetic orientation hardening lives beside missing-cell
+                    # corruption. We transform only after source corruption and
+                    # target composition so the static target cache stays valid.
+                    augmentation_seed = (
+                        cfg.refinement_crop_seed
+                        + 7_000_001 * self.global_step
+                        + 389 * crop_index
+                        + 53_123
+                    )
+                    (
+                        crop,
+                        crop_geometry_targets,
+                        xy_flip_stats,
+                    ) = apply_xy_flip_augmentation(
+                        crop,
+                        crop_geometry_targets,
+                        probability=cfg.refinement_crop_xy_flip_probability,
+                        seed=augmentation_seed,
+                    )
+                    xy_flip_identity_count += xy_flip_stats["identity"]
+                    xy_flip_x_count += xy_flip_stats["flip_x"]
+                    xy_flip_y_count += xy_flip_stats["flip_y"]
+                    xy_flip_xy_count += xy_flip_stats["flip_xy"]
+
                     model_crop_batch = move_batch_to_device(crop.batch, self.device)
                 started = time.perf_counter()
                 with self._autocast():
@@ -988,6 +1018,18 @@ class Trainer:
                 ),
                 "crop_merge_count": phase_loss.new_tensor(merge_crop_count),
                 "crop_coverage_count": phase_loss.new_tensor(coverage_crop_count),
+                "crop_xy_flip_identity_count": phase_loss.new_tensor(
+                    xy_flip_identity_count
+                ),
+                "crop_xy_flip_x_count": phase_loss.new_tensor(
+                    xy_flip_x_count
+                ),
+                "crop_xy_flip_y_count": phase_loss.new_tensor(
+                    xy_flip_y_count
+                ),
+                "crop_xy_flip_xy_count": phase_loss.new_tensor(
+                    xy_flip_xy_count
+                ),
             },
             {
                 "phase_a_crop_forward_seconds": forward_seconds,
@@ -1003,6 +1045,10 @@ class Trainer:
                 "phase_a_crop_merge_count": float(merge_crop_count),
                 "phase_a_crop_coverage_count": float(coverage_crop_count),
                 "phase_a_source_dropout_count": float(source_dropout_count),
+                "phase_a_xy_flip_identity_count": float(xy_flip_identity_count),
+                "phase_a_xy_flip_x_count": float(xy_flip_x_count),
+                "phase_a_xy_flip_y_count": float(xy_flip_y_count),
+                "phase_a_xy_flip_xy_count": float(xy_flip_xy_count),
             },
         )
 

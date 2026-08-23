@@ -22,6 +22,8 @@ What it does
 * Keeps natural merge/under-segmentation cases untouched.
 * Uses the production missing-source-cell augmentation on eligible coverage
   crops.
+* Uses synthetic X/Y reflection augmentation (p=0.5 independently per axis)
+  after crop/source preparation, covering identity/X/Y/XY orientations.
 * Uses exact static GT crop caching and the existing CuPy EDT path.
 * Trains geometry_bootstrap -> spatial_partition only; no temporal stage.
 * Writes one durable scalar record after every successful optimizer step.
@@ -783,6 +785,9 @@ def _build_configs(
     curriculum.refinement_crop_source_dropout_probability = 0.15
     curriculum.refinement_crop_source_dropout_max_instances = 1
 
+    # Normal spatial-training augmentation, not a checkpoint-specific stage.
+    curriculum.refinement_crop_xy_flip_probability = 0.50
+
     train_cfg.validate()
     return model_cfg, train_cfg
 
@@ -841,6 +846,11 @@ def _print_header(
     )
     print(f"AMP                       : {train_cfg.amp_dtype}", flush=True)
     print(f"Learning rate             : {train_cfg.lr}", flush=True)
+    print(
+        f"XY flip p/axis            : "
+        f"{train_cfg.curriculum.refinement_crop_xy_flip_probability:.2f}",
+        flush=True,
+    )
     print(f"Watershed backend         : {model_cfg.partition.watershed_backend}", flush=True)
     print(f"GT backend                : {train_cfg.geometry_target_backend}", flush=True)
     print("=" * 118, flush=True)
