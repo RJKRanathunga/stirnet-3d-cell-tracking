@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+import numpy as np
+import torch
+
+from learned.stirnet import StirNet
+from learned.stirnet.training.crop_target_cache import StaticCropTargetCache
+from learned.stirnet.training.crops import CropSpec, prepare_crop_batch
+from learned.stirnet.training.raw_source import materialize_raw_source_crop_batch, prepare_raw_training_batch
+from learned.stirnet.training.trainer import Trainer
+from .conftest import fixed_stage_training, small_model_config, synthetic_batch
+
+
+def _manual_raw_batch():
+    shape = (8, 24, 24)
+    # PyTorch does not implement boolean masked assignment for UInt16 on CPU.
+    # Build this tiny synthetic fixture in a supported integer dtype, then cast
+    # to the real raw-volume dtype used by production training.
+    raw = torch.zeros((1, *shape), dtype=torch.int32)
+    gt = torch.zeros((1, *shape), dtype=torch.long)
+    gt[0, 2:6, 5:10, 5:10] = 1
+    gt[0, 2:6, 14:19, 14:19] = 2
+    current = gt.to(torch.int32)
+    raw[0][gt[0] == 1] = 1000
+    raw[0][gt[0] == 2] = 800
+    raw = raw.to(torch.uint16)
+    return {
+        "raw_volume": raw,
+        "raw_normalization_bounds": torch.tensor([[0.0, 1000.0]]),
+        "instance_labels": current,
+        "gt_labels": gt,
+        "targets": [{"label_map": gt[0]}],
+        "spacing_um": torch.tensor([[2.0, 0.4, 0.4]]),
+        "dref_um": torch.tensor([4.0]),
+        "source_ids": ("toy-frame",),
+    }
+
+
+def test_raw_frame_preprocessing_can_cache_source_state(tmp_path):
+    raw = np.zeros((8, 24, 24), dtype=np.uint16)
+    raw[2:6, 6:18, 6:18] = 1200
+    gt = np.zeros_like(raw, dtype=np.int32)
+    gt[2:6, 6:12, 6:12] = 1
+    gt[2:6, 12:18, 12:18] = 2
+    cache = tmp_path / "source.pt"
+    first = prepare_raw_training_batch(raw, gt, (2.0, 0.4, 0.4), source_id="toy-source", source_cache_path=cache)
+    second = prepare_raw_training_batch(raw, gt, (2.0, 0.4, 0.4), source_id="toy-source", source_cache_path=cache)
+    assert cache.exists()
+    assert "spatial_inputs" not in first
+    assert first["raw_volume"].dtype == torch.uint16
+    assert first["instance_labels"].shape == first["gt_labels"].shape
+    assert not first["source_preprocessing_metadata"][0]["source_cache_hit"]
+    assert second["source_preprocessing_metadata"][0]["source_cache_hit"]
+    assert torch.equal(first["instance_labels"], second["instance_labels"])
+    torch.testing.assert_close(first["raw_normalization_bounds"], second["raw_normalization_bounds"])
+
+
+def test_missing_cell_rebuilds_all_source_priors_and_preserves_raw_gt():
+    batch = _manual_raw_batch()
+    gt = batch["gt_labels"]
+    spec = CropSpec(0, (slice(0, 8), slice(0, 24), slice(0, 24)), (8, 24, 24), torch.zeros(3), "coverage", (1, 2), (), (), ())
+    crop = prepare_crop_batch(batch, gt, [spec])
+    materialized = materialize_raw_source_crop_batch(
+        batch, crop,
+        source_halo_um=0.0,
+        dropout_probability=1.0,
+        dropout_max_instances=1,
+        dropout_seed=7,
+        dropout_min_purity=0.8,
+        dropout_min_gt_coverage=0.5,
+    )
+    dropped = materialized.batch["source_dropout_ids"][0]
+    assert len(dropped) == 1
+    original_mask = batch["instance_labels"][0] == dropped[0]
+    assert not bool(materialized.batch["instance_labels"][0][original_mask].any())
+    raw_channel = materialized.batch["spatial_inputs"][0, 0]
+    assert float(raw_channel[original_mask].max()) > 0
+    assert not bool(materialized.batch["spatial_inputs"][0, 1][original_mask].any())
+    assert not bool(materialized.batch["spatial_inputs"][0, 2][original_mask].any())
+    assert not bool(materialized.batch["spatial_inputs"][0, 4][original_mask].any())
+    assert torch.equal(materialized.gt_labels, gt)
+
+
+def test_real_merge_crop_is_never_synthetically_deleted():
+    batch = _manual_raw_batch()
+    gt = batch["gt_labels"]
+    merged = batch["instance_labels"].clone()
+    merged[merged == 2] = 1
+    batch["instance_labels"] = merged
+    spec = CropSpec(0, (slice(0, 8), slice(0, 24), slice(0, 24)), (8, 24, 24), torch.zeros(3), "merge", (1, 2), (), (), (1,))
+    crop = prepare_crop_batch(batch, gt, [spec])
+    materialized = materialize_raw_source_crop_batch(
+        batch, crop,
+        source_halo_um=0.0,
+        dropout_probability=1.0,
+        dropout_max_instances=1,
+        dropout_seed=7,
+        dropout_min_purity=0.8,
+        dropout_min_gt_coverage=0.5,
+    )
+    assert materialized.batch["source_dropout_ids"] == ((),)
+    assert torch.equal(materialized.batch["instance_labels"], merged)
+
+
+def test_static_gt_crop_cache_is_independent_of_source_state(tmp_path):
+    batch = _manual_raw_batch()
+    gt = batch["gt_labels"]
+    spec = CropSpec(0, (slice(0, 8), slice(0, 24), slice(0, 24)), (8, 24, 24), torch.zeros(3), "coverage", (1, 2), (), (), ())
+    cache = StaticCropTargetCache(max_memory_entries=1, disk_dir=tmp_path)
+    geometry = small_model_config().geometry
+    first, stats1 = cache.get_or_build_batch(
+        batch, gt, [spec], spacing_um=batch["spacing_um"], dref_um=batch["dref_um"],
+        geometry_config=geometry, backend="scipy", gpu_min_voxels=1, halo_um=0.0,
+    )
+    changed = dict(batch)
+    current = batch["instance_labels"].clone()
+    current[current == 1] = 0
+    changed["instance_labels"] = current
+    second, stats2 = cache.get_or_build_batch(
+        changed, gt, [spec], spacing_um=batch["spacing_um"], dref_um=batch["dref_um"],
+        geometry_config=geometry, backend="scipy", gpu_min_voxels=1, halo_um=0.0,
+    )
+    assert stats1["misses"] == 1
+    assert stats2["memory_hits"] == 1
+    for name in first.__dict__:
+        torch.testing.assert_close(getattr(first, name), getattr(second, name))
+
+
+def test_trainer_accepts_raw_only_frame_and_builds_true_crop_batch():
+    base = synthetic_batch(temporal=False)
+    raw_float = base["spatial_inputs"][:, 0].clamp(0, 1)
+    gt = torch.stack([torch.as_tensor(target["label_map"]).long() for target in base["targets"]])
+    batch = dict(base)
+    batch.pop("spatial_inputs")
+    batch["raw_volume"] = (raw_float * 65535).to(torch.uint16)
+    batch["raw_normalization_bounds"] = torch.tensor([[0.0, 65535.0]])
+    batch["gt_labels"] = gt
+    batch["source_ids"] = ("synthetic-raw-frame",)
+    config = small_model_config()
+    config.partition.rag_min_node_gt_support = 0.0
+    training = fixed_stage_training("spatial_partition")
+    training.geometry_target_backend = "scipy"
+    training.crop_static_target_memory_entries = 2
+    training.curriculum.refinement_crop_shape_zyx = (4, 8, 8)
+    training.curriculum.refinement_crop_batch_size = 2
+    training.curriculum.refinement_crop_merge_fraction = 0.5
+    training.curriculum.refinement_crops_per_step = 1
+    training.curriculum.refinement_crop_source_halo_um = 0.0
+    training.curriculum.refinement_crop_target_halo_um = 0.0
+    training.curriculum.refinement_crop_source_dropout_probability = 0.0
+    trainer = Trainer(StirNet(config), training, device="cpu")
+    seen_batches = []
+    handle = trainer.model.geometry_decoder.register_forward_pre_hook(
+        lambda _, args: seen_batches.append(int(args[0].shape[0]))
+    )
+    try:
+        metrics = trainer.train_step(batch)
+    finally:
+        handle.remove()
+    assert seen_batches == [2]
+    assert metrics["crop_true_batch_size"] == 2
+    assert metrics["phase_a_crop_effective_batch_size"] == 2
+    assert (
+        metrics["phase_a_static_target_misses"]
+        + metrics["phase_a_static_target_memory_hits"]
+        + metrics["phase_a_static_target_disk_hits"]
+    ) == 2
+    assert metrics["phase_a_static_target_misses"] >= 1
+    assert metrics["grad_geometry_spatial"] > 0

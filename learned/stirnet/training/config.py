@@ -53,6 +53,14 @@ class CurriculumConfig:
     refinement_crop_merge_min_gt_fraction: float = 0.05
     refinement_crop_source_dropout_probability: float = 0.15
     refinement_crop_source_dropout_max_instances: int = 1
+    # Missing-cell synthesis starts only from a trustworthy one-to-one source.
+    # Real natural merge/error crops are never synthetically corrupted.
+    refinement_crop_source_dropout_min_purity: float = 0.80
+    refinement_crop_source_dropout_min_gt_coverage: float = 0.50
+    # Build source priors / static GT targets with physical context and
+    # retain only the requested model crop core.
+    refinement_crop_source_halo_um: float = 4.0
+    refinement_crop_target_halo_um: float = 4.0
     refinement_crop_geometry_weight: float = 1.0
     refinement_crop_rag_weight: float = 0.0
     refinement_crop_seed: int = 40_266
@@ -72,6 +80,10 @@ class TrainingConfig:
     memory_profile_path: str | None = None
     geometry_target_backend: str = "auto"
     geometry_target_gpu_min_voxels: int = 262_144
+    # Exact float32 GT-only crop cache. Keep RAM small; optionally use
+    # a persistent run/Modal-volume directory for disk-backed reuse.
+    crop_static_target_memory_entries: int = 4
+    crop_static_target_cache_dir: str | None = None
     refinement_teacher_forcing_start: float = 1.0
     refinement_teacher_forcing_end: float = 0.0
     refinement_teacher_forcing_decay_steps: int = 2_000
@@ -91,6 +103,8 @@ class TrainingConfig:
             raise ValueError("geometry_target_backend must be auto, scipy, or cupy")
         if self.geometry_target_gpu_min_voxels < 1:
             raise ValueError("geometry_target_gpu_min_voxels must be positive")
+        if self.crop_static_target_memory_entries < 0:
+            raise ValueError("crop_static_target_memory_entries cannot be negative")
         if not 0.0 <= self.refinement_teacher_forcing_start <= 1.0:
             raise ValueError("refinement_teacher_forcing_start must be in [0, 1]")
         if not 0.0 <= self.refinement_teacher_forcing_end <= 1.0:
@@ -130,6 +144,14 @@ class TrainingConfig:
             raise ValueError("refinement_crop_source_dropout_probability must be in [0,1]")
         if self.curriculum.refinement_crop_source_dropout_max_instances < 0:
             raise ValueError("refinement_crop_source_dropout_max_instances cannot be negative")
+        if not 0.0 <= self.curriculum.refinement_crop_source_dropout_min_purity <= 1.0:
+            raise ValueError("refinement_crop_source_dropout_min_purity must be in [0,1]")
+        if not 0.0 <= self.curriculum.refinement_crop_source_dropout_min_gt_coverage <= 1.0:
+            raise ValueError("refinement_crop_source_dropout_min_gt_coverage must be in [0,1]")
+        if self.curriculum.refinement_crop_source_halo_um < 0:
+            raise ValueError("refinement_crop_source_halo_um cannot be negative")
+        if self.curriculum.refinement_crop_target_halo_um < 0:
+            raise ValueError("refinement_crop_target_halo_um cannot be negative")
         if not 0.0 <= self.curriculum.refinement_crop_min_foreground_fraction <= 1.0:
             raise ValueError(
                 "refinement_crop_min_foreground_fraction must be in [0, 1]"

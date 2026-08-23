@@ -116,29 +116,99 @@ def renormalize_cached_dref(
     return result
 
 
-def robust_normalize(raw: np.ndarray, low_pct: float = 1.0, high_pct: float = 99.8) -> np.ndarray:
-    raw=np.asarray(raw,np.float32)
-    lo,hi=np.percentile(raw,[low_pct,high_pct])
-    if hi<=lo:return np.zeros_like(raw,np.float32)
-    return np.clip((raw-lo)/(hi-lo),0,1).astype(np.float32)
+def robust_percentiles(
+    raw: np.ndarray,
+    low_pct: float = 1.0,
+    high_pct: float = 99.8,
+) -> tuple[float, float]:
+    values = np.asarray(raw, np.float32)
+    low, high = np.percentile(values, [low_pct, high_pct])
+    return float(low), float(high)
 
 
-def build_spatial_channels(raw_norm: np.ndarray, instance_labels: np.ndarray, spacing_um, dref_um: float, marker_heatmap=None) -> np.ndarray:
-    foreground=(instance_labels>0).astype(np.float32)
-    edt=np.zeros_like(raw_norm,np.float32)
-    for label, bbox in enumerate(ndi.find_objects(instance_labels), 1):
+def normalize_with_percentiles(
+    raw: np.ndarray,
+    low: float,
+    high: float,
+) -> np.ndarray:
+    values = np.asarray(raw, np.float32)
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        return np.zeros_like(values, dtype=np.float32)
+    return np.clip((values - low) / (high - low), 0.0, 1.0).astype(np.float32)
+
+
+def robust_normalize(
+    raw: np.ndarray,
+    low_pct: float = 1.0,
+    high_pct: float = 99.8,
+) -> np.ndarray:
+    low, high = robust_percentiles(raw, low_pct, high_pct)
+    return normalize_with_percentiles(raw, low, high)
+
+
+def build_source_prior_channels(
+    instance_labels: np.ndarray,
+    spacing_um,
+    dref_um: float,
+    *,
+    marker_heatmap=None,
+    derive_marker: bool = False,
+) -> np.ndarray:
+    """Build the four fallible source-prior channels from current labels."""
+    labels = np.asarray(instance_labels)
+    spacing = np.asarray(spacing_um, dtype=np.float64)
+    foreground = (labels > 0).astype(np.float32)
+    edt = np.zeros(labels.shape, dtype=np.float32)
+    if marker_heatmap is not None and derive_marker:
+        raise ValueError("marker_heatmap and derive_marker are mutually exclusive")
+    marker = (
+        np.zeros(labels.shape, dtype=np.float32)
+        if marker_heatmap is None
+        else np.asarray(marker_heatmap, dtype=np.float32).copy()
+    )
+    for label, bbox in enumerate(ndi.find_objects(labels), 1):
         if bbox is None:
             continue
-        local = instance_labels[bbox] == label
+        local = labels[bbox] == label
+        if not local.any():
+            continue
         padded = np.pad(local, 1, mode="constant", constant_values=False)
         distance = ndi.distance_transform_edt(
-            padded, sampling=spacing_um
-        )[tuple(slice(1, -1) for _ in range(3))]
+            padded, sampling=spacing
+        )[tuple(slice(1, -1) for _ in range(3))].astype(np.float32)
         view = edt[bbox]
-        view[local] = distance[local] / max(dref_um, 1e-6)
-    boundary=make_instance_boundary(instance_labels).astype(np.float32)
-    marker=np.zeros_like(raw_norm,np.float32) if marker_heatmap is None else np.asarray(marker_heatmap,np.float32)
-    spatial = np.stack([raw_norm,foreground,edt,boundary,marker],axis=0)
+        view[local] = distance[local] / max(float(dref_um), 1e-6)
+        if derive_marker:
+            score = np.where(local, distance, -np.inf)
+            local_pos = np.unravel_index(int(np.argmax(score)), score.shape)
+            global_pos = tuple(
+                int(bbox[axis].start) + int(local_pos[axis]) for axis in range(3)
+            )
+            marker[global_pos] = 1.0
+    boundary = make_instance_boundary(labels).astype(np.float32)
+    return np.stack([foreground, edt, boundary, marker], axis=0)
+
+
+def build_spatial_channels(
+    raw_norm: np.ndarray,
+    instance_labels: np.ndarray,
+    spacing_um,
+    dref_um: float,
+    marker_heatmap=None,
+    *,
+    derive_marker: bool = False,
+) -> np.ndarray:
+    priors = build_source_prior_channels(
+        instance_labels,
+        spacing_um,
+        dref_um,
+        marker_heatmap=marker_heatmap,
+        derive_marker=derive_marker,
+    )
+    raw_channel = np.asarray(raw_norm, dtype=np.float32)
+    if raw_channel.shape != priors.shape[-3:]:
+        raise ValueError("raw/source-prior shapes must match")
+    spatial = np.concatenate([raw_channel[None], priors], axis=0)
     if spatial.shape[0] != len(SPATIAL_CHANNEL_NAMES):
         raise RuntimeError("STIR-Net spatial channel contract is inconsistent")
     return spatial

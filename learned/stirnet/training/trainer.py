@@ -43,6 +43,8 @@ from .merge_aware_crops import (
     source_signature as merge_crop_source_signature,
 )
 from .source_corruption import apply_source_instance_dropout
+from .crop_target_cache import StaticCropTargetCache
+from .raw_source import materialize_raw_source_crop_batch
 
 
 MODEL_INPUT_KEYS = frozenset(
@@ -96,9 +98,17 @@ def move_batch_to_device(
 
 
 def gt_labels_from_batch(batch: dict) -> torch.Tensor:
+    direct = batch.get("gt_labels")
+    if direct is not None:
+        labels = torch.as_tensor(direct)
+        if labels.ndim == 3:
+            labels = labels[None]
+        if labels.ndim != 4:
+            raise ValueError("batch['gt_labels'] must be [B,Z,Y,X]")
+        return labels
     targets = batch.get("targets")
     if not targets:
-        raise ValueError("V2 training requires batch['targets'][b]['label_map']")
+        raise ValueError("V2 training requires gt_labels or targets[].label_map")
     labels = [torch.as_tensor(target["label_map"]).long() for target in targets]
     return torch.stack(labels)
 
@@ -291,6 +301,10 @@ class Trainer:
         )
         self._crop_candidate_cache: CropCandidateCache | None = None
         self._coverage_crop_manifest: MergeAwareCropManifest | None = None
+        self._static_crop_target_cache = StaticCropTargetCache(
+            max_memory_entries=self.training_config.crop_static_target_memory_entries,
+            disk_dir=self.training_config.crop_static_target_cache_dir,
+        )
 
     def checkpoint_metadata(self) -> dict[str, int | str]:
         """Return the stage-local progress required for an exact resume."""
@@ -745,7 +759,11 @@ class Trainer:
         backward_seconds = 0.0
         candidate_types: list[str] = []
         source_dropout_count = 0
+        source_channel_prepare_seconds = 0.0
         crop_target_prepare_seconds = 0.0
+        static_target_memory_hits = 0
+        static_target_disk_hits = 0
+        static_target_misses = 0
         merge_crop_count = 0
         coverage_crop_count = 0
 
@@ -794,26 +812,63 @@ class Trainer:
                         batch, labels, specs, geometry_targets=geometry_targets,
                         partial_ignore_margin_um=cfg.refinement_crop_partial_ignore_margin_um,
                     )
-                    crop = apply_source_instance_dropout(
-                        crop, probability=cfg.refinement_crop_source_dropout_probability,
-                        max_instances=cfg.refinement_crop_source_dropout_max_instances,
-                        seed=cfg.refinement_crop_seed + 1_000_003 * self.global_step + 97 * crop_index,
+                    corruption_seed = (
+                        cfg.refinement_crop_seed
+                        + 1_000_003 * self.global_step
+                        + 97 * crop_index
                     )
-                    dropped_this_batch = sum(len(row) for row in crop.batch.get("source_dropout_ids", ()))
+                    source_prepare_started = time.perf_counter()
+                    if batch.get("raw_volume") is not None:
+                        crop = materialize_raw_source_crop_batch(
+                            batch,
+                            crop,
+                            source_halo_um=cfg.refinement_crop_source_halo_um,
+                            dropout_probability=cfg.refinement_crop_source_dropout_probability,
+                            dropout_max_instances=cfg.refinement_crop_source_dropout_max_instances,
+                            dropout_seed=corruption_seed,
+                            dropout_min_purity=cfg.refinement_crop_source_dropout_min_purity,
+                            dropout_min_gt_coverage=cfg.refinement_crop_source_dropout_min_gt_coverage,
+                        )
+                    else:
+                        crop = apply_source_instance_dropout(
+                            crop,
+                            probability=cfg.refinement_crop_source_dropout_probability,
+                            max_instances=cfg.refinement_crop_source_dropout_max_instances,
+                            seed=corruption_seed,
+                            min_purity=cfg.refinement_crop_source_dropout_min_purity,
+                            min_gt_coverage=cfg.refinement_crop_source_dropout_min_gt_coverage,
+                        )
+                    source_channel_prepare_seconds += time.perf_counter() - source_prepare_started
+                    dropped_this_batch = sum(
+                        len(row) for row in crop.batch.get("source_dropout_ids", ())
+                    )
                     source_dropout_count += dropped_this_batch
                     crop_geometry_targets = crop.geometry_targets
                     if crop_geometry_targets is None or dropped_this_batch:
                         target_prepare_started = time.perf_counter()
                         with self.stage_profiler.profile("crop_geometry_targets_prepare"):
-                            crop_geometry_targets = build_prepared_geometry_targets(
-                                crop.gt_labels,
-                                crop.batch["spacing_um"],
-                                crop.batch["dref_um"],
-                                current_labels=crop.batch.get("instance_labels"),
+                            static_targets, cache_stats = self._static_crop_target_cache.get_or_build_batch(
+                                batch,
+                                labels,
+                                specs,
+                                spacing_um=batch["spacing_um"],
+                                dref_um=batch["dref_um"],
                                 geometry_config=self.model.cfg.geometry,
                                 backend=self.training_config.geometry_target_backend,
                                 gpu_min_voxels=self.training_config.geometry_target_gpu_min_voxels,
-                                device=torch.device("cpu"),
+                                halo_um=cfg.refinement_crop_target_halo_um,
+                            )
+                            static_target_memory_hits += cache_stats["memory_hits"]
+                            static_target_disk_hits += cache_stats["disk_hits"]
+                            static_target_misses += cache_stats["misses"]
+                            crop_geometry_targets = compose_source_conditioned_geometry_targets(
+                                static_targets,
+                                crop.gt_labels,
+                                crop.batch.get("instance_labels"),
+                                crop.batch["spacing_um"],
+                                geometry_config=self.model.cfg.geometry,
+                                backend=self.training_config.geometry_target_backend,
+                                gpu_min_voxels=self.training_config.geometry_target_gpu_min_voxels,
                             )
                         crop_target_prepare_seconds += time.perf_counter() - target_prepare_started
                     model_crop_batch = move_batch_to_device(crop.batch, self.device)
@@ -893,7 +948,11 @@ class Trainer:
             {
                 "phase_a_crop_forward_seconds": forward_seconds,
                 "phase_a_crop_target_seconds": target_seconds,
+                "phase_a_crop_source_channel_prepare_seconds": source_channel_prepare_seconds,
                 "phase_a_crop_geometry_target_prepare_seconds": crop_target_prepare_seconds,
+                "phase_a_static_target_memory_hits": float(static_target_memory_hits),
+                "phase_a_static_target_disk_hits": float(static_target_disk_hits),
+                "phase_a_static_target_misses": float(static_target_misses),
                 "phase_a_crop_backward_seconds": backward_seconds,
                 "phase_a_crop_candidate_count": float(len(candidate_types)),
                 "phase_a_crop_effective_batch_size": float(cfg.refinement_crop_batch_size * labels.shape[0]),

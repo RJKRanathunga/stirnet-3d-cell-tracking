@@ -422,9 +422,17 @@ def prepare_crop_batch(
     geometry_targets: GeometryTargets | None = None,
     partial_ignore_margin_um: float = 0.0,
 ) -> CropBatch:
-    """Crop aligned model inputs, current labels, GT, and dense targets."""
+    """Crop aligned state for cached-input or raw-source training."""
     cropped = {
-        "spatial_inputs": torch.cat(
+        "spacing_um": torch.stack(
+            [batch["spacing_um"][spec.batch_index] for spec in specs]
+        ),
+        "dref_um": torch.stack(
+            [batch["dref_um"][spec.batch_index] for spec in specs]
+        ),
+    }
+    if batch.get("spatial_inputs") is not None:
+        cropped["spatial_inputs"] = torch.cat(
             [
                 batch["spatial_inputs"][
                     spec.batch_index : spec.batch_index + 1,
@@ -436,40 +444,38 @@ def prepare_crop_batch(
                 for spec in specs
             ],
             dim=0,
-        ),
-        "spacing_um": torch.stack(
-            [batch["spacing_um"][spec.batch_index] for spec in specs]
-        ),
-        "dref_um": torch.stack(
-            [batch["dref_um"][spec.batch_index] for spec in specs]
-        ),
-    }
+        )
     if batch.get("instance_labels") is not None:
         cropped["instance_labels"] = torch.stack(
-            [
-                batch["instance_labels"][spec.batch_index][spec.slices_zyx]
-                for spec in specs
-            ]
+            [batch["instance_labels"][spec.batch_index][spec.slices_zyx] for spec in specs]
         )
     if batch.get("spatial_padding_mask") is not None:
         cropped["spatial_padding_mask"] = torch.stack(
-            [
-                batch["spatial_padding_mask"][spec.batch_index][spec.slices_zyx]
-                for spec in specs
-            ]
+            [batch["spatial_padding_mask"][spec.batch_index][spec.slices_zyx] for spec in specs]
         )
+    if batch.get("raw_normalization_bounds") is not None:
+        cropped["raw_normalization_bounds"] = torch.stack(
+            [torch.as_tensor(batch["raw_normalization_bounds"][spec.batch_index]) for spec in specs]
+        )
+    if batch.get("source_ids") is not None:
+        cropped["source_ids"] = tuple(batch["source_ids"][spec.batch_index] for spec in specs)
     cropped_gt = torch.stack(
         [gt_labels[spec.batch_index][spec.slices_zyx] for spec in specs]
     )
+    mask_device = (
+        cropped["spatial_inputs"].device if "spatial_inputs" in cropped else cropped_gt.device
+    )
     cropped["supervision_valid_mask"] = torch.stack([
-        _crop_supervision_valid_mask(cropped_gt[row], spec, cropped["spacing_um"][row], margin_um=float(partial_ignore_margin_um), device=cropped["spatial_inputs"].device)
+        _crop_supervision_valid_mask(
+            cropped_gt[row],
+            spec,
+            cropped["spacing_um"][row],
+            margin_um=float(partial_ignore_margin_um),
+            device=mask_device,
+        )
         for row, spec in enumerate(specs)
     ])
-    cropped_targets = (
-        None
-        if geometry_targets is None
-        else crop_geometry_targets(geometry_targets, specs)
-    )
+    cropped_targets = None if geometry_targets is None else crop_geometry_targets(geometry_targets, specs)
     return CropBatch(
         batch=cropped,
         gt_labels=cropped_gt,
