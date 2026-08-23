@@ -6,7 +6,11 @@ import torch
 from learned.stirnet import StirNet
 from learned.stirnet.training.crop_target_cache import StaticCropTargetCache
 from learned.stirnet.training.crops import CropSpec, prepare_crop_batch
-from learned.stirnet.training.raw_source import materialize_raw_source_crop_batch, prepare_raw_training_batch
+from learned.stirnet.training.raw_source import (
+    materialize_raw_source_crop_batch,
+    prepare_raw_source_volume_cache,
+    prepare_raw_training_batch,
+)
 from learned.stirnet.training.trainer import Trainer
 from .conftest import fixed_stage_training, small_model_config, synthetic_batch
 
@@ -126,6 +130,155 @@ def test_real_merge_crop_is_never_synthetically_deleted():
     )
     assert materialized.batch["source_dropout_ids"] == ((),)
     assert torch.equal(materialized.batch["instance_labels"], merged)
+
+
+def _materialize_for_test(batch, spec, *, dropout_probability: float, seed: int = 7):
+    crop = prepare_crop_batch(batch, batch["gt_labels"], [spec])
+    return materialize_raw_source_crop_batch(
+        batch,
+        crop,
+        source_halo_um=0.0,
+        dropout_probability=dropout_probability,
+        dropout_max_instances=1,
+        dropout_seed=seed,
+        dropout_min_purity=0.8,
+        dropout_min_gt_coverage=0.5,
+    )
+
+
+def test_source_ram_cache_preserves_exact_channels_without_dropout():
+    baseline_batch = _manual_raw_batch()
+    cached_batch = prepare_raw_source_volume_cache(
+        baseline_batch,
+        release_raw_volume=True,
+    )
+    spec = CropSpec(
+        0,
+        (slice(0, 8), slice(0, 24), slice(0, 24)),
+        (8, 24, 24),
+        torch.zeros(3),
+        "coverage",
+        (1, 2),
+        (),
+        (),
+        (),
+    )
+
+    baseline = _materialize_for_test(
+        baseline_batch,
+        spec,
+        dropout_probability=0.0,
+    )
+    accelerated = _materialize_for_test(
+        cached_batch,
+        spec,
+        dropout_probability=0.0,
+    )
+
+    assert cached_batch["raw_volume"] is None
+    assert "raw_normalized_volume" in cached_batch
+    assert "source_edt_prior_volume" in cached_batch
+    assert "current_foreground_prior" not in cached_batch
+    assert "current_boundary_prior" not in cached_batch
+    assert "current_marker_prior" not in cached_batch
+    assert accelerated.batch["source_materialization_modes"] == ("ram_cache",)
+    assert accelerated.batch["source_ram_cache_recomputed_edt_label_counts"] == (0,)
+    assert torch.equal(
+        baseline.batch["spatial_inputs"],
+        accelerated.batch["spatial_inputs"],
+    )
+    assert torch.equal(
+        baseline.batch["instance_labels"],
+        accelerated.batch["instance_labels"],
+    )
+
+
+def test_source_ram_cache_preserves_exact_channels_with_missing_cell_dropout():
+    baseline_batch = _manual_raw_batch()
+    cached_batch = prepare_raw_source_volume_cache(
+        baseline_batch,
+        release_raw_volume=True,
+    )
+    spec = CropSpec(
+        0,
+        (slice(0, 8), slice(0, 24), slice(0, 24)),
+        (8, 24, 24),
+        torch.zeros(3),
+        "coverage",
+        (1, 2),
+        (),
+        (),
+        (),
+    )
+
+    baseline = _materialize_for_test(
+        baseline_batch,
+        spec,
+        dropout_probability=1.0,
+        seed=19,
+    )
+    accelerated = _materialize_for_test(
+        cached_batch,
+        spec,
+        dropout_probability=1.0,
+        seed=19,
+    )
+
+    assert baseline.batch["source_dropout_ids"] == accelerated.batch["source_dropout_ids"]
+    assert torch.equal(
+        baseline.batch["spatial_inputs"],
+        accelerated.batch["spatial_inputs"],
+    )
+    assert torch.equal(
+        baseline.batch["instance_labels"],
+        accelerated.batch["instance_labels"],
+    )
+
+
+def test_source_ram_cache_exactly_repairs_cell_clipped_by_halo():
+    baseline_batch = _manual_raw_batch()
+    cached_batch = prepare_raw_source_volume_cache(
+        baseline_batch,
+        release_raw_volume=True,
+    )
+    # This crop cuts source instance 1 in Y/X. With a zero halo, its cached
+    # full-volume EDT must not be used blindly; the accelerated path repairs
+    # just that source instance using the historical cropped-halo definition.
+    spec = CropSpec(
+        0,
+        (slice(2, 6), slice(5, 8), slice(5, 8)),
+        (8, 24, 24),
+        torch.zeros(3),
+        "coverage",
+        (),
+        (),
+        (),
+        (),
+    )
+
+    baseline = _materialize_for_test(
+        baseline_batch,
+        spec,
+        dropout_probability=0.0,
+    )
+    accelerated = _materialize_for_test(
+        cached_batch,
+        spec,
+        dropout_probability=0.0,
+    )
+
+    assert accelerated.batch["source_materialization_modes"] == ("ram_cache",)
+    assert accelerated.batch["source_ram_cache_recomputed_edt_label_counts"][0] >= 1
+    assert torch.equal(
+        baseline.batch["spatial_inputs"],
+        accelerated.batch["spatial_inputs"],
+    )
+    assert torch.equal(
+        baseline.batch["instance_labels"],
+        accelerated.batch["instance_labels"],
+    )
+
+
 
 
 def test_static_gt_crop_cache_is_independent_of_source_state(tmp_path):

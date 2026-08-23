@@ -9,7 +9,7 @@ putting them into the model/trainer.
 
 What it does
 ------------
-* Runs on Modal L40S, 4 CPU cores, 8 GiB host RAM.
+* Runs on Modal L40S, 4 CPU cores, 16 GiB host RAM.
 * Loads NIS3D TIFF volumes from the existing `stirnet-data` Modal volume.
 * Uses Info.txt spacing by default, with an explicit --spacing-xyz effective-spacing override.
 * Uses ConfidenceScore==1 as undefined/unreliable supervision.
@@ -25,6 +25,8 @@ What it does
 * Uses synthetic X/Y reflection augmentation (p=0.5 independently per axis)
   after crop/source preparation, covering identity/X/Y/XY orientations.
 * Uses exact static GT crop caching and the existing CuPy EDT path.
+* Keeps normalized raw + source EDT for each prepared volume in host RAM,
+  then derives cheap foreground/boundary/marker priors per crop.
 * Trains geometry_bootstrap -> spatial_partition only; no temporal stage.
 * Writes one durable scalar record after every successful optimizer step.
 * Saves a recoverable checkpoint every N successful steps (default 50) and at
@@ -101,7 +103,7 @@ APP_NAME = "stirnet-nis3d-spatial-training"
 
 GPU = "L40S"
 CPU = 4.0
-MEMORY_MB = 8_192
+MEMORY_MB = 16_384
 TIMEOUT_SECONDS = 6 * 60 * 60
 
 # NIS3D is stored in the dedicated Modal volume named "external".
@@ -747,10 +749,14 @@ def _prepare_sample_batch(
     cache_namespace: str,
     confidence_ignore_margin_um: float,
     spacing_override_zyx_um: tuple[float, float, float] | None,
+    source_ram_cache: bool,
 ):
     import torch
 
-    from learned.stirnet.training import prepare_raw_training_batch
+    from learned.stirnet.training import (
+        prepare_raw_source_volume_cache,
+        prepare_raw_training_batch,
+    )
 
     sample_dir = nis3d_root / sample_name
     (
@@ -794,6 +800,20 @@ def _prepare_sample_batch(
     )
     prepare_seconds = time.perf_counter() - started
 
+    ram_cache_metadata = {
+        "enabled": False,
+        "prepare_seconds": 0.0,
+        "gross_cache_bytes": 0,
+        "released_raw_bytes": 0,
+        "net_added_bytes": 0,
+    }
+    if source_ram_cache:
+        batch = prepare_raw_source_volume_cache(
+            batch,
+            release_raw_volume=True,
+        )
+        ram_cache_metadata = dict(batch["source_ram_cache_metadata"])
+
     batch["supervision_valid_mask"] = torch.from_numpy(valid_mask)[None]
     batch["nis3d_sample_name"] = sample_name
 
@@ -810,6 +830,16 @@ def _prepare_sample_batch(
         "spacing_source": spacing_source,
         "source_prepare_seconds": float(prepare_seconds),
         "source_cache_hit": bool(metadata.get("source_cache_hit", False)),
+        "source_ram_cache_enabled": bool(ram_cache_metadata.get("enabled", False)),
+        "source_ram_cache_prepare_seconds": float(
+            ram_cache_metadata.get("prepare_seconds", 0.0)
+        ),
+        "source_ram_cache_gross_gib": float(
+            ram_cache_metadata.get("gross_cache_bytes", 0) / 2**30
+        ),
+        "source_ram_cache_net_added_gib": float(
+            ram_cache_metadata.get("net_added_bytes", 0) / 2**30
+        ),
         "current_instance_count": int(
             metadata.get("source_current_instance_count", 0)
         ),
@@ -977,6 +1007,7 @@ def _print_header(
     train_cfg,
     execution_mode: str,
     results_root: Path,
+    source_ram_cache: bool,
 ):
     import torch
 
@@ -1026,6 +1057,14 @@ def _print_header(
             flush=True,
         )
     print(f"Data signature            : {data_signature}", flush=True)
+    print(
+        "Source RAM cache          : " + (
+            "ON (normalized raw + source EDT; raw uint16 released)"
+            if source_ram_cache
+            else "OFF (legacy per-crop source materialization)"
+        ),
+        flush=True,
+    )
     print(f"Samples                   : {list(samples)}", flush=True)
     print(f"Maximum optimizer steps   : {max_steps}", flush=True)
     print(f"Checkpoint interval       : {checkpoint_every} successful steps", flush=True)
@@ -1069,6 +1108,7 @@ def _train_nis3d_impl(
     data_dir: str = "",
     spacing_xyz: str = "",
     crop_shape_zyx: str = "32,192,192",
+    source_ram_cache: bool = True,
     execution_mode: str = "modal",
 ) -> dict[str, Any]:
     import numpy as np
@@ -1171,6 +1211,7 @@ def _train_nis3d_impl(
         train_cfg=train_cfg,
         execution_mode=execution_mode,
         results_root=experiment_root,
+        source_ram_cache=source_ram_cache,
     )
 
     prepared_batches: dict[str, dict] = {}
@@ -1184,6 +1225,7 @@ def _train_nis3d_impl(
             cache_namespace=data_signature,
             confidence_ignore_margin_um=confidence_ignore_margin_um,
             spacing_override_zyx_um=spacing_override_zyx_um,
+            source_ram_cache=source_ram_cache,
         )
         prepared_batches[sample] = batch
         sample_reports[sample] = report
@@ -1195,6 +1237,9 @@ def _train_nis3d_impl(
             f"source={report['current_instance_count']} "
             f"dref={report['model_dref_um']:.4f}um "
             f"source_cache_hit={report['source_cache_hit']} "
+            f"ram_cache={report['source_ram_cache_gross_gib']:.2f}GiB "
+            f"net+={report['source_ram_cache_net_added_gib']:.2f}GiB "
+            f"ram_prep={report['source_ram_cache_prepare_seconds']:.2f}s "
             f"prepare={report['source_prepare_seconds']:.2f}s",
             flush=True,
         )
@@ -1227,6 +1272,7 @@ def _train_nis3d_impl(
                 else [float(v) for v in spacing_override_zyx_um]
             ),
             "crop_shape_zyx": [int(v) for v in crop_shape],
+            "source_ram_cache_enabled": bool(source_ram_cache),
             "confidence_ignore_margin_um": float(confidence_ignore_margin_um),
             "startup_note": (
                 "Modal source/cache writes are committed at checkpoint/final "
@@ -1548,6 +1594,7 @@ def train_nis3d(
     data_dir: str = "",
     spacing_xyz: str = "",
     crop_shape_zyx: str = "32,192,192",
+    source_ram_cache: bool = True,
 ) -> dict[str, Any]:
     return _train_nis3d_impl(
         max_steps=max_steps,
@@ -1563,6 +1610,7 @@ def train_nis3d(
         data_dir=data_dir,
         spacing_xyz=spacing_xyz,
         crop_shape_zyx=crop_shape_zyx,
+        source_ram_cache=source_ram_cache,
         execution_mode="modal",
     )
 
@@ -1586,6 +1634,7 @@ def main(
     data_dir: str = "",
     spacing_xyz: str = "",
     crop_shape_zyx: str = "32,192,192",
+    source_ram_cache: bool = True,
 ) -> None:
     result = train_nis3d.remote(
         max_steps=max_steps,
@@ -1601,6 +1650,7 @@ def main(
         data_dir=data_dir,
         spacing_xyz=spacing_xyz,
         crop_shape_zyx=crop_shape_zyx,
+        source_ram_cache=source_ram_cache,
     )
     print(json.dumps(result, indent=2))
 
@@ -1670,6 +1720,16 @@ def _python_cli_main() -> None:
         type=float,
         default=1.0,
     )
+    parser.add_argument(
+        "--no-source-ram-cache",
+        dest="source_ram_cache",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable the full-volume normalized-raw/source-EDT RAM cache "
+            "and use the historical per-crop materialization path."
+        ),
+    )
     args = parser.parse_args()
 
     run_name = args.run_name
@@ -1698,6 +1758,7 @@ def _python_cli_main() -> None:
             data_dir=args.data_dir,
             spacing_xyz=args.spacing_xyz,
             crop_shape_zyx=args.crop_shape_zyx,
+            source_ram_cache=args.source_ram_cache,
             execution_mode="local",
         )
         print(json.dumps(result, indent=2))
@@ -1745,6 +1806,8 @@ def _python_cli_main() -> None:
         command.extend(["--data-dir", args.data_dir])
     if args.spacing_xyz:
         command.extend(["--spacing-xyz", args.spacing_xyz])
+    if not args.source_ram_cache:
+        command.append("--no-source-ram-cache")
     if args.resume:
         command.append("--resume")
 

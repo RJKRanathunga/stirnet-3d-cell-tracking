@@ -22,7 +22,7 @@ from .crops import CropBatch, CropCandidateCache, CropSpec
 from .trainer import Trainer
 from .profiler import StageProfileRecord, StageProfiler
 from .crop_target_cache import StaticCropTargetCache
-from .raw_source import prepare_raw_training_batch
+from .raw_source import prepare_raw_source_volume_cache, prepare_raw_training_batch
 
 __all__ = [
     "ARCHITECTURE_ID",
@@ -46,6 +46,7 @@ __all__ = [
     "curriculum_stage",
     "instance_metrics",
     "load_checkpoint",
+    "prepare_raw_source_volume_cache",
     "prepare_raw_training_batch",
     "save_checkpoint",
     "stage_name_for_step",

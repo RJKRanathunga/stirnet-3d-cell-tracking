@@ -804,6 +804,9 @@ class Trainer:
         backward_seconds = 0.0
         candidate_types: list[str] = []
         source_dropout_count = 0
+        source_ram_cache_rows = 0
+        source_ram_cache_recomputed_edt_labels = 0
+        source_legacy_materialization_rows = 0
         source_channel_prepare_seconds = 0.0
         crop_target_prepare_seconds = 0.0
         static_target_memory_hits = 0
@@ -867,7 +870,10 @@ class Trainer:
                         + 97 * crop_index
                     )
                     source_prepare_started = time.perf_counter()
-                    if batch.get("raw_volume") is not None:
+                    if (
+                        batch.get("raw_volume") is not None
+                        or batch.get("raw_normalized_volume") is not None
+                    ):
                         crop = materialize_raw_source_crop_batch(
                             batch,
                             crop,
@@ -892,6 +898,20 @@ class Trainer:
                         len(row) for row in crop.batch.get("source_dropout_ids", ())
                     )
                     source_dropout_count += dropped_this_batch
+                    materialization_modes = crop.batch.get(
+                        "source_materialization_modes", ()
+                    )
+                    source_ram_cache_rows += sum(
+                        mode == "ram_cache" for mode in materialization_modes
+                    )
+                    source_legacy_materialization_rows += sum(
+                        mode == "legacy" for mode in materialization_modes
+                    )
+                    source_ram_cache_recomputed_edt_labels += sum(
+                        int(value) for value in crop.batch.get(
+                            "source_ram_cache_recomputed_edt_label_counts", ()
+                        )
+                    )
                     crop_geometry_targets = crop.geometry_targets
                     if crop_geometry_targets is None or dropped_this_batch:
                         target_prepare_started = time.perf_counter()
@@ -1045,6 +1065,13 @@ class Trainer:
                 "phase_a_crop_merge_count": float(merge_crop_count),
                 "phase_a_crop_coverage_count": float(coverage_crop_count),
                 "phase_a_source_dropout_count": float(source_dropout_count),
+                "phase_a_source_ram_cache_rows": float(source_ram_cache_rows),
+                "phase_a_source_ram_cache_recomputed_edt_labels": float(
+                    source_ram_cache_recomputed_edt_labels
+                ),
+                "phase_a_source_legacy_materialization_rows": float(
+                    source_legacy_materialization_rows
+                ),
                 "phase_a_xy_flip_identity_count": float(xy_flip_identity_count),
                 "phase_a_xy_flip_x_count": float(xy_flip_x_count),
                 "phase_a_xy_flip_y_count": float(xy_flip_y_count),
