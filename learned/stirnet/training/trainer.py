@@ -300,7 +300,15 @@ class Trainer:
             output_path=self.training_config.memory_profile_path,
         )
         self._crop_candidate_cache: CropCandidateCache | None = None
+        # `_coverage_crop_manifest` remains the most recently used manifest for
+        # compatibility/debugging. The dictionary prevents rebuilding the
+        # expensive coverage manifest every time training rotates to a
+        # different source volume.
         self._coverage_crop_manifest: MergeAwareCropManifest | None = None
+        self._coverage_crop_manifest_cache: dict[
+            tuple, MergeAwareCropManifest
+        ] = {}
+        self._coverage_crop_manifest_cache_max_entries = 8
         self._static_crop_target_cache = StaticCropTargetCache(
             max_memory_entries=self.training_config.crop_static_target_memory_entries,
             disk_dir=self.training_config.crop_static_target_cache_dir,
@@ -698,32 +706,68 @@ class Trainer:
             )
         return self._crop_candidate_cache
 
-    def _coverage_manifest(self, batch: dict, labels: torch.Tensor) -> MergeAwareCropManifest:
+    def _coverage_manifest(
+        self,
+        batch: dict,
+        labels: torch.Tensor,
+    ) -> MergeAwareCropManifest:
         cfg = self.training_config.curriculum
         current_labels = batch.get("instance_labels")
-        signature = merge_crop_source_signature(labels, current_labels, batch["spacing_um"])
-        current = self._coverage_crop_manifest
-        if (
-            current is None or current.source_signature != signature
-            or current.crop_shape_zyx != tuple(cfg.refinement_crop_shape_zyx)
-            or current.min_complete_cells != int(cfg.refinement_crop_min_complete_cells)
-            or current.preferred_complete_cells != int(cfg.refinement_crop_preferred_complete_cells)
-            or current.views_per_cell != int(cfg.refinement_crop_views_per_cell)
-            or current.context_um != float(cfg.refinement_crop_context_um)
-            or current.merge_min_overlap_voxels != int(cfg.refinement_crop_merge_min_overlap_voxels)
-            or current.merge_min_gt_fraction != float(cfg.refinement_crop_merge_min_gt_fraction)
-        ):
+        source_sig = merge_crop_source_signature(
+            labels,
+            current_labels,
+            batch["spacing_um"],
+        )
+
+        # All fields below affect manifest construction. Including them in the
+        # key guarantees that a config change gets a fresh manifest.
+        cache_key = (
+            source_sig,
+            tuple(cfg.refinement_crop_shape_zyx),
+            int(cfg.refinement_crop_min_complete_cells),
+            int(cfg.refinement_crop_preferred_complete_cells),
+            int(cfg.refinement_crop_views_per_cell),
+            float(cfg.refinement_crop_context_um),
+            int(cfg.refinement_crop_merge_min_overlap_voxels),
+            float(cfg.refinement_crop_merge_min_gt_fraction),
+        )
+
+        current = self._coverage_crop_manifest_cache.get(cache_key)
+        if current is None:
             current = build_merge_aware_crop_manifest(
-                labels, current_labels=current_labels, spacing_um=batch["spacing_um"],
+                labels,
+                current_labels=current_labels,
+                spacing_um=batch["spacing_um"],
                 crop_shape_zyx=tuple(cfg.refinement_crop_shape_zyx),
-                min_complete_cells=int(cfg.refinement_crop_min_complete_cells),
-                preferred_complete_cells=int(cfg.refinement_crop_preferred_complete_cells),
+                min_complete_cells=int(
+                    cfg.refinement_crop_min_complete_cells
+                ),
+                preferred_complete_cells=int(
+                    cfg.refinement_crop_preferred_complete_cells
+                ),
                 views_per_cell=int(cfg.refinement_crop_views_per_cell),
                 context_um=float(cfg.refinement_crop_context_um),
-                merge_min_overlap_voxels=int(cfg.refinement_crop_merge_min_overlap_voxels),
-                merge_min_gt_fraction=float(cfg.refinement_crop_merge_min_gt_fraction),
+                merge_min_overlap_voxels=int(
+                    cfg.refinement_crop_merge_min_overlap_voxels
+                ),
+                merge_min_gt_fraction=float(
+                    cfg.refinement_crop_merge_min_gt_fraction
+                ),
             )
-            self._coverage_crop_manifest = current
+            self._coverage_crop_manifest_cache[cache_key] = current
+
+            # Training normally needs only a handful of source volumes. Bound
+            # the cache defensively so unusual callers that continuously create
+            # new source tensors cannot grow host memory without limit.
+            while (
+                len(self._coverage_crop_manifest_cache)
+                > self._coverage_crop_manifest_cache_max_entries
+            ):
+                oldest_key = next(iter(self._coverage_crop_manifest_cache))
+                self._coverage_crop_manifest_cache.pop(oldest_key)
+
+        # Preserve the historical attribute as "most recently used".
+        self._coverage_crop_manifest = current
         return current
 
     def _crop_phase_a_backward(
