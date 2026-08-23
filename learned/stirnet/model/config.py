@@ -117,7 +117,7 @@ class PartitionConfig:
     node_feature_channels: int = 24
     rag_hidden_dim: int = 96
     rag_layers: int = 2
-    spatial_merge_threshold: float = 0.50
+    spatial_merge_threshold: float = 0.845
     final_merge_threshold: float = 0.50
     max_supervoxels: int = 4096
     rag_min_node_purity: float = 0.80
