@@ -55,6 +55,32 @@ def test_raw_frame_preprocessing_can_cache_source_state(tmp_path):
     torch.testing.assert_close(first["raw_normalization_bounds"], second["raw_normalization_bounds"])
 
 
+def test_raw_frame_preprocessing_accepts_big_endian_uint16(tmp_path):
+    raw_native = np.zeros((8, 24, 24), dtype=np.uint16)
+    raw_native[2:6, 6:18, 6:18] = 1200
+    raw_big_endian = raw_native.astype(">u2")
+
+    gt = np.zeros(raw_native.shape, dtype=np.int32)
+    gt[2:6, 6:12, 6:12] = 1
+    gt[2:6, 12:18, 12:18] = 2
+
+    batch = prepare_raw_training_batch(
+        raw_big_endian,
+        gt,
+        (2.0, 0.4, 0.4),
+        source_id="toy-big-endian-source",
+        source_cache_path=tmp_path / "source.pt",
+    )
+
+    raw_tensor = batch["raw_volume"][0]
+    assert raw_tensor.dtype == torch.uint16
+    assert raw_tensor.shape == raw_native.shape
+    np.testing.assert_array_equal(
+        raw_tensor.to(torch.int32).numpy(),
+        raw_native.astype(np.int32),
+    )
+
+
 def test_missing_cell_rebuilds_all_source_priors_and_preserves_raw_gt():
     batch = _manual_raw_batch()
     gt = batch["gt_labels"]

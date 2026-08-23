@@ -78,7 +78,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
+from tqdm import tqdm
 import modal
 
 
@@ -90,7 +90,7 @@ APP_NAME = "stirnet-nis3d-spatial-training"
 
 GPU = "L40S"
 CPU = 4.0
-MEMORY_MB = 16_384
+MEMORY_MB = 8_192
 TIMEOUT_SECONDS = 6 * 60 * 60
 
 # NIS3D is stored in the dedicated Modal volume named "external".
@@ -733,9 +733,8 @@ def _save_recovery_checkpoint(
     # Make the checkpoint durable in the Modal volume before more training.
     if commit_to_modal:
         runs_volume.commit()
-    print(
-        f"[checkpoint] persisted step={step} path={path}",
-        flush=True,
+    tqdm.write(
+        f"[checkpoint] persisted step={step} path={path}"
     )
     return path
 
@@ -866,7 +865,6 @@ def _train_nis3d_impl(
 ) -> dict[str, Any]:
     import numpy as np
     import torch
-    from tqdm.auto import tqdm
 
     from learned.stirnet import StirNet
     from learned.stirnet.training.trainer import Trainer

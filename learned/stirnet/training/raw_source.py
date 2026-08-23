@@ -33,6 +33,30 @@ def _torch_load(path: Path) -> dict[str, Any]:
         return torch.load(path, map_location="cpu")
 
 
+def _native_contiguous_array(value: np.ndarray) -> np.ndarray:
+    """Return a writable C-contiguous NumPy array with native byte order.
+
+    PyTorch ``torch.from_numpy`` does not accept arrays whose dtype byte order
+    differs from the host. TIFF/memmap inputs may be big-endian (for example
+    ``>u2``) even on little-endian hosts.
+
+    The dtype conversion below performs the required byte swap while preserving
+    numeric values. Native writable C-contiguous arrays are returned without an
+    unnecessary copy.
+    """
+    array = np.asarray(value)
+    if array.dtype.isnative and array.flags.c_contiguous and array.flags.writeable:
+        return array
+
+    native_dtype = array.dtype.newbyteorder("=")
+    return np.array(
+        array,
+        dtype=native_dtype,
+        order="C",
+        copy=True,
+    )
+
+
 def _source_id(raw: np.ndarray, explicit: str | None) -> str:
     if explicit:
         return str(explicit)
@@ -160,7 +184,7 @@ def prepare_raw_training_batch(
         dref_um = float(cached["dref_um"])
         component_count = int(cached.get("current_instance_count", int(torch.as_tensor(cached["current_labels"]).max())))
 
-    raw_tensor = torch.from_numpy(np.ascontiguousarray(raw))
+    raw_tensor = torch.from_numpy(_native_contiguous_array(raw))
     gt_tensor = torch.from_numpy(np.asarray(gt, dtype=np.int64).copy())
     current_tensor = torch.as_tensor(cached["current_labels"]).to(torch.int32)
     metadata = {
