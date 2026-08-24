@@ -1,20 +1,31 @@
-# STIRNET_MORPHOLOGY_AWARE_RAG_V1
+# STIRNET_MORPHOLOGY_AWARE_RAG_V2
 from __future__ import annotations
 
 """Bounded 3-D morphology evidence for STIR-Net's spatial RAG.
 
-The legacy RAG statistics are retained. This module adds complementary spatial
-information:
+Node evidence remains whole-supervoxel morphology.
 
-* node embedding: complete supervoxel morphology with aspect ratio preserved;
-* edge embedding: a physical cube centered on the exact A<->B interface;
-* inputs: raw appearance, learned scalar geometry, learned vector geometry,
-  and explicit topology masks.
+Edge evidence is v2:
+* every A<->B touching voxel is first located;
+* the COMPLETE contact bounding box is retained;
+* two joint A+B ROIs are extracted:
+    - local:  50% contact-bbox headroom per side by default;
+    - broad: 100% contact-bbox headroom per side by default;
+* a minimum physical headroom in dref units prevents a one-voxel-thick contact
+  from producing a nearly planar crop;
+* A and B are separate topology channels in the SAME ROI;
+* A/B ordering is made exactly symmetric by a shared member stem followed by
+  sum and absolute-difference fusion;
+* union/interface/proximity are encoded by a relation stem;
+* topology directly conditions context features;
+* global and interface-aware pooling preserve thin-neck information;
+* local+broad embeddings are fused with physical contact/ROI metadata.
 
-Patches are processed in bounded chunks. Dense geometry can be detached so a
-RAG-only fine-tuning stage cannot perturb the known-good geometry network.
+Dense geometry can be detached so RAG-only optimization cannot perturb the
+known-good geometry network.
 """
 
+from dataclasses import dataclass
 import math
 
 import torch
@@ -24,6 +35,9 @@ import torch.nn.functional as F
 from ..config import PartitionConfig
 from ..types import GeometryLike, RAGState, geometry_field_crop
 from ..utils.tensor_ops import reduce_labeled_voxels
+
+
+EDGE_METADATA_DIM = 16
 
 
 def _group_count(channels: int) -> int:
@@ -43,7 +57,7 @@ class _Stem3D(nn.Sequential):
 
 
 class MorphologyPatchEncoder(nn.Module):
-    """Modality-specific shallow stems followed by joint 3-D reasoning."""
+    """Legacy-shape node morphology encoder."""
 
     def __init__(self, topology_channels: int, output_dim: int):
         super().__init__()
@@ -95,19 +109,193 @@ class MorphologyPatchEncoder(nn.Module):
         return self.head(pooled)
 
 
+class EdgeMorphologyPatchEncoder(nn.Module):
+    """Joint A/B edge encoder with strong, symmetric topology conditioning.
+
+    topology channels:
+        0: member A
+        1: member B
+        2: A union B
+        3: visible A<->B interface
+        4: wider interface-proximity support
+    """
+
+    def __init__(self, output_dim: int):
+        super().__init__()
+        self.appearance = _Stem3D(1, 8)
+        self.scalar_geometry = _Stem3D(5, 16)
+        self.vector_geometry = _Stem3D(6, 16)
+
+        self.member = _Stem3D(1, 12)
+        self.relation = _Stem3D(3, 16)
+
+        self.context_projection = nn.Sequential(
+            nn.Conv3d(40, 48, 3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(48), 48),
+            nn.SiLU(),
+        )
+        self.topology_projection = nn.Sequential(
+            nn.Conv3d(40, 48, 3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(48), 48),
+            nn.SiLU(),
+        )
+        self.topology_gate = nn.Sequential(
+            nn.Conv3d(48, 48, 1),
+            nn.Sigmoid(),
+        )
+
+        self.fusion = nn.Sequential(
+            nn.Conv3d(48, 64, 3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(64), 64),
+            nn.SiLU(),
+            nn.Conv3d(64, 64, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(_group_count(64), 64),
+            nn.SiLU(),
+            nn.Conv3d(64, 64, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(_group_count(64), 64),
+            nn.SiLU(),
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.SiLU(),
+            nn.Linear(128, 96),
+            nn.SiLU(),
+            nn.Linear(96, output_dim),
+        )
+
+    @staticmethod
+    def _interface_pool(
+        features: Tensor,
+        proximity: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        weights = F.interpolate(
+            proximity.float(),
+            size=tuple(int(v) for v in features.shape[-3:]),
+            mode="trilinear",
+            align_corners=False,
+        ).to(dtype=features.dtype)
+        weights = weights.clamp(0.0, 1.0)
+
+        denominator = weights.sum(dim=(-3, -2, -1)).clamp_min(1e-6)
+        local_avg = (
+            (features * weights).sum(dim=(-3, -2, -1))
+            / denominator
+        )
+
+        mask = weights > 0.05
+        expanded_mask = mask.expand_as(features)
+        very_negative = torch.finfo(features.dtype).min
+        local_max = features.masked_fill(
+            ~expanded_mask,
+            very_negative,
+        ).amax(dim=(-3, -2, -1))
+
+        has_support = mask.flatten(1).any(dim=1)
+        global_max = features.amax(dim=(-3, -2, -1))
+        local_max = torch.where(
+            has_support[:, None],
+            local_max,
+            global_max,
+        )
+        return local_avg, local_max
+
+    def forward(
+        self,
+        appearance: Tensor,
+        scalar_geometry: Tensor,
+        vector_geometry: Tensor,
+        topology: Tensor,
+    ) -> Tensor:
+        if topology.shape[1] != 5:
+            raise ValueError(
+                "Edge topology must be [A, B, union, interface, proximity]"
+            )
+
+        member_a = self.member(topology[:, 0:1])
+        member_b = self.member(topology[:, 1:2])
+        member_sum = member_a + member_b
+        member_absdiff = (member_a - member_b).abs()
+        relation = self.relation(topology[:, 2:5])
+
+        context = torch.cat(
+            [
+                self.appearance(appearance),
+                self.scalar_geometry(scalar_geometry),
+                self.vector_geometry(vector_geometry),
+            ],
+            dim=1,
+        )
+        topology_features = torch.cat(
+            [member_sum, member_absdiff, relation],
+            dim=1,
+        )
+
+        context = self.context_projection(context)
+        topology_features = self.topology_projection(topology_features)
+
+        gate = self.topology_gate(topology_features)
+        fused = context * (1.0 + gate) + topology_features
+        features = self.fusion(fused)
+
+        global_avg = features.mean(dim=(-3, -2, -1))
+        global_max = features.amax(dim=(-3, -2, -1))
+        interface_avg, interface_max = self._interface_pool(
+            features,
+            topology[:, 4:5],
+        )
+
+        pooled = torch.cat(
+            [global_avg, global_max, interface_avg, interface_max],
+            dim=-1,
+        )
+        return self.head(pooled)
+
+
+@dataclass(frozen=True)
+class EdgeScalePatch:
+    appearance: Tensor
+    scalar_geometry: Tensor
+    vector_geometry: Tensor
+    topology: Tensor
+    requested_start_zyx: Tensor
+    requested_stop_zyx: Tensor
+    roi_extent_um: Tensor
+
+
+@dataclass(frozen=True)
+class EdgePairPatch:
+    broad: EdgeScalePatch
+    local: EdgeScalePatch
+    metadata: Tensor
+    contact_lower_zyx: Tensor
+    contact_upper_zyx: Tensor
+    contact_face_counts_zyx: Tensor
+
+
 class RAGMorphologyEmbeddingBuilder(nn.Module):
-    """Build node/edge embeddings from bounded physical 3-D patches."""
+    """Build node and edge embeddings from bounded physical 3-D patches."""
 
     def __init__(self, cfg: PartitionConfig):
         super().__init__()
         self.cfg = cfg
+
         self.node_encoder = MorphologyPatchEncoder(
             topology_channels=1,
             output_dim=cfg.rag_node_morphology_dim,
         )
-        self.edge_encoder = MorphologyPatchEncoder(
-            topology_channels=2,
+        self.edge_encoder = EdgeMorphologyPatchEncoder(
             output_dim=cfg.rag_edge_morphology_dim,
+        )
+        self.edge_scale_fusion = nn.Sequential(
+            nn.Linear(
+                2 * cfg.rag_edge_morphology_dim + EDGE_METADATA_DIM,
+                128,
+            ),
+            nn.SiLU(),
+            nn.Linear(128, 96),
+            nn.SiLU(),
+            nn.Linear(96, cfg.rag_edge_morphology_dim),
         )
 
     @staticmethod
@@ -166,7 +354,10 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
         return value
 
     @staticmethod
-    def _resize_continuous(value: Tensor, shape: tuple[int, int, int]) -> Tensor:
+    def _resize_continuous(
+        value: Tensor,
+        shape: tuple[int, int, int],
+    ) -> Tensor:
         return F.interpolate(
             value[None].float(),
             size=shape,
@@ -175,7 +366,10 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
         )[0]
 
     @staticmethod
-    def _resize_nearest(value: Tensor, shape: tuple[int, int, int]) -> Tensor:
+    def _resize_nearest(
+        value: Tensor,
+        shape: tuple[int, int, int],
+    ) -> Tensor:
         return F.interpolate(
             value[None].float(),
             size=shape,
@@ -203,11 +397,15 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
         separator = geometry_field_crop(
             geometry, "separator_logits", batch_index, crop
         ).sigmoid()
-        sdf = geometry_field_crop(geometry, "sdf", batch_index, crop)
+        sdf = geometry_field_crop(
+            geometry, "sdf", batch_index, crop
+        )
         seed = geometry_field_crop(
             geometry, "seed_logits", batch_index, crop
         ).sigmoid()
-        flow = geometry_field_crop(geometry, "flow", batch_index, crop)
+        flow = geometry_field_crop(
+            geometry, "flow", batch_index, crop
+        )
         offset = geometry_field_crop(
             geometry, "centroid_offset", batch_index, crop
         )
@@ -227,13 +425,19 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
         )
         scalar = self._resize_continuous(
             self._pad(
-                torch.cat([foreground, surface, separator, sdf, seed], dim=0),
+                torch.cat(
+                    [foreground, surface, separator, sdf, seed],
+                    dim=0,
+                ),
                 padding,
             ),
             patch_shape,
         )
         vector = self._resize_continuous(
-            self._pad(torch.cat([flow, offset], dim=0), padding),
+            self._pad(
+                torch.cat([flow, offset], dim=0),
+                padding,
+            ),
             patch_shape,
         )
         return appearance, scalar, vector
@@ -273,13 +477,19 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
         dref_um: Tensor,
     ):
         center = 0.5 * (lower.float() + upper.float())
-        extent_um = (upper.float() - lower.float() + 1.0) * spacing_um.float()
+        extent_um = (
+            upper.float() - lower.float() + 1.0
+        ) * spacing_um.float()
         radius_um = (
             0.5 * float(extent_um.max().detach().cpu())
-            + self.cfg.rag_node_context_dref * float(dref_um.detach().cpu())
+            + self.cfg.rag_node_context_dref
+            * float(dref_um.detach().cpu())
         )
         crop, padding = self._physical_cube(
-            center, radius_um, spacing_um, tuple(int(v) for v in labels.shape)
+            center,
+            radius_um,
+            spacing_um,
+            tuple(int(v) for v in labels.shape),
         )
         appearance, scalar, vector = self._modalities(
             spatial_inputs,
@@ -291,7 +501,8 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
         )
         topology = (labels[crop] == node_id).float()[None]
         topology = self._resize_nearest(
-            self._pad(topology, padding), self.cfg.rag_node_patch_shape_zyx
+            self._pad(topology, padding),
+            self.cfg.rag_node_patch_shape_zyx,
         )
         return appearance, scalar, vector, topology
 
@@ -317,39 +528,129 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
         )
 
     @staticmethod
-    def _interface_center(
+    def _contact_voxel_bounds(
         labels: Tensor,
         label_a: int,
         label_b: int,
         bbox: tuple[slice, slice, slice],
-        fallback: Tensor,
-    ) -> Tensor:
+        fallback_center: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Inclusive global bounds of ALL A/B touching endpoint voxels."""
         local = labels[bbox]
         origin = torch.tensor(
             [int(axis.start) for axis in bbox],
             device=labels.device,
+            dtype=torch.long,
+        )
+
+        points: list[Tensor] = []
+        face_counts = torch.zeros(
+            (3,),
+            device=labels.device,
             dtype=torch.float32,
         )
-        points = []
+
         for axis in range(3):
             lower_slice = [slice(None)] * 3
             upper_slice = [slice(None)] * 3
             lower_slice[axis] = slice(0, -1)
             upper_slice[axis] = slice(1, None)
+
             lower = local[tuple(lower_slice)]
             upper = local[tuple(upper_slice)]
             touch = (
                 ((lower == label_a) & (upper == label_b))
                 | ((lower == label_b) & (upper == label_a))
             )
-            if not touch.any():
+            if not bool(touch.any()):
                 continue
-            face = torch.nonzero(touch, as_tuple=False).float()
-            face[:, axis] += 0.5
-            points.append(face + origin)
+
+            coordinates = torch.nonzero(
+                touch,
+                as_tuple=False,
+            ).long()
+            first = coordinates + origin
+            second = first.clone()
+            second[:, axis] += 1
+            points.extend([first, second])
+            face_counts[axis] = float(coordinates.shape[0])
+
         if not points:
-            return fallback.float()
-        return torch.cat(points, dim=0).mean(dim=0)
+            center = fallback_center.round().long()
+            maximum = torch.as_tensor(
+                labels.shape,
+                device=labels.device,
+                dtype=torch.long,
+            ) - 1
+            center = torch.minimum(
+                center.clamp_min(0),
+                maximum,
+            )
+            return center, center, face_counts
+
+        point_cloud = torch.cat(points, dim=0)
+        return (
+            point_cloud.amin(dim=0),
+            point_cloud.amax(dim=0),
+            face_counts,
+        )
+
+    @classmethod
+    def _contact_roi(
+        cls,
+        contact_lower: Tensor,
+        contact_upper: Tensor,
+        *,
+        spacing_um: Tensor,
+        dref_um: Tensor,
+        shape: tuple[int, int, int],
+        headroom_fraction: float,
+        minimum_headroom_dref: float,
+    ):
+        spacing = spacing_um.float()
+        contact_extent_vox = (
+            contact_upper.long()
+            - contact_lower.long()
+            + 1
+        ).clamp_min(1)
+        contact_extent_um = contact_extent_vox.float() * spacing
+
+        minimum_um = (
+            float(minimum_headroom_dref)
+            * float(dref_um.detach().cpu())
+        )
+        margin_um = torch.maximum(
+            contact_extent_um * float(headroom_fraction),
+            torch.full_like(contact_extent_um, minimum_um),
+        )
+        margin_vox = torch.ceil(
+            margin_um / spacing.clamp_min(1e-6)
+        ).long()
+
+        requested_start = contact_lower.long() - margin_vox
+        requested_stop = contact_upper.long() + margin_vox + 1
+        roi_extent_um = (
+            requested_stop - requested_start
+        ).float() * spacing
+
+        crop, padding = cls._padding_from_bounds(
+            tuple(
+                int(v)
+                for v in requested_start.detach().cpu().tolist()
+            ),
+            tuple(
+                int(v)
+                for v in requested_stop.detach().cpu().tolist()
+            ),
+            shape,
+        )
+        return (
+            crop,
+            padding,
+            requested_start,
+            requested_stop,
+            roi_extent_um,
+        )
 
     @staticmethod
     def _edge_topology(
@@ -361,63 +662,98 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
         patch_shape: tuple[int, int, int],
     ) -> Tensor:
         local = labels[crop]
-        union = ((local == label_a) | (local == label_b)).float()
+        mask_a = local == label_a
+        mask_b = local == label_b
+        union = mask_a | mask_b
         interface = torch.zeros_like(union, dtype=torch.bool)
+
         for axis in range(3):
             lower_slice = [slice(None)] * 3
             upper_slice = [slice(None)] * 3
             lower_slice[axis] = slice(0, -1)
             upper_slice[axis] = slice(1, None)
+
             lower = local[tuple(lower_slice)]
             upper = local[tuple(upper_slice)]
             touch = (
                 ((lower == label_a) & (upper == label_b))
                 | ((lower == label_b) & (upper == label_a))
             )
-            if touch.any():
+            if bool(touch.any()):
                 interface[tuple(lower_slice)] |= touch
                 interface[tuple(upper_slice)] |= touch
 
-        stacked = torch.stack([union, interface.float()], dim=0)
-        stacked = RAGMorphologyEmbeddingBuilder._pad(stacked, padding)
-        stacked = RAGMorphologyEmbeddingBuilder._resize_nearest(
-            stacked, patch_shape
+        base = torch.stack(
+            [
+                mask_a.float(),
+                mask_b.float(),
+                union.float(),
+                interface.float(),
+            ],
+            dim=0,
         )
-        stacked[1:2] = F.max_pool3d(
-            stacked[1:2][None], kernel_size=3, stride=1, padding=1
-        )[0]
-        return stacked
+        base = RAGMorphologyEmbeddingBuilder._pad(base, padding)
+        base = RAGMorphologyEmbeddingBuilder._resize_nearest(
+            base,
+            patch_shape,
+        )
 
-    def _edge_patch(
+        visible_interface = F.max_pool3d(
+            base[3:4][None],
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )[0]
+        proximity = F.max_pool3d(
+            visible_interface[None],
+            kernel_size=5,
+            stride=1,
+            padding=2,
+        )[0]
+
+        return torch.cat(
+            [
+                base[0:3],
+                visible_interface,
+                proximity,
+            ],
+            dim=0,
+        )
+
+    def _edge_scale_patch(
         self,
+        *,
         labels: Tensor,
-        local_a: int,
-        local_b: int,
-        lower: Tensor,
-        upper: Tensor,
+        label_a: int,
+        label_b: int,
+        contact_lower: Tensor,
+        contact_upper: Tensor,
         spatial_inputs: Tensor,
         geometry: GeometryLike,
         batch_index: int,
         spacing_um: Tensor,
         dref_um: Tensor,
-    ):
-        label_a = local_a + 1
-        label_b = local_b + 1
+        headroom_fraction: float,
+    ) -> EdgeScalePatch:
         shape = tuple(int(v) for v in labels.shape)
-        pair_bbox = self._union_bbox(
-            lower[local_a], upper[local_a], lower[local_b], upper[local_b], shape
+        (
+            crop,
+            padding,
+            requested_start,
+            requested_stop,
+            roi_extent_um,
+        ) = self._contact_roi(
+            contact_lower,
+            contact_upper,
+            spacing_um=spacing_um,
+            dref_um=dref_um,
+            shape=shape,
+            headroom_fraction=headroom_fraction,
+            minimum_headroom_dref=(
+                self.cfg.rag_edge_min_headroom_dref
+            ),
         )
-        fallback = 0.25 * (
-            lower[local_a].float()
-            + upper[local_a].float()
-            + lower[local_b].float()
-            + upper[local_b].float()
-        )
-        center = self._interface_center(
-            labels, label_a, label_b, pair_bbox, fallback
-        )
-        radius_um = self.cfg.rag_edge_radius_dref * float(dref_um.detach().cpu())
-        crop, padding = self._physical_cube(center, radius_um, spacing_um, shape)
+
         appearance, scalar, vector = self._modalities(
             spatial_inputs,
             geometry,
@@ -434,13 +770,203 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
             label_b,
             self.cfg.rag_edge_patch_shape_zyx,
         )
-        return appearance, scalar, vector, topology
+        return EdgeScalePatch(
+            appearance=appearance,
+            scalar_geometry=scalar,
+            vector_geometry=vector,
+            topology=topology,
+            requested_start_zyx=requested_start,
+            requested_stop_zyx=requested_stop,
+            roi_extent_um=roi_extent_um,
+        )
 
     @staticmethod
-    def _stack_rows(rows):
+    def _edge_metadata(
+        *,
+        contact_lower: Tensor,
+        contact_upper: Tensor,
+        contact_face_counts: Tensor,
+        broad: EdgeScalePatch,
+        local: EdgeScalePatch,
+        spacing_um: Tensor,
+        dref_um: Tensor,
+    ) -> Tensor:
+        dref = dref_um.float().reshape(()).clamp_min(1e-6)
+        spacing = spacing_um.float()
+
+        contact_extent_um = (
+            contact_upper.float()
+            - contact_lower.float()
+            + 1.0
+        ) * spacing
+
+        face_areas = torch.stack(
+            [
+                spacing[1] * spacing[2],
+                spacing[0] * spacing[2],
+                spacing[0] * spacing[1],
+            ]
+        )
+        contact_area_um2 = (
+            contact_face_counts.float()
+            * face_areas
+        ).sum()
+
+        broad_topology = broad.topology.float()
+        local_topology = local.topology.float()
+
+        broad_a = broad_topology[0].mean()
+        broad_b = broad_topology[1].mean()
+        local_a = local_topology[0].mean()
+        local_b = local_topology[1].mean()
+
+        metadata = torch.cat(
+            [
+                contact_extent_um / dref,
+                broad.roi_extent_um.float() / dref,
+                local.roi_extent_um.float() / dref,
+                torch.log1p(
+                    contact_area_um2 / (dref * dref)
+                )[None],
+                broad_topology[2].mean()[None],
+                local_topology[2].mean()[None],
+                (broad_a - broad_b).abs()[None],
+                (local_a - local_b).abs()[None],
+                broad_topology[4].mean()[None],
+                local_topology[4].mean()[None],
+            ],
+            dim=0,
+        )
+
+        if metadata.numel() != EDGE_METADATA_DIM:
+            raise RuntimeError(
+                f"Expected {EDGE_METADATA_DIM} edge metadata "
+                f"values, got {metadata.numel()}"
+            )
+        return metadata
+
+    def _edge_pair_patch(
+        self,
+        labels: Tensor,
+        local_a: int,
+        local_b: int,
+        lower: Tensor,
+        upper: Tensor,
+        spatial_inputs: Tensor,
+        geometry: GeometryLike,
+        batch_index: int,
+        spacing_um: Tensor,
+        dref_um: Tensor,
+    ) -> EdgePairPatch:
+        label_a = local_a + 1
+        label_b = local_b + 1
+        shape = tuple(int(v) for v in labels.shape)
+
+        pair_bbox = self._union_bbox(
+            lower[local_a],
+            upper[local_a],
+            lower[local_b],
+            upper[local_b],
+            shape,
+        )
+        fallback = 0.25 * (
+            lower[local_a].float()
+            + upper[local_a].float()
+            + lower[local_b].float()
+            + upper[local_b].float()
+        )
+        (
+            contact_lower,
+            contact_upper,
+            face_counts,
+        ) = self._contact_voxel_bounds(
+            labels,
+            label_a,
+            label_b,
+            pair_bbox,
+            fallback,
+        )
+
+        broad = self._edge_scale_patch(
+            labels=labels,
+            label_a=label_a,
+            label_b=label_b,
+            contact_lower=contact_lower,
+            contact_upper=contact_upper,
+            spatial_inputs=spatial_inputs,
+            geometry=geometry,
+            batch_index=batch_index,
+            spacing_um=spacing_um,
+            dref_um=dref_um,
+            headroom_fraction=(
+                self.cfg.rag_edge_contact_headroom_fraction
+            ),
+        )
+        local = self._edge_scale_patch(
+            labels=labels,
+            label_a=label_a,
+            label_b=label_b,
+            contact_lower=contact_lower,
+            contact_upper=contact_upper,
+            spatial_inputs=spatial_inputs,
+            geometry=geometry,
+            batch_index=batch_index,
+            spacing_um=spacing_um,
+            dref_um=dref_um,
+            headroom_fraction=(
+                self.cfg.rag_edge_local_headroom_fraction
+            ),
+        )
+
+        metadata = self._edge_metadata(
+            contact_lower=contact_lower,
+            contact_upper=contact_upper,
+            contact_face_counts=face_counts,
+            broad=broad,
+            local=local,
+            spacing_um=spacing_um,
+            dref_um=dref_um,
+        )
+        return EdgePairPatch(
+            broad=broad,
+            local=local,
+            metadata=metadata,
+            contact_lower_zyx=contact_lower,
+            contact_upper_zyx=contact_upper,
+            contact_face_counts_zyx=face_counts,
+        )
+
+    @staticmethod
+    def _stack_node_rows(rows):
         return tuple(
-            torch.stack([row[column] for row in rows], dim=0)
+            torch.stack(
+                [row[column] for row in rows],
+                dim=0,
+            )
             for column in range(4)
+        )
+
+    @staticmethod
+    def _stack_edge_scale(
+        rows: list[EdgeScalePatch],
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        return (
+            torch.stack(
+                [row.appearance for row in rows],
+                dim=0,
+            ),
+            torch.stack(
+                [row.scalar_geometry for row in rows],
+                dim=0,
+            ),
+            torch.stack(
+                [row.vector_geometry for row in rows],
+                dim=0,
+            ),
+            torch.stack(
+                [row.topology for row in rows],
+                dim=0,
+            ),
         )
 
     def _encode_nodes(
@@ -455,8 +981,15 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
     ) -> Tensor:
         n = int(labels.max().item())
         if n == 0:
-            return spatial_inputs.new_zeros((0, self.cfg.rag_node_morphology_dim))
-        lower, upper = self._node_bounds(rag, batch_index, labels, spacing_um)
+            return spatial_inputs.new_zeros(
+                (0, self.cfg.rag_node_morphology_dim)
+            )
+        lower, upper = self._node_bounds(
+            rag,
+            batch_index,
+            labels,
+            spacing_um,
+        )
         outputs = []
         chunk = self.cfg.rag_morphology_chunk_size
         for start in range(0, n, chunk):
@@ -472,9 +1005,16 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
                     spacing_um,
                     dref_um,
                 )
-                for row in range(start, min(start + chunk, n))
+                for row in range(
+                    start,
+                    min(start + chunk, n),
+                )
             ]
-            outputs.append(self.node_encoder(*self._stack_rows(rows)))
+            outputs.append(
+                self.node_encoder(
+                    *self._stack_node_rows(rows)
+                )
+            )
         return torch.cat(outputs, dim=0)
 
     def _encode_edges(
@@ -490,13 +1030,22 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
     ) -> Tensor:
         count = int(local_edges.shape[1])
         if count == 0:
-            return spatial_inputs.new_zeros((0, self.cfg.rag_edge_morphology_dim))
-        lower, upper = self._node_bounds(rag, batch_index, labels, spacing_um)
+            return spatial_inputs.new_zeros(
+                (0, self.cfg.rag_edge_morphology_dim)
+            )
+
+        lower, upper = self._node_bounds(
+            rag,
+            batch_index,
+            labels,
+            spacing_um,
+        )
         outputs = []
         chunk = self.cfg.rag_morphology_chunk_size
+
         for start in range(0, count, chunk):
-            rows = [
-                self._edge_patch(
+            pair_rows = [
+                self._edge_pair_patch(
                     labels,
                     int(local_edges[0, row].item()),
                     int(local_edges[1, row].item()),
@@ -508,10 +1057,93 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
                     spacing_um,
                     dref_um,
                 )
-                for row in range(start, min(start + chunk, count))
+                for row in range(
+                    start,
+                    min(start + chunk, count),
+                )
             ]
-            outputs.append(self.edge_encoder(*self._stack_rows(rows)))
+
+            broad = self.edge_encoder(
+                *self._stack_edge_scale(
+                    [row.broad for row in pair_rows]
+                )
+            )
+            local = self.edge_encoder(
+                *self._stack_edge_scale(
+                    [row.local for row in pair_rows]
+                )
+            )
+            metadata = torch.stack(
+                [row.metadata for row in pair_rows],
+                dim=0,
+            ).to(
+                device=broad.device,
+                dtype=broad.dtype,
+            )
+
+            outputs.append(
+                self.edge_scale_fusion(
+                    torch.cat(
+                        [broad, local, metadata],
+                        dim=-1,
+                    )
+                )
+            )
+
         return torch.cat(outputs, dim=0)
+
+    def edge_debug_patch(
+        self,
+        rag: RAGState,
+        edge_row: int,
+        spatial_inputs: Tensor,
+        geometry: GeometryLike,
+        spacing_um: Tensor,
+        dref_um: Tensor,
+    ) -> EdgePairPatch:
+        """Return exact production local/broad CNN inputs for one RAG edge."""
+        edge_row = int(edge_row)
+        if not 0 <= edge_row < rag.edge_index.shape[1]:
+            raise IndexError(
+                f"edge_row {edge_row} outside "
+                f"[0, {rag.edge_index.shape[1]})"
+            )
+
+        batch_index = int(
+            rag.edge_batch[edge_row].item()
+        )
+        start = int(
+            rag.node_offsets[batch_index].item()
+        )
+        labels = rag.supervoxel_labels[batch_index]
+        lower, upper = self._node_bounds(
+            rag,
+            batch_index,
+            labels,
+            spacing_um[batch_index],
+        )
+
+        local_a = (
+            int(rag.edge_index[0, edge_row].item())
+            - start
+        )
+        local_b = (
+            int(rag.edge_index[1, edge_row].item())
+            - start
+        )
+
+        return self._edge_pair_patch(
+            labels,
+            local_a,
+            local_b,
+            lower,
+            upper,
+            spatial_inputs,
+            geometry,
+            batch_index,
+            spacing_um[batch_index],
+            dref_um[batch_index],
+        )
 
     def forward(
         self,
@@ -523,9 +1155,17 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         node_outputs = []
         edge_outputs = []
-        for batch_index, labels in enumerate(rag.supervoxel_labels):
-            start = int(rag.node_offsets[batch_index].item())
-            stop = int(rag.node_offsets[batch_index + 1].item())
+
+        for batch_index, labels in enumerate(
+            rag.supervoxel_labels
+        ):
+            start = int(
+                rag.node_offsets[batch_index].item()
+            )
+            stop = int(
+                rag.node_offsets[batch_index + 1].item()
+            )
+
             if stop > start:
                 node_outputs.append(
                     self._encode_nodes(
@@ -540,10 +1180,14 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
                 )
 
             edge_rows = torch.nonzero(
-                rag.edge_batch == batch_index, as_tuple=False
+                rag.edge_batch == batch_index,
+                as_tuple=False,
             ).flatten()
             if edge_rows.numel():
-                local_edges = rag.edge_index[:, edge_rows] - start
+                local_edges = (
+                    rag.edge_index[:, edge_rows]
+                    - start
+                )
                 edge_outputs.append(
                     self._encode_edges(
                         rag,
@@ -560,24 +1204,39 @@ class RAGMorphologyEmbeddingBuilder(nn.Module):
         node_embedding = (
             torch.cat(node_outputs, dim=0)
             if node_outputs
-            else spatial_inputs.new_zeros((0, self.cfg.rag_node_morphology_dim))
+            else spatial_inputs.new_zeros(
+                (0, self.cfg.rag_node_morphology_dim)
+            )
         )
         edge_embedding = (
             torch.cat(edge_outputs, dim=0)
             if edge_outputs
-            else spatial_inputs.new_zeros((0, self.cfg.rag_edge_morphology_dim))
+            else spatial_inputs.new_zeros(
+                (0, self.cfg.rag_edge_morphology_dim)
+            )
         )
+
         if node_embedding.shape[0] != rag.node_features.shape[0]:
             raise RuntimeError(
                 "Node morphology rows do not align with RAG nodes: "
-                f"{node_embedding.shape[0]} != {rag.node_features.shape[0]}"
+                f"{node_embedding.shape[0]} "
+                f"!= {rag.node_features.shape[0]}"
             )
         if edge_embedding.shape[0] != rag.edge_features.shape[0]:
             raise RuntimeError(
                 "Edge morphology rows do not align with RAG edges: "
-                f"{edge_embedding.shape[0]} != {rag.edge_features.shape[0]}"
+                f"{edge_embedding.shape[0]} "
+                f"!= {rag.edge_features.shape[0]}"
             )
+
         return node_embedding, edge_embedding
 
 
-__all__ = ["MorphologyPatchEncoder", "RAGMorphologyEmbeddingBuilder"]
+__all__ = [
+    "EDGE_METADATA_DIM",
+    "EdgeMorphologyPatchEncoder",
+    "EdgePairPatch",
+    "EdgeScalePatch",
+    "MorphologyPatchEncoder",
+    "RAGMorphologyEmbeddingBuilder",
+]

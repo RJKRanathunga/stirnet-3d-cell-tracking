@@ -1,5 +1,8 @@
 from .graph_net import SpatialRAGNetwork
 from .morphology import (
+    EdgeMorphologyPatchEncoder,
+    EdgePairPatch,
+    EdgeScalePatch,
     MorphologyPatchEncoder,
     RAGMorphologyEmbeddingBuilder,
 )
@@ -35,6 +38,9 @@ __all__ = [
     "RAGCriterion",
     "RAGTargets",
     "SpatialRAGNetwork",
+    "EdgeMorphologyPatchEncoder",
+    "EdgePairPatch",
+    "EdgeScalePatch",
     "MorphologyPatchEncoder",
     "RAGMorphologyEmbeddingBuilder",
     "LocalPartitionUpdateResult",

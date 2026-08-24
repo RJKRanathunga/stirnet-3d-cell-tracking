@@ -125,7 +125,19 @@ class PartitionConfig:
     rag_node_patch_shape_zyx: Tuple[int, int, int] = (20, 20, 20)
     rag_edge_patch_shape_zyx: Tuple[int, int, int] = (20, 20, 20)
     rag_node_context_dref: float = 0.25
+
+    # Morphology-v1 used a fixed cube centered on the mean A<->B interface.
+    # Keep this field so historical serialized configs still hydrate, but the
+    # v2 edge extractor no longer uses it.
     rag_edge_radius_dref: float = 1.25
+
+    # Morphology-v2 starts from the COMPLETE A<->B contact bounding box.
+    # Fractional headroom is measured per side and independently on Z/Y/X.
+    # 0.50 gives ~2x contact extent; 1.00 gives ~3x contact extent.
+    rag_edge_contact_headroom_fraction: float = 1.00
+    rag_edge_local_headroom_fraction: float = 0.50
+    rag_edge_min_headroom_dref: float = 0.50
+
     rag_morphology_chunk_size: int = 32
     rag_morphology_detach_geometry: bool = True
     spatial_merge_threshold: float = 0.845
@@ -338,6 +350,25 @@ class ModelConfig:
             raise ValueError("rag_node_context_dref cannot be negative")
         if self.partition.rag_edge_radius_dref <= 0:
             raise ValueError("rag_edge_radius_dref must be positive")
+        if self.partition.rag_edge_contact_headroom_fraction < 0.50:
+            raise ValueError(
+                "rag_edge_contact_headroom_fraction must be >= 0.50"
+            )
+        if self.partition.rag_edge_local_headroom_fraction < 0.50:
+            raise ValueError(
+                "rag_edge_local_headroom_fraction must be >= 0.50"
+            )
+        if (
+            self.partition.rag_edge_contact_headroom_fraction
+            < self.partition.rag_edge_local_headroom_fraction
+        ):
+            raise ValueError(
+                "broad edge headroom must be >= local edge headroom"
+            )
+        if self.partition.rag_edge_min_headroom_dref <= 0:
+            raise ValueError(
+                "rag_edge_min_headroom_dref must be positive"
+            )
         if self.partition.rag_morphology_chunk_size < 1:
             raise ValueError("rag_morphology_chunk_size must be positive")
         channels = self.evidence.raw_channels + self.evidence.prior_channels

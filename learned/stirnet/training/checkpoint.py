@@ -7,7 +7,7 @@ import torch
 
 
 ARCHITECTURE_ID = "spatial_first_v2"
-CHECKPOINT_VERSION = 3
+CHECKPOINT_VERSION = 4
 
 
 def _serialize(value: Any) -> Any:
