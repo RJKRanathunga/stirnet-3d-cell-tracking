@@ -103,9 +103,9 @@ import modal
 APP_NAME = "stirnet-nis3d-spatial-training"
 
 GPU = "L40S"
-CPU = 4.0
+CPU = 3.0
 MEMORY_MB = 16_384
-TIMEOUT_SECONDS = 6 * 60 * 60
+TIMEOUT_SECONDS = 3 * 60 * 60
 
 # NIS3D is stored in the dedicated Modal volume named "external".
 # Keep training outputs/checkpoints in the separate "stirnet-runs" volume.
@@ -1637,7 +1637,7 @@ def main(
     crop_shape_zyx: str = "32,192,192",
     source_ram_cache: bool = True,
 ) -> None:
-    result = train_nis3d.remote(
+    call = train_nis3d.spawn(
         max_steps=max_steps,
         samples_csv=samples,
         run_name=run_name,
@@ -1653,6 +1653,13 @@ def main(
         crop_shape_zyx=crop_shape_zyx,
         source_ram_cache=source_ram_cache,
     )
+
+    print(
+        f"[launcher] spawned durable training call: {call.object_id}",
+        flush=True,
+    )
+
+    result = call.get()
     print(json.dumps(result, indent=2))
 
 

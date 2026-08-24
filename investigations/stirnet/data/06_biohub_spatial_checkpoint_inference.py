@@ -16,6 +16,10 @@ accuracy benchmark.
 
 Recommended:
     python investigations/stirnet/data/06_biohub_spatial_checkpoint_inference.py --napari
+
+Checkpoint selection:
+    --checkpoint FILE
+    --checkpoint-dir DIRECTORY   # selects highest checkpoint_step_*.pt
 """
 
 import argparse
@@ -33,10 +37,8 @@ import zarr
 
 DEFAULT_SAMPLE = "44b6_0113de3b"
 DEFAULT_SPACING_ZYX_UM = (1.625, 0.40625, 0.40625)
-DEFAULT_CHECKPOINT = (
-    "runs/stirnet/training/01_nis3d_spatial_training/recovery/"
-    "nis3d_zebrafish_spatial_v1/checkpoint_step_000600.pt"
-)
+DEFAULT_CHECKPOINT = "runs/stirnet/training/drosophila_12_spatial_v1/checkpoint_step_001000.pt"
+
 
 
 def json_default(value):
@@ -93,6 +95,76 @@ E04 = load_eval04()
 def resolve(path: str | Path) -> Path:
     p = Path(path)
     return p.resolve() if p.is_absolute() else (ROOT / p).resolve()
+
+
+def _checkpoint_step(path: Path) -> int:
+    """Extract the optimizer step from checkpoint_step_XXXXXX.pt."""
+    name = path.name
+    prefix = "checkpoint_step_"
+    suffix = ".pt"
+    if not (name.startswith(prefix) and name.endswith(suffix)):
+        return -1
+    token = name[len(prefix) : -len(suffix)]
+    return int(token) if token.isdigit() else -1
+
+
+def _latest_checkpoint_in_directory(directory: Path) -> Path:
+    """Select the highest-step STIR-Net checkpoint below a directory."""
+    if not directory.is_dir():
+        raise NotADirectoryError(f"Checkpoint directory does not exist: {directory}")
+
+    direct = [
+        path
+        for path in directory.glob("checkpoint_step_*.pt")
+        if path.is_file() and _checkpoint_step(path) >= 0
+    ]
+    candidates = direct
+    search_mode = "direct"
+
+    if not candidates:
+        candidates = [
+            path
+            for path in directory.rglob("checkpoint_step_*.pt")
+            if path.is_file() and _checkpoint_step(path) >= 0
+        ]
+        search_mode = "recursive"
+
+    if not candidates:
+        raise FileNotFoundError(
+            "No checkpoint_step_XXXXXX.pt files found in checkpoint directory: "
+            f"{directory}"
+        )
+
+    selected = max(
+        candidates,
+        key=lambda path: (_checkpoint_step(path), str(path)),
+    )
+    print(
+        f"[checkpoint] directory={directory} "
+        f"search={search_mode} candidates={len(candidates)} "
+        f"selected={selected.name} step={_checkpoint_step(selected)}",
+        flush=True,
+    )
+    return selected.resolve()
+
+
+def resolve_checkpoint_path(
+    checkpoint: str | None,
+    checkpoint_dir: str | None,
+) -> Path:
+    """Resolve a checkpoint file, directory, or DEFAULT_CHECKPOINT."""
+    if checkpoint is not None and checkpoint_dir is not None:
+        raise ValueError("--checkpoint and --checkpoint-dir are mutually exclusive")
+
+    if checkpoint_dir is not None:
+        return _latest_checkpoint_in_directory(resolve(checkpoint_dir))
+
+    candidate = resolve(DEFAULT_CHECKPOINT if checkpoint is None else checkpoint)
+    if candidate.is_dir():
+        return _latest_checkpoint_in_directory(candidate)
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Checkpoint file does not exist: {candidate}")
+    return candidate
 
 
 def find_sample(sample_id: str, data_root: str | None) -> Path:
@@ -352,7 +424,24 @@ def open_napari(npz_path, title, default_threshold, alt_threshold):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
+    checkpoint_group = p.add_mutually_exclusive_group()
+    checkpoint_group.add_argument(
+        "--checkpoint",
+        default=None,
+        help=(
+            "Checkpoint .pt file. A directory is also accepted; the "
+            "highest checkpoint_step_XXXXXX.pt is selected. If omitted, "
+            "DEFAULT_CHECKPOINT is used."
+        ),
+    )
+    checkpoint_group.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help=(
+            "Directory containing checkpoint_step_XXXXXX.pt files. "
+            "The highest optimizer-step checkpoint is selected."
+        ),
+    )
     p.add_argument("--sample-id", default=DEFAULT_SAMPLE)
     p.add_argument("--data-root", default=None)
     p.add_argument("--timepoint", type=int, default=0)
@@ -381,7 +470,10 @@ def main():
     raw = np.asarray(volume[args.timepoint])
     spacing = tuple(float(v) for v in args.spacing)
 
-    ckpt_path = resolve(args.checkpoint)
+    ckpt_path = resolve_checkpoint_path(
+        args.checkpoint,
+        args.checkpoint_dir,
+    )
     device = torch.device(
         "cuda" if args.device == "auto" and torch.cuda.is_available()
         else "cpu" if args.device == "auto"
@@ -478,6 +570,7 @@ def main():
         "sample_id": args.sample_id,
         "timepoint": args.timepoint,
         "checkpoint_step": step,
+        "checkpoint_path": str(ckpt_path),
         "frame_shape_zyx": list(raw.shape),
         "spacing_zyx_um": list(spacing),
         "crop_bounds_zyx": [[s.start, s.stop] for s in crop],
