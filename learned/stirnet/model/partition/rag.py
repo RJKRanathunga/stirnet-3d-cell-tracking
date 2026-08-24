@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import nullcontext
 from typing import Dict, List, Tuple
 
@@ -33,6 +33,7 @@ from .statistics import (
     local_refresh_groups,
     update_supervoxel_statistics_local,
 )
+from .morphology import RAGMorphologyEmbeddingBuilder
 
 
 def _profile(profiler, name: str):
@@ -182,6 +183,38 @@ class RAGBuilder(nn.Module):
         # 2*C D0 summary + 2*12 dense/raw summary + centroid(3)+log-volume(1)
         self.node_feature_dim = 2 * cfg.node_feature_channels + 24 + 4
         self.edge_feature_dim = 8
+        self.morphology_builder = (
+            RAGMorphologyEmbeddingBuilder(cfg)
+            if cfg.rag_morphology_enabled
+            else None
+        )
+
+    def _attach_morphology(
+        self,
+        rag: RAGState,
+        spatial_inputs: Tensor,
+        geometry: GeometryLike,
+        spacing_um: Tensor,
+        dref_um: Tensor,
+        *,
+        stage_profiler=None,
+        profile_prefix: str = "rag",
+    ) -> RAGState:
+        if self.morphology_builder is None:
+            return rag
+        with _profile(stage_profiler, f"{profile_prefix}_morphology_embedding"):
+            node_morphology, edge_morphology = self.morphology_builder(
+                rag,
+                spatial_inputs,
+                geometry,
+                spacing_um,
+                dref_um,
+            )
+        return replace(
+            rag,
+            node_morphology_embeddings=node_morphology,
+            edge_morphology_embeddings=edge_morphology,
+        )
 
     def _load_from_state_dict(
         self,
@@ -543,7 +576,7 @@ class RAGBuilder(nn.Module):
             )
         )
 
-        return RAGState(
+        rag = RAGState(
             node_features=node_features,
             node_embeddings=decoded.d0.new_zeros(
                 (node_features.shape[0], self.cfg.rag_hidden_dim)
@@ -592,6 +625,15 @@ class RAGBuilder(nn.Module):
                 dtype=torch.long,
             ),
             statistics=statistics,
+        )
+        return self._attach_morphology(
+            rag,
+            spatial_inputs,
+            geometry,
+            spacing_um,
+            dref_um,
+            stage_profiler=stage_profiler,
+            profile_prefix=profile_prefix,
         )
 
     def update_local(
@@ -855,7 +897,7 @@ class RAGBuilder(nn.Module):
         edge_features = torch.cat(all_edge_features) if all_edge_features else d0.new_zeros((0, self.edge_feature_dim))
         edge_index = torch.cat(all_edges, dim=1) if all_edges else torch.zeros((2, 0), device=d0.device, dtype=torch.long)
         edge_batch = torch.cat(all_edge_batch) if all_edge_batch else torch.zeros((0,), device=d0.device, dtype=torch.long)
-        return RAGState(
+        rag = RAGState(
             node_features=node_features,
             node_embeddings=d0.new_zeros((node_features.shape[0], self.cfg.rag_hidden_dim)),
             node_batch=torch.cat(all_node_batch) if all_node_batch else torch.zeros((0,), device=d0.device, dtype=torch.long),
@@ -869,6 +911,15 @@ class RAGBuilder(nn.Module):
             edge_batch=edge_batch,
             supervoxel_labels=supervoxel_labels,
             node_offsets=torch.tensor(node_offsets, device=d0.device, dtype=torch.long),
+        )
+        return self._attach_morphology(
+            rag,
+            spatial_inputs,
+            geometry,
+            spacing_um,
+            dref_um,
+            stage_profiler=stage_profiler,
+            profile_prefix=profile_prefix,
         )
 
     def forward(
@@ -1034,7 +1085,7 @@ class RAGBuilder(nn.Module):
             if all_edge_batch
             else torch.zeros(0, device=device, dtype=torch.long)
         )
-        return RAGState(
+        rag = RAGState(
             node_features=node_features,
             node_embeddings=d0.new_zeros((node_features.shape[0], self.cfg.rag_hidden_dim)),
             node_batch=node_batch,
@@ -1049,6 +1100,15 @@ class RAGBuilder(nn.Module):
             supervoxel_labels=supervoxel_labels,
             node_offsets=torch.tensor(node_offsets, device=device, dtype=torch.long),
             statistics=statistics_by_batch,
+        )
+        return self._attach_morphology(
+            rag,
+            spatial_inputs,
+            geometry,
+            spacing_um,
+            dref_um,
+            stage_profiler=stage_profiler,
+            profile_prefix=profile_prefix,
         )
 
 

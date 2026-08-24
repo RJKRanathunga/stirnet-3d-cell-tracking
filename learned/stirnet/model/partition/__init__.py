@@ -1,4 +1,8 @@
 from .graph_net import SpatialRAGNetwork
+from .morphology import (
+    MorphologyPatchEncoder,
+    RAGMorphologyEmbeddingBuilder,
+)
 from .local_update import LocalPartitionUpdateResult, LocalPartitionUpdater
 from .partitioner import GraphPartitioner
 from .rag import RAGBuilder, RAGCriterion, RAGTargets
@@ -31,6 +35,8 @@ __all__ = [
     "RAGCriterion",
     "RAGTargets",
     "SpatialRAGNetwork",
+    "MorphologyPatchEncoder",
+    "RAGMorphologyEmbeddingBuilder",
     "LocalPartitionUpdateResult",
     "LocalPartitionUpdater",
     "GraphPartitioner",

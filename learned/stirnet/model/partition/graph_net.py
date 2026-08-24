@@ -1,10 +1,10 @@
+# STIRNET_MORPHOLOGY_AWARE_RAG_V1
 from __future__ import annotations
 
 from dataclasses import replace
 
 import torch
 from torch import Tensor, nn
-import torch.nn.functional as F
 
 from ..config import PartitionConfig
 from ..types import RAGState
@@ -27,12 +27,20 @@ class RAGMessageBlock(nn.Module):
         )
 
     def forward(
-        self, nodes: Tensor, edge_index: Tensor, edge_raw: Tensor
+        self,
+        nodes: Tensor,
+        edge_index: Tensor,
+        edge_raw: Tensor,
+        edge_residual: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         if edge_index.shape[1] == 0:
             return nodes, edge_raw.new_zeros((0, nodes.shape[-1]))
         src, dst = edge_index
-        edge_emb = self.edge_mlp(torch.cat([nodes[src], nodes[dst], edge_raw], dim=-1))
+        edge_emb = self.edge_mlp(
+            torch.cat([nodes[src], nodes[dst], edge_raw], dim=-1)
+        )
+        if edge_residual is not None:
+            edge_emb = edge_emb + edge_residual
         agg = nodes.new_zeros(nodes.shape)
         degree = nodes.new_zeros((nodes.shape[0], 1))
         agg.index_add_(0, src, edge_emb)
@@ -41,7 +49,9 @@ class RAGMessageBlock(nn.Module):
         degree.index_add_(0, src, ones)
         degree.index_add_(0, dst, ones)
         agg = agg / degree.clamp_min(1)
-        update = self.node_mlp(torch.cat([self.node_norm(nodes), agg], dim=-1))
+        update = self.node_mlp(
+            torch.cat([self.node_norm(nodes), agg], dim=-1)
+        )
         return nodes + update, edge_emb
 
 
@@ -65,18 +75,65 @@ class SpatialRAGNetwork(nn.Module):
         )
         self.classifier = nn.Linear(h, 1)
 
+        if cfg.rag_morphology_enabled:
+            self.node_morphology_projection = nn.Linear(
+                cfg.rag_node_morphology_dim, h, bias=False
+            )
+            self.edge_morphology_projection = nn.Linear(
+                cfg.rag_edge_morphology_dim, h, bias=False
+            )
+            # Exact legacy behavior at transfer initialization.
+            nn.init.zeros_(self.node_morphology_projection.weight)
+            nn.init.zeros_(self.edge_morphology_projection.weight)
+        else:
+            self.node_morphology_projection = None
+            self.edge_morphology_projection = None
+
+    def _morphology_residuals(
+        self, rag: RAGState
+    ) -> tuple[Tensor | None, Tensor | None]:
+        if not self.cfg.rag_morphology_enabled:
+            return None, None
+        if (
+            rag.node_morphology_embeddings is None
+            or rag.edge_morphology_embeddings is None
+        ):
+            raise ValueError(
+                "Morphology-aware RAG is enabled but RAGState does not contain "
+                "node/edge morphology embeddings"
+            )
+        if rag.node_morphology_embeddings.shape[0] != rag.node_features.shape[0]:
+            raise ValueError("Node morphology rows must align with RAG nodes")
+        if rag.edge_morphology_embeddings.shape[0] != rag.edge_features.shape[0]:
+            raise ValueError("Edge morphology rows must align with RAG edges")
+        return (
+            self.node_morphology_projection(rag.node_morphology_embeddings),
+            self.edge_morphology_projection(rag.edge_morphology_embeddings),
+        )
+
     def forward(self, rag: RAGState) -> RAGState:
         nodes = self.node_encoder(rag.node_features)
+        node_residual, edge_residual = self._morphology_residuals(rag)
+        if node_residual is not None:
+            nodes = nodes + node_residual
+
         edge_emb = rag.edge_features.new_zeros(
             (rag.edge_features.shape[0], self.cfg.rag_hidden_dim)
         )
         for block in self.blocks:
-            nodes, edge_emb = block(nodes, rag.edge_index, rag.edge_features)
+            nodes, edge_emb = block(
+                nodes,
+                rag.edge_index,
+                rag.edge_features,
+                edge_residual=edge_residual,
+            )
         if rag.edge_index.shape[1]:
             src, dst = rag.edge_index
             edge_emb = self.final_edge(
                 torch.cat([nodes[src], nodes[dst], rag.edge_features], dim=-1)
             )
+            if edge_residual is not None:
+                edge_emb = edge_emb + edge_residual
             logits = self.classifier(edge_emb).squeeze(-1)
         else:
             logits = rag.node_features.new_zeros((0,))

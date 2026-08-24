@@ -117,6 +117,17 @@ class PartitionConfig:
     node_feature_channels: int = 24
     rag_hidden_dim: int = 96
     rag_layers: int = 2
+    # Optional morphology-aware residual evidence for the spatial RAG.
+    # Disabled by default so old checkpoints instantiate the exact legacy model.
+    rag_morphology_enabled: bool = False
+    rag_node_morphology_dim: int = 64
+    rag_edge_morphology_dim: int = 64
+    rag_node_patch_shape_zyx: Tuple[int, int, int] = (20, 20, 20)
+    rag_edge_patch_shape_zyx: Tuple[int, int, int] = (20, 20, 20)
+    rag_node_context_dref: float = 0.25
+    rag_edge_radius_dref: float = 1.25
+    rag_morphology_chunk_size: int = 32
+    rag_morphology_detach_geometry: bool = True
     spatial_merge_threshold: float = 0.845
     final_merge_threshold: float = 0.50
     max_supervoxels: int = 4096
@@ -311,6 +322,24 @@ class ModelConfig:
             raise ValueError("rag_min_node_purity must be in [0, 1]")
         if not 0.0 <= self.partition.rag_min_node_gt_support <= 1.0:
             raise ValueError("rag_min_node_gt_support must be in [0, 1]")
+        if self.partition.rag_node_morphology_dim < 1:
+            raise ValueError("rag_node_morphology_dim must be positive")
+        if self.partition.rag_edge_morphology_dim < 1:
+            raise ValueError("rag_edge_morphology_dim must be positive")
+        for patch_shape in (
+            self.partition.rag_node_patch_shape_zyx,
+            self.partition.rag_edge_patch_shape_zyx,
+        ):
+            if len(patch_shape) != 3 or any(value < 4 for value in patch_shape):
+                raise ValueError(
+                    "RAG morphology patch shapes must contain three values >= 4"
+                )
+        if self.partition.rag_node_context_dref < 0:
+            raise ValueError("rag_node_context_dref cannot be negative")
+        if self.partition.rag_edge_radius_dref <= 0:
+            raise ValueError("rag_edge_radius_dref must be positive")
+        if self.partition.rag_morphology_chunk_size < 1:
+            raise ValueError("rag_morphology_chunk_size must be positive")
         channels = self.evidence.raw_channels + self.evidence.prior_channels
         if sorted(channels) != list(range(self.spatial.in_channels)):
             raise ValueError(

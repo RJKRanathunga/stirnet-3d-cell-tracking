@@ -7,7 +7,7 @@ import torch
 
 
 ARCHITECTURE_ID = "spatial_first_v2"
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 
 
 def _serialize(value: Any) -> Any:
@@ -91,6 +91,15 @@ def load_checkpoint(
                 "checkpoints are intentionally incompatible; pass "
                 "transfer_compatible=True only for explicit exact-name/exact-shape transfer."
             )
+        checkpoint["transferred_parameters"] = _load_exact_compatible(
+            model, checkpoint.get("model", {})
+        )
+        return checkpoint
+
+    if transfer_compatible:
+        # Explicit architecture transfer also applies when the architecture ID
+        # is unchanged but optional modules (for example morphology-aware RAG)
+        # have been added. Optimizer state is intentionally not transferred.
         checkpoint["transferred_parameters"] = _load_exact_compatible(
             model, checkpoint.get("model", {})
         )

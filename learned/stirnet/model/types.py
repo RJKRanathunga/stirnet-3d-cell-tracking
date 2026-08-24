@@ -365,6 +365,10 @@ class RAGState:
     supervoxel_labels: List[Tensor]
     node_offsets: Tensor
     statistics: Optional[List[SupervoxelStatistics]] = None
+    # Optional bounded 3-D morphology evidence. Kept separate from legacy
+    # scalar features so old RAG weights stay shape-compatible.
+    node_morphology_embeddings: Optional[Tensor] = None
+    edge_morphology_embeddings: Optional[Tensor] = None
 
     @property
     def is_empty(self) -> bool:
