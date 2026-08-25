@@ -494,6 +494,15 @@ class RefinementState:
 
 
 @dataclass
+class SplitOnlyPostprocessState:
+    labels: List[Tensor]
+    candidate_count: int = 0
+    applied_count: int = 0
+    skipped_too_many_cores: int = 0
+    records: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class GeometryForwardOutput:
     geometry: GeometryState
     spatial_pyramid: SpatialPyramid
@@ -525,6 +534,7 @@ class StirNetOutput:
     initial_provisional_instances: InstanceState
     initial_reasoning: ReasoningState
     refinement: Optional[RefinementState] = None
+    split_only_postprocess: Optional[SplitOnlyPostprocessState] = None
     debug: Optional[Dict[str, Any]] = None
 
     @property

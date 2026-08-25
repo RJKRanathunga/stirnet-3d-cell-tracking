@@ -21,6 +21,7 @@ from .partition.partitioner import GraphPartitioner
 from .partition.rag import RAGBuilder
 from .partition.statistics import build_supervoxel_statistics
 from .partition.watershed import LearnedGeometryWatershed
+from .postprocess.source_core_split import SourceCoreSplitOnlyFilter
 from .refinement.local_refiner import LocalGeometryRefiner
 from .refinement.requests import (
     build_refinement_requests,
@@ -59,6 +60,7 @@ from .types import (
     RefinementRequest,
     SpatialObservationCache,
     SpatialForwardOutput,
+    SplitOnlyPostprocessState,
     StirNetOutput,
     TemporalInput,
     TemporalState,
@@ -125,6 +127,9 @@ class StirNet(nn.Module):
             self.cfg.spatial,
             self.cfg.geometry.hidden_channels,
             self.cfg.instances.d_model,
+        )
+        self.source_core_split_filter = SourceCoreSplitOnlyFilter(
+            self.cfg.inference
         )
 
     def _coerce_temporal_input(
@@ -308,6 +313,22 @@ class StirNet(nn.Module):
             cache=cache,
         )
 
+    def apply_source_core_split_filter(
+        self,
+        labels: list[Tensor],
+        spatial_inputs: Tensor,
+        geometry: GeometryLike,
+        spacing_um: Tensor,
+        dref_um: Tensor,
+    ) -> SplitOnlyPostprocessState:
+        """Split-only final filter; learned graph state is untouched."""
+        channel = int(self.cfg.inference.source_core_split_foreground_channel)
+        source_foreground = spatial_inputs[:, channel]
+        separator = geometry.probabilities()["separator"][:, 0]
+        return self.source_core_split_filter(
+            labels, source_foreground, separator, spacing_um, dref_um
+        )
+
     @staticmethod
     def _filter_by_existence(
         partition: PartitionState,
@@ -375,6 +396,7 @@ class StirNet(nn.Module):
         ]
         | None = None,
         apply_existence_filter: bool | None = None,
+        apply_source_core_split_filter: bool | None = None,
         return_debug: bool = False,
         precomputed_geometry: GeometryForwardOutput | None = None,
         stage_profiler=None,
@@ -790,7 +812,23 @@ class StirNet(nn.Module):
                 for label in final_labels
             ]
 
-        if rag.statistics is not None:
+        use_split_only_filter = (
+            self.cfg.inference.source_core_split_enabled
+            if apply_source_core_split_filter is None
+            else bool(apply_source_core_split_filter)
+        )
+        split_only_postprocess: SplitOnlyPostprocessState | None = None
+        if use_split_only_filter:
+            # AFTER all learned graph reasoning. This can only split.
+            split_only_postprocess = self.apply_source_core_split_filter(
+                final_labels, spatial_inputs, geometry, spacing_um, dref_um
+            )
+            final_labels = split_only_postprocess.labels
+
+        if rag.statistics is not None and not (
+            split_only_postprocess is not None
+            and split_only_postprocess.applied_count > 0
+        ):
             all_centers = centers_from_partition_statistics(final_partition, rag)
             centers = (
                 [
@@ -827,6 +865,13 @@ class StirNet(nn.Module):
                 ],
                 "final_instance_count": [int(x.max().item()) for x in final_labels],
                 "final_component_existence_scores": existence_scores,
+                "source_core_split_filter_enabled": bool(use_split_only_filter),
+                "source_core_split_candidate_count": (
+                    0 if split_only_postprocess is None else split_only_postprocess.candidate_count
+                ),
+                "source_core_split_applied_count": (
+                    0 if split_only_postprocess is None else split_only_postprocess.applied_count
+                ),
                 "temporal_edge_gate": reasoning.edge_temporal_gate.detach(),
                 "temporal_edge_delta": reasoning.edge_temporal_delta.detach(),
                 "refinement_requests": []
@@ -878,5 +923,6 @@ class StirNet(nn.Module):
             initial_provisional_instances=initial_instances,
             initial_reasoning=initial_reasoning,
             refinement=refinement,
+            split_only_postprocess=split_only_postprocess,
             debug=debug,
         )

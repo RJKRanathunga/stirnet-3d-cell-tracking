@@ -240,6 +240,24 @@ class InferenceConfig:
     tile_halo_zyx: Tuple[int, int, int] = (4, 16, 16)
     tile_batch_size: int = 1
 
+    # Asymmetric inference-only final postprocessor. Fallible source priors
+    # may request a split but are never interpreted as merge / must-link evidence.
+    # Keep OFF by default until calibrated on GT and BioHub inspection.
+    source_core_split_enabled: bool = False
+    source_core_split_foreground_channel: int = 1
+    source_core_split_foreground_threshold: float = 0.50
+    source_core_split_min_core_voxels: int = 8
+    source_core_split_min_core_containment: float = 0.80
+    source_core_split_min_core_separation_dref: float = 0.60
+    source_core_split_separation_softness_dref: float = 0.25
+    source_core_split_max_cores_per_component: int = 4
+    source_core_split_min_child_fraction: float = 0.12
+    source_core_split_min_reference_components: int = 5
+    source_core_split_volume_ratio_center: float = 1.50
+    source_core_split_volume_ratio_softness: float = 0.35
+    source_core_split_separator_support_threshold: float = 0.55
+    source_core_split_separator_boost: float = 0.50
+    source_core_split_confidence_threshold: float = 0.78
 
 @dataclass
 class ModelConfig:
@@ -429,6 +447,32 @@ class ModelConfig:
             raise ValueError("inference.mode must be 'full' or 'tiled'")
         if self.inference.tile_batch_size < 1:
             raise ValueError("inference.tile_batch_size must be positive")
+        if not 0 <= self.inference.source_core_split_foreground_channel < self.spatial.in_channels:
+            raise ValueError("source_core_split_foreground_channel is outside spatial inputs")
+        if not 0.0 <= self.inference.source_core_split_foreground_threshold <= 1.0:
+            raise ValueError("source_core_split_foreground_threshold must be in [0,1]")
+        if self.inference.source_core_split_min_core_voxels < 1:
+            raise ValueError("source_core_split_min_core_voxels must be positive")
+        if not 0.0 <= self.inference.source_core_split_min_core_containment <= 1.0:
+            raise ValueError("source_core_split_min_core_containment must be in [0,1]")
+        if self.inference.source_core_split_min_core_separation_dref < 0:
+            raise ValueError("source_core_split_min_core_separation_dref cannot be negative")
+        if self.inference.source_core_split_separation_softness_dref <= 0:
+            raise ValueError("source_core_split_separation_softness_dref must be positive")
+        if self.inference.source_core_split_max_cores_per_component < 2:
+            raise ValueError("source_core_split_max_cores_per_component must be >=2")
+        if not 0.0 < self.inference.source_core_split_min_child_fraction < 0.5:
+            raise ValueError("source_core_split_min_child_fraction must be in (0,0.5)")
+        if self.inference.source_core_split_min_reference_components < 1:
+            raise ValueError("source_core_split_min_reference_components must be positive")
+        if self.inference.source_core_split_volume_ratio_softness <= 0:
+            raise ValueError("source_core_split_volume_ratio_softness must be positive")
+        if not 0.0 <= self.inference.source_core_split_separator_support_threshold <= 1.0:
+            raise ValueError("source_core_split_separator_support_threshold must be in [0,1]")
+        if not 0.0 <= self.inference.source_core_split_separator_boost <= 1.0:
+            raise ValueError("source_core_split_separator_boost must be in [0,1]")
+        if not 0.0 <= self.inference.source_core_split_confidence_threshold <= 1.0:
+            raise ValueError("source_core_split_confidence_threshold must be in [0,1]")
         for size, overlap, halo in zip(
             self.inference.tile_shape_zyx,
             self.inference.tile_overlap_zyx,
