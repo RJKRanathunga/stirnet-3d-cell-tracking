@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-Interactive BioHub supervoxel split annotator — v7.
+Interactive BioHub supervoxel split annotator — v9.
 
 Purpose
 -------
@@ -66,6 +66,15 @@ Undo:
     - click-drag camera navigation is left unchanged,
     - "Reset selections" clears the boxes and seed highlights,
     - Save automatically resets the selections after a successful split.
+
+Adjacency-aware graph coloring:
+    - one node = one positive label value,
+    - one edge = two labels touch through a 3-D voxel face,
+    - touching atomic supervoxels are forced to different display colors,
+    - touching segmented/current instances are forced to different display colors,
+    - non-touching labels may reuse colors,
+    - no time-axis adjacency is introduced,
+    - after Save/Undo only the changed instance frame's contact graph is rebuilt.
 
 Default production input
 ------------------------
@@ -1546,6 +1555,438 @@ def parse_supervoxel_group(text: str) -> list[int]:
 
 
 
+
+# ============================================================
+# ADJACENCY-AWARE LABEL GRAPH COLORING
+# ============================================================
+
+# A restrained but visually distinct starting palette. The graph-color index,
+# not the raw label ID, selects the display color.
+_GRAPH_COLOR_BASE_RGBA = (
+    (0.90, 0.12, 0.12, 1.0),  # red
+    (0.12, 0.36, 0.95, 1.0),  # blue
+    (0.10, 0.74, 0.20, 1.0),  # green
+    (0.92, 0.12, 0.72, 1.0),  # magenta
+    (0.00, 0.74, 0.80, 1.0),  # cyan
+    (0.96, 0.70, 0.05, 1.0),  # amber
+    (0.54, 0.22, 0.86, 1.0),  # purple
+    (0.98, 0.42, 0.05, 1.0),  # orange
+    (0.42, 0.84, 0.06, 1.0),  # lime
+    (0.96, 0.34, 0.55, 1.0),  # pink
+    (0.18, 0.72, 0.54, 1.0),  # teal-green
+    (0.43, 0.47, 0.96, 1.0),  # periwinkle
+)
+
+
+def _hsv_to_rgba(
+    hue: float,
+    saturation: float,
+    value: float,
+) -> tuple[float, float, float, float]:
+    """Dependency-free HSV -> RGBA conversion."""
+    hue = float(hue) % 1.0
+    saturation = float(np.clip(saturation, 0.0, 1.0))
+    value = float(np.clip(value, 0.0, 1.0))
+
+    h6 = hue * 6.0
+    sector = int(np.floor(h6)) % 6
+    fraction = h6 - np.floor(h6)
+
+    p = value * (1.0 - saturation)
+    q = value * (1.0 - saturation * fraction)
+    t = value * (1.0 - saturation * (1.0 - fraction))
+
+    if sector == 0:
+        r, g, b = value, t, p
+    elif sector == 1:
+        r, g, b = q, value, p
+    elif sector == 2:
+        r, g, b = p, value, t
+    elif sector == 3:
+        r, g, b = p, q, value
+    elif sector == 4:
+        r, g, b = t, p, value
+    else:
+        r, g, b = value, p, q
+
+    return float(r), float(g), float(b), 1.0
+
+
+def _display_color_for_graph_index(
+    color_index: int,
+) -> tuple[float, float, float, float]:
+    """
+    Map one graph-color index to one deterministic RGBA color.
+
+    We never modulo-wrap the graph-color index. If the graph needs more colors
+    than the base palette, new hues are generated, preserving the invariant that
+    distinct graph-color indices remain distinct display colors.
+    """
+    color_index = int(color_index)
+
+    if color_index < len(_GRAPH_COLOR_BASE_RGBA):
+        return _GRAPH_COLOR_BASE_RGBA[color_index]
+
+    extra = color_index - len(_GRAPH_COLOR_BASE_RGBA)
+
+    # Golden-ratio hue stepping distributes an arbitrary number of colors around
+    # the hue circle without requiring a fixed palette length.
+    hue = (
+        0.08
+        + (extra + 1) * 0.6180339887498949
+    ) % 1.0
+
+    saturation = 0.68 + 0.08 * (extra % 3)
+    value = 0.90 + 0.05 * (extra % 2)
+
+    return _hsv_to_rgba(
+        hue,
+        saturation,
+        value,
+    )
+
+
+def _build_frame_touch_adjacency(
+    labels_zyx: np.ndarray,
+) -> tuple[
+    dict[int, set[int]],
+    set[int],
+]:
+    """
+    Build the 6-neighbour face-contact graph for ONE 3-D label volume.
+
+    Two positive labels are adjacent iff at least one z/y/x voxel face separates
+    them. Background 0 is excluded.
+    """
+    frame = np.asarray(labels_zyx)
+
+    if frame.ndim != 3:
+        raise ValueError(
+            "Frame adjacency expects (Z,Y,X), got "
+            f"{frame.shape}."
+        )
+
+    positive_ids = np.unique(frame)
+    positive_ids = positive_ids[positive_ids > 0]
+
+    all_labels = {
+        int(value)
+        for value in positive_ids.tolist()
+    }
+    adjacency: dict[int, set[int]] = {
+        label_id: set()
+        for label_id in all_labels
+    }
+
+    for axis in range(3):
+        left = [slice(None)] * 3
+        right = [slice(None)] * 3
+        left[axis] = slice(0, -1)
+        right[axis] = slice(1, None)
+
+        a = frame[tuple(left)]
+        b = frame[tuple(right)]
+
+        touching = (
+            (a > 0)
+            & (b > 0)
+            & (a != b)
+        )
+
+        if not np.any(touching):
+            continue
+
+        aa = a[touching].astype(
+            np.int64,
+            copy=False,
+        )
+        bb = b[touching].astype(
+            np.int64,
+            copy=False,
+        )
+
+        pairs = np.stack(
+            [
+                np.minimum(aa, bb),
+                np.maximum(aa, bb),
+            ],
+            axis=1,
+        )
+
+        # Thousands of voxel faces can represent the same graph edge.
+        pairs = np.unique(
+            pairs,
+            axis=0,
+        )
+
+        for u, v in pairs.tolist():
+            u = int(u)
+            v = int(v)
+
+            adjacency.setdefault(u, set()).add(v)
+            adjacency.setdefault(v, set()).add(u)
+
+            all_labels.add(u)
+            all_labels.add(v)
+
+    return adjacency, all_labels
+
+
+def _build_frame_graph_cache(
+    labels_tzyx: np.ndarray,
+) -> list[
+    tuple[
+        dict[int, set[int]],
+        set[int],
+    ]
+]:
+    """
+    Cache one contact graph per selected timepoint.
+
+    This intentionally does NOT connect labels between t and t+1.
+    """
+    data = np.asarray(labels_tzyx)
+
+    if data.ndim == 3:
+        return [
+            _build_frame_touch_adjacency(data)
+        ]
+
+    if data.ndim != 4:
+        raise ValueError(
+            "Graph-coloring expects (Z,Y,X) or (T,Z,Y,X), got "
+            f"{data.shape}."
+        )
+
+    return [
+        _build_frame_touch_adjacency(
+            data[t]
+        )
+        for t in range(data.shape[0])
+    ]
+
+
+def _merge_frame_graph_cache(
+    frame_graphs: list[
+        tuple[
+            dict[int, set[int]],
+            set[int],
+        ]
+    ],
+) -> tuple[
+    dict[int, set[int]],
+    set[int],
+]:
+    """
+    Merge per-frame graphs by LABEL VALUE.
+
+    Napari Labels colors are keyed by label value, not by (time,label), so if
+    values 12 and 19 touch in any selected frame they must receive different
+    global display colors. This union graph guarantees that.
+    """
+    merged_adjacency: dict[int, set[int]] = {}
+    all_labels: set[int] = set()
+
+    for adjacency, labels in frame_graphs:
+        all_labels.update(
+            int(value)
+            for value in labels
+        )
+
+        for node, neighbours in adjacency.items():
+            target = merged_adjacency.setdefault(
+                int(node),
+                set(),
+            )
+            target.update(
+                int(value)
+                for value in neighbours
+            )
+
+    for label_id in all_labels:
+        merged_adjacency.setdefault(
+            int(label_id),
+            set(),
+        )
+
+    return merged_adjacency, all_labels
+
+
+def _greedy_graph_coloring(
+    adjacency: dict[int, set[int]],
+    all_labels: set[int],
+) -> dict[int, int]:
+    """
+    Deterministic largest-degree-first greedy graph coloring.
+
+    Guarantee:
+        if u-v is an adjacency edge, color[u] != color[v]
+    """
+    assigned: dict[int, int] = {}
+
+    nodes = sorted(
+        all_labels,
+        key=lambda node: (
+            -len(
+                adjacency.get(
+                    int(node),
+                    set(),
+                )
+            ),
+            int(node),
+        ),
+    )
+
+    for node in nodes:
+        used = {
+            assigned[neighbour]
+            for neighbour in adjacency.get(
+                int(node),
+                set(),
+            )
+            if neighbour in assigned
+        }
+
+        candidate = 0
+        while candidate in used:
+            candidate += 1
+
+        assigned[int(node)] = int(candidate)
+
+    return assigned
+
+
+def _color_dict_from_frame_graph_cache(
+    frame_graphs: list[
+        tuple[
+            dict[int, set[int]],
+            set[int],
+        ]
+    ],
+) -> tuple[
+    dict[int, tuple[float, float, float, float]],
+    dict[str, int],
+]:
+    adjacency, all_labels = (
+        _merge_frame_graph_cache(
+            frame_graphs
+        )
+    )
+
+    graph_colors = _greedy_graph_coloring(
+        adjacency,
+        all_labels,
+    )
+
+    color_dict: dict[
+        int,
+        tuple[float, float, float, float],
+    ] = {
+        0: (0.0, 0.0, 0.0, 0.0),
+    }
+
+    for label_id, color_index in graph_colors.items():
+        color_dict[int(label_id)] = (
+            _display_color_for_graph_index(
+                int(color_index)
+            )
+        )
+
+    edge_count = (
+        sum(
+            len(neighbours)
+            for neighbours in adjacency.values()
+        )
+        // 2
+    )
+
+    stats = {
+        "label_count": int(len(all_labels)),
+        "touch_edge_count": int(edge_count),
+        "color_count": int(
+            max(
+                graph_colors.values(),
+                default=-1,
+            )
+            + 1
+        ),
+    }
+
+    return color_dict, stats
+
+
+def _apply_label_color_dict(
+    layer,
+    color_dict: dict[
+        int,
+        tuple[float, float, float, float],
+    ],
+) -> None:
+    """
+    Update a Napari Labels layer's explicit label -> RGBA mapping.
+
+    Napari's API differs across versions:
+        newer: layer.color = mapping
+        older: layer.color_mode / internal direct-color machinery may be needed
+
+    Try public APIs first and only then fall back to the layer's direct-colormap
+    interface if exposed.
+    """
+    first_error = None
+
+    try:
+        layer.color = color_dict
+        layer.refresh()
+        return
+    except Exception as exc:
+        first_error = exc
+
+    # Some versions expose a setter through the property but require direct
+    # color mode before assigning the mapping.
+    try:
+        if hasattr(layer, "color_mode"):
+            try:
+                layer.color_mode = "direct"
+            except Exception:
+                pass
+
+        layer.color = color_dict
+        layer.refresh()
+        return
+    except Exception:
+        pass
+
+    # Older Labels implementations may expose `_direct_colormap` or
+    # `direct_colormap`. We avoid assuming one exact class/API shape.
+    for attr_name in (
+        "direct_colormap",
+        "_direct_colormap",
+    ):
+        if not hasattr(layer, attr_name):
+            continue
+
+        try:
+            colormap = getattr(layer, attr_name)
+
+            if hasattr(colormap, "color_dict"):
+                colormap.color_dict = color_dict
+                layer.refresh()
+                return
+
+            if hasattr(colormap, "colors"):
+                colormap.colors = color_dict
+                layer.refresh()
+                return
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        "This Napari version did not accept the adjacency-aware Labels color "
+        "mapping after layer creation either. "
+        f"Original error: {first_error}"
+    )
+
+
 # ============================================================
 # 3-D RAY PICKING
 # ============================================================
@@ -1817,6 +2258,49 @@ def make_viewer(
     viewer = napari.Viewer(ndisplay=2)
     scale_4d = (1.0, *DEFAULT_SPACING_ZYX_UM)
 
+    print()
+    print("=" * 72)
+    print("Computing adjacency-aware graph colors")
+    print("=" * 72)
+
+    supervoxel_frame_graphs = (
+        _build_frame_graph_cache(
+            supervoxels
+        )
+    )
+    instance_frame_graphs = (
+        _build_frame_graph_cache(
+            session.corrected
+        )
+    )
+
+    (
+        supervoxel_color_dict,
+        supervoxel_color_stats,
+    ) = _color_dict_from_frame_graph_cache(
+        supervoxel_frame_graphs
+    )
+
+    (
+        instance_color_dict,
+        instance_color_stats,
+    ) = _color_dict_from_frame_graph_cache(
+        instance_frame_graphs
+    )
+
+    print(
+        "[graph colors] supervoxels: "
+        f"{supervoxel_color_stats['label_count']} label values | "
+        f"{supervoxel_color_stats['touch_edge_count']} touching pairs | "
+        f"{supervoxel_color_stats['color_count']} colors"
+    )
+    print(
+        "[graph colors] instances: "
+        f"{instance_color_stats['label_count']} label values | "
+        f"{instance_color_stats['touch_edge_count']} touching pairs | "
+        f"{instance_color_stats['color_count']} colors"
+    )
+
     viewer.dims.axis_labels = (
         "annotation frame",
         "z",
@@ -1842,6 +2326,14 @@ def make_viewer(
         name="Corrected instances",
         scale=scale_4d,
         opacity=0.45,
+    )
+
+    # Older Napari versions do not accept color= in viewer.add_labels(), but
+    # they can still accept the explicit label->RGBA mapping on the created
+    # Labels layer. Apply it after construction for compatibility.
+    _apply_label_color_dict(
+        corrected_layer,
+        instance_color_dict,
     )
 
     # ----------------------------------------
@@ -1891,6 +2383,11 @@ def make_viewer(
         name="Atomic supervoxel boundaries",
         scale=scale_4d,
         opacity=0.95,
+    )
+
+    _apply_label_color_dict(
+        supervoxel_layer,
+        supervoxel_color_dict,
     )
 
     try:
@@ -1952,6 +2449,7 @@ def make_viewer(
     )
     instruction_label = Label(
         value=(
+            "Touching SVs/instances use different graph colors.\n"
             "Single-click visible supervoxels to add split seeds.\n"
             "1st click -> Instance 1; 2nd -> Instance 2.\n"
             "Further clicks use Instance 3/4 if needed.\n"
@@ -2026,6 +2524,39 @@ def make_viewer(
 
     def current_local_t() -> int:
         return int(round(viewer.dims.current_step[0]))
+
+    def refresh_instance_graph_colors(
+        changed_local_t: int,
+    ) -> None:
+        """
+        Rebuild only the changed frame's raster contact graph, then recolor the
+        union graph across all selected frames.
+        """
+        instance_frame_graphs[changed_local_t] = (
+            _build_frame_touch_adjacency(
+                session.corrected[
+                    changed_local_t
+                ]
+            )
+        )
+
+        color_dict, stats = (
+            _color_dict_from_frame_graph_cache(
+                instance_frame_graphs
+            )
+        )
+
+        _apply_label_color_dict(
+            corrected_layer,
+            color_dict,
+        )
+
+        print(
+            "[graph colors] refreshed instances: "
+            f"{stats['label_count']} label values | "
+            f"{stats['touch_edge_count']} touching pairs | "
+            f"{stats['color_count']} colors"
+        )
 
     selected_seed_ids: list[int | None] = [
         None,
@@ -2266,6 +2797,10 @@ def make_viewer(
         corrected_layer.data = session.corrected
         corrected_layer.refresh()
 
+        refresh_instance_graph_colors(
+            current_local_t()
+        )
+
         reset_selections()
         update_frame_status()
 
@@ -2308,14 +2843,19 @@ def make_viewer(
         corrected_layer.data = session.corrected
         corrected_layer.refresh()
 
-        clear_boxes()
+        undo_local_t = timepoints.index(
+            int(result.timepoint)
+        )
+
+        refresh_instance_graph_colors(
+            undo_local_t
+        )
+
+        reset_selections()
 
         # Undo is global/LIFO across the loaded sequence. If the user has moved
         # elsewhere since Save, jump back to the affected frame so the restored
         # cell is immediately visible.
-        undo_local_t = timepoints.index(
-            int(result.timepoint)
-        )
         viewer.dims.set_current_step(
             0,
             undo_local_t,
@@ -2397,31 +2937,35 @@ def make_viewer(
     print("1. Navigate through the selected timepoints and z slices.")
     print("2. Find a merged spatial instance.")
     print(
-        "3. In 3-D, SINGLE-CLICK the first visible seed supervoxel. "
+        "3. Touching atomic supervoxels and touching segmented instances "
+        "are graph-colored so neighbours have different display colors."
+    )
+    print(
+        "4. In 3-D, SINGLE-CLICK the first visible seed supervoxel. "
         "Its ID automatically goes into Instance 1."
     )
     print(
-        "4. SINGLE-CLICK the second visible seed supervoxel. "
+        "5. SINGLE-CLICK the second visible seed supervoxel. "
         "Its ID automatically goes into Instance 2."
     )
     print(
-        "5. Optional third/fourth clicks fill Instance 3/4."
+        "6. Optional third/fourth clicks fill Instance 3/4."
     )
     print(
-        "6. Selected seeds are highlighted with distinct colors: "
+        "7. Selected seeds are highlighted with distinct colors: "
         "red, blue, green, magenta."
     )
     print(
-        "7. Click-drag still rotates/pans normally; background clicks add nothing."
+        "8. Click-drag still rotates/pans normally; background clicks add nothing."
     )
     print(
-        "8. Press Reset selections to clear all boxes/highlights without saving."
+        "9. Press Reset selections to clear all boxes/highlights without saving."
     )
     print(
-        "9. Press Save (or Ctrl+S). The split is applied and selections reset."
+        "10. Press Save (or Ctrl+S). The split is applied and selections reset."
     )
     print(
-        "10. Press Undo last Save (or Ctrl+Z) to reverse the newest split."
+        "11. Press Undo last Save (or Ctrl+Z) to reverse the newest split."
     )
     print()
     print(
@@ -2465,7 +3009,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("BIOHUB SUPERVOXEL INSTANCE ANNOTATOR V7")
+    print("BIOHUB SUPERVOXEL INSTANCE ANNOTATOR V9")
     print("=" * 72)
     print(f"Repository       : {REPO_ROOT}")
     print(f"Sample           : {args.sample_id}")
