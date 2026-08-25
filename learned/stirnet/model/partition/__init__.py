@@ -1,4 +1,10 @@
 from .graph_net import SpatialRAGNetwork
+from .separator_barrier import (
+    SEPARATOR_BARRIER_FEATURE_DIM,
+    SEPARATOR_BARRIER_FEATURE_NAMES,
+    SeparatorAwareBarrier,
+    build_separator_barrier_features,
+)
 from .morphology import (
     EdgeMorphologyPatchEncoder,
     EdgePairPatch,
@@ -38,6 +44,10 @@ __all__ = [
     "RAGCriterion",
     "RAGTargets",
     "SpatialRAGNetwork",
+    "SEPARATOR_BARRIER_FEATURE_DIM",
+    "SEPARATOR_BARRIER_FEATURE_NAMES",
+    "SeparatorAwareBarrier",
+    "build_separator_barrier_features",
     "EdgeMorphologyPatchEncoder",
     "EdgePairPatch",
     "EdgeScalePatch",

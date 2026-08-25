@@ -8,6 +8,7 @@ from torch import Tensor, nn
 
 from ..config import PartitionConfig
 from ..types import RAGState
+from .separator_barrier import SeparatorAwareBarrier
 
 
 class RAGMessageBlock(nn.Module):
@@ -75,6 +76,22 @@ class SpatialRAGNetwork(nn.Module):
         )
         self.classifier = nn.Linear(h, 1)
 
+        if cfg.rag_separator_barrier_enabled:
+            morphology_dim = (
+                cfg.rag_edge_morphology_dim
+                if cfg.rag_separator_barrier_use_morphology
+                else 0
+            )
+            self.separator_barrier = SeparatorAwareBarrier(
+                morphology_dim=morphology_dim,
+                hidden_dim=cfg.rag_separator_barrier_hidden_dim,
+                max_barrier_logit=cfg.rag_separator_barrier_max_logit,
+                initial_gate_bias=cfg.rag_separator_barrier_initial_gate_bias,
+                score_scale=cfg.rag_separator_barrier_score_scale,
+            )
+        else:
+            self.separator_barrier = None
+
         if cfg.rag_morphology_enabled:
             self.node_morphology_projection = nn.Linear(
                 cfg.rag_node_morphology_dim, h, bias=False
@@ -127,6 +144,8 @@ class SpatialRAGNetwork(nn.Module):
                 rag.edge_features,
                 edge_residual=edge_residual,
             )
+        barrier_score: Tensor | None = None
+        barrier_correction: Tensor | None = None
         if rag.edge_index.shape[1]:
             src, dst = rag.edge_index
             edge_emb = self.final_edge(
@@ -134,12 +153,34 @@ class SpatialRAGNetwork(nn.Module):
             )
             if edge_residual is not None:
                 edge_emb = edge_emb + edge_residual
-            logits = self.classifier(edge_emb).squeeze(-1)
+            base_logits = self.classifier(edge_emb).squeeze(-1)
+            if self.separator_barrier is not None:
+                if rag.separator_barrier_features is None:
+                    raise ValueError("separator barrier enabled without features")
+                morphology = (
+                    rag.edge_morphology_embeddings
+                    if self.cfg.rag_separator_barrier_use_morphology
+                    else None
+                )
+                barrier_score, barrier_correction = self.separator_barrier(
+                    rag.separator_barrier_features,
+                    morphology,
+                )
+                logits = base_logits - barrier_correction
+            else:
+                logits = base_logits
         else:
-            logits = rag.node_features.new_zeros((0,))
+            base_logits = rag.node_features.new_zeros((0,))
+            logits = base_logits
+            if self.separator_barrier is not None:
+                barrier_score = base_logits
+                barrier_correction = base_logits
         return replace(
             rag,
             node_embeddings=nodes,
             edge_embeddings=edge_emb,
             spatial_edge_logits=logits,
+            base_spatial_edge_logits=base_logits,
+            separator_barrier_score=barrier_score,
+            separator_barrier_correction=barrier_correction,
         )

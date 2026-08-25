@@ -59,6 +59,110 @@ def _safe_binary_metrics(logits: Tensor, target: Tensor) -> dict[str, Tensor]:
     }
 
 
+def _separator_barrier_auxiliary(
+    rag: RAGState,
+    targets,
+    cfg: LossConfig,
+    *,
+    neutral_probability: float,
+) -> dict[str, Tensor]:
+    """Teach the RAG to respect already-good separator evidence."""
+    zero = rag.spatial_edge_logits.sum() * 0
+    features = rag.separator_barrier_features
+    score = rag.separator_barrier_score
+    correction = rag.separator_barrier_correction
+
+    if (
+        features is None
+        or score is None
+        or correction is None
+        or features.shape[0] == 0
+    ):
+        return {
+            "separator_barrier_semantic": zero,
+            "separator_barrier_margin": zero,
+            "separator_barrier_strong_negative_count": zero.detach(),
+            "separator_barrier_false_merge_count": zero.detach(),
+            "separator_barrier_mean_correction": zero.detach(),
+        }
+
+    valid = targets.valid.bool()
+    same_gt = targets.target >= 0.5
+    strong_separator = (
+        features[:, 0]
+        >= float(cfg.separator_barrier_negative_mean_min)
+    ) | (
+        (
+            features[:, 1]
+            >= float(cfg.separator_barrier_negative_max_min)
+        )
+        & (
+            features[:, 4]
+            >= float(cfg.separator_barrier_negative_coverage70_min)
+        )
+    )
+    strong_negative = valid & (~same_gt) & strong_separator
+    same_valid = valid & same_gt
+
+    if bool(strong_negative.any()):
+        semantic_valid = strong_negative | same_valid
+        semantic_target = strong_negative[semantic_valid].to(score.dtype)
+        semantic_score = score[semantic_valid]
+        positives = semantic_target.sum()
+        negatives = semantic_target.numel() - positives
+        pos_weight = (
+            negatives / positives.clamp_min(1)
+        ).clamp(0.5, 20.0)
+        semantic = F.binary_cross_entropy_with_logits(
+            semantic_score,
+            semantic_target,
+            pos_weight=pos_weight,
+        )
+
+        neutral_logit = rag.spatial_edge_logits.new_tensor(
+            math.log(
+                neutral_probability / (1.0 - neutral_probability)
+            )
+        )
+        signed_cost = (
+            rag.spatial_edge_logits[strong_negative]
+            - neutral_logit
+        )
+        margin = F.relu(
+            signed_cost
+            + float(cfg.separator_barrier_signed_margin)
+        ).square().mean()
+    else:
+        semantic = zero
+        margin = zero
+
+    neutral_logit = rag.spatial_edge_logits.new_tensor(
+        math.log(
+            neutral_probability / (1.0 - neutral_probability)
+        )
+    )
+    false_merge = (
+        strong_negative
+        & (rag.spatial_edge_logits >= neutral_logit)
+    )
+    mean_correction = (
+        correction[strong_negative].mean().detach()
+        if bool(strong_negative.any())
+        else zero.detach()
+    )
+    return {
+        "separator_barrier_semantic": semantic,
+        "separator_barrier_margin": margin,
+        "separator_barrier_strong_negative_count": (
+            strong_negative.sum().detach().float()
+        ),
+        "separator_barrier_false_merge_count": (
+            false_merge.sum().detach().float()
+        ),
+        "separator_barrier_mean_correction": mean_correction,
+    }
+
+
 def build_instance_targets(
     provisional_labels: Iterable[Tensor],
     gt_labels: Tensor,
@@ -617,10 +721,25 @@ class StirNetCriterion(nn.Module):
                 ],
             }
         )
+        separator_barrier = _separator_barrier_auxiliary(
+            output.rag,
+            spatial_targets,
+            self.cfg,
+            neutral_probability=self.model_config.partition.spatial_merge_threshold,
+        )
+        separator_barrier_aux_loss = (
+            self.cfg.separator_barrier_semantic_weight
+            * separator_barrier["separator_barrier_semantic"]
+            + self.cfg.separator_barrier_margin_weight
+            * separator_barrier["separator_barrier_margin"]
+        )
+        metrics.update(separator_barrier)
+        metrics["separator_barrier_aux_loss"] = separator_barrier_aux_loss
         if stage == "spatial_partition":
             metrics["loss"] = (
                 self.cfg.geometry_weight * geometry_total
                 + self.cfg.spatial_rag_weight * spatial_rag["rag_bce"]
+                + separator_barrier_aux_loss
             )
             return metrics
         if not isinstance(output, StirNetOutput):
@@ -729,6 +848,7 @@ class StirNetCriterion(nn.Module):
             + self.cfg.existence_weight * existence_loss
             + self.cfg.split_weight * split_loss
             + self.cfg.recovery_weight * recovery_loss
+            + separator_barrier_aux_loss
         )
         metrics.update(
             {

@@ -34,6 +34,7 @@ from .statistics import (
     update_supervoxel_statistics_local,
 )
 from .morphology import RAGMorphologyEmbeddingBuilder
+from .separator_barrier import build_separator_barrier_features
 
 
 def _profile(profiler, name: str):

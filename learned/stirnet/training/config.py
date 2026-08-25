@@ -15,6 +15,13 @@ class LossConfig:
     # Average RAG losses per crop row instead of pooling every edge in B.
     rag_balance_across_batch: bool = True
 
+    separator_barrier_semantic_weight: float = 0.25
+    separator_barrier_margin_weight: float = 0.25
+    separator_barrier_negative_mean_min: float = 0.55
+    separator_barrier_negative_max_min: float = 0.85
+    separator_barrier_negative_coverage70_min: float = 0.25
+    separator_barrier_signed_margin: float = 1.50
+
     existence_min_precision: float = 0.25
     existence_min_gt_coverage: float = 0.10
     split_min_pred_fraction: float = 0.10
@@ -170,6 +177,15 @@ class TrainingConfig:
             raise ValueError("refinement_crop_rag_weight cannot be negative")
         if self.curriculum.refinement_crop_seed < 0:
             raise ValueError("refinement_crop_seed cannot be negative")
+        for name, value in (
+            ("separator_barrier_negative_mean_min", self.loss.separator_barrier_negative_mean_min),
+            ("separator_barrier_negative_max_min", self.loss.separator_barrier_negative_max_min),
+            ("separator_barrier_negative_coverage70_min", self.loss.separator_barrier_negative_coverage70_min),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0,1]")
+        if self.loss.separator_barrier_signed_margin < 0:
+            raise ValueError("separator_barrier_signed_margin cannot be negative")
         weights = (
             self.loss.geometry_weight,
             self.loss.spatial_rag_weight,
@@ -177,6 +193,8 @@ class TrainingConfig:
             self.loss.existence_weight,
             self.loss.split_weight,
             self.loss.recovery_weight,
+            self.loss.separator_barrier_semantic_weight,
+            self.loss.separator_barrier_margin_weight,
         )
         if any(value < 0 for value in weights):
             raise ValueError("loss weights cannot be negative")
