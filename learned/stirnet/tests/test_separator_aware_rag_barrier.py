@@ -76,6 +76,7 @@ def test_strong_separator_false_merge_gets_margin_loss():
     features[:, 1] = 0.98
     features[:, 4] = 0.90
     rag = _rag(features)
+    rag.base_spatial_edge_logits = torch.tensor([4.0])
     rag.spatial_edge_logits = torch.tensor([4.0], requires_grad=True)
     rag.separator_barrier_score = torch.tensor([0.0], requires_grad=True)
     rag.separator_barrier_correction = torch.tensor([0.1], requires_grad=True)
@@ -172,3 +173,37 @@ def test_rag_builder_attaches_separator_features_before_graph_network():
         SEPARATOR_BARRIER_FEATURE_DIM,
     )
     assert float(attached.separator_barrier_features[0, 0]) > 0.9
+
+
+def test_already_correct_strong_negative_is_not_barrier_on_target():
+    features = torch.zeros(1, SEPARATOR_BARRIER_FEATURE_DIM)
+    features[:, 0] = 0.90
+    features[:, 1] = 0.98
+    features[:, 4] = 0.90
+
+    rag = _rag(features)
+    rag.base_spatial_edge_logits = torch.tensor([-4.0])
+    rag.spatial_edge_logits = torch.tensor([-4.0], requires_grad=True)
+    rag.separator_barrier_score = torch.tensor([0.0], requires_grad=True)
+    rag.separator_barrier_correction = torch.tensor([0.0], requires_grad=True)
+
+    targets = RAGTargets(
+        target=torch.tensor([0.0]),
+        valid=torch.tensor([True]),
+        weight=torch.ones(1),
+        node_purity=torch.ones(2),
+        node_gt_support=torch.ones(2),
+        dominant_gt=torch.tensor([1, 2]),
+    )
+    losses = _separator_barrier_auxiliary(
+        rag,
+        targets,
+        LossConfig(),
+        neutral_probability=0.845,
+    )
+
+    assert int(losses["separator_barrier_strong_negative_count"]) == 1
+    assert int(losses["separator_barrier_residual_negative_count"]) == 0
+    assert float(losses["separator_barrier_margin"]) == 0.0
+    assert float(losses["separator_barrier_semantic"]) == 0.0
+

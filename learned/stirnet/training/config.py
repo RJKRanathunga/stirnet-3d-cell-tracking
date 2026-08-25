@@ -20,6 +20,10 @@ class LossConfig:
     separator_barrier_negative_mean_min: float = 0.55
     separator_barrier_negative_max_min: float = 0.85
     separator_barrier_negative_coverage70_min: float = 0.25
+    # Residual-veto target: already-correct negative edges do not
+    # train the barrier ON. Only strong-separator GT negatives whose
+    # frozen/base RAG p_merge is at least this value are veto targets.
+    separator_barrier_residual_min_base_probability: float = 0.50
     separator_barrier_signed_margin: float = 1.50
 
     existence_min_precision: float = 0.25
@@ -181,6 +185,7 @@ class TrainingConfig:
             ("separator_barrier_negative_mean_min", self.loss.separator_barrier_negative_mean_min),
             ("separator_barrier_negative_max_min", self.loss.separator_barrier_negative_max_min),
             ("separator_barrier_negative_coverage70_min", self.loss.separator_barrier_negative_coverage70_min),
+            ("separator_barrier_residual_min_base_probability", self.loss.separator_barrier_residual_min_base_probability),
         ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0,1]")

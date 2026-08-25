@@ -9,7 +9,7 @@ Test whether the NEW production ``SeparatorAwareBarrier`` can teach the spatial
 RAG to respect separator evidence that the dense geometry network already gets
 right.
 
-This is deliberately a short, conservative 300-step probe.
+This is a longer 600-step residual-veto run with conservative validation and bounded checkpoint storage.
 
 Architecture under test
 -----------------------
@@ -48,7 +48,7 @@ TRAINABLE:
 
 Why crop mining happens BEFORE training
 ---------------------------------------
-A 300-step targeted run is unsafe if only a few useful separator-backed cases
+A targeted run is unsafe if only a few useful separator-backed cases
 exist.  Therefore this script first scans the fixed training crop manifest with
 the frozen h100 baseline.
 
@@ -81,44 +81,28 @@ Default:
     75% draws -> mined good-crop pool
     25% draws -> ordinary train-manifest pool
 
-Inside each crop, the edge loss remains class-balanced and reserves 75% of the
-negative quota for strong-separator negatives, prioritized by base p_merge.
+Inside each crop, negative supervision is residual-only: only strong-separator
+GT-negative edges with frozen base p_merge >= 0.50 are eligible. Already-correct
+ordinary negatives never teach the barrier to become more suppressive.
 
 Early stopping
 --------------
-The script validates every 50 optimizer steps and writes recovery checkpoints
-at 100, 200, and 300 by default.
+The script validates every 50 optimizer steps. It stores only two model checkpoints: the best SAFE checkpoint and one latest checkpoint that is overwritten in place.
 
-At the decision checkpoints 100 and 200 it evaluates:
+Automatic early stopping is disabled by default for this 600-step run.
+Validation still tracks positive-merge safety and separator-veto learning, but
+the run is allowed to continue through step 600 unless it fails numerically.
 
-1. fixed held-out validation crops:
-       positive acceptance at q=0.845 must remain safe;
+Checkpoint storage is intentionally bounded for small SSDs:
 
-2. fixed target audit over the mined good-crop pool:
-       strong-separator bad-edge rate must improve, OR
-       mean strong-separator negative p_merge must fall enough.
+    best_checkpoint.pt
+        updated only when a validation point is SAFE and improves the ranking;
 
-Default learning gates:
+    latest_checkpoint.pt
+        overwritten at each checkpoint interval.
 
-    step 100:
-        >= 15% reduction in target bad-edge rate
-        OR >= 0.05 drop in mean strong-negative p_merge
-
-    step 200:
-        >= 30% reduction in target bad-edge rate
-        OR >= 0.10 drop in mean strong-negative p_merge
-
-Safety gate:
-    held-out positive acceptance may not fall by > 0.02 absolute.
-
-At an early-stop checkpoint the sequence is intentionally:
-
-    validate
-    -> SAVE checkpoint
-    -> write decision JSON
-    -> terminate
-
-so a stopped run is fully recoverable/inspectable.
+All checkpoint/validation metadata are retained as JSON/JSONL, so the complete
+training trajectory remains inspectable without storing many large ``.pt`` files.
 
 Important
 ---------
@@ -146,7 +130,6 @@ Quick smoke:
         --validation-every 2 `
         --checkpoint-every 2 `
         --min-good-crops 2 `
-        --disable-early-stop `
         --run-name separator_barrier_26_smoke
 """
 
@@ -171,6 +154,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
+# STIRNET_INV26_RESIDUAL_VETO_600_V2
 EXPERIMENT_NAME = "26_separator_aware_rag_barrier_training"
 DEFAULT_SAMPLES = "Drosophila_1,Drosophila_2"
 DEFAULT_SPACING_XYZ = "0.20312639,0.20312639,0.79099447"
@@ -820,6 +804,33 @@ def _mine_good_crops(
         reverse=True,
     )
 
+    per_sample: dict[str, dict[str, int]] = {}
+    for sample in source_batches:
+        sample_rows = [
+            row for row in scan_rows
+            if row["sample"] == sample
+        ]
+        sample_good = [
+            row for row in good
+            if row["sample"] == sample
+        ]
+        per_sample[sample] = {
+            "scanned_crop_count": len(sample_rows),
+            "good_crop_count": len(sample_good),
+            "hard_good_crop_count": sum(
+                int(row["hard_edges"] > 0)
+                for row in sample_good
+            ),
+            "good_edge_count": sum(
+                int(row["good_edges"])
+                for row in sample_good
+            ),
+            "hard_edge_count": sum(
+                int(row["hard_edges"])
+                for row in sample_good
+            ),
+        }
+
     return {
         "good": good,
         "ordinary": ordinary,
@@ -837,6 +848,7 @@ def _mine_good_crops(
             row["hard_edges"]
             for row in good
         ),
+        "per_sample": per_sample,
     }
 
 
@@ -919,27 +931,11 @@ def _select_edges(
     )
     selected_priority = priority_negative[:reserved]
 
-    used = set(
-        int(value)
-        for value in selected_priority.detach().cpu().tolist()
-    )
-    remaining_negative = torch.as_tensor(
-        [
-            int(value)
-            for value in negative.detach().cpu().tolist()
-            if int(value) not in used
-        ],
-        device=negative.device,
-        dtype=negative.dtype,
-    )
-    selected_ordinary = _spread_indices(
-        remaining_negative,
-        negative_quota - reserved,
-    )
-    selected_negative = torch.cat(
-        [selected_priority, selected_ordinary],
-        dim=0,
-    )
+    # Residual-veto training: DO NOT use already-correct ordinary negatives.
+    # With the legacy RAG frozen, BCE on an easy negative could only teach the
+    # barrier to suppress it even further, which is exactly the broad
+    # separation bias observed in the first 100-step probe.
+    selected_negative = selected_priority
 
     return {
         "positive_indices": selected_positive,
@@ -1662,8 +1658,11 @@ def _training_impl(args) -> dict[str, Any]:
         flush=True,
     )
     print(
-        "Early-stop decisions      : "
-        + ("OFF" if args.disable_early_stop else "steps 100 and 200"),
+        "Automatic early stop      : OFF (validation remains observational)",
+        flush=True,
+    )
+    print(
+        "Checkpoint storage        : best_checkpoint.pt + latest_checkpoint.pt only",
         flush=True,
     )
     print("=" * 124, flush=True)
@@ -1745,6 +1744,12 @@ def _training_impl(args) -> dict[str, Any]:
     rag_criterion.eval()
 
     loss_cfg = LossConfig()
+    # The production auxiliary is now a RESIDUAL veto target: strong
+    # GT-negative edges only activate the barrier when the frozen legacy RAG
+    # is still ambiguous/wrong. Keep mining and production loss aligned.
+    loss_cfg.separator_barrier_residual_min_base_probability = (
+        args.good_crop_min_base_probability
+    )
     loss_cfg.separator_barrier_semantic_weight = (
         args.semantic_weight
     )
@@ -1809,6 +1814,7 @@ def _training_impl(args) -> dict[str, Any]:
             args.good_crop_min_base_probability
         ),
         "good_crops": mining["good"],
+        "per_sample": mining["per_sample"],
     }
     _atomic_json(
         run_dir / "mining_summary.json",
@@ -1828,6 +1834,16 @@ def _training_impl(args) -> dict[str, Any]:
         f"hard-edges={mining['hard_edge_count']}",
         flush=True,
     )
+    for sample, row in mining["per_sample"].items():
+        print(
+            f"[mining] {sample}: "
+            f"scanned={row['scanned_crop_count']} "
+            f"good={row['good_crop_count']} "
+            f"hard-good={row['hard_good_crop_count']} "
+            f"good-edges={row['good_edge_count']} "
+            f"hard-edges={row['hard_edge_count']}",
+            flush=True,
+        )
 
     if len(mining["good"]) < args.min_good_crops:
         summary = {
@@ -1982,6 +1998,9 @@ def _training_impl(args) -> dict[str, Any]:
         "good_crop_min_base_probability": float(
             args.good_crop_min_base_probability
         ),
+        "separator_barrier_residual_min_base_probability": float(
+            loss_cfg.separator_barrier_residual_min_base_probability
+        ),
         "separator_negative_fraction": float(
             args.separator_negative_fraction
         ),
@@ -2010,7 +2029,7 @@ def _training_impl(args) -> dict[str, Any]:
         "signed_margin": float(
             loss_cfg.separator_barrier_signed_margin
         ),
-        "early_stop_enabled": not args.disable_early_stop,
+        "early_stop_enabled": False,
         "early_stop_step100_min_bad_reduction": float(
             args.early_stop_step100_min_bad_reduction
         ),
@@ -2064,7 +2083,8 @@ def _training_impl(args) -> dict[str, Any]:
 
     history_path = run_dir / "history.jsonl"
     validation_path = run_dir / "validation.jsonl"
-    decision_path = run_dir / "early_stop_decisions.jsonl"
+    checkpoint_metadata_path = run_dir / "checkpoint_metadata.jsonl"
+    checkpoint_index_path = recovery_dir / "checkpoint_index.json"
 
     rng = random.Random(args.seed + 26)
     good_cycle = good_jobs.copy()
@@ -2394,14 +2414,22 @@ def _training_impl(args) -> dict[str, Any]:
                 heldout_candidate = last_validation["candidate"]
                 target_candidate = last_target_audit["candidate"]
 
-                last_decision = _early_stop_decision(
-                    step=global_step,
-                    heldout_baseline=heldout_baseline,
-                    heldout_candidate=heldout_candidate,
-                    target_baseline=target_baseline,
-                    target_candidate=target_candidate,
-                    args=args,
+                positive_accept_drop = (
+                    heldout_baseline["positive_accept_rate"]
+                    - heldout_candidate["positive_accept_rate"]
                 )
+                last_decision = {
+                    "automatic_early_stop_enabled": False,
+                    "positive_accept_drop": float(positive_accept_drop),
+                    "safety_ok": bool(
+                        positive_accept_drop
+                        <= args.early_stop_max_positive_accept_drop
+                    ),
+                    "note": (
+                        "observational safety metadata only; "
+                        "Investigation 26 v2 runs through max_steps"
+                    ),
+                }
 
                 validation_row = {
                     "step": global_step,
@@ -2428,19 +2456,18 @@ def _training_impl(args) -> dict[str, Any]:
                     f"bar+={heldout_candidate['mean_correction_positive']:.4f}"
                 )
 
-                positive_floor_ok = (
-                    heldout_candidate["positive_accept_rate"]
-                    >= heldout_baseline["positive_accept_rate"]
-                    - args.early_stop_max_positive_accept_drop
+                positive_floor_ok = bool(
+                    last_decision["safety_ok"]
                 )
                 rank = (
-                    int(not positive_floor_ok),
                     target_candidate["bad_strong_negative_rate"],
                     target_candidate["hard_strong_negative_rate"],
                     heldout_candidate["false_merge_rate"],
                     heldout_candidate["bce"],
                 )
-                if best_rank is None or rank < best_rank:
+                if positive_floor_ok and (
+                    best_rank is None or rank < best_rank
+                ):
                     best_rank = rank
                     best_step = global_step
                     _save_checkpoint(
@@ -2459,24 +2486,36 @@ def _training_impl(args) -> dict[str, Any]:
                         decision=last_decision,
                         config_payload=config_payload,
                     )
+                    _append_jsonl(
+                        checkpoint_metadata_path,
+                        {
+                            "step": global_step,
+                            "kind": "best",
+                            "path": str(best_path),
+                            "safe": True,
+                            "rank": list(rank),
+                            "heldout": heldout_candidate,
+                            "target_audit": target_candidate,
+                        },
+                    )
                     progress.write(
-                        f"[best] step={global_step} -> {best_path}"
+                        f"[best] SAFE step={global_step} -> {best_path}"
+                    )
+                elif not positive_floor_ok:
+                    progress.write(
+                        f"[best] step={global_step} not eligible: "
+                        "positive-acceptance safety floor failed"
                     )
 
             should_checkpoint = (
                 global_step % args.checkpoint_every == 0
-                or global_step in {100, 200}
                 or global_step == args.max_steps
             )
 
-            checkpoint_path = None
             if should_checkpoint:
-                checkpoint_path = (
-                    recovery_dir
-                    / f"checkpoint_step_{global_step:06d}.pt"
-                )
+                latest_path = recovery_dir / "latest_checkpoint.pt"
                 _save_checkpoint(
-                    path=checkpoint_path,
+                    path=latest_path,
                     model=model,
                     model_cfg=model_cfg,
                     optimizer=optimizer,
@@ -2491,43 +2530,52 @@ def _training_impl(args) -> dict[str, Any]:
                     decision=last_decision,
                     config_payload=config_payload,
                 )
-                progress.write(
-                    f"[checkpoint] {checkpoint_path}"
-                )
-
-            if (
-                not args.disable_early_stop
-                and last_decision is not None
-                and last_decision.get(
-                    "decision_checkpoint",
-                    False,
-                )
-                and last_decision.get("stop", False)
-            ):
-                # The checkpoint has already been saved above.
-                if checkpoint_path is None:
-                    raise RuntimeError(
-                        "Early-stop decision reached without checkpoint save"
-                    )
-
-                early_stopped = True
-                early_stop_reason = "; ".join(
-                    last_decision.get("reasons", [])
-                )
-                decision_record = {
+                latest_metadata = {
                     "step": global_step,
-                    "checkpoint": str(checkpoint_path),
-                    **last_decision,
+                    "kind": "latest",
+                    "path": str(latest_path),
+                    "best_step": best_step,
+                    "best_path": (
+                        str(best_path)
+                        if best_path.is_file()
+                        else None
+                    ),
+                    "heldout": (
+                        None
+                        if last_validation is None
+                        else last_validation["candidate"]
+                    ),
+                    "target_audit": (
+                        None
+                        if last_target_audit is None
+                        else last_target_audit["candidate"]
+                    ),
+                    "safety": last_decision,
                 }
                 _append_jsonl(
-                    decision_path,
-                    decision_record,
+                    checkpoint_metadata_path,
+                    latest_metadata,
+                )
+                _atomic_json(
+                    checkpoint_index_path,
+                    {
+                        "latest": {
+                            "step": global_step,
+                            "path": str(latest_path),
+                        },
+                        "best": (
+                            None
+                            if not best_path.is_file()
+                            else {
+                                "step": best_step,
+                                "path": str(best_path),
+                            }
+                        ),
+                    },
                 )
                 progress.write(
-                    "[EARLY STOP] "
-                    f"step={global_step}: {early_stop_reason}"
+                    f"[latest] step={global_step} -> {latest_path}"
                 )
-                break
 
             del (
                 result,
@@ -2560,11 +2608,7 @@ def _training_impl(args) -> dict[str, Any]:
 
     elapsed = time.perf_counter() - started
 
-    status = (
-        "early_stopped"
-        if early_stopped
-        else "success"
-    )
+    status = "success"
     summary = {
         "status": status,
         "global_step": global_step,
@@ -2633,7 +2677,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Train the production STIR-Net separator-aware RAG barrier for a "
-            "300-step value probe with crop-mining and early-stop safety gates."
+            "600-step residual-veto training run with full crop mining and bounded checkpoint storage."
         )
     )
 
@@ -2647,12 +2691,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--run-name",
-        default="drosophila_12_separator_barrier_prod_300",
+        default="drosophila_12_separator_barrier_residual_600",
     )
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=300,
+        default=600,
     )
     parser.add_argument(
         "--validation-every",
@@ -2662,7 +2706,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checkpoint-every",
         type=int,
-        default=100,
+        default=50,
     )
     parser.add_argument(
         "--validation-crops-per-sample",
@@ -2709,7 +2753,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-good-crops",
         type=int,
-        default=64,
+        default=0,
         help=(
             "Stop mining once this many good crops are found. Set 0 to scan all."
         ),
@@ -2732,10 +2776,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--separator-negative-fraction",
         type=float,
-        default=0.75,
+        default=1.00,
         help=(
-            "Fraction of selected negative edge quota preferentially reserved "
-            "for strong-separator wrong/ambiguous negatives."
+            "Fraction of the negative quota used for residual strong-separator "
+            "wrong/ambiguous negatives. Already-correct ordinary negatives are never selected."
         ),
     )
     parser.add_argument(
@@ -2748,7 +2792,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--barrier-lr",
         type=float,
-        default=1e-3,
+        default=3e-4,
     )
     parser.add_argument(
         "--weight-decay",
@@ -2773,12 +2817,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--positive-preservation-weight",
         type=float,
-        default=0.50,
+        default=1.00,
     )
     parser.add_argument(
         "--positive-barrier-weight",
         type=float,
-        default=0.25,
+        default=0.75,
     )
     parser.add_argument(
         "--merge-threshold",
@@ -2812,6 +2856,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--disable-early-stop",
         action="store_true",
+        default=True,
+        help=(
+            "Deprecated compatibility flag. Automatic early stopping is "
+            "disabled in Investigation 26 v2; validation is observational."
+        ),
     )
     parser.add_argument(
         "--early-stop-step100-min-bad-reduction",

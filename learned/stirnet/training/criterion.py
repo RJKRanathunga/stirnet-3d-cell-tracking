@@ -66,11 +66,17 @@ def _separator_barrier_auxiliary(
     *,
     neutral_probability: float,
 ) -> dict[str, Tensor]:
-    """Teach the RAG to respect already-good separator evidence."""
+    """Train the separator branch as a residual veto, not a second classifier.
+
+    A strong GT-negative separator edge activates the barrier only when the
+    frozen/base RAG is still ambiguous or wrong. Already-correct negatives are
+    deliberately ignored by barrier-ON supervision.
+    """
     zero = rag.spatial_edge_logits.sum() * 0
     features = rag.separator_barrier_features
     score = rag.separator_barrier_score
     correction = rag.separator_barrier_correction
+    base_logits = rag.base_spatial_edge_logits
 
     if (
         features is None
@@ -82,9 +88,15 @@ def _separator_barrier_auxiliary(
             "separator_barrier_semantic": zero,
             "separator_barrier_margin": zero,
             "separator_barrier_strong_negative_count": zero.detach(),
+            "separator_barrier_residual_negative_count": zero.detach(),
             "separator_barrier_false_merge_count": zero.detach(),
             "separator_barrier_mean_correction": zero.detach(),
         }
+
+    if base_logits is None:
+        raise ValueError(
+            "separator barrier supervision requires base_spatial_edge_logits"
+        )
 
     valid = targets.valid.bool()
     same_gt = targets.target >= 0.5
@@ -102,11 +114,22 @@ def _separator_barrier_auxiliary(
         )
     )
     strong_negative = valid & (~same_gt) & strong_separator
+
+    base_probability = base_logits.detach().sigmoid()
+    residual_negative = (
+        strong_negative
+        & (
+            base_probability
+            >= float(
+                cfg.separator_barrier_residual_min_base_probability
+            )
+        )
+    )
     same_valid = valid & same_gt
 
-    if bool(strong_negative.any()):
-        semantic_valid = strong_negative | same_valid
-        semantic_target = strong_negative[semantic_valid].to(score.dtype)
+    if bool(residual_negative.any()):
+        semantic_valid = residual_negative | same_valid
+        semantic_target = residual_negative[semantic_valid].to(score.dtype)
         semantic_score = score[semantic_valid]
         positives = semantic_target.sum()
         negatives = semantic_target.numel() - positives
@@ -125,7 +148,7 @@ def _separator_barrier_auxiliary(
             )
         )
         signed_cost = (
-            rag.spatial_edge_logits[strong_negative]
+            rag.spatial_edge_logits[residual_negative]
             - neutral_logit
         )
         margin = F.relu(
@@ -133,7 +156,15 @@ def _separator_barrier_auxiliary(
             + float(cfg.separator_barrier_signed_margin)
         ).square().mean()
     else:
-        semantic = zero
+        # Same-cell OFF supervision remains active even when a crop has no
+        # residual negative, so ordinary crops teach selectivity/preservation.
+        if bool(same_valid.any()):
+            semantic = F.binary_cross_entropy_with_logits(
+                score[same_valid],
+                torch.zeros_like(score[same_valid]),
+            )
+        else:
+            semantic = zero
         margin = zero
 
     neutral_logit = rag.spatial_edge_logits.new_tensor(
@@ -146,8 +177,8 @@ def _separator_barrier_auxiliary(
         & (rag.spatial_edge_logits >= neutral_logit)
     )
     mean_correction = (
-        correction[strong_negative].mean().detach()
-        if bool(strong_negative.any())
+        correction[residual_negative].mean().detach()
+        if bool(residual_negative.any())
         else zero.detach()
     )
     return {
@@ -155,6 +186,9 @@ def _separator_barrier_auxiliary(
         "separator_barrier_margin": margin,
         "separator_barrier_strong_negative_count": (
             strong_negative.sum().detach().float()
+        ),
+        "separator_barrier_residual_negative_count": (
+            residual_negative.sum().detach().float()
         ),
         "separator_barrier_false_merge_count": (
             false_merge.sum().detach().float()
