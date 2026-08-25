@@ -244,6 +244,10 @@ class InferenceConfig:
     # may request a split but are never interpreted as merge / must-link evidence.
     # Keep OFF by default until calibrated on GT and BioHub inspection.
     source_core_split_enabled: bool = False
+    # Default v2: source masks anchor a graph watershed over the EXISTING
+    # atomic watershed supervoxels. The legacy voxel-level method remains
+    # available as "voxel_watershed" for A/B comparison.
+    source_core_split_method: str = "supervoxel_graph"
     source_core_split_foreground_channel: int = 1
     source_core_split_foreground_threshold: float = 0.50
     source_core_split_min_core_voxels: int = 8
@@ -258,6 +262,11 @@ class InferenceConfig:
     source_core_split_separator_support_threshold: float = 0.55
     source_core_split_separator_boost: float = 0.50
     source_core_split_confidence_threshold: float = 0.78
+    # A supervoxel may be anchored by a source mask only when the local
+    # source-mask overlap is sufficiently unambiguous. If one atomic SV
+    # materially contains two source masks, v2 refuses to cut through it.
+    source_core_split_supervoxel_anchor_purity: float = 0.80
+    source_core_split_supervoxel_min_anchor_voxels: int = 2
 
 @dataclass
 class ModelConfig:
@@ -447,6 +456,10 @@ class ModelConfig:
             raise ValueError("inference.mode must be 'full' or 'tiled'")
         if self.inference.tile_batch_size < 1:
             raise ValueError("inference.tile_batch_size must be positive")
+        if self.inference.source_core_split_method not in {"supervoxel_graph", "voxel_watershed"}:
+            raise ValueError(
+                "source_core_split_method must be 'supervoxel_graph' or 'voxel_watershed'"
+            )
         if not 0 <= self.inference.source_core_split_foreground_channel < self.spatial.in_channels:
             raise ValueError("source_core_split_foreground_channel is outside spatial inputs")
         if not 0.0 <= self.inference.source_core_split_foreground_threshold <= 1.0:
@@ -473,6 +486,14 @@ class ModelConfig:
             raise ValueError("source_core_split_separator_boost must be in [0,1]")
         if not 0.0 <= self.inference.source_core_split_confidence_threshold <= 1.0:
             raise ValueError("source_core_split_confidence_threshold must be in [0,1]")
+        if not 0.5 <= self.inference.source_core_split_supervoxel_anchor_purity <= 1.0:
+            raise ValueError(
+                "source_core_split_supervoxel_anchor_purity must be in [0.5,1]"
+            )
+        if self.inference.source_core_split_supervoxel_min_anchor_voxels < 1:
+            raise ValueError(
+                "source_core_split_supervoxel_min_anchor_voxels must be positive"
+            )
         for size, overlap, halo in zip(
             self.inference.tile_shape_zyx,
             self.inference.tile_overlap_zyx,

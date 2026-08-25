@@ -320,13 +320,20 @@ class StirNet(nn.Module):
         geometry: GeometryLike,
         spacing_um: Tensor,
         dref_um: Tensor,
+        *,
+        supervoxel_labels: list[Tensor] | None = None,
     ) -> SplitOnlyPostprocessState:
         """Split-only final filter; learned graph state is untouched."""
         channel = int(self.cfg.inference.source_core_split_foreground_channel)
         source_foreground = spatial_inputs[:, channel]
         separator = geometry.probabilities()["separator"][:, 0]
         return self.source_core_split_filter(
-            labels, source_foreground, separator, spacing_um, dref_um
+            labels,
+            source_foreground,
+            separator,
+            spacing_um,
+            dref_um,
+            supervoxel_labels=supervoxel_labels,
         )
 
     @staticmethod
@@ -821,7 +828,14 @@ class StirNet(nn.Module):
         if use_split_only_filter:
             # AFTER all learned graph reasoning. This can only split.
             split_only_postprocess = self.apply_source_core_split_filter(
-                final_labels, spatial_inputs, geometry, spacing_um, dref_um
+                final_labels,
+                spatial_inputs,
+                geometry,
+                spacing_um,
+                dref_um,
+                # V2 keeps atomic watershed supervoxels immutable and
+                # partitions them only after all learned graph reasoning.
+                supervoxel_labels=rag.supervoxel_labels,
             )
             final_labels = split_only_postprocess.labels
 

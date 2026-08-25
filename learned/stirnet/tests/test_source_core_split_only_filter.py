@@ -4,25 +4,9 @@ import numpy as np
 import torch
 
 from learned.stirnet.model.config import InferenceConfig
-from learned.stirnet.model.postprocess.source_core_split import SourceCoreSplitOnlyFilter
-
-
-def _filter(final, source, separator, *, threshold=0.70):
-    cfg = InferenceConfig()
-    cfg.source_core_split_min_core_voxels = 4
-    cfg.source_core_split_min_reference_components = 1
-    cfg.source_core_split_min_core_containment = 0.80
-    cfg.source_core_split_min_core_separation_dref = 0.50
-    cfg.source_core_split_min_child_fraction = 0.10
-    cfg.source_core_split_confidence_threshold = threshold
-    cfg.source_core_split_volume_ratio_center = 1.20
-    return SourceCoreSplitOnlyFilter(cfg)(
-        [torch.as_tensor(final, dtype=torch.long)],
-        torch.as_tensor(source[None], dtype=torch.float32),
-        torch.as_tensor(separator[None], dtype=torch.float32),
-        torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32),
-        torch.tensor([4.0], dtype=torch.float32),
-    )
+from learned.stirnet.model.postprocess.source_core_split import (
+    SourceCoreSplitOnlyFilter,
+)
 
 
 def _case():
@@ -42,28 +26,145 @@ def _case():
 
     separator = np.zeros(shape, np.float32)
     separator[:, :, 10:12] = 0.95
-    return final, source, separator
+
+    # Atomic supervoxels. The large final component has four existing atomic
+    # pieces separated along X. The two source masks anchor the left and right
+    # sides; the graph watershed must split only along these existing SVs.
+    sv = np.zeros(shape, np.int64)
+    sv[1:4, 1:5, 1:5] = 1
+    sv[1:4, 1:5, 7:11] = 2
+    sv[1:4, 1:5, 13:17] = 3
+    large = final == 4
+    for x0, x1, sid in ((3, 7, 4), (7, 10, 5), (10, 13, 6), (13, 17, 7)):
+        mask = large.copy()
+        x = np.zeros(shape, dtype=bool)
+        x[:, :, x0:x1] = True
+        sv[mask & x] = sid
+
+    return final, source, separator, sv
 
 
-def test_two_bright_cores_can_split_one_final_component():
-    final, source, separator = _case()
-    state = _filter(final, source, separator)
+def _filter(
+    final,
+    source,
+    separator,
+    *,
+    supervoxels=None,
+    method="supervoxel_graph",
+    threshold=0.70,
+):
+    cfg = InferenceConfig()
+    cfg.source_core_split_method = method
+    cfg.source_core_split_min_core_voxels = 4
+    cfg.source_core_split_min_reference_components = 1
+    cfg.source_core_split_min_core_containment = 0.80
+    cfg.source_core_split_min_core_separation_dref = 0.50
+    cfg.source_core_split_min_child_fraction = 0.10
+    cfg.source_core_split_confidence_threshold = threshold
+    cfg.source_core_split_volume_ratio_center = 1.20
+    cfg.source_core_split_supervoxel_min_anchor_voxels = 1
+    return SourceCoreSplitOnlyFilter(cfg)(
+        [torch.as_tensor(final, dtype=torch.long)],
+        torch.as_tensor(source[None], dtype=torch.float32),
+        torch.as_tensor(separator[None], dtype=torch.float32),
+        torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32),
+        torch.tensor([4.0], dtype=torch.float32),
+        supervoxel_labels=(
+            None
+            if supervoxels is None
+            else [torch.as_tensor(supervoxels, dtype=torch.long)]
+        ),
+    )
+
+
+def test_default_method_is_supervoxel_graph_and_filter_remains_toggleable():
+    cfg = InferenceConfig()
+    assert cfg.source_core_split_method == "supervoxel_graph"
+    # The architecture can still be globally/per-call switched off as before.
+    assert cfg.source_core_split_enabled is False
+
+
+def test_supervoxel_graph_splits_multi_mask_final_component():
+    final, source, separator, supervoxels = _case()
+    state = _filter(
+        final,
+        source,
+        separator,
+        supervoxels=supervoxels,
+    )
     assert state.applied_count >= 1
+
     output = state.labels[0].numpy()
     ids = np.unique(output[final == 4])
     assert len(ids[ids > 0]) >= 2
 
+    row = next(
+        r for r in state.records
+        if r.get("final_component_id") == 4
+        and r.get("status") == "applied"
+    )
+    assert row["method"] == "supervoxel_graph"
+    assert row["supervoxel_count"] >= 4
+    assert row["cut_supervoxel_edge_count"] >= 1
 
-def test_merged_source_core_never_merges_graph_separated_components():
+
+def test_supervoxel_graph_never_cuts_through_an_atomic_supervoxel():
+    final, source, separator, supervoxels = _case()
+    state = _filter(
+        final,
+        source,
+        separator,
+        supervoxels=supervoxels,
+    )
+    output = state.labels[0].numpy()
+
+    for sv_id in np.unique(supervoxels[supervoxels > 0]):
+        old_ids = np.unique(final[supervoxels == sv_id])
+        if len(old_ids[old_ids > 0]) != 1:
+            continue
+        new_ids = np.unique(output[supervoxels == sv_id])
+        new_ids = new_ids[new_ids > 0]
+        assert len(new_ids) <= 1
+
+
+def test_legacy_voxel_watershed_is_still_available():
+    final, source, separator, _ = _case()
+    state = _filter(
+        final,
+        source,
+        separator,
+        method="voxel_watershed",
+        supervoxels=None,
+    )
+    assert state.applied_count >= 1
+    row = next(
+        r for r in state.records
+        if r.get("final_component_id") == 4
+        and r.get("status") == "applied"
+    )
+    assert row["method"] == "voxel_watershed"
+
+
+def test_merged_source_mask_never_merges_graph_separated_components():
     shape = (6, 16, 16)
     final = np.zeros(shape, np.int64)
     final[:, 2:8, 2:7] = 1
     final[:, 2:8, 9:14] = 2
+
     source = np.zeros(shape, np.float32)
-    source[2:4, 4:6, 4:12] = 1  # one connected source bridge
+    source[2:4, 4:6, 4:12] = 1
+
     separator = np.ones(shape, np.float32)
-    state = _filter(final, source, separator)
+    supervoxels = final.copy()
+
+    state = _filter(
+        final,
+        source,
+        separator,
+        supervoxels=supervoxels,
+    )
     output = state.labels[0].numpy()
+
     left = set(np.unique(output[final == 1]).tolist()) - {0}
     right = set(np.unique(output[final == 2]).tolist()) - {0}
     assert left.isdisjoint(right)
@@ -71,14 +172,32 @@ def test_merged_source_core_never_merges_graph_separated_components():
 
 
 def test_separator_only_boosts_split_confidence():
-    final, source, strong = _case()
+    final, source, strong, supervoxels = _case()
     weak = np.zeros_like(strong)
-    weak_state = _filter(final, source, weak, threshold=0.99)
-    strong_state = _filter(final, source, strong, threshold=0.99)
-    weak_row = next(r for r in weak_state.records if r.get("final_component_id") == 4)
-    strong_row = next(r for r in strong_state.records if r.get("final_component_id") == 4)
+
+    weak_state = _filter(
+        final,
+        source,
+        weak,
+        supervoxels=supervoxels,
+        threshold=0.99,
+    )
+    strong_state = _filter(
+        final,
+        source,
+        strong,
+        supervoxels=supervoxels,
+        threshold=0.99,
+    )
+
+    weak_row = next(
+        r for r in weak_state.records
+        if r.get("final_component_id") == 4
+        and "split_confidence" in r
+    )
+    strong_row = next(
+        r for r in strong_state.records
+        if r.get("final_component_id") == 4
+        and "split_confidence" in r
+    )
     assert strong_row["split_confidence"] >= weak_row["split_confidence"]
-
-
-def test_default_is_off():
-    assert InferenceConfig().source_core_split_enabled is False

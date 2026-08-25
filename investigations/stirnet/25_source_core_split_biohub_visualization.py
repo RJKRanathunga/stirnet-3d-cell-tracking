@@ -456,7 +456,7 @@ def output_variant_name(
     separator_boost: float | None,
 ) -> str:
     if confidence_threshold is None and separator_boost is None:
-        return "production_defaults"
+        return "supervoxel_graph_defaults"
 
     pieces = []
     if confidence_threshold is not None:
@@ -561,6 +561,12 @@ def materialize_frame(
         / "partition"
         / "spatial_partition.npy"
     )
+    watershed_path = (
+        multicut_root
+        / f"t{frame:03d}"
+        / "partition"
+        / "watershed_supervoxels.npy"
+    )
     separator_path = (
         h100_root
         / f"t{frame:03d}"
@@ -574,6 +580,7 @@ def materialize_frame(
 
     for required in (
         before_path,
+        watershed_path,
         separator_path,
         source_mask_path,
         source_segmentation_path,
@@ -584,6 +591,10 @@ def materialize_frame(
     before = np.asarray(
         np.load(before_path, mmap_mode="r", allow_pickle=False),
         dtype=np.int32,
+    )
+    watershed_supervoxels = np.asarray(
+        np.load(watershed_path, mmap_mode="r", allow_pickle=False),
+        dtype=np.int64,
     )
     separator = np.asarray(
         np.load(separator_path, mmap_mode="r", allow_pickle=False),
@@ -602,7 +613,8 @@ def materialize_frame(
     )
 
     if (
-        before.shape != separator.shape
+        before.shape != watershed_supervoxels.shape
+        or before.shape != separator.shape
         or before.shape != source_mask.shape
         or before.shape != source_segmentation.shape
     ):
@@ -642,6 +654,9 @@ def materialize_frame(
         ),
         torch.tensor([spacing], dtype=torch.float32),
         torch.tensor([dref_um], dtype=torch.float32),
+        supervoxel_labels=[
+            torch.as_tensor(watershed_supervoxels, dtype=torch.long)
+        ],
     )
     elapsed = time.perf_counter() - started
 
