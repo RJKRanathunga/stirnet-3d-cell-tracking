@@ -1,3 +1,4 @@
+# STIRNET_GENERIC_BIOHUB_VIEWER_V2
 from __future__ import annotations
 
 """
@@ -152,6 +153,120 @@ def resolve_inference_directory(
             f"Inference directory is incomplete: {root}; missing={missing}"
         )
     return root.resolve()
+
+
+def result_label(
+    inference_root: Path,
+    manifest: dict,
+    override: str | None,
+) -> str:
+    if override is not None:
+        label = override.strip()
+        if not label:
+            raise ValueError("Result label cannot be empty")
+        return label
+
+    run_label = manifest.get("run_label")
+    if isinstance(run_label, str) and run_label.strip():
+        return run_label.strip()
+
+    checkpoint_path = manifest.get("checkpoint_path")
+    if isinstance(checkpoint_path, str) and checkpoint_path:
+        parent = Path(checkpoint_path).parent.name
+        if parent:
+            return parent
+
+    if inference_root.name.startswith("step"):
+        return inference_root.parent.name
+    return inference_root.name
+
+
+def load_result_metadata(inference_root: Path) -> tuple[dict, dict]:
+    manifest = json.loads(
+        (inference_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    summary = json.loads(
+        (inference_root / "summary.json").read_text(encoding="utf-8")
+    )
+    return manifest, summary
+
+
+def watershed_mismatch_frames(
+    primary_root: Path,
+    comparison_root: Path,
+    frames: list[int],
+) -> list[int]:
+    mismatches: list[int] = []
+    relative = Path("partition") / "watershed_supervoxels.npy"
+
+    for frame in frames:
+        primary = np.load(
+            primary_root / f"t{frame:03d}" / relative,
+            mmap_mode="r",
+            allow_pickle=False,
+        )
+        comparison = np.load(
+            comparison_root / f"t{frame:03d}" / relative,
+            mmap_mode="r",
+            allow_pickle=False,
+        )
+        if (
+            primary.shape != comparison.shape
+            or primary.dtype != comparison.dtype
+            or not np.array_equal(primary, comparison)
+        ):
+            mismatches.append(int(frame))
+    return mismatches
+
+
+def internal_partition_boundary_4d(labels):
+    """Return internal boundaries between positive labels.
+
+    Works lazily for Dask arrays and eagerly for NumPy arrays. Raw label IDs are
+    never compared across runs; only each run's own boundary geometry is used.
+    """
+
+    try:
+        import dask.array as da
+        is_dask = isinstance(labels, da.Array)
+    except ImportError:
+        da = None
+        is_dask = False
+
+    pad = da.pad if is_dask else np.pad
+    boundary = None
+
+    # labels are [T,Z,Y,X]; never compare across the T axis.
+    for axis in (1, 2, 3):
+        lower_slice = [slice(None)] * 4
+        upper_slice = [slice(None)] * 4
+        lower_slice[axis] = slice(0, -1)
+        upper_slice[axis] = slice(1, None)
+
+        lower = labels[tuple(lower_slice)]
+        upper = labels[tuple(upper_slice)]
+        changed = (
+            (lower > 0)
+            & (upper > 0)
+            & (lower != upper)
+        )
+
+        low_padding = [(0, 0)] * 4
+        high_padding = [(0, 0)] * 4
+        low_padding[axis] = (0, 1)
+        high_padding[axis] = (1, 0)
+
+        axis_boundary = (
+            pad(changed, low_padding, mode="constant")
+            | pad(changed, high_padding, mode="constant")
+        )
+        boundary = (
+            axis_boundary
+            if boundary is None
+            else (boundary | axis_boundary)
+        )
+
+    return boundary
 
 
 def resolve_stage6_root(sample_id: str, override: str | None) -> Path:
@@ -420,9 +535,44 @@ def main() -> None:
         "--inference-dir",
         default=None,
         help=(
-            "Investigation-12 stepXXXXXX directory. Default selects the highest "
-            "available step for the sample."
+            "Primary Investigation-12-compatible result directory. Default "
+            "selects the highest legacy step for the sample."
         ),
+    )
+    parser.add_argument(
+        "--inference-label",
+        default=None,
+        help="Optional display label for the primary result.",
+    )
+    parser.add_argument(
+        "--compare-dir",
+        action="append",
+        default=[],
+        help=(
+            "Additional Investigation-12-compatible result directory to compare "
+            "against the primary. Repeat this argument for multiple models."
+        ),
+    )
+    parser.add_argument(
+        "--compare-label",
+        action="append",
+        default=[],
+        help=(
+            "Optional display label corresponding to each --compare-dir, in "
+            "the same order. Omit to infer labels from manifests."
+        ),
+    )
+    parser.add_argument(
+        "--no-difference-overlays",
+        action="store_true",
+        help=(
+            "Do not add primary-only/comparison-only internal-boundary overlays."
+        ),
+    )
+    parser.add_argument(
+        "--no-watershed-check",
+        action="store_true",
+        help="Skip exact watershed identity checks between result directories.",
     )
     parser.add_argument(
         "--stage6-root",
@@ -491,12 +641,7 @@ def main() -> None:
     available = completed_timepoints(inference_root)
     frames = parse_timepoints(args.timepoints, available)
 
-    manifest = json.loads(
-        (inference_root / "manifest.json").read_text(encoding="utf-8")
-    )
-    summary = json.loads(
-        (inference_root / "summary.json").read_text(encoding="utf-8")
-    )
+    manifest, summary = load_result_metadata(inference_root)
     spacing = tuple(
         float(value)
         for value in manifest.get(
@@ -505,6 +650,81 @@ def main() -> None:
         )
     )
     scale_4d = (1.0, *spacing)
+    primary_label = result_label(
+        inference_root,
+        manifest,
+        args.inference_label,
+    )
+
+    if len(args.compare_label) > len(args.compare_dir):
+        raise ValueError(
+            "More --compare-label values were provided than --compare-dir values"
+        )
+
+    comparisons = []
+    for index, directory_text in enumerate(args.compare_dir):
+        comparison_root = resolve_inference_directory(
+            args.sample_id,
+            directory_text,
+        )
+        if comparison_root == inference_root:
+            raise ValueError(
+                f"Comparison directory equals primary directory: {comparison_root}"
+            )
+
+        comparison_available = set(
+            completed_timepoints(comparison_root)
+        )
+        missing_frames = [
+            frame
+            for frame in frames
+            if frame not in comparison_available
+        ]
+        if missing_frames:
+            raise FileNotFoundError(
+                f"Comparison directory {comparison_root} is missing displayed "
+                f"frames: {missing_frames}"
+            )
+
+        comparison_manifest, comparison_summary = load_result_metadata(
+            comparison_root
+        )
+        comparison_spacing = tuple(
+            float(value)
+            for value in comparison_manifest.get(
+                "spacing_zyx_um",
+                DEFAULT_SPACING_ZYX_UM,
+            )
+        )
+        if not np.allclose(
+            np.asarray(comparison_spacing, dtype=np.float64),
+            np.asarray(spacing, dtype=np.float64),
+            rtol=0.0,
+            atol=1e-9,
+        ):
+            raise ValueError(
+                "Primary/comparison physical spacing differs: "
+                f"{spacing} vs {comparison_spacing} ({comparison_root})"
+            )
+
+        explicit_label = (
+            args.compare_label[index]
+            if index < len(args.compare_label)
+            else None
+        )
+        label = result_label(
+            comparison_root,
+            comparison_manifest,
+            explicit_label,
+        )
+        comparisons.append(
+            {
+                "root": comparison_root,
+                "manifest": comparison_manifest,
+                "summary": comparison_summary,
+                "label": label,
+            }
+        )
 
     print("=" * 110)
     print("STIR-Net Investigation 13 — BioHub full-volume result viewer")
@@ -512,8 +732,16 @@ def main() -> None:
     print("sample             :", args.sample_id)
     print("Raw sample Zarr    :", sample_zarr)
     print("Stage-6            :", stage6_root)
-    print("Inference          :", inference_root)
+    print("Primary inference  :", inference_root)
+    print("Primary label      :", primary_label)
     print("checkpoint step    :", manifest.get("checkpoint_step"))
+    for index, comparison in enumerate(comparisons, 1):
+        print(
+            f"Compare {index:<11}:",
+            comparison["label"],
+            "->",
+            comparison["root"],
+        )
     print("frames             :", frames)
     print("spacing ZYX um     :", spacing)
     print("completed          :", summary.get("completed_count"))
@@ -546,8 +774,42 @@ def main() -> None:
             frames,
             "partition/spatial_partition.npy",
         ),
-        name="STIR-Net spatial partition",
+        name=f"STIR-Net spatial partition [{primary_label}]",
     )
+
+    comparison_partitions = []
+    for comparison in comparisons:
+        comparison_partition, _ = stack_npy(
+            inference_paths(
+                comparison["root"],
+                frames,
+                "partition/spatial_partition.npy",
+            ),
+            name=(
+                "STIR-Net spatial partition "
+                f"[{comparison['label']}]"
+            ),
+        )
+        comparison_partitions.append(
+            (comparison, comparison_partition)
+        )
+
+        if not args.no_watershed_check:
+            mismatches = watershed_mismatch_frames(
+                inference_root,
+                comparison["root"],
+                frames,
+            )
+            print(
+                f"[compare] watershed {primary_label} vs "
+                f"{comparison['label']}: "
+                + (
+                    "IDENTICAL"
+                    if not mismatches
+                    else f"DIFFERS at frames {mismatches}"
+                ),
+                flush=True,
+            )
 
     print(
         f"[viewer] array backend: raw={raw_backend}, saved-results={backend}",
@@ -565,7 +827,7 @@ def main() -> None:
     viewer = napari.Viewer(
         title=(
             f"STIR-Net BioHub full volume | {args.sample_id} | "
-            f"step {manifest.get('checkpoint_step', '?')}"
+            f"{primary_label} | step {manifest.get('checkpoint_step', '?')}"
         )
     )
 
@@ -608,11 +870,68 @@ def main() -> None:
     )
     viewer.add_labels(
         spatial_partition,
-        name="STIR-Net spatial partition",
+        name=f"STIR-Net spatial partition [{primary_label}]",
         scale=scale_4d,
         opacity=0.55,
         visible=True,
     )
+
+    for comparison, comparison_partition in comparison_partitions:
+        viewer.add_labels(
+            comparison_partition,
+            name=(
+                "STIR-Net spatial partition "
+                f"[{comparison['label']}]"
+            ),
+            scale=scale_4d,
+            opacity=0.55,
+            visible=False,
+        )
+
+    if comparison_partitions and not args.no_difference_overlays:
+        primary_boundary = internal_partition_boundary_4d(
+            spatial_partition
+        )
+        for index, (
+            comparison,
+            comparison_partition,
+        ) in enumerate(comparison_partitions):
+            comparison_boundary = internal_partition_boundary_4d(
+                comparison_partition
+            )
+            primary_only = (
+                primary_boundary & ~comparison_boundary
+            )
+            comparison_only = (
+                comparison_boundary & ~primary_boundary
+            )
+
+            viewer.add_image(
+                primary_only,
+                name=(
+                    f"DIFF boundary [{primary_label}] only "
+                    f"vs [{comparison['label']}]"
+                ),
+                scale=scale_4d,
+                colormap="green",
+                contrast_limits=(0.0, 1.0),
+                opacity=1.0,
+                blending="additive",
+                visible=(index == 0),
+            )
+            viewer.add_image(
+                comparison_only,
+                name=(
+                    f"DIFF boundary [{comparison['label']}] only "
+                    f"vs [{primary_label}]"
+                ),
+                scale=scale_4d,
+                colormap="red",
+                contrast_limits=(0.0, 1.0),
+                opacity=1.0,
+                blending="additive",
+                visible=False,
+            )
 
     if not args.no_geometry:
         geometry_specs = (
@@ -734,11 +1053,29 @@ def main() -> None:
         + ", ".join(f"{i}->t{frame:03d}" for i, frame in enumerate(frames)),
         flush=True,
     )
-    print(
-        "[viewer] Toggle Stage-6 source segmentation and STIR-Net spatial "
-        "partition to inspect corrected merges.",
-        flush=True,
-    )
+    if comparisons:
+        print(
+            "[viewer] Toggle the named spatial-partition layers for direct "
+            "model comparison.",
+            flush=True,
+        )
+        if not args.no_difference_overlays:
+            print(
+                "[viewer] GREEN = internal boundary present only in PRIMARY; "
+                "RED = boundary present only in COMPARISON.",
+                flush=True,
+            )
+            print(
+                "[viewer] Difference overlays compare boundary geometry, not "
+                "raw label IDs, so relabeling alone does not create a change.",
+                flush=True,
+            )
+    else:
+        print(
+            "[viewer] Toggle Stage-6 source segmentation and STIR-Net spatial "
+            "partition to inspect corrected merges.",
+            flush=True,
+        )
 
     napari.run()
 

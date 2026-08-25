@@ -1,3 +1,4 @@
+# STIRNET_GENERIC_BIOHUB_INFERENCE_V2
 from __future__ import annotations
 
 """
@@ -70,6 +71,7 @@ import math
 import os
 import shutil
 import sys
+import tempfile
 import time
 from contextlib import nullcontext
 from dataclasses import replace
@@ -219,6 +221,110 @@ def load_eval04():
 
 
 E04 = load_eval04()
+
+
+def _load_raw_checkpoint(path: Path) -> dict[str, Any]:
+    try:
+        return torch.load(
+            path,
+            map_location="cpu",
+            weights_only=False,
+        )
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def load_checkpoint_model_for_inference(
+    checkpoint_path: Path,
+    device: torch.device,
+):
+    """Load experiment checkpoints without weakening strict model checks.
+
+    Normal checkpoints are passed directly to Eval-04.
+
+    Some investigation checkpoints intentionally store experiment metadata under
+    ``training_config`` rather than a serialized TrainingConfig dataclass.
+    Eval-04 correctly rejects those unknown fields. Only for that specific
+    compatibility error, this function makes a temporary checkpoint copy with
+    ``training_config`` omitted and retries. ModelConfig hydration and strict
+    model-state loading remain unchanged. The original checkpoint is untouched.
+    """
+
+    try:
+        checkpoint, model, model_cfg, train_cfg = E04._load_checkpoint_model(
+            checkpoint_path,
+            device,
+        )
+        return checkpoint, model, model_cfg, train_cfg, False
+    except KeyError as exc:
+        message = str(exc)
+        if (
+            "training_config." not in message
+            or "unknown field" not in message
+        ):
+            raise
+
+    payload = _load_raw_checkpoint(checkpoint_path)
+    training_config = payload.get("training_config")
+    if not isinstance(training_config, dict):
+        raise RuntimeError(
+            "Eval-04 rejected checkpoint configuration, but the checkpoint "
+            "does not contain a dictionary training_config to strip."
+        )
+
+    stripped_fields = sorted(str(key) for key in training_config)
+    compatibility_payload = dict(payload)
+    compatibility_payload.pop("training_config", None)
+
+    print(
+        "[checkpoint] experiment-local training_config is not a TrainingConfig; "
+        "retrying inference with a temporary compatibility copy.",
+        flush=True,
+    )
+    print(
+        "[checkpoint] stripped from temporary copy only: "
+        + ", ".join(stripped_fields),
+        flush=True,
+    )
+
+    with tempfile.TemporaryDirectory(
+        prefix="stirnet_inference_checkpoint_"
+    ) as temporary_directory:
+        temporary_path = (
+            Path(temporary_directory)
+            / checkpoint_path.name
+        )
+        torch.save(compatibility_payload, temporary_path)
+
+        checkpoint, model, model_cfg, train_cfg = E04._load_checkpoint_model(
+            temporary_path,
+            device,
+        )
+
+    print(
+        "[checkpoint] strict model load succeeded; original checkpoint "
+        "remains unchanged.",
+        flush=True,
+    )
+    return checkpoint, model, model_cfg, train_cfg, True
+
+
+def validate_run_label(value: str | None) -> str | None:
+    if value is None:
+        return None
+    label = value.strip()
+    if not label:
+        raise ValueError("--run-label cannot be empty")
+    if label in {".", ".."}:
+        raise ValueError("--run-label cannot be '.' or '..'")
+    if any(
+        not (character.isalnum() or character in "-_.")
+        for character in label
+    ):
+        raise ValueError(
+            "--run-label may contain only letters, digits, '-', '_' and '.'"
+        )
+    return label
 
 
 def checkpoint_step_from_name(path: Path) -> int:
@@ -794,7 +900,17 @@ def main() -> None:
         help=(
             "Stable run directory. Default: "
             "runs/stirnet/evaluation/12_biohub_full_volume_spatial_inference/"
-            "<sample>/stepXXXXXX"
+            "<sample>/stepXXXXXX, or <sample>/<run-label>/stepXXXXXX when "
+            "--run-label is supplied."
+        ),
+    )
+    parser.add_argument(
+        "--run-label",
+        default=None,
+        help=(
+            "Optional collision-free experiment label used in the default "
+            "output path. Useful when multiple checkpoints share the same "
+            "global step, e.g. morphology_v2_h100 and morphology_v2_h150."
         ),
     )
     parser.add_argument(
@@ -809,7 +925,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    checkpoint_path = resolve_checkpoint(args.checkpoint, args.checkpoint_dir)
+    checkpoint_path = resolve_checkpoint(
+        args.checkpoint,
+        args.checkpoint_dir,
+    )
+    run_label = validate_run_label(args.run_label)
 
     device = torch.device(
         "cuda"
@@ -822,8 +942,15 @@ def main() -> None:
         raise RuntimeError("--device cuda requested but CUDA is unavailable")
 
     print("[model] loading checkpoint ...", flush=True)
-    checkpoint, model, model_cfg, train_cfg = E04._load_checkpoint_model(
-        checkpoint_path, device
+    (
+        checkpoint,
+        model,
+        model_cfg,
+        train_cfg,
+        stripped_training_config,
+    ) = load_checkpoint_model_for_inference(
+        checkpoint_path,
+        device,
     )
     model.eval()
     step = int(checkpoint["global_step"])
@@ -854,17 +981,21 @@ def main() -> None:
     )
     selected = parse_timepoints(args.timepoints, available)
 
-    output_root = (
-        resolve(args.output_dir)
-        if args.output_dir
-        else ROOT
-        / "runs"
-        / "stirnet"
-        / "evaluation"
-        / SCRIPT_NAME
-        / args.sample_id
-        / f"step{step:06d}"
-    )
+    if args.output_dir:
+        output_root = resolve(args.output_dir)
+    else:
+        output_base = (
+            ROOT
+            / "runs"
+            / "stirnet"
+            / "evaluation"
+            / SCRIPT_NAME
+            / args.sample_id
+        )
+        if run_label is not None:
+            output_base = output_base / run_label
+        output_root = output_base / f"step{step:06d}"
+
     output_root.mkdir(parents=True, exist_ok=True)
 
     config_payload = {
@@ -874,6 +1005,10 @@ def main() -> None:
         "stage6_root": str(stage6_root),
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_step": step,
+        "run_label": run_label,
+        "checkpoint_training_config_stripped_for_inference": bool(
+            stripped_training_config
+        ),
         "device": str(device),
         "spacing_zyx_um": list(spacing),
         "available_timepoints": available,
@@ -905,6 +1040,7 @@ def main() -> None:
             "sample_id",
             "checkpoint_path",
             "checkpoint_step",
+            "run_label",
             "spacing_zyx_um",
             "tile_shape_zyx",
             "tile_overlap_zyx",
@@ -931,6 +1067,13 @@ def main() -> None:
     print("stage-6 root              :", stage6_root)
     print("checkpoint                :", checkpoint_path)
     print("checkpoint step           :", step)
+    print("run label                 :", run_label)
+    print(
+        "training-config compat    :",
+        "stripped temporary copy"
+        if stripped_training_config
+        else "native",
+    )
     print("device                    :", device)
     print("timepoints                :", selected)
     print("spacing ZYX um            :", spacing)
