@@ -102,7 +102,7 @@ class StirNet(nn.Module):
             self.rag_builder.node_feature_dim,
             self.rag_builder.edge_feature_dim,
         )
-        self.partitioner = GraphPartitioner()
+        self.partitioner = GraphPartitioner(self.cfg.partition)
         self.instance_tokenizer = InstanceTokenizer(
             self.cfg.instances, self.cfg.spatial
         )
@@ -284,6 +284,7 @@ class StirNet(nn.Module):
             rag,
             rag.spatial_edge_logits,
             self.cfg.partition.spatial_merge_threshold,
+            stage="spatial",
         )
         return rag, partition
 
@@ -669,6 +670,7 @@ class StirNet(nn.Module):
                             rag,
                             rag.spatial_edge_logits,
                             self.cfg.partition.spatial_merge_threshold,
+                            stage="spatial",
                         )
                     refinement = replace(
                         refinement,
@@ -763,6 +765,7 @@ class StirNet(nn.Module):
             rag,
             reasoning.final_edge_logits,
             self.cfg.partition.final_merge_threshold,
+            stage="final",
         )
 
         use_exist = (

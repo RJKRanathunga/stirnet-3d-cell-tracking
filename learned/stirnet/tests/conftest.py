@@ -1,3 +1,4 @@
+# STIRNET_MULTICUT_POSTINTEGRATION_FIX_V1
 from __future__ import annotations
 
 import torch
@@ -23,6 +24,10 @@ def small_model_config() -> StirNetConfig:
     cfg.partition.rag_hidden_dim = 16
     cfg.partition.rag_layers = 1
     cfg.partition.max_supervoxels = 128
+    # Keep legacy synthetic integration tests topology-stable.
+    # Production PartitionConfig still defaults to spatial multicut.
+    cfg.partition.spatial_partition_backend = "union_find"
+    cfg.partition.final_partition_backend = "union_find"
     cfg.instances.d_model = 32
     cfg.instances.pooled_feature_dim = 8
     cfg.instances.apply_existence_filter = False

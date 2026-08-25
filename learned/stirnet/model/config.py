@@ -142,6 +142,18 @@ class PartitionConfig:
     rag_morphology_detach_geometry: bool = True
     spatial_merge_threshold: float = 0.845
     final_merge_threshold: float = 0.50
+
+    # Signed graph partitioning. Investigation 21 validated minimum-cost
+    # multicut at q=spatial_merge_threshold=0.845 on BioHub. Historical
+    # positive-only connected components remain selectable as "union_find".
+    spatial_partition_backend: str = "multicut"
+    final_partition_backend: str = "union_find"
+    multicut_max_rounds: int = 50
+    multicut_max_constraints_per_round: int = 512
+    multicut_time_limit_seconds: float = 120.0
+    multicut_mip_rel_gap: float = 0.0
+    multicut_probability_epsilon: float = 1e-6
+
     max_supervoxels: int = 4096
     rag_min_node_purity: float = 0.80
     # Require at least half of a proposed node to be backed by GT foreground.
@@ -272,6 +284,30 @@ class ModelConfig:
             raise ValueError("partition.watershed_backend must be 'reference' or 'fast'")
         if self.partition.region_stats_backend not in {"torch", "auto"}:
             raise ValueError("partition.region_stats_backend must be 'torch' or 'auto'")
+        if self.partition.spatial_partition_backend not in {"union_find", "multicut"}:
+            raise ValueError(
+                "partition.spatial_partition_backend must be 'union_find' or 'multicut'"
+            )
+        if self.partition.final_partition_backend not in {"union_find", "multicut"}:
+            raise ValueError(
+                "partition.final_partition_backend must be 'union_find' or 'multicut'"
+            )
+        if self.partition.multicut_max_rounds < 1:
+            raise ValueError("partition.multicut_max_rounds must be positive")
+        if self.partition.multicut_max_constraints_per_round < 1:
+            raise ValueError(
+                "partition.multicut_max_constraints_per_round must be positive"
+            )
+        if self.partition.multicut_time_limit_seconds < 0:
+            raise ValueError(
+                "partition.multicut_time_limit_seconds cannot be negative"
+            )
+        if self.partition.multicut_mip_rel_gap < 0:
+            raise ValueError("partition.multicut_mip_rel_gap cannot be negative")
+        if not 0.0 < self.partition.multicut_probability_epsilon < 0.5:
+            raise ValueError(
+                "partition.multicut_probability_epsilon must be in (0, 0.5)"
+            )
         if self.partition.watershed_component_halo_voxels < 0:
             raise ValueError("watershed_component_halo_voxels cannot be negative")
         if not (
