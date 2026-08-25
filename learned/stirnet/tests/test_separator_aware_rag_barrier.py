@@ -95,3 +95,80 @@ def test_strong_separator_false_merge_gets_margin_loss():
     )
     assert float(losses["separator_barrier_margin"]) > 0
     assert int(losses["separator_barrier_strong_negative_count"]) == 1
+
+def test_rag_builder_attaches_separator_features_before_graph_network():
+    """Regression test for the real production RAGBuilder -> graph-net path."""
+    from learned.stirnet.model.config import PartitionConfig, SpatialConfig
+    from learned.stirnet.model.partition.rag import RAGBuilder
+    from learned.stirnet.model.types import GeometryState, RAGState
+
+    cfg = PartitionConfig()
+    cfg.rag_hidden_dim = 8
+    cfg.rag_layers = 1
+    cfg.rag_morphology_enabled = False
+    cfg.rag_separator_barrier_enabled = True
+    cfg.rag_separator_barrier_use_morphology = False
+
+    spatial_cfg = SpatialConfig()
+    builder = RAGBuilder(cfg, spatial_cfg)
+
+    labels = torch.tensor(
+        [[[1, 1, 2, 2], [1, 1, 2, 2]]],
+        dtype=torch.long,
+    )
+    rag = RAGState(
+        node_features=torch.zeros(2, builder.node_feature_dim),
+        node_embeddings=torch.zeros(2, cfg.rag_hidden_dim),
+        node_batch=torch.zeros(2, dtype=torch.long),
+        node_supervoxel_id=torch.tensor([1, 2], dtype=torch.long),
+        node_centroid_um=torch.zeros(2, 3),
+        node_volume_voxels=torch.ones(2),
+        edge_index=torch.tensor([[0], [1]], dtype=torch.long),
+        edge_features=torch.zeros(1, builder.edge_feature_dim),
+        edge_embeddings=torch.zeros(1, cfg.rag_hidden_dim),
+        spatial_edge_logits=torch.zeros(1),
+        edge_batch=torch.zeros(1, dtype=torch.long),
+        supervoxel_labels=[labels],
+        node_offsets=torch.tensor([0, 2], dtype=torch.long),
+    )
+
+    shape = (1, 1, 1, 2, 4)
+    separator_probability = torch.zeros(shape)
+    separator_probability[..., 1:3] = 0.95
+    surface_probability = torch.zeros(shape)
+    foreground_probability = torch.ones(shape)
+    seed_probability = torch.zeros(shape)
+
+    geometry = GeometryState(
+        foreground_logits=torch.logit(
+            foreground_probability.clamp(1e-4, 1 - 1e-4)
+        ),
+        surface_logits=torch.logit(
+            surface_probability.clamp(1e-4, 1 - 1e-4)
+        ),
+        separator_logits=torch.logit(
+            separator_probability.clamp(1e-4, 1 - 1e-4)
+        ),
+        sdf=torch.zeros(shape),
+        flow=torch.zeros(1, 3, 1, 2, 4),
+        centroid_offset=torch.zeros(1, 3, 1, 2, 4),
+        seed_logits=torch.logit(
+            seed_probability.clamp(1e-4, 1 - 1e-4)
+        ),
+        features=None,
+    )
+
+    attached = builder._attach_morphology(
+        rag,
+        torch.zeros(1, spatial_cfg.in_channels, 1, 2, 4),
+        geometry,
+        torch.tensor([[1.0, 1.0, 1.0]]),
+        torch.tensor([2.0]),
+    )
+
+    assert attached.separator_barrier_features is not None
+    assert attached.separator_barrier_features.shape == (
+        1,
+        SEPARATOR_BARRIER_FEATURE_DIM,
+    )
+    assert float(attached.separator_barrier_features[0, 0]) > 0.9

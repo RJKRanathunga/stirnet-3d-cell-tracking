@@ -201,8 +201,37 @@ class RAGBuilder(nn.Module):
         stage_profiler=None,
         profile_prefix: str = "rag",
     ) -> RAGState:
+        # STIRNET_SEPARATOR_BARRIER_FEATURE_ATTACHMENT_FIX_V1
+        #
+        # The production graph network consumes separator_barrier_features
+        # whenever rag_separator_barrier_enabled=True. These features belong
+        # to RAG construction and must be attached BEFORE
+        # SpatialRAGNetwork.forward().
+        #
+        # Keep this independent of morphology: barrier configurations that do
+        # not use morphology still require the exact-contact features.
+        if self.cfg.rag_separator_barrier_enabled:
+            with _profile(
+                stage_profiler,
+                f"{profile_prefix}_separator_barrier_features",
+            ):
+                separator_features = build_separator_barrier_features(
+                    rag,
+                    geometry,
+                    spacing_um,
+                    dref_um,
+                    detach_geometry=(
+                        self.cfg.rag_separator_barrier_detach_geometry
+                    ),
+                )
+            rag = replace(
+                rag,
+                separator_barrier_features=separator_features,
+            )
+
         if self.morphology_builder is None:
             return rag
+
         with _profile(stage_profiler, f"{profile_prefix}_morphology_embedding"):
             node_morphology, edge_morphology = self.morphology_builder(
                 rag,
