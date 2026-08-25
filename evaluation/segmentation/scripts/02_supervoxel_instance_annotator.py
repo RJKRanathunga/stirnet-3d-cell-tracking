@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-Interactive BioHub supervoxel split annotator — v9.
+Interactive BioHub supervoxel split annotator — v10.
 
 Purpose
 -------
@@ -67,14 +67,21 @@ Undo:
     - "Reset selections" clears the boxes and seed highlights,
     - Save automatically resets the selections after a successful split.
 
-Adjacency-aware graph coloring:
-    - one node = one positive label value,
-    - one edge = two labels touch through a 3-D voxel face,
-    - touching atomic supervoxels are forced to different display colors,
-    - touching segmented/current instances are forced to different display colors,
-    - non-touching labels may reuse colors,
-    - no time-axis adjacency is introduced,
-    - after Save/Undo only the changed instance frame's contact graph is rebuilt.
+Unique label display coloring:
+    - every positive atomic-supervoxel label value gets its own display color,
+    - every positive segmented/current-instance label value gets its own display color,
+    - two DIFFERENT label IDs therefore never intentionally reuse the same color,
+    - touching labels are automatically different because all distinct IDs differ,
+    - the mapping is deterministic across all loaded timepoints,
+    - after Save/Undo the changed instance frame is rescanned and new output IDs
+      receive new unique colors.
+
+Why this is stronger than the previous graph coloring:
+    - graph coloring only guaranteed different colors when two labels physically
+      shared a voxel face,
+    - two separate cells with a thin background gap could legally reuse a color,
+    - that was visually misleading in 3-D projection,
+    - this annotator therefore uses unique-per-label colors instead.
 
 Default production input
 ------------------------
@@ -1612,32 +1619,59 @@ def _hsv_to_rgba(
     return float(r), float(g), float(b), 1.0
 
 
-def _display_color_for_graph_index(
-    color_index: int,
+def _display_color_for_unique_index(
+    unique_index: int,
 ) -> tuple[float, float, float, float]:
     """
-    Map one graph-color index to one deterministic RGBA color.
+    Return a deterministic, non-repeating display color for one label rank.
 
-    We never modulo-wrap the graph-color index. If the graph needs more colors
-    than the base palette, new hues are generated, preserving the invariant that
-    distinct graph-color indices remain distinct display colors.
+    Consecutive indices are deliberately far apart in hue using golden-ratio
+    stepping. That is particularly useful here because neighbouring watershed
+    IDs are often numerically close.
+
+    For the few hundred labels in these BioHub frames this produces a large
+    practical palette without exact color reuse.
     """
-    color_index = int(color_index)
+    unique_index = int(unique_index)
 
-    if color_index < len(_GRAPH_COLOR_BASE_RGBA):
-        return _GRAPH_COLOR_BASE_RGBA[color_index]
+    if unique_index < 0:
+        raise ValueError(
+            f"unique_index must be non-negative, got {unique_index}"
+        )
 
-    extra = color_index - len(_GRAPH_COLOR_BASE_RGBA)
+    # Keep the first few colors maximally obvious.
+    if unique_index < len(_GRAPH_COLOR_BASE_RGBA):
+        return _GRAPH_COLOR_BASE_RGBA[unique_index]
 
-    # Golden-ratio hue stepping distributes an arbitrary number of colors around
-    # the hue circle without requiring a fixed palette length.
+    extra = unique_index - len(_GRAPH_COLOR_BASE_RGBA)
+
+    golden_ratio_conjugate = 0.6180339887498949
     hue = (
-        0.08
-        + (extra + 1) * 0.6180339887498949
+        0.03
+        + (extra + 1) * golden_ratio_conjugate
     ) % 1.0
 
-    saturation = 0.68 + 0.08 * (extra % 3)
-    value = 0.90 + 0.05 * (extra % 2)
+    # Cycle saturation/value independently from hue. This increases separation
+    # between colors whose hue eventually comes close after many labels.
+    saturation_cycle = (
+        0.82,
+        0.68,
+        0.92,
+        0.74,
+    )
+    value_cycle = (
+        0.98,
+        0.86,
+        0.94,
+    )
+
+    saturation = saturation_cycle[
+        extra % len(saturation_cycle)
+    ]
+    value = value_cycle[
+        (extra // len(saturation_cycle))
+        % len(value_cycle)
+    ]
 
     return _hsv_to_rgba(
         hue,
@@ -1867,15 +1901,22 @@ def _color_dict_from_frame_graph_cache(
     dict[int, tuple[float, float, float, float]],
     dict[str, int],
 ]:
+    """
+    Build a UNIQUE label-value -> RGBA mapping.
+
+    The frame contact graphs are still merged for diagnostics, but unlike the
+    previous graph-coloring implementation we never reuse a display color
+    between two different positive label IDs.
+    """
     adjacency, all_labels = (
         _merge_frame_graph_cache(
             frame_graphs
         )
     )
 
-    graph_colors = _greedy_graph_coloring(
-        adjacency,
-        all_labels,
+    ordered_labels = sorted(
+        int(label_id)
+        for label_id in all_labels
     )
 
     color_dict: dict[
@@ -1885,10 +1926,12 @@ def _color_dict_from_frame_graph_cache(
         0: (0.0, 0.0, 0.0, 0.0),
     }
 
-    for label_id, color_index in graph_colors.items():
+    for unique_index, label_id in enumerate(
+        ordered_labels
+    ):
         color_dict[int(label_id)] = (
-            _display_color_for_graph_index(
-                int(color_index)
+            _display_color_for_unique_index(
+                int(unique_index)
             )
         )
 
@@ -1900,16 +1943,23 @@ def _color_dict_from_frame_graph_cache(
         // 2
     )
 
+    # Defensive invariant: every touching pair must have different RGBA values.
+    # This is now implied by unique-per-label coloring, but checking it here
+    # protects future modifications to the color generator.
+    for node, neighbours in adjacency.items():
+        node_color = color_dict[int(node)]
+
+        for neighbour in neighbours:
+            if node_color == color_dict[int(neighbour)]:
+                raise RuntimeError(
+                    "Unique display-color invariant failed for touching "
+                    f"labels {node} and {neighbour}."
+                )
+
     stats = {
-        "label_count": int(len(all_labels)),
+        "label_count": int(len(ordered_labels)),
         "touch_edge_count": int(edge_count),
-        "color_count": int(
-            max(
-                graph_colors.values(),
-                default=-1,
-            )
-            + 1
-        ),
+        "color_count": int(len(ordered_labels)),
     }
 
     return color_dict, stats
@@ -2260,7 +2310,7 @@ def make_viewer(
 
     print()
     print("=" * 72)
-    print("Computing adjacency-aware graph colors")
+    print("Computing unique per-label display colors")
     print("=" * 72)
 
     supervoxel_frame_graphs = (
@@ -2289,16 +2339,16 @@ def make_viewer(
     )
 
     print(
-        "[graph colors] supervoxels: "
+        "[display colors] supervoxels: "
         f"{supervoxel_color_stats['label_count']} label values | "
         f"{supervoxel_color_stats['touch_edge_count']} touching pairs | "
-        f"{supervoxel_color_stats['color_count']} colors"
+        f"{supervoxel_color_stats['color_count']} unique colors"
     )
     print(
-        "[graph colors] instances: "
+        "[display colors] instances: "
         f"{instance_color_stats['label_count']} label values | "
         f"{instance_color_stats['touch_edge_count']} touching pairs | "
-        f"{instance_color_stats['color_count']} colors"
+        f"{instance_color_stats['color_count']} unique colors"
     )
 
     viewer.dims.axis_labels = (
@@ -2325,7 +2375,7 @@ def make_viewer(
         session.corrected,
         name="Corrected instances",
         scale=scale_4d,
-        opacity=0.45,
+        opacity=1,
     )
 
     # Older Napari versions do not accept color= in viewer.add_labels(), but
@@ -2449,7 +2499,7 @@ def make_viewer(
     )
     instruction_label = Label(
         value=(
-            "Touching SVs/instances use different graph colors.\n"
+            "Every different SV/instance ID gets its own display color.\n"
             "Single-click visible supervoxels to add split seeds.\n"
             "1st click -> Instance 1; 2nd -> Instance 2.\n"
             "Further clicks use Instance 3/4 if needed.\n"
@@ -2552,10 +2602,10 @@ def make_viewer(
         )
 
         print(
-            "[graph colors] refreshed instances: "
+            "[display colors] refreshed instances: "
             f"{stats['label_count']} label values | "
             f"{stats['touch_edge_count']} touching pairs | "
-            f"{stats['color_count']} colors"
+            f"{stats['color_count']} unique colors"
         )
 
     selected_seed_ids: list[int | None] = [
@@ -2937,8 +2987,8 @@ def make_viewer(
     print("1. Navigate through the selected timepoints and z slices.")
     print("2. Find a merged spatial instance.")
     print(
-        "3. Touching atomic supervoxels and touching segmented instances "
-        "are graph-colored so neighbours have different display colors."
+        "3. Every different supervoxel ID and every different segmented "
+        "instance ID gets its own display color; colors are not reused."
     )
     print(
         "4. In 3-D, SINGLE-CLICK the first visible seed supervoxel. "
@@ -3009,7 +3059,7 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("BIOHUB SUPERVOXEL INSTANCE ANNOTATOR V9")
+    print("BIOHUB SUPERVOXEL INSTANCE ANNOTATOR V10")
     print("=" * 72)
     print(f"Repository       : {REPO_ROOT}")
     print(f"Sample           : {args.sample_id}")
