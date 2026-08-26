@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""
+r"""
 Interactive BioHub supervoxel split annotator — v11.
 
 # STIRNET_ANNOTATOR_V11_DEFAULT_INV25_V1
@@ -129,12 +129,34 @@ BINARY_MASK_PATH is optional. If omitted, after_split_only > 0 is used as the
 foreground mask for placing supervoxel text outside cell surfaces.
 
 Run this file from the repository root.
+
+    python .\apply_biohub_merge_suspect_layer_patch.py
+
+Then you can run the scorer separately:
+
+    python .\evaluation\segmentation\scripts\03_biohub_merge_suspect_export.py `
+        --sample-id 44b6_0113de3b `
+        --timepoints all
+
+and later open the annotator with any threshold:
+
+    python .\evaluation\segmentation\scripts\02_supervoxel_instance_annotator.py `
+        --timepoints all `
+        --suspect-threshold 0.70
+
+Or use the one-command version:
+
+    python .\evaluation\segmentation\scripts\02_supervoxel_instance_annotator.py `
+        --timepoints all `
+        --build-suspects `
+        --suspect-threshold 0.70
 """
 
 import argparse
 import heapq
 import json
 import math
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -177,6 +199,10 @@ DEFAULT_SAMPLE_ID = "44b6_0113de3b"
 DEFAULT_TIMEPOINTS = (0, 1, 2)
 
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "evaluation" / "segmentation" / "annotations"
+
+# STIRNET_ANNOTATOR_SUSPECT_LAYER_V1
+DEFAULT_SUSPECT_ROOT = REPO_ROOT / "evaluation" / "segmentation" / "suspects"
+DEFAULT_SUSPECT_THRESHOLD = 0.70
 
 DEFAULT_INV25_ROOT = (
     REPO_ROOT
@@ -328,6 +354,48 @@ def parse_args() -> argparse.Namespace:
         help="Annotation output directory.",
     )
     parser.add_argument(
+        "--suspect-root",
+        type=Path,
+        default=None,
+        help=(
+            "Directory containing 03_ suspect t###.npz outputs. Default: "
+            "evaluation/segmentation/suspects/<sample-id>."
+        ),
+    )
+    parser.add_argument(
+        "--suspect-threshold",
+        type=float,
+        default=DEFAULT_SUSPECT_THRESHOLD,
+        help=(
+            "Display an original predicted instance when suspect_score is >= "
+            "this threshold. Changing it does not rerun inference."
+        ),
+    )
+    parser.add_argument(
+        "--build-suspects",
+        action="store_true",
+        help=(
+            "Run sibling 03_biohub_merge_suspect_export.py first, then consume "
+            "its score files."
+        ),
+    )
+    parser.add_argument(
+        "--suspect-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional causal temporal checkpoint passed to the 03_ exporter.",
+    )
+    parser.add_argument(
+        "--suspect-device",
+        default="auto",
+        help="Device passed to 03_: auto, cpu, cuda, cuda:0, ...",
+    )
+    parser.add_argument(
+        "--rebuild-suspects",
+        action="store_true",
+        help="Recompute score NPZ files when --build-suspects is used.",
+    )
+    parser.add_argument(
         "--no-resume",
         action="store_true",
         help="Ignore existing manual-instance outputs in the output directory.",
@@ -440,6 +508,12 @@ def resolve_paths(args: argparse.Namespace) -> argparse.Namespace:
 
     if args.output_dir is None:
         args.output_dir = DEFAULT_OUTPUT_ROOT / sample_id
+
+    if args.suspect_root is None:
+        args.suspect_root = DEFAULT_SUSPECT_ROOT / sample_id
+
+    if not 0.0 <= float(args.suspect_threshold) <= 1.0:
+        raise AnnotationError("--suspect-threshold must lie in [0, 1].")
 
     return args
 
@@ -581,6 +655,121 @@ def load_investigation25_frames(
         np.stack(supervoxel_frames, axis=0),
         np.stack(instance_frames, axis=0),
     )
+
+
+# ============================================================
+# OPTIONAL MERGE-SUSPECT DISPLAY ARTIFACT
+# ============================================================
+
+
+def _suspect_score_path(suspect_root: Path, dataset_t: int) -> Path:
+    return suspect_root / f"t{int(dataset_t):03d}.npz"
+
+
+def run_suspect_exporter(
+    *,
+    args: argparse.Namespace,
+    timepoints: tuple[int, ...],
+    spatial_root: Path,
+    supervoxel_root: Path,
+) -> None:
+    """Convenience wrapper; all scoring remains in sibling 03_."""
+    script = Path(__file__).resolve().parent / "03_biohub_merge_suspect_export.py"
+    if not script.is_file():
+        raise FileNotFoundError(f"Merge-suspect exporter is missing:\n  {script}")
+
+    selection = ",".join(str(int(t)) for t in timepoints)
+    command = [
+        sys.executable,
+        str(script),
+        "--sample-id", str(args.sample_id),
+        "--timepoints", selection,
+        "--inv25", str(spatial_root),
+        "--inv24", str(supervoxel_root),
+        "--zarr", str(args.zarr_path),
+        "--output-dir", str(args.suspect_root),
+        "--device", str(args.suspect_device),
+    ]
+    if args.suspect_checkpoint is not None:
+        command.extend(["--checkpoint", str(args.suspect_checkpoint)])
+    if args.rebuild_suspects:
+        command.append("--rebuild-scores")
+
+    print()
+    print("=" * 72)
+    print("Building merge-suspect scores with sibling 03_ exporter")
+    print("=" * 72)
+    print(" ".join(command))
+    print("=" * 72)
+    subprocess.run(command, cwd=REPO_ROOT, check=True)
+
+
+def load_suspect_instance_frames(
+    *,
+    suspect_root: Path,
+    timepoints: tuple[int, ...],
+    instances: np.ndarray,
+    threshold: float,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Rasterize threshold-passing ORIGINAL instance IDs only."""
+    if instances.ndim != 4:
+        raise AnnotationError(
+            f"Suspect display expects (T,Z,Y,X); got {instances.shape}."
+        )
+    if len(timepoints) != instances.shape[0]:
+        raise AnnotationError("Suspect timepoint/instance-stack length mismatch.")
+
+    output = np.zeros_like(instances)
+    total_rows = 0
+    total_displayed = 0
+
+    for local_t, dataset_t in enumerate(timepoints):
+        path = _suspect_score_path(suspect_root, dataset_t)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Missing merge-suspect score file:\n  {path}\n"
+                "Run 03_ first or pass --build-suspects."
+            )
+        with np.load(path, allow_pickle=False) as payload:
+            missing = [
+                key for key in ("instance_id", "suspect_score")
+                if key not in payload.files
+            ]
+            if missing:
+                raise AnnotationError(f"{path} is missing arrays: {missing}")
+            ids = np.asarray(payload["instance_id"], dtype=np.int64).reshape(-1)
+            scores = np.asarray(payload["suspect_score"], dtype=np.float32).reshape(-1)
+
+        if ids.shape != scores.shape:
+            raise AnnotationError(f"ID/score mismatch in {path}")
+        if ids.size and len(np.unique(ids)) != len(ids):
+            raise AnnotationError(f"Duplicate instance IDs in {path}")
+        if np.any(ids <= 0) or np.any(~np.isfinite(scores)):
+            raise AnnotationError(f"Invalid suspect rows in {path}")
+
+        frame = instances[local_t]
+        max_label = int(frame.max(initial=0))
+        lookup = np.zeros(max_label + 1, dtype=bool)
+        passing_ids = ids[scores >= float(threshold)]
+        passing_ids = passing_ids[passing_ids <= max_label]
+        if passing_ids.size:
+            lookup[passing_ids] = True
+            frame_index = frame.astype(np.int64, copy=False)
+            output[local_t] = np.where(lookup[frame_index], frame, 0).astype(
+                instances.dtype, copy=False
+            )
+
+        total_rows += int(len(ids))
+        total_displayed += int(len(passing_ids))
+        print(
+            f"[suspects] t={dataset_t}: {len(passing_ids)}/{len(ids)} "
+            f"instances >= {float(threshold):.3f}"
+        )
+
+    return output, {
+        "score_rows": int(total_rows),
+        "displayed_instances": int(total_displayed),
+    }
 
 
 # ============================================================
@@ -2420,6 +2609,7 @@ def make_viewer(
     supervoxels: np.ndarray,
     foreground: np.ndarray,
     session: AnnotationSession,
+    suspect_instances: np.ndarray | None = None,
 ) -> napari.Viewer:
     print()
     print("=" * 72)
@@ -2528,6 +2718,24 @@ def make_viewer(
         corrected_layer,
         instance_color_dict,
     )
+
+    # ----------------------------------------
+    # Merge-suspect predicted instances
+    # ----------------------------------------
+    # Static read-only visualization of the ORIGINAL prediction. Save/Undo do
+    # not mutate this layer or any existing annotation state.
+    if suspect_instances is not None:
+        suspect_layer = viewer.add_labels(
+            suspect_instances,
+            name="Suspect predicted instances",
+            scale=scale_4d,
+            opacity=1.0,
+            visible=False,
+        )
+        _apply_label_color_dict(
+            suspect_layer,
+            instance_color_dict,
+        )
 
     # ----------------------------------------
     # Ray-picked seed supervoxel highlights
@@ -3229,6 +3437,9 @@ def main() -> None:
     )
     print(f"Spacing ZYX um   : {DEFAULT_SPACING_ZYX_UM}")
     print(f"Output           : {args.output_dir}")
+    print(f"Suspect root     : {args.suspect_root}")
+    print(f"Suspect threshold: {float(args.suspect_threshold):.3f}")
+    print(f"Build suspects   : {bool(args.build_suspects)}")
     print()
 
     raw = load_raw_frames(
@@ -3304,6 +3515,45 @@ def main() -> None:
             f"supervoxels={supervoxels.shape}."
         )
 
+    suspect_instances = None
+
+    if args.build_suspects:
+        run_suspect_exporter(
+            args=args,
+            timepoints=timepoints,
+            spatial_root=spatial_root,
+            supervoxel_root=supervoxel_root,
+        )
+
+    suspect_root = args.suspect_root.resolve()
+    if suspect_root.is_dir():
+        try:
+            suspect_instances, suspect_stats = load_suspect_instance_frames(
+                suspect_root=suspect_root,
+                timepoints=timepoints,
+                instances=instances,
+                threshold=float(args.suspect_threshold),
+            )
+            print(
+                "[suspects] display stack ready: "
+                f"{suspect_stats['displayed_instances']} threshold-passing "
+                f"instances from {suspect_stats['score_rows']} score rows"
+            )
+        except FileNotFoundError as exc:
+            if args.build_suspects:
+                raise
+            print(
+                "[suspects] score directory is incomplete for selected frames; "
+                "suspect layer disabled."
+            )
+            print(exc)
+            suspect_instances = None
+    else:
+        print(
+            "[suspects] no score directory found; existing annotator behavior "
+            "is unchanged. Use --build-suspects to create it."
+        )
+
     session = AnnotationSession(
         sample_id=args.sample_id,
         timepoints=timepoints,
@@ -3321,6 +3571,7 @@ def main() -> None:
         supervoxels=supervoxels,
         foreground=foreground,
         session=session,
+        suspect_instances=suspect_instances,
     )
 
     napari.run()

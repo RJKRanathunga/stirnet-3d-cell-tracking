@@ -16,4 +16,7 @@ dist/
 
 # Training checkpoints
 /runs/
+
 /kaggle/offline_wheels/
+
+/evaluation/segmentation/suspects/
