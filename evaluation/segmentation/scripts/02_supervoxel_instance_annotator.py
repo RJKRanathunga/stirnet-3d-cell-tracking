@@ -3,6 +3,8 @@ from __future__ import annotations
 """
 Interactive BioHub supervoxel split annotator — v11.
 
+# STIRNET_ANNOTATOR_V11_DEFAULT_INV25_V1
+
 Purpose
 -------
 Use the current spatial segmentation as pseudo-ground-truth and manually correct
@@ -87,19 +89,30 @@ Why this is stronger than the previous graph coloring:
 
 Default production input
 ------------------------
-By default this script directly consumes Investigation 24:
+By default this script now uses Investigation 25 as the CURRENT instance
+segmentation:
+
+    runs/stirnet/evaluation/
+        25_source_core_split_biohub_visualization/
+        <sample-id>/
+        source_instance_anchors_supervoxel_graph_defaults/
+            t000/partition/after_split_only.npy
+            ...
+            t019/partition/after_split_only.npy
+
+Investigation 25 deliberately reuses the Investigation-24 atomic watershed
+instead of duplicating it. Therefore the annotator loads atomic SV IDs from:
 
     runs/stirnet/evaluation/
         24_multicut_biohub_full_volume_visualization/
         <sample-id>/h100_q0p845/
             t000/partition/watershed_supervoxels.npy
-            t000/partition/spatial_partition.npy
             ...
             t019/partition/watershed_supervoxels.npy
-            t019/partition/spatial_partition.npy
 
-`watershed_supervoxels.npy` supplies the atomic SV IDs.
-`spatial_partition.npy` supplies the strong multicut instance segmentation.
+`after_split_only.npy` supplies the final Investigation-25 instances.
+`watershed_supervoxels.npy` supplies the same atomic SV IDs used by
+Investigation 25.
 
 Timepoint selection examples:
     --timepoints all
@@ -109,10 +122,10 @@ Timepoint selection examples:
 Legacy --supervoxels/--instances overrides are still supported, but normally
 you should omit them.
 
-The BioHub physical scale follows Investigation 24:
+The BioHub physical scale is unchanged across Investigations 24/25:
     Z,Y,X = 1.625, 0.40625, 0.40625 um
 
-BINARY_MASK_PATH is optional. If omitted, spatial_partition > 0 is used as the
+BINARY_MASK_PATH is optional. If omitted, after_split_only > 0 is used as the
 foreground mask for placing supervoxel text outside cell surfaces.
 
 Run this file from the repository root.
@@ -165,13 +178,23 @@ DEFAULT_TIMEPOINTS = (0, 1, 2)
 
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "evaluation" / "segmentation" / "annotations"
 
-DEFAULT_MULTICUT_ROOT = (
+DEFAULT_INV25_ROOT = (
+    REPO_ROOT
+    / "runs"
+    / "stirnet"
+    / "evaluation"
+    / "25_source_core_split_biohub_visualization"
+)
+
+DEFAULT_INV24_MULTICUT_ROOT = (
     REPO_ROOT
     / "runs"
     / "stirnet"
     / "evaluation"
     / "24_multicut_biohub_full_volume_visualization"
 )
+
+DEFAULT_INV25_VARIANT = "source_instance_anchors_supervoxel_graph_defaults"
 
 DEFAULT_SPACING_ZYX_UM = (1.625, 0.40625, 0.40625)
 
@@ -243,10 +266,19 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Investigation-24 output root containing "
-            "t###/partition/watershed_supervoxels.npy and "
-            "spatial_partition.npy. If omitted, the standard "
-            "h100_q0p845 output root is used."
+            "Investigation-25 output root containing "
+            "t###/partition/after_split_only.npy. If omitted, the standard "
+            "source_instance_anchors_supervoxel_graph_defaults root is used."
+        ),
+    )
+    parser.add_argument(
+        "--supervoxel-root",
+        type=Path,
+        default=None,
+        help=(
+            "Investigation-24 h100_q0p845 root containing "
+            "t###/partition/watershed_supervoxels.npy. Investigation 25 "
+            "reuses these atomic supervoxels. Normally omit this option."
         ),
     )
     parser.add_argument(
@@ -271,7 +303,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional legacy override for atomic supervoxels. Normally omit "
-            "this and use the Investigation-24 --spatial-root."
+            "this and use the default Investigation-25/24 roots."
         ),
     )
     parser.add_argument(
@@ -280,7 +312,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional legacy override for spatial instances. Normally omit "
-            "this and use the Investigation-24 --spatial-root."
+            "this and use the default Investigation-25/24 roots."
         ),
     )
     parser.add_argument(
@@ -304,8 +336,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def default_spatial_root(sample_id: str) -> Path:
+    """Final Investigation-25 split-only instance root."""
     return (
-        DEFAULT_MULTICUT_ROOT
+        DEFAULT_INV25_ROOT
+        / sample_id
+        / DEFAULT_INV25_VARIANT
+    )
+
+
+def default_supervoxel_root(sample_id: str) -> Path:
+    """Investigation-24 atomic watershed inherited by Investigation 25."""
+    return (
+        DEFAULT_INV24_MULTICUT_ROOT
         / sample_id
         / "h100_q0p845"
     )
@@ -322,10 +364,7 @@ def completed_spatial_frames(root: Path) -> list[int]:
             continue
 
         partition_dir = frame_dir / "partition"
-        if (
-            (partition_dir / "watershed_supervoxels.npy").is_file()
-            and (partition_dir / "spatial_partition.npy").is_file()
-        ):
+        if (partition_dir / "after_split_only.npy").is_file():
             frames.append(int(frame_dir.name[1:]))
 
     return sorted(frames)
@@ -339,7 +378,7 @@ def parse_timepoint_selection(
 
     if not available:
         raise AnnotationError(
-            "No completed Investigation-24 frames were found."
+            "No completed Investigation-25 frames were found."
         )
 
     if token in {"all", "*"}:
@@ -395,6 +434,9 @@ def resolve_paths(args: argparse.Namespace) -> argparse.Namespace:
 
     if args.spatial_root is None:
         args.spatial_root = default_spatial_root(sample_id)
+
+    if args.supervoxel_root is None:
+        args.supervoxel_root = default_supervoxel_root(sample_id)
 
     if args.output_dir is None:
         args.output_dir = DEFAULT_OUTPUT_ROOT / sample_id
@@ -480,56 +522,55 @@ def load_stage6_binary_mask_frames(
     return np.stack(frames, axis=0)
 
 
-def load_investigation24_frames(
+def load_investigation25_frames(
     spatial_root: Path,
+    supervoxel_root: Path,
     timepoints: tuple[int, ...],
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Load Inv25 final instances with the exact Inv24 atomic SVs they refine."""
     supervoxel_frames: list[np.ndarray] = []
     instance_frames: list[np.ndarray] = []
 
     for t in timepoints:
-        partition_dir = spatial_root / f"t{t:03d}" / "partition"
-        sv_path = partition_dir / "watershed_supervoxels.npy"
-        instance_path = partition_dir / "spatial_partition.npy"
+        inv25_partition = spatial_root / f"t{t:03d}" / "partition"
+        inv24_partition = supervoxel_root / f"t{t:03d}" / "partition"
+
+        sv_path = inv24_partition / "watershed_supervoxels.npy"
+        instance_path = inv25_partition / "after_split_only.npy"
 
         if not sv_path.is_file():
             raise FileNotFoundError(
-                "Missing Investigation-24 watershed supervoxels:\n"
+                "Missing Investigation-24 atomic watershed supervoxels "
+                "required by Investigation 25:\n"
                 f"  {sv_path}"
             )
 
         if not instance_path.is_file():
             raise FileNotFoundError(
-                "Missing Investigation-24 spatial partition:\n"
+                "Missing Investigation-25 final split-only instances:\n"
                 f"  {instance_path}"
             )
 
-        print(f"[spatial] loading t={t}: {sv_path}")
-
-        sv = np.asarray(
-            np.load(
-                sv_path,
-                mmap_mode="r",
-                allow_pickle=False,
-            )
+        print(
+            f"[spatial] loading t={t}:\n"
+            f"  supervoxels : {sv_path}\n"
+            f"  instances   : {instance_path}"
         )
+
+        sv = np.asarray(np.load(sv_path, mmap_mode="r", allow_pickle=False))
         instances = np.asarray(
-            np.load(
-                instance_path,
-                mmap_mode="r",
-                allow_pickle=False,
-            )
+            np.load(instance_path, mmap_mode="r", allow_pickle=False)
         )
 
         if sv.ndim != 3 or instances.ndim != 3:
             raise AnnotationError(
-                f"Investigation-24 arrays must be 3-D at t={t}; "
+                f"Investigation-24/25 arrays must be 3-D at t={t}; "
                 f"got supervoxels={sv.shape}, instances={instances.shape}."
             )
 
         if sv.shape != instances.shape:
             raise AnnotationError(
-                f"Shape mismatch at t={t}: "
+                f"Investigation-24/25 shape mismatch at t={t}: "
                 f"supervoxels={sv.shape}, instances={instances.shape}."
             )
 
@@ -3151,6 +3192,7 @@ def main() -> None:
     args = resolve_paths(parse_args())
 
     spatial_root = args.spatial_root.resolve()
+    supervoxel_root = args.supervoxel_root.resolve()
     stage6_root = resolve_stage6_root(
         args.sample_id,
         args.stage6_root,
@@ -3159,11 +3201,10 @@ def main() -> None:
 
     if not available:
         raise FileNotFoundError(
-            "No complete Investigation-24 frames were found below:\n"
+            "No complete Investigation-25 frames were found below:\n"
             f"  {spatial_root}\n\n"
             "Expected, for example:\n"
-            "  t000/partition/watershed_supervoxels.npy\n"
-            "  t000/partition/spatial_partition.npy"
+            "  t000/partition/after_split_only.npy"
         )
 
     timepoints = parse_timepoint_selection(
@@ -3176,14 +3217,15 @@ def main() -> None:
     print("=" * 72)
     print(f"Repository       : {REPO_ROOT}")
     print(f"Sample           : {args.sample_id}")
-    print(f"Spatial root     : {spatial_root}")
+    print(f"Inv25 instances : {spatial_root}")
+    print(f"Inv24 SV root   : {supervoxel_root}")
     print(f"Stage-6 root     : {stage6_root}")
     print(f"Available frames : {available}")
     print(f"Selected frames  : {timepoints}")
     print(f"Raw Zarr         : {args.zarr_path}")
     print(
         f"Binary mask      : "
-        f"{args.binary_mask or '(derived from multicut instances)'}"
+        f"{args.binary_mask or '(derived from Investigation-25 instances)'}"
     )
     print(f"Spacing ZYX um   : {DEFAULT_SPACING_ZYX_UM}")
     print(f"Output           : {args.output_dir}")
@@ -3207,10 +3249,13 @@ def main() -> None:
         f"dtype={stage6_binary_mask.dtype}"
     )
 
-    # Recommended production path: consume Investigation-24 artifacts directly.
+    # Recommended production path:
+    #   instances   -> Investigation 25 final split-only partition
+    #   supervoxels -> Investigation 24 atomic watershed reused by Inv25
     if args.supervoxels is None and args.instances is None:
-        supervoxels, instances = load_investigation24_frames(
+        supervoxels, instances = load_investigation25_frames(
             spatial_root,
+            supervoxel_root,
             timepoints,
         )
         supervoxels = supervoxels.astype(np.int32, copy=False)
@@ -3233,7 +3278,7 @@ def main() -> None:
     else:
         raise AnnotationError(
             "--supervoxels and --instances must either both be omitted "
-            "(recommended Investigation-24 mode) or both be supplied."
+            "(recommended Investigation-25 mode) or both be supplied."
         )
 
     if args.binary_mask is None:
