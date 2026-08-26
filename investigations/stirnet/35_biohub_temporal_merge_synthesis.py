@@ -69,7 +69,7 @@ FULL temporal state:
     - balanced preservation edges supervised
     - weak split-head supervision
 
-CORRUPTED state (alternating CONTENTLESS / SHUFFLED):
+CORRUPTED state (alternating CONTENTLESS / WRONG-NEIGHBOURHOOD):
     - corruption is applied BEFORE TemporalSpatialObserver
     - spatial observer evidence remains available
     - corrupted final logits must regress to synthetic spatial logits
@@ -96,9 +96,9 @@ A deterministic held-out adjacent-pair pool reports:
     FULL correction-edge accuracy
     preservation-edge accuracy
     exact recovery of selected merged cells
-    SHUFFLED correction accuracy
+    WRONG-NEIGHBOURHOOD correction accuracy
     CONTENTLESS correction accuracy
-    FULL-SHUFFLED and FULL-CONTENTLESS causal gaps
+    FULL-WRONG-NEIGHBOURHOOD and FULL-CONTENTLESS causal gaps
 
 This is same-movie held-out corruption validation, NOT cross-movie generalization.
 
@@ -254,7 +254,6 @@ from learned.stirnet.training import TrainingConfig
 from learned.stirnet.training.checkpoint import save_checkpoint
 from learned.stirnet.training.temporal_causal import (
     contentless_temporal_state,
-    shuffled_temporal_state,
 )
 
 
@@ -282,7 +281,7 @@ DEFAULT_PRINT_EVERY = 10
 DEFAULT_VAL_CASES = 32
 
 DEFAULT_SYNTHETIC_LOGIT = 3.5
-DEFAULT_CLEAN_FRACTION = 0.25
+DEFAULT_CLEAN_FRACTION = 0.40
 DEFAULT_TRIPLE_FRACTION = 0.10
 DEFAULT_VAL_FRACTION = 0.15
 DEFAULT_MIN_VOXELS = 64
@@ -294,13 +293,16 @@ DEFAULT_MAX_TRIPLES_PER_FRAME = 32
 
 DEFAULT_PRESERVE_EDGES = 512
 DEFAULT_PRESERVE_RATIO = 12
+DEFAULT_PRESERVATION_WEIGHT = 2.0
 DEFAULT_SPLIT_WEIGHT = 0.05
 DEFAULT_NOOP_WEIGHT = 0.50
 DEFAULT_CORRUPTED_GATE_WEIGHT = 0.05
 DEFAULT_MARGIN_WEIGHT = 0.50
 DEFAULT_MARGIN = 1.0
 
-CORRUPTIONS = ("contentless", "shuffled")
+# STIRNET_INV35_OBJECTIVE_V2_WRONG_NEIGHBOURHOOD
+CORRUPTIONS = ("contentless", "wrong_neighbourhood")
+OBJECTIVE_VERSION = 2
 CACHE_VERSION = 2
 OBSERVER_CACHE_VERSION = 1
 
@@ -2022,6 +2024,8 @@ def production_temporal_forward(
     device: torch.device,
     corruption: str,
     corruption_seed: int,
+    corruption_temporal_graph: dict[str, Any] | None = None,
+    corruption_translation_um: Tensor | None = None,
 ) -> ProductionTemporalForward:
     reference = case.rag.node_features
     decoded, geometry = dummy_geometry_and_decode(model, reference)
@@ -2044,12 +2048,46 @@ def production_temporal_forward(
 
     if corruption == "contentless":
         corrupted_base = contentless_temporal_state(temporal_base)
-    elif corruption == "shuffled":
-        corrupted_base = shuffled_temporal_state(temporal_base, seed=int(corruption_seed))
+        corrupted_temporal = observe_from_raw_lookup(
+            model,
+            corrupted_base,
+            observer_lookup,
+        )
+    elif corruption == "wrong_neighbourhood":
+        if corruption_temporal_graph is None or corruption_translation_um is None:
+            raise ValueError(
+                "wrong_neighbourhood requires a donor temporal graph and "
+                "a donor->target physical translation"
+            )
+        donor_input = temporal_input_from_graph(
+            model,
+            corruption_temporal_graph,
+            device,
+        )
+        donor_base = model.temporal_encoder(donor_input)
+        # Observe at real donor cache coordinates first. Recenter only after
+        # observation, so the expensive observer cache remains fully reusable.
+        corrupted_temporal = observe_from_raw_lookup(
+            model,
+            donor_base,
+            observer_lookup,
+        )
+        translation = corruption_translation_um.to(
+            device=corrupted_temporal.ref_um.device,
+            dtype=corrupted_temporal.ref_um.dtype,
+        )
+        corrupted_temporal = replace(
+            corrupted_temporal,
+            ref_um=corrupted_temporal.ref_um + translation[None],
+        )
     else:
         raise ValueError(f"Unknown corruption: {corruption}")
-    corrupted_temporal = observe_from_raw_lookup(model, corrupted_base, observer_lookup)
-    corrupted_reasoning = model.instance_temporal(instances, case.rag, corrupted_temporal, dref_t)
+    corrupted_reasoning = model.instance_temporal(
+        instances,
+        case.rag,
+        corrupted_temporal,
+        dref_t,
+    )
     return ProductionTemporalForward(
         instances,
         temporal_base,
@@ -2141,6 +2179,7 @@ def synthetic_causal_loss(
     *,
     preserve_edges: int,
     preserve_ratio: int,
+    preservation_weight: float,
     split_weight: float,
     noop_weight: float,
     corrupted_gate_weight: float,
@@ -2172,12 +2211,13 @@ def synthetic_causal_loss(
 
     correction_loss = bce(correction_index)
     preservation_loss = bce(preserve_index)
+    weighted_preservation = float(preservation_weight) * preservation_loss
     if correction_index.numel() and preserve_index.numel():
-        edge_loss = correction_loss + preservation_loss
+        edge_loss = correction_loss + weighted_preservation
     elif correction_index.numel():
         edge_loss = correction_loss
     else:
-        edge_loss = preservation_loss
+        edge_loss = weighted_preservation
 
     sidx = split_indices(case.instance_split_target, negative_ratio=8, rng=rng)
     split_loss = (
@@ -2244,7 +2284,7 @@ class EvalAccumulator35:
     cases: int = 0
     correction_edges: int = 0
     full_correction_correct: int = 0
-    shuffled_correction_correct: int = 0
+    wrong_neighbourhood_correction_correct: int = 0
     contentless_correction_correct: int = 0
     preservation_edges: int = 0
     preservation_correct: int = 0
@@ -2259,15 +2299,16 @@ class EvalAccumulator35:
         cases = max(self.cases, 1)
         clean = max(self.local_clean_components, 1)
         full = self.full_correction_correct / corr
-        shuffled = self.shuffled_correction_correct / corr
+        wrong = self.wrong_neighbourhood_correction_correct / corr
         contentless = self.contentless_correction_correct / corr
         return {
+            "objective_version": OBJECTIVE_VERSION,
             "cases": self.cases,
             "correction_edges": self.correction_edges,
             "full_correction_accuracy": float(full),
-            "shuffled_correction_accuracy": float(shuffled),
+            "wrong_neighbourhood_correction_accuracy": float(wrong),
             "contentless_correction_accuracy": float(contentless),
-            "full_minus_shuffled": float(full - shuffled),
+            "full_minus_wrong_neighbourhood": float(full - wrong),
             "full_minus_contentless": float(full - contentless),
             "preservation_edges": self.preservation_edges,
             "preservation_accuracy": float(self.preservation_correct / pres),
@@ -2453,13 +2494,79 @@ def evaluate_model35(
         full_temporal = observe_from_raw_lookup(model, temporal_base, runtime.observer)
         full = model.instance_temporal(instances, synthetic.rag, full_temporal, dref_t)
 
-        shuffled_base = shuffled_temporal_state(temporal_base, seed=seed + 1009 * case_index)
-        shuffled = model.instance_temporal(
+        evaluation_rows = manifest.frames[int(pair.frame)].pairs
+        donor_rng = random.Random(
+            int(seed) + 104_729 * int(case_index)
+        )
+        donor = choose_wrong_neighbour_pair(
+            evaluation_rows,
+            target_ids=merge_ids,
+            reference_pair=pair,
+            temporal_static=temporal_static,
+            track_graph=track_graph,
+            target_t=int(pair.frame),
+            available_offsets=sequence_available_time_offsets(
+                pair.frame,
+                frame_count,
+                temporal_radius,
+            ),
+            rng=donor_rng,
+        )
+        donor_ids = (int(donor.a), int(donor.b))
+        donor_graph = build_local_temporal_graph(
+            temporal_static=temporal_static,
+            track_graph=track_graph,
+            manual_labels=runtime.manual,
+            target_t=pair.frame,
+            frame_count=frame_count,
+            temporal_radius=temporal_radius,
+            available_offsets=sequence_available_time_offsets(
+                pair.frame,
+                frame_count,
+                temporal_radius,
+            ),
+            anchor_ids=donor_ids,
+            merge_ids=donor_ids,
+            spacing=spacing,
+            dref_um=dref_um,
+            neighbourhood_dref=neighbourhood_dref,
+            complete_candidate_graph=complete_candidate_graph,
+        )
+        donor_base = model.temporal_encoder(
+            temporal_input_from_graph(
+                model,
+                donor_graph,
+                device,
+            )
+        )
+        wrong_neighbourhood = observe_from_raw_lookup(
+            model,
+            donor_base,
+            runtime.observer,
+        )
+        donor_anchor = torch.as_tensor(
+            anchor_for_manual_ids(
+                temporal_static,
+                pair.frame,
+                donor_ids,
+            ),
+            device=device,
+            dtype=wrong_neighbourhood.ref_um.dtype,
+        )
+        translation = synthetic.anchor_um.to(
+            wrong_neighbourhood.ref_um
+        ) - donor_anchor
+        wrong_neighbourhood = replace(
+            wrong_neighbourhood,
+            ref_um=wrong_neighbourhood.ref_um + translation[None],
+        )
+        wrong = model.instance_temporal(
             instances,
             synthetic.rag,
-            observe_from_raw_lookup(model, shuffled_base, runtime.observer),
+            wrong_neighbourhood,
             dref_t,
         )
+
         contentless_base = contentless_temporal_state(temporal_base)
         contentless = model.instance_temporal(
             instances,
@@ -2487,8 +2594,8 @@ def evaluate_model35(
             synthetic,
             merge_threshold=final_threshold,
         )
-        shuffled_correct, _ = correction_correct(
-            shuffled,
+        wrong_correct, _ = correction_correct(
+            wrong,
             synthetic,
             merge_threshold=final_threshold,
         )
@@ -2505,7 +2612,7 @@ def evaluate_model35(
         acc.cases += 1
         acc.correction_edges += correction_count
         acc.full_correction_correct += full_correct
-        acc.shuffled_correction_correct += shuffled_correct
+        acc.wrong_neighbourhood_correction_correct += wrong_correct
         acc.contentless_correction_correct += contentless_correct
         acc.preservation_edges += preserve_count
         acc.preservation_correct += preserve_correct_count
@@ -2529,7 +2636,10 @@ def evaluate_model35(
 
     metrics = acc.as_dict()
     metrics["empty_exact_noop"] = bool(metrics["max_empty_noop_error"] == 0.0)
-    min_gap = min(metrics["full_minus_shuffled"], metrics["full_minus_contentless"])
+    min_gap = min(
+        metrics["full_minus_wrong_neighbourhood"],
+        metrics["full_minus_contentless"],
+    )
     metrics["minimum_causal_gap"] = float(min_gap)
     metrics["strict_pass"] = bool(
         metrics["empty_exact_noop"]
@@ -2544,7 +2654,7 @@ def evaluate_model35(
         + 2.0 * metrics["selected_component_exact_rate"]
         + 1.0 * metrics["preservation_accuracy"]
         - 4.0 * metrics["local_clean_component_split_rate"]
-        + 1.5 * metrics["full_minus_shuffled"]
+        + 1.5 * metrics["full_minus_wrong_neighbourhood"]
         + 1.5 * metrics["full_minus_contentless"]
     )
     set_temporal_train_mode(model, True)
@@ -2560,9 +2670,15 @@ def print_eval35(step: int, metrics: dict[str, Any]) -> None:
     print(f"preservation         : {metrics['preservation_accuracy']:.4f}")
     print(f"selected exact       : {metrics['selected_component_exact_rate']:.4f}")
     print(f"local clean split    : {metrics['local_clean_component_split_rate']:.4f}")
-    print(f"SHUFFLED correction  : {metrics['shuffled_correction_accuracy']:.4f}")
+    print(
+        "WRONG-NEIGHBOR correction: "
+        f"{metrics['wrong_neighbourhood_correction_accuracy']:.4f}"
+    )
     print(f"CONTENTLESS correction: {metrics['contentless_correction_accuracy']:.4f}")
-    print(f"FULL - SHUFFLED      : {metrics['full_minus_shuffled']:+.4f}")
+    print(
+        "FULL - WRONG-NEIGHBOR : "
+        f"{metrics['full_minus_wrong_neighbourhood']:+.4f}"
+    )
     print(f"FULL - CONTENTLESS   : {metrics['full_minus_contentless']:+.4f}")
     print(f"EMPTY exact no-op    : {metrics['empty_exact_noop']}")
     print(f"STRICT PASS          : {metrics['strict_pass']}")
@@ -2655,7 +2771,10 @@ def make_training_config(args: argparse.Namespace) -> TrainingConfig:
     )
     config.loss.temporal_causal_margin_weight = float(args.margin_weight)
     config.loss.temporal_causal_margin = float(args.margin)
-    config.loss.temporal_causal_corruptions = tuple(CORRUPTIONS)
+    # WRONG-NEIGHBOURHOOD requires a second temporal graph and is
+    # implemented locally in Investigation 35. Keep the generic production
+    # config on its state-only CONTENTLESS corruption.
+    config.loss.temporal_causal_corruptions = ("contentless",)
     config.loss.temporal_causal_seed = int(args.seed) + 35_000
     config.validate()
     return config
@@ -2680,6 +2799,7 @@ def checkpoint_extra(
 ) -> dict[str, Any]:
     return {
         "investigation": SCRIPT_NAME,
+        "objective_version": OBJECTIVE_VERSION,
         "curriculum_stage": "instance_temporal",
         "sample_id": paths.sample,
         "spatial_checkpoint": str(paths.checkpoint),
@@ -2702,6 +2822,11 @@ def checkpoint_extra(
                 "after TemporalGraphEncoder and before TemporalSpatialObserver"
             ),
             "corruptions": list(CORRUPTIONS),
+            "wrong_neighbourhood": (
+                "same-frame matched synthetic donor observed at donor "
+                "coordinates then recentered onto the target anchor"
+            ),
+            "preservation_weight": float(args.preservation_weight),
             "full_keep_gate_penalty": False,
         },
     }
@@ -2845,6 +2970,81 @@ def sample_train_pair(
     return rng.choices(list(rows), weights=weights, k=1)[0]
 
 
+def _pair_matches_ids(pair: PairCandidate, ids: Sequence[int]) -> bool:
+    if len(ids) != 2:
+        return False
+    return {int(pair.a), int(pair.b)} == {int(ids[0]), int(ids[1])}
+
+
+def choose_wrong_neighbour_pair(
+    rows: Sequence[PairCandidate],
+    *,
+    target_ids: Sequence[int],
+    reference_pair: PairCandidate | None,
+    temporal_static: TemporalStatic,
+    track_graph,
+    target_t: int,
+    available_offsets: Sequence[int],
+    rng: random.Random,
+) -> PairCandidate:
+    # Choose a matched, unrelated same-frame donor temporal neighbourhood.
+    target_set = {int(v) for v in target_ids}
+
+    def supported(pair: PairCandidate) -> bool:
+        if int(pair.a) in target_set or int(pair.b) in target_set:
+            return False
+        nodes = member_target_nodes(
+            temporal_static,
+            int(target_t),
+            (int(pair.a), int(pair.b)),
+        )
+        return target_nodes_have_context(
+            track_graph,
+            nodes,
+            target_t=int(target_t),
+            available_offsets=available_offsets,
+        )
+
+    candidates = [pair for pair in rows if supported(pair)]
+    if not candidates:
+        # Defensive fallback for very small datasets. Identities must still be
+        # disjoint, but the donor may have weaker context under this variant.
+        candidates = [
+            pair
+            for pair in rows
+            if int(pair.a) not in target_set and int(pair.b) not in target_set
+        ]
+    if not candidates:
+        raise RuntimeError(
+            "No disjoint same-frame pair is available for the "
+            f"wrong-neighbourhood counterfactual at t={target_t}, "
+            f"target_ids={tuple(map(int, target_ids))}"
+        )
+
+    if reference_pair is not None:
+        # Match pair phenotype to avoid a trivial scale/distance discriminator.
+        def score(pair: PairCandidate) -> float:
+            volume = abs(
+                math.log(
+                    max(float(pair.volume_ratio), 1e-6)
+                    / max(float(reference_pair.volume_ratio), 1e-6)
+                )
+            )
+            distance = abs(
+                float(pair.distance_dref)
+                - float(reference_pair.distance_dref)
+            )
+            interface = abs(
+                math.log1p(float(pair.interface_edges))
+                - math.log1p(float(reference_pair.interface_edges))
+            )
+            return volume + distance + 0.25 * interface
+
+        candidates = sorted(candidates, key=score)[: min(12, len(candidates))]
+
+    return rng.choice(candidates)
+
+
 @dataclass(frozen=True)
 class TrainMicroSpec:
     frame: int
@@ -2920,6 +3120,7 @@ def run_train_microcase(
     *,
     runtime: RuntimeFrame,
     spec: TrainMicroSpec,
+    train_pairs: Sequence[PairCandidate],
     temporal_static: TemporalStatic,
     track_graph,
     args: argparse.Namespace,
@@ -2961,6 +3162,55 @@ def run_train_microcase(
         complete_candidate_graph=bool(args.complete_candidate_graph),
     )
 
+    donor_graph = None
+    donor_translation = None
+    donor_ids: tuple[int, ...] = ()
+    if spec.corruption == "wrong_neighbourhood":
+        reference_pair = next(
+            (
+                pair
+                for pair in train_pairs
+                if _pair_matches_ids(pair, spec.anchor_ids)
+            ),
+            None,
+        )
+        donor = choose_wrong_neighbour_pair(
+            train_pairs,
+            target_ids=spec.anchor_ids,
+            reference_pair=reference_pair,
+            temporal_static=temporal_static,
+            track_graph=track_graph,
+            target_t=runtime.t,
+            available_offsets=spec.available_offsets,
+            rng=rng,
+        )
+        donor_ids = (int(donor.a), int(donor.b))
+        donor_graph = build_local_temporal_graph(
+            temporal_static=temporal_static,
+            track_graph=track_graph,
+            manual_labels=runtime.manual,
+            target_t=runtime.t,
+            frame_count=int(args.frame_count),
+            temporal_radius=int(args.temporal_radius),
+            available_offsets=spec.available_offsets,
+            anchor_ids=donor_ids,
+            merge_ids=donor_ids,
+            spacing=args.spacing,
+            dref_um=dref_um,
+            neighbourhood_dref=float(args.temporal_neighbourhood_dref),
+            complete_candidate_graph=bool(args.complete_candidate_graph),
+        )
+        donor_anchor = torch.as_tensor(
+            anchor_for_manual_ids(
+                temporal_static,
+                runtime.t,
+                donor_ids,
+            ),
+            device=device,
+            dtype=case.anchor_um.dtype,
+        )
+        donor_translation = case.anchor_um - donor_anchor
+
     forward = production_temporal_forward(
         model,
         case=case,
@@ -2971,6 +3221,8 @@ def run_train_microcase(
         device=device,
         corruption=spec.corruption,
         corruption_seed=int(corruption_seed),
+        corruption_temporal_graph=donor_graph,
+        corruption_translation_um=donor_translation,
     )
 
     loss = synthetic_causal_loss(
@@ -2978,6 +3230,7 @@ def run_train_microcase(
         forward,
         preserve_edges=int(args.preserve_edges),
         preserve_ratio=int(args.preserve_ratio),
+        preservation_weight=float(args.preservation_weight),
         split_weight=float(args.split_weight),
         noop_weight=float(args.noop_weight),
         corrupted_gate_weight=float(args.corrupted_gate_weight),
@@ -3004,6 +3257,7 @@ def run_train_microcase(
         "context": spec.context_name,
         "available_offsets": list(spec.available_offsets),
         "corruption": spec.corruption,
+        "wrong_neighbour_ids": list(donor_ids),
         "correction_edges": int(loss.correction_edges),
         "preservation_edges": int(loss.preservation_edges),
         "mean_full_correction_gate": correction_gate,
@@ -3131,8 +3385,17 @@ def train_model35(
     if best_metrics_path.is_file():
         try:
             old_best = json.loads(best_metrics_path.read_text(encoding="utf-8"))
-            best_score = float(old_best.get("checkpoint_score", -float("inf")))
-            best_strict = bool(old_best.get("strict_pass", False))
+            if int(old_best.get("objective_version", -1)) == OBJECTIVE_VERSION:
+                best_score = float(
+                    old_best.get("checkpoint_score", -float("inf"))
+                )
+                best_strict = bool(old_best.get("strict_pass", False))
+            else:
+                print(
+                    "[best] previous best_metrics.json belongs to an older "
+                    "objective; objective-v2 best-score comparison is reset.",
+                    flush=True,
+                )
         except Exception:
             pass
 
@@ -3151,6 +3414,8 @@ def train_model35(
     print(f"learning rate            : {args.lr:g}")
     print(f"synthetic spatial logit  : +/-{args.synthetic_spatial_logit:g}")
     print(f"clean close-pair fraction: {args.clean_fraction:.2f}")
+    print(f"preservation loss weight : {args.preservation_weight:.2f}")
+    print(f"causal negatives         : {', '.join(CORRUPTIONS)}")
     print(f"three-cell merge fraction: {args.triple_fraction:.2f}")
     print("spatial CNN during train : NO")
     print("spatial parameters       : FROZEN")
@@ -3234,6 +3499,7 @@ def train_model35(
                     model,
                     runtime=runtime,
                     spec=spec,
+                    train_pairs=pair_by_frame[current_frame],
                     temporal_static=temporal_static,
                     track_graph=track_graph,
                     args=args,
@@ -3623,6 +3889,9 @@ def prepare_investigation35(
         "synthetic_training": {
             "synthetic_spatial_logit": float(args.synthetic_spatial_logit),
             "clean_fraction": float(args.clean_fraction),
+            "preservation_weight": float(args.preservation_weight),
+            "objective_version": OBJECTIVE_VERSION,
+            "corruptions": list(CORRUPTIONS),
             "triple_fraction": float(args.triple_fraction),
             "temporal_neighbourhood_dref": float(
                 args.temporal_neighbourhood_dref
@@ -3775,6 +4044,15 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--preserve-edges", type=int, default=DEFAULT_PRESERVE_EDGES)
     parser.add_argument("--preserve-ratio", type=int, default=DEFAULT_PRESERVE_RATIO)
+    parser.add_argument(
+        "--preservation-weight",
+        type=float,
+        default=DEFAULT_PRESERVATION_WEIGHT,
+        help=(
+            "Weight applied to preservation BCE after its own mean reduction. "
+            "Default 2.0 counters collateral over-splitting."
+        ),
+    )
     parser.add_argument("--split-weight", type=float, default=DEFAULT_SPLIT_WEIGHT)
     parser.add_argument("--noop-weight", type=float, default=DEFAULT_NOOP_WEIGHT)
     parser.add_argument(
@@ -3849,6 +4127,7 @@ def parse_args() -> argparse.Namespace:
     if any(
         value < 0
         for value in (
+            args.preservation_weight,
             args.split_weight,
             args.noop_weight,
             args.corrupted_gate_weight,
