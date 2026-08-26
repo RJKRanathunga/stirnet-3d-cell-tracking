@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-Interactive BioHub supervoxel split annotator — v10.
+Interactive BioHub supervoxel split annotator — v11.
 
 Purpose
 -------
@@ -17,9 +17,10 @@ automatic split naturally prefers narrow necks / weak geometric connections.
 
 The viewer shows:
     1. raw BioHub image,
-    2. current/corrected instance labels,
-    3. atomic supervoxel boundaries,
-    4. supervoxel ID text placed just outside foreground surfaces.
+    2. Stage-6 binary foreground mask,
+    3. current/corrected instance labels,
+    4. atomic supervoxel boundaries,
+    5. supervoxel ID text placed just outside foreground surfaces.
 
 Workflow
 --------
@@ -65,6 +66,7 @@ Undo:
     - selected seed supervoxels get distinct highlight colors,
     - click-drag camera navigation is left unchanged,
     - "Reset selections" clears the boxes and seed highlights,
+    - Escape is the keyboard shortcut for Reset selections,
     - Save automatically resets the selections after a successful split.
 
 Unique label display coloring:
@@ -254,6 +256,16 @@ def parse_args() -> argparse.Namespace:
         help="Raw BioHub .zarr path. Default is derived from --sample-id.",
     )
     parser.add_argument(
+        "--stage6-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional Stage-6 sample directory containing preprocessing/, "
+            "masking/, and segmentation/. Default is resolved through "
+            "src.io.PipelinePaths for --sample-id."
+        ),
+    )
+    parser.add_argument(
         "--supervoxels",
         type=Path,
         default=None,
@@ -388,6 +400,84 @@ def resolve_paths(args: argparse.Namespace) -> argparse.Namespace:
         args.output_dir = DEFAULT_OUTPUT_ROOT / sample_id
 
     return args
+
+
+def resolve_stage6_root(
+    sample_id: str,
+    override: Path | None,
+) -> Path:
+    """Resolve the same Stage-6 sample root used by Investigation 13/24."""
+    from src.io import PipelinePaths
+
+    if override is None:
+        root = (
+            PipelinePaths.discover(REPO_ROOT)
+            .processed_dataset(sample_id)
+        )
+    else:
+        supplied = Path(override).expanduser()
+        if not supplied.is_absolute():
+            supplied = REPO_ROOT / supplied
+        supplied = supplied.resolve()
+
+        if (supplied / "masking").is_dir():
+            root = supplied
+        elif (supplied / sample_id / "masking").is_dir():
+            root = supplied / sample_id
+        else:
+            root = supplied
+
+    required = ("preprocessing", "masking", "segmentation")
+    missing = [
+        name for name in required
+        if not (root / name).is_dir()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"Stage-6 directory is incomplete: {root}; missing={missing}"
+        )
+
+    return root.resolve()
+
+
+def load_stage6_binary_mask_frames(
+    stage6_root: Path,
+    timepoints: tuple[int, ...],
+) -> np.ndarray:
+    """Stack Stage-6 masking/t###.npy into [T,Z,Y,X] uint8."""
+    frames: list[np.ndarray] = []
+
+    for dataset_t in timepoints:
+        path = stage6_root / "masking" / f"t{dataset_t:03d}.npy"
+
+        if not path.is_file():
+            raise FileNotFoundError(
+                "Missing Stage-6 binary mask:\n"
+                f"  {path}"
+            )
+
+        mask = np.asarray(
+            np.load(
+                path,
+                mmap_mode="r",
+                allow_pickle=False,
+            )
+        )
+
+        if mask.ndim != 3:
+            raise AnnotationError(
+                f"Stage-6 mask at t={dataset_t} must be 3-D; "
+                f"got {mask.shape}."
+            )
+
+        frames.append(
+            (mask > 0).astype(
+                np.uint8,
+                copy=False,
+            )
+        )
+
+    return np.stack(frames, axis=0)
 
 
 def load_investigation24_frames(
@@ -2285,6 +2375,7 @@ def make_viewer(
     sample_id: str,
     timepoints: tuple[int, ...],
     raw: np.ndarray,
+    stage6_binary_mask: np.ndarray,
     supervoxels: np.ndarray,
     foreground: np.ndarray,
     session: AnnotationSession,
@@ -2369,13 +2460,24 @@ def make_viewer(
     )
 
     # ----------------------------------------
+    # Stage-6 binary foreground mask
+    # ----------------------------------------
+    viewer.add_labels(
+        stage6_binary_mask,
+        name="Stage-6 binary mask",
+        scale=scale_4d,
+        opacity=0.30,
+        visible=False,
+    )
+
+    # ----------------------------------------
     # Current corrected pseudo-GT instances
     # ----------------------------------------
     corrected_layer = viewer.add_labels(
         session.corrected,
         name="Corrected instances",
         scale=scale_4d,
-        opacity=1,
+        opacity=1.0,
     )
 
     # Older Napari versions do not accept color= in viewer.add_labels(), but
@@ -2525,7 +2627,7 @@ def make_viewer(
     undo_button = PushButton(text="Undo last Save")
     status_label = Label(
         value=(
-            "Ready. Click two visible SVs, then Save. Ctrl+Z undoes the last Save."
+            "Ready. Click two visible SVs, then Save. Esc resets; Ctrl+Z undoes."
         )
     )
 
@@ -2949,6 +3051,12 @@ def make_viewer(
     def _undo_with_keyboard(_viewer):
         undo_last_operation()
 
+    @viewer.bind_key("Escape")
+    def _reset_with_escape(_viewer):
+        reset_selections(
+            message="Selections reset."
+        )
+
     # Clear stale typed IDs when the user changes TIME. Moving through z does
     # not clear them.
     last_local_t = {"value": current_local_t()}
@@ -3009,7 +3117,8 @@ def make_viewer(
         "8. Click-drag still rotates/pans normally; background clicks add nothing."
     )
     print(
-        "9. Press Reset selections to clear all boxes/highlights without saving."
+        "9. Press Reset selections or Esc to clear all boxes/highlights "
+        "without saving."
     )
     print(
         "10. Press Save (or Ctrl+S). The split is applied and selections reset."
@@ -3042,6 +3151,10 @@ def main() -> None:
     args = resolve_paths(parse_args())
 
     spatial_root = args.spatial_root.resolve()
+    stage6_root = resolve_stage6_root(
+        args.sample_id,
+        args.stage6_root,
+    )
     available = completed_spatial_frames(spatial_root)
 
     if not available:
@@ -3059,11 +3172,12 @@ def main() -> None:
     )
 
     print("=" * 72)
-    print("BIOHUB SUPERVOXEL INSTANCE ANNOTATOR V10")
+    print("BIOHUB SUPERVOXEL INSTANCE ANNOTATOR V11")
     print("=" * 72)
     print(f"Repository       : {REPO_ROOT}")
     print(f"Sample           : {args.sample_id}")
     print(f"Spatial root     : {spatial_root}")
+    print(f"Stage-6 root     : {stage6_root}")
     print(f"Available frames : {available}")
     print(f"Selected frames  : {timepoints}")
     print(f"Raw Zarr         : {args.zarr_path}")
@@ -3078,6 +3192,19 @@ def main() -> None:
     raw = load_raw_frames(
         args.zarr_path.resolve(),
         timepoints,
+    )
+
+    stage6_binary_mask = (
+        load_stage6_binary_mask_frames(
+            stage6_root,
+            timepoints,
+        )
+    )
+
+    print(
+        f"[stage6] loaded binary mask stack: "
+        f"shape={stage6_binary_mask.shape}, "
+        f"dtype={stage6_binary_mask.dtype}"
     )
 
     # Recommended production path: consume Investigation-24 artifacts directly.
@@ -3125,6 +3252,13 @@ def main() -> None:
         foreground,
     )
 
+    if stage6_binary_mask.shape != supervoxels.shape:
+        raise AnnotationError(
+            "Stage-6 binary-mask stack shape does not match spatial data: "
+            f"mask={stage6_binary_mask.shape}, "
+            f"supervoxels={supervoxels.shape}."
+        )
+
     session = AnnotationSession(
         sample_id=args.sample_id,
         timepoints=timepoints,
@@ -3138,6 +3272,7 @@ def main() -> None:
         sample_id=args.sample_id,
         timepoints=timepoints,
         raw=raw,
+        stage6_binary_mask=stage6_binary_mask,
         supervoxels=supervoxels,
         foreground=foreground,
         session=session,
