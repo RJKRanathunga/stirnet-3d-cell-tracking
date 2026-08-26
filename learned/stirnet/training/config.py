@@ -15,6 +15,21 @@ class LossConfig:
     # Average RAG losses per crop row instead of pooling every edge in B.
     rag_balance_across_batch: bool = True
 
+    # STIRNET_CAUSAL_TEMPORAL_TRAINING_V1
+    # Investigation-31 causal temporal training. Correct temporal
+    # content may override spatial RAG decisions; corrupted temporal
+    # content must regress to the frozen spatial answer.
+    temporal_causal_enabled: bool = True
+    temporal_causal_noop_weight: float = 0.50
+    temporal_causal_corrupted_gate_weight: float = 0.05
+    temporal_causal_margin_weight: float = 0.50
+    temporal_causal_margin: float = 1.0
+    temporal_causal_corruptions: Tuple[str, ...] = (
+        "contentless",
+        "shuffled",
+    )
+    temporal_causal_seed: int = 31_000
+
     existence_min_precision: float = 0.25
     existence_min_gt_coverage: float = 0.10
     split_min_pred_fraction: float = 0.10
@@ -73,7 +88,10 @@ class CurriculumConfig:
     full_frame_spatial_grad: bool = False
     geometry_bootstrap_crop_enabled: bool = True
     spatial_partition_crop_enabled: bool = True
-    instance_temporal_detached_spatial: bool = False
+    # Investigation-31 production contract: keep mature spatial
+    # geometry/RAG fixed while learning instance + temporal reasoning.
+    instance_temporal_detached_spatial: bool = True
+    instance_temporal_freeze_spatial: bool = True
 
 
 @dataclass
@@ -180,6 +198,31 @@ class TrainingConfig:
         )
         if any(value < 0 for value in weights):
             raise ValueError("loss weights cannot be negative")
+
+        causal_values = (
+            self.loss.temporal_causal_noop_weight,
+            self.loss.temporal_causal_corrupted_gate_weight,
+            self.loss.temporal_causal_margin_weight,
+            self.loss.temporal_causal_margin,
+        )
+        if any(value < 0 for value in causal_values):
+            raise ValueError(
+                "temporal causal weights/margin cannot be negative"
+            )
+        if self.loss.temporal_causal_seed < 0:
+            raise ValueError("temporal_causal_seed cannot be negative")
+        corruptions = tuple(self.loss.temporal_causal_corruptions)
+        valid_corruptions = {"contentless", "shuffled"}
+        if self.loss.temporal_causal_enabled and not corruptions:
+            raise ValueError(
+                "temporal_causal_corruptions cannot be empty when enabled"
+            )
+        unknown = sorted(set(corruptions) - valid_corruptions)
+        if unknown:
+            raise ValueError(
+                "Unknown temporal causal corruption(s): "
+                + ", ".join(unknown)
+            )
 
     def to_dict(self) -> dict:
         self.validate()

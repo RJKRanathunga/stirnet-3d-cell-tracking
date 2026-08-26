@@ -17,6 +17,7 @@ from .criterion import (
     build_teacher_refinement_requests,
     teacher_forcing_fraction,
 )
+from .temporal_causal import temporal_causal_objective
 from .crops import (
     CropCandidateCache,
     build_crop_candidate_cache,
@@ -418,6 +419,52 @@ class Trainer:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
+    # STIRNET_CAUSAL_TEMPORAL_TRAINING_V1
+    def _apply_temporal_causal_objective(
+        self,
+        output,
+        metrics: dict[str, torch.Tensor],
+        gt_labels: torch.Tensor,
+        dref_um: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        # Add causal negatives only in the dedicated temporal stage.
+        cfg = self.training_config.loss
+        if (
+            self.curriculum_stage.name != "instance_temporal"
+            or not cfg.temporal_causal_enabled
+        ):
+            return metrics
+
+        corruptions = tuple(cfg.temporal_causal_corruptions)
+        corruption = corruptions[
+            int(self.global_step) % len(corruptions)
+        ]
+        seed = (
+            int(cfg.temporal_causal_seed)
+            + 1_000_003 * int(self.global_step)
+        )
+
+        with self.stage_profiler.profile(
+            "temporal_causal_objective", qualify=False
+        ):
+            causal = temporal_causal_objective(
+                self.model,
+                output,
+                gt_labels,
+                dref_um,
+                rag_criterion=self.criterion.rag,
+                loss_config=cfg,
+                corruption=corruption,
+                seed=seed,
+            )
+
+        result = dict(metrics)
+        base_loss = result["loss"]
+        result.update(causal)
+        result["loss_before_temporal_causal"] = base_loss.detach()
+        result["loss"] = base_loss + causal["temporal_causal_loss"]
+        return result
+
     def _forward_and_loss(
         self,
         batch: dict,
@@ -479,6 +526,12 @@ class Trainer:
                     discrete_target_cache if discrete_target_cache else None
                 ),
             )
+        losses = self._apply_temporal_causal_objective(
+            output,
+            losses,
+            labels,
+            batch["dref_um"],
+        )
         self._sync_device()
         target_seconds = time.perf_counter() - target_started
         return output, losses, {
@@ -1320,6 +1373,12 @@ class Trainer:
                         stage="instance_temporal",
                         geometry_losses_override=zero_geometry,
                         geometry_valid_fraction_override=valid_fraction,
+                    )
+                    metrics = self._apply_temporal_causal_objective(
+                        output,
+                        metrics,
+                        labels,
+                        batch["dref_um"],
                     )
                     loss = metrics["loss"]
         self._sync_device()

@@ -18,6 +18,13 @@ from .curriculum import (
     stage_name_for_step,
 )
 from .metrics import instance_metrics
+from .temporal_causal import (
+    causal_temporal_loss_terms,
+    contentless_temporal_state,
+    corrupt_temporal_state,
+    shuffled_temporal_state,
+    temporal_causal_objective,
+)
 from .crops import CropBatch, CropCandidateCache, CropSpec
 from .trainer import Trainer
 from .profiler import StageProfileRecord, StageProfiler
@@ -43,11 +50,16 @@ __all__ = [
     "TrainingConfig",
     "build_instance_targets",
     "build_recovery_targets",
+    "causal_temporal_loss_terms",
+    "contentless_temporal_state",
+    "corrupt_temporal_state",
     "curriculum_stage",
     "instance_metrics",
     "load_checkpoint",
     "prepare_raw_source_volume_cache",
     "prepare_raw_training_batch",
     "save_checkpoint",
+    "shuffled_temporal_state",
     "stage_name_for_step",
+    "temporal_causal_objective",
 ]

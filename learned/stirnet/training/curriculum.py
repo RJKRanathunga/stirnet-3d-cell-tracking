@@ -91,11 +91,18 @@ def curriculum_stage(config: CurriculumConfig, step: int) -> CurriculumStage:
             execution_stage="spatial",
         )
     if name == "instance_temporal":
-        trainable = frozenset(
-            {"geometry_spatial", "partition", "instances", "temporal"}
-        )
+        # STIRNET_CAUSAL_TEMPORAL_TRAINING_V1
+        # Freeze mature spatial modules by default while allowing
+        # the instance tokenizer and temporal stack to learn together.
+        if config.instance_temporal_freeze_spatial:
+            trainable = frozenset({"instances", "temporal"})
+        else:
+            trainable = frozenset(
+                {"geometry_spatial", "partition", "instances", "temporal"}
+            )
         scales = {group: float(group in trainable) for group in groups}
-        scales["geometry_spatial"] = config.spatial_lr_scale_temporal
+        if "geometry_spatial" in trainable:
+            scales["geometry_spatial"] = config.spatial_lr_scale_temporal
         return CurriculumStage(
             name,
             trainable,
