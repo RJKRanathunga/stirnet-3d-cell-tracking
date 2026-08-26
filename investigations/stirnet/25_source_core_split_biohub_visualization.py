@@ -456,7 +456,7 @@ def output_variant_name(
     separator_boost: float | None,
 ) -> str:
     if confidence_threshold is None and separator_boost is None:
-        return "supervoxel_graph_defaults"
+        return "source_instance_anchors_supervoxel_graph_defaults"
 
     pieces = []
     if confidence_threshold is not None:
@@ -630,6 +630,8 @@ def materialize_frame(
     )
 
     cfg = InferenceConfig()
+    # Stage-6 segmentation IDs are now independent SPLIT-ONLY anchors.
+    cfg.source_core_split_anchor_mode = "prefer_source_instances"
     if confidence_threshold_override is not None:
         cfg.source_core_split_confidence_threshold = float(
             confidence_threshold_override
@@ -657,6 +659,10 @@ def materialize_frame(
         supervoxel_labels=[
             torch.as_tensor(watershed_supervoxels, dtype=torch.long)
         ],
+        source_instance_labels=torch.as_tensor(
+            source_segmentation[None],
+            dtype=torch.long,
+        ),
     )
     elapsed = time.perf_counter() - started
 

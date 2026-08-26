@@ -1,4 +1,5 @@
 # STIRNET_SOURCE_CORE_SPLIT_ONLY_FILTER_V2
+# STIRNET_SOURCE_INSTANCE_ANCHOR_SPLIT_ONLY_V1
 from __future__ import annotations
 
 """Asymmetric inference-only post-graph split filter.
@@ -134,6 +135,89 @@ def _source_cores(
         )
 
     return cores.astype(np.int32, copy=False), by_final
+
+
+
+def _source_instance_cores(
+    source_instance_labels: np.ndarray,
+    final_labels: np.ndarray,
+    *,
+    min_voxels: int,
+    min_containment: float,
+) -> tuple[np.ndarray, dict[int, list[dict[str, Any]]]]:
+    # Discrete initial/source IDs are independent one-way SPLIT anchors.
+    #
+    # Unlike _source_cores(), this function never connected-components the
+    # binary foreground. Therefore two face-touching cells remain two anchors
+    # when their positive source instance IDs differ.
+    #
+    # Safety is still asymmetric: an initial instance is assigned only to the
+    # one final component containing the largest share of that source instance,
+    # and is discarded unless min_containment is met. It never becomes must-link
+    # evidence between already-separated final components.
+    source = np.asarray(source_instance_labels)
+    if source.ndim != 3:
+        raise ValueError("source instance labels must be a 3-D volume")
+    if source.shape != final_labels.shape:
+        raise ValueError("source-instance/final label shapes must match")
+
+    source = np.where(source > 0, source, 0).astype(np.int64, copy=False)
+    positive = source > 0
+    by_final: dict[int, list[dict[str, Any]]] = {}
+    if not bool(positive.any()):
+        return source, by_final
+
+    source_ids = np.unique(source[positive]).astype(np.int64, copy=False)
+
+    # Use a compact temporary label volume only for fast bounding-box lookup.
+    # The returned label map preserves original source IDs for diagnostics and
+    # for the existing graph/watershed anchor matching.
+    dense = np.zeros(source.shape, dtype=np.int32)
+    dense[positive] = (
+        np.searchsorted(source_ids, source[positive]).astype(np.int32) + 1
+    )
+    objects = ndi.find_objects(dense)
+
+    for dense_id, source_id in enumerate(source_ids.tolist(), 1):
+        box = objects[dense_id - 1] if dense_id - 1 < len(objects) else None
+        if box is None:
+            continue
+
+        local = dense[box] == dense_id
+        voxels = int(local.sum())
+        if voxels < min_voxels:
+            continue
+
+        final_values = final_labels[box][local]
+        positive_final = final_values[final_values > 0]
+        if positive_final.size == 0:
+            continue
+
+        ids, counts = np.unique(positive_final, return_counts=True)
+        best = int(np.argmax(counts))
+        final_id = int(ids[best])
+        contained_voxels = int(counts[best])
+        containment = contained_voxels / max(voxels, 1)
+        if containment < min_containment:
+            continue
+
+        local_coords = np.argwhere(local).astype(np.float64)
+        starts = np.asarray([axis.start for axis in box], dtype=np.float64)
+        centroid_voxel = local_coords.mean(axis=0) + starts
+
+        by_final.setdefault(final_id, []).append(
+            {
+                "core_id": int(source_id),
+                "source_instance_id": int(source_id),
+                "anchor_origin": "source_instance",
+                "voxels": voxels,
+                "contained_voxels": contained_voxels,
+                "containment": float(containment),
+                "centroid_voxel": centroid_voxel,
+            }
+        )
+
+    return source, by_final
 
 
 def _single_core_reference_volume(
@@ -554,6 +638,7 @@ class SourceCoreSplitOnlyFilter:
         dref_um: Tensor,
         *,
         supervoxel_labels: list[Tensor] | None = None,
+        source_instance_labels: Tensor | None = None,
     ) -> SplitOnlyPostprocessState:
         if source_foreground_prior.ndim != 4:
             raise ValueError("source foreground must be [B,Z,Y,X]")
@@ -561,6 +646,38 @@ class SourceCoreSplitOnlyFilter:
             raise ValueError("separator/source shapes must match")
         if len(final_labels) != source_foreground_prior.shape[0]:
             raise ValueError("label batch does not match source batch")
+
+        if source_instance_labels is not None:
+            if (
+                source_instance_labels.ndim == 5
+                and source_instance_labels.shape[1] == 1
+            ):
+                source_instance_labels = source_instance_labels[:, 0]
+            if source_instance_labels.ndim != 4:
+                raise ValueError(
+                    "source_instance_labels must be [B,Z,Y,X] or [B,1,Z,Y,X]"
+                )
+            if source_instance_labels.shape != source_foreground_prior.shape:
+                raise ValueError(
+                    "source-instance/source-foreground shapes must match"
+                )
+
+        anchor_mode = str(self.cfg.source_core_split_anchor_mode)
+        if anchor_mode not in {
+            "prefer_source_instances",
+            "source_instances",
+            "binary_components",
+        }:
+            raise ValueError(
+                "source_core_split_anchor_mode must be "
+                "'prefer_source_instances', 'source_instances', or "
+                "'binary_components'"
+            )
+        if anchor_mode == "source_instances" and source_instance_labels is None:
+            raise ValueError(
+                "source_core_split_anchor_mode='source_instances' requires "
+                "source_instance_labels"
+            )
 
         method = str(self.cfg.source_core_split_method)
         if method not in {"supervoxel_graph", "voxel_watershed"}:
@@ -579,6 +696,11 @@ class SourceCoreSplitOnlyFilter:
                 )
 
         source_cpu = source_foreground_prior.detach().float().cpu().numpy()
+        source_instances_cpu = (
+            None
+            if source_instance_labels is None
+            else source_instance_labels.detach().long().cpu().numpy()
+        )
         separator_cpu = separator_probability.detach().float().cpu().numpy()
         spacing_cpu = spacing_um.detach().float().cpu().numpy()
         dref_cpu = dref_um.detach().float().cpu().numpy()
@@ -590,6 +712,7 @@ class SourceCoreSplitOnlyFilter:
         skipped_too_many = 0
 
         for batch_index, labels_tensor in enumerate(final_labels):
+            batch_record_start = len(records)
             old = labels_tensor.detach().long().cpu().numpy()
             source_binary = source_cpu[batch_index] >= float(
                 self.cfg.source_core_split_foreground_threshold
@@ -609,14 +732,31 @@ class SourceCoreSplitOnlyFilter:
                     "supervoxel/final label shapes must match"
                 )
 
-            core_labels, by_final = _source_cores(
-                source_binary,
-                old,
-                min_voxels=int(self.cfg.source_core_split_min_core_voxels),
-                min_containment=float(
-                    self.cfg.source_core_split_min_core_containment
-                ),
+            use_source_instances = (
+                anchor_mode in {"prefer_source_instances", "source_instances"}
+                and source_instances_cpu is not None
             )
+            if use_source_instances:
+                active_anchor_mode = "source_instances"
+                core_labels, by_final = _source_instance_cores(
+                    source_instances_cpu[batch_index],
+                    old,
+                    min_voxels=int(self.cfg.source_core_split_min_core_voxels),
+                    min_containment=float(
+                        self.cfg.source_core_split_min_core_containment
+                    ),
+                )
+            else:
+                active_anchor_mode = "binary_components"
+                core_labels, by_final = _source_cores(
+                    source_binary,
+                    old,
+                    min_voxels=int(self.cfg.source_core_split_min_core_voxels),
+                    min_containment=float(
+                        self.cfg.source_core_split_min_core_containment
+                    ),
+                )
+
             reference_volume = _single_core_reference_volume(
                 old,
                 by_final,
@@ -910,6 +1050,9 @@ class SourceCoreSplitOnlyFilter:
                     local_result[local_territory == child_id] = int(output_id)
                 result[component] = local_result
                 applied_count += 1
+
+            for row in records[batch_record_start:]:
+                row.setdefault("source_anchor_mode", active_anchor_mode)
 
             result = _compact(result)
             _verify_split_only(old, result)

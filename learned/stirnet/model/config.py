@@ -258,6 +258,21 @@ class InferenceConfig:
     # atomic watershed supervoxels. The legacy voxel-level method remains
     # available as "voxel_watershed" for A/B comparison.
     source_core_split_method: str = "supervoxel_graph"
+
+    # Which initial/source representation provides SPLIT-ONLY anchors.
+    #
+    # prefer_source_instances (NEW DEFAULT):
+    #   Use explicit source instance IDs when supplied. Different positive IDs
+    #   remain different anchors even when their binary foreground touches.
+    #   If labels are absent, fall back to historical binary connected components.
+    #
+    # source_instances:
+    #   Require explicit source instance IDs.
+    #
+    # binary_components:
+    #   Historical behavior exactly.
+    source_core_split_anchor_mode: str = "prefer_source_instances"
+
     source_core_split_foreground_channel: int = 1
     source_core_split_foreground_threshold: float = 0.50
     source_core_split_min_core_voxels: int = 8
@@ -481,6 +496,16 @@ class ModelConfig:
         if self.inference.source_core_split_method not in {"supervoxel_graph", "voxel_watershed"}:
             raise ValueError(
                 "source_core_split_method must be 'supervoxel_graph' or 'voxel_watershed'"
+            )
+        if self.inference.source_core_split_anchor_mode not in {
+            "prefer_source_instances",
+            "source_instances",
+            "binary_components",
+        }:
+            raise ValueError(
+                "source_core_split_anchor_mode must be "
+                "'prefer_source_instances', 'source_instances', or "
+                "'binary_components'"
             )
         if not 0 <= self.inference.source_core_split_foreground_channel < self.spatial.in_channels:
             raise ValueError("source_core_split_foreground_channel is outside spatial inputs")

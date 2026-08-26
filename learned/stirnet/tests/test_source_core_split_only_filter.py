@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from scipy import ndimage as ndi
 
 from learned.stirnet.model.config import InferenceConfig
 from learned.stirnet.model.postprocess.source_core_split import (
@@ -50,11 +51,14 @@ def _filter(
     separator,
     *,
     supervoxels=None,
+    source_instances=None,
+    anchor_mode="prefer_source_instances",
     method="supervoxel_graph",
     threshold=0.70,
 ):
     cfg = InferenceConfig()
     cfg.source_core_split_method = method
+    cfg.source_core_split_anchor_mode = anchor_mode
     cfg.source_core_split_min_core_voxels = 4
     cfg.source_core_split_min_reference_components = 1
     cfg.source_core_split_min_core_containment = 0.80
@@ -74,12 +78,18 @@ def _filter(
             if supervoxels is None
             else [torch.as_tensor(supervoxels, dtype=torch.long)]
         ),
+        source_instance_labels=(
+            None
+            if source_instances is None
+            else torch.as_tensor(source_instances[None], dtype=torch.long)
+        ),
     )
 
 
 def test_default_method_is_supervoxel_graph_and_filter_remains_toggleable():
     cfg = InferenceConfig()
     assert cfg.source_core_split_method == "supervoxel_graph"
+    assert cfg.source_core_split_anchor_mode == "prefer_source_instances"
     # The architecture can still be globally/per-call switched off as before.
     assert cfg.source_core_split_enabled is False
 
@@ -201,3 +211,110 @@ def test_separator_only_boosts_split_confidence():
         and "split_confidence" in r
     )
     assert strong_row["split_confidence"] >= weak_row["split_confidence"]
+
+
+
+# STIRNET_SOURCE_INSTANCE_ANCHOR_SPLIT_ONLY_V1
+def test_touching_binary_cells_split_when_two_discrete_source_ids_exist():
+    final, _source, separator, supervoxels = _case()
+
+    source_instances = np.zeros(final.shape, dtype=np.int64)
+    # Face-touching labels: binary foreground is ONE 6-connected component.
+    source_instances[3:6, 9:13, 5:10] = 101
+    source_instances[3:6, 9:13, 10:15] = 202
+    source_binary = (source_instances > 0).astype(np.float32)
+
+    _components, count = ndi.label(
+        source_binary > 0,
+        structure=ndi.generate_binary_structure(3, 1),
+    )
+    assert count == 1
+
+    historical = _filter(
+        final,
+        source_binary,
+        separator,
+        supervoxels=supervoxels,
+        anchor_mode="binary_components",
+    )
+    assert historical.applied_count == 0
+
+    upgraded = _filter(
+        final,
+        source_binary,
+        separator,
+        supervoxels=supervoxels,
+        source_instances=source_instances,
+        anchor_mode="prefer_source_instances",
+    )
+    assert upgraded.applied_count >= 1
+
+    output = upgraded.labels[0].numpy()
+    ids = np.unique(output[final == 4])
+    assert len(ids[ids > 0]) >= 2
+
+    row = next(
+        record
+        for record in upgraded.records
+        if record.get("final_component_id") == 4
+        and record.get("status") == "applied"
+    )
+    assert row["source_anchor_mode"] == "source_instances"
+    assert set(row["source_core_ids"]) == {101, 202}
+
+
+def test_prefer_source_instances_falls_back_when_labels_are_absent():
+    final, source, separator, supervoxels = _case()
+
+    historical = _filter(
+        final,
+        source,
+        separator,
+        supervoxels=supervoxels,
+        anchor_mode="binary_components",
+    )
+    fallback = _filter(
+        final,
+        source,
+        separator,
+        supervoxels=supervoxels,
+        source_instances=None,
+        anchor_mode="prefer_source_instances",
+    )
+
+    assert historical.applied_count == fallback.applied_count
+    assert np.array_equal(
+        historical.labels[0].numpy(),
+        fallback.labels[0].numpy(),
+    )
+
+
+def test_discrete_source_ids_can_never_merge_final_components():
+    shape = (6, 16, 16)
+    final = np.zeros(shape, np.int64)
+    final[:, 2:8, 2:8] = 1
+    final[:, 2:8, 8:14] = 2
+
+    source_instances = np.zeros(shape, np.int64)
+    source_instances[2:4, 4:6, 4:8] = 11
+    source_instances[2:4, 4:6, 8:12] = 22
+    source_binary = (source_instances > 0).astype(np.float32)
+
+    separator = np.ones(shape, np.float32)
+    supervoxels = final.copy()
+
+    state = _filter(
+        final,
+        source_binary,
+        separator,
+        supervoxels=supervoxels,
+        source_instances=source_instances,
+        anchor_mode="prefer_source_instances",
+    )
+
+    output = state.labels[0].numpy()
+    left = set(np.unique(output[final == 1]).tolist()) - {0}
+    right = set(np.unique(output[final == 2]).tolist()) - {0}
+
+    assert left.isdisjoint(right)
+    assert state.applied_count == 0
