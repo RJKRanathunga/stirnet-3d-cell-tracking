@@ -45,7 +45,8 @@ Visualization intentionally follows notebooks/09_visualization.ipynb:
 - Tracks - all
 - Centroids - all
 - Ended Tracks / Centroids
-- New Tracks / Centroids
+- Birth Event Tracks
+- Broken / New Tracks
 - Boundary Entry Tracks / Centroids
 - Boundary Exit Tracks / Centroids
 - same physical Z/Y/X scaling and endpoint grouping
@@ -374,6 +375,7 @@ def trackastra_cache_complete(paths: OutputPaths) -> bool:
         paths.track_graph.is_file()
         and paths.tracked_masks.is_file()
         and paths.napari_tracks.is_file()
+        and paths.napari_graph.is_file()
         and paths.tracks_csv.is_file()
     )
 
@@ -984,6 +986,33 @@ def open_napari_viewer(
     if endpoint_groups is None:
         raise RuntimeError("Endpoint grouping unexpectedly returned None")
 
+    # INV36_BIRTH_BROKEN_TRACK_LAYERS_PATCH
+    # graph_to_napari_tracks() encodes lineage as
+    # child_track_id -> parent_track_id. Therefore every JSON key is a
+    # daughter track born from a Trackastra-predicted division.
+    lineage_payload = json.loads(
+        output.napari_graph.read_text(encoding="utf-8")
+    )
+    if not isinstance(lineage_payload, dict):
+        raise RuntimeError(
+            f"Expected a dict in {output.napari_graph}, got "
+            f"{type(lineage_payload).__name__}"
+        )
+
+    birth_track_ids = {int(child) for child in lineage_payload.keys()}
+    birth_event_tracks = visualization.tracks.loc[
+        visualization.tracks["track_id"].isin(birth_track_ids)
+    ].copy()
+
+    # Stage-09 new_failure_tracks already excludes boundary entries.
+    # Removing Trackastra daughters leaves unexplained starts: broken
+    # associations and genuinely new/hallucinated detections.
+    broken_new_tracks = endpoint_groups.new_failure_tracks.loc[
+        ~endpoint_groups.new_failure_tracks["track_id"].isin(
+            birth_track_ids
+        )
+    ].copy()
+
     scale_tzyx = (1.0, *spacing)
 
     print("", flush=True)
@@ -999,6 +1028,16 @@ def open_napari_viewer(
     print(
         "New failure candidates  : "
         f"{endpoint_groups.new_failure_tracks.track_id.nunique()}",
+        flush=True,
+    )
+    print(
+        "Birth-event tracks      : "
+        f"{birth_event_tracks.track_id.nunique()}",
+        flush=True,
+    )
+    print(
+        "Broken/new after births : "
+        f"{broken_new_tracks.track_id.nunique()}",
         flush=True,
     )
     print(
@@ -1102,14 +1141,40 @@ def open_napari_viewer(
         color="red",
         scale=scale_tzyx,
     )
-    add_track_group(
-        viewer,
-        endpoint_groups.new_failure_tracks,
-        track_name="New Tracks",
-        point_name="New Centroids",
-        color="lime",
-        scale=scale_tzyx,
-    )
+    # Complete daughter trajectories created by Trackastra divisions.
+    if not birth_event_tracks.empty:
+        birth_tracks_layer = viewer.add_tracks(
+            birth_event_tracks[
+                ["track_id", "frame", "z", "y", "x"]
+            ].to_numpy(float),
+            name="Birth Event Tracks",
+            scale=scale_tzyx,
+            tail_length=20,
+        )
+        birth_tracks_layer.visible = True
+    else:
+        print(
+            "[viewer] Trackastra predicted no division-born tracks.",
+            flush=True,
+        )
+
+    # Non-boundary track starts after removing division daughters.
+    if not broken_new_tracks.empty:
+        broken_new_layer = viewer.add_tracks(
+            broken_new_tracks[
+                ["track_id", "frame", "z", "y", "x"]
+            ].to_numpy(float),
+            name="Broken / New Tracks",
+            scale=scale_tzyx,
+            tail_length=20,
+        )
+        broken_new_layer.visible = True
+    else:
+        print(
+            "[viewer] No non-boundary broken/new starts remain after "
+            "removing birth tracks.",
+            flush=True,
+        )
     add_track_group(
         viewer,
         endpoint_groups.boundary_entry_tracks,
@@ -1182,8 +1247,9 @@ def open_napari_viewer(
         )
 
     print(
-        "[viewer] Raw visible by default. Toggle 'Spatial Final Instances', "
-        "'Trackastra Tracked Masks', and 'Tracks - all' for direct inspection.",
+        "[viewer] Birth Event Tracks and Broken / New Tracks separate "
+        "Trackastra lineage births from unexplained non-boundary starts. "
+        "Toggle 'Tracks - all' for full context.",
         flush=True,
     )
     napari.run()
