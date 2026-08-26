@@ -238,7 +238,7 @@ class SegmentationConfig:
         default_factory=_default_pair_feature_models
     )
 
-    enable_geometric_completion: bool = True
+    enable_geometric_completion: bool = False
 
     geometric_completion: GeometricCompletionConfig = field(
         default_factory=GeometricCompletionConfig

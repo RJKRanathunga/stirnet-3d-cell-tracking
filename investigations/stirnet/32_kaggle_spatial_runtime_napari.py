@@ -58,6 +58,9 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 
+from dataclasses import replace
+from importlib import import_module
+
 
 SCRIPT_NAME = "30_kaggle_spatial_runtime_napari"
 DEFAULT_SAMPLE_ID = "44b6_0113de3b"
@@ -376,7 +379,20 @@ def pipeline_profile(
         mask_seconds = elapsed(t)
 
         t = stage_timer()
-        source_labels = segment_instances(source_mask)
+
+        segmentation_config_module = import_module(
+            "src.03_segmentation.config"
+        )
+
+        SOURCE_SEGMENTATION_CONFIG = replace(
+            segmentation_config_module.DEFAULT_SEGMENTATION_CONFIG,
+            enable_geometric_completion=False,
+        )
+
+        source_labels = segment_instances(
+            source_mask,
+            config=SOURCE_SEGMENTATION_CONFIG,
+        )
         source_segment_seconds = elapsed(t)
 
         t = stage_timer()
@@ -648,7 +664,7 @@ def open_viewer(
         raw_backend = "numpy"
 
     scale_4d = (1.0, *spacing)
-    viewer = napari.Viewer(title=f"{SCRIPT_NAME} — {sample_zarr.name}")
+    viewer = napari.Viewer(title=f"{SCRIPT_NAME} — {sample_zarr.name}", ndisplay=3)
 
     viewer.add_image(
         raw,
