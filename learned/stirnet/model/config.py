@@ -141,15 +141,6 @@ class PartitionConfig:
     rag_morphology_chunk_size: int = 32
     rag_morphology_detach_geometry: bool = True
 
-    # Learned separator veto. OFF keeps historical checkpoints exact.
-    rag_separator_barrier_enabled: bool = False
-    rag_separator_barrier_use_morphology: bool = True
-    rag_separator_barrier_hidden_dim: int = 64
-    rag_separator_barrier_max_logit: float = 8.0
-    rag_separator_barrier_initial_gate_bias: float = -8.0
-    rag_separator_barrier_score_scale: float = 4.0
-    rag_separator_barrier_detach_geometry: bool = True
-
     spatial_merge_threshold: float = 0.845
     final_merge_threshold: float = 0.50
 
@@ -344,18 +335,6 @@ class ModelConfig:
             raise ValueError(
                 "partition.final_partition_backend must be 'union_find' or 'multicut'"
             )
-        if self.partition.rag_separator_barrier_hidden_dim < 1:
-            raise ValueError("rag_separator_barrier_hidden_dim must be positive")
-        if self.partition.rag_separator_barrier_max_logit <= 0:
-            raise ValueError("rag_separator_barrier_max_logit must be positive")
-        if self.partition.rag_separator_barrier_score_scale <= 0:
-            raise ValueError("rag_separator_barrier_score_scale must be positive")
-        if (
-            self.partition.rag_separator_barrier_enabled
-            and self.partition.rag_separator_barrier_use_morphology
-            and not self.partition.rag_morphology_enabled
-        ):
-            raise ValueError("separator barrier morphology requires rag_morphology_enabled")
         if self.partition.multicut_max_rounds < 1:
             raise ValueError("partition.multicut_max_rounds must be positive")
         if self.partition.multicut_max_constraints_per_round < 1:

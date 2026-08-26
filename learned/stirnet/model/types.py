@@ -369,10 +369,6 @@ class RAGState:
     # scalar features so old RAG weights stay shape-compatible.
     node_morphology_embeddings: Optional[Tensor] = None
     edge_morphology_embeddings: Optional[Tensor] = None
-    separator_barrier_features: Optional[Tensor] = None
-    base_spatial_edge_logits: Optional[Tensor] = None
-    separator_barrier_score: Optional[Tensor] = None
-    separator_barrier_correction: Optional[Tensor] = None
 
     @property
     def is_empty(self) -> bool:
