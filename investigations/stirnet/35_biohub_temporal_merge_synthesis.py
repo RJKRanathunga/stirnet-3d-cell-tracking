@@ -427,6 +427,28 @@ def tree_device(value: Any, device: torch.device) -> Any:
     return map_tree(value, lambda x: x.to(device, non_blocking=True))
 
 
+# STIRNET_INV35_FROZEN_CACHE_TRAINING_DTYPE_V1
+def tree_device_training_float(
+    value: Any,
+    device: torch.device,
+    floating_dtype: torch.dtype,
+) -> Any:
+    # Restore floating cache tensors to the dtype used by trainable modules.
+    def convert(tensor: Tensor) -> Tensor:
+        if tensor.is_floating_point():
+            return tensor.to(
+                device=device,
+                dtype=floating_dtype,
+                non_blocking=True,
+            )
+        return tensor.to(
+            device=device,
+            non_blocking=True,
+        )
+
+    return map_tree(value, convert)
+
+
 def autocast_for(device: torch.device, dtype_name: str):
     if device.type != "cuda" or dtype_name == "fp32":
         return nullcontext()
@@ -1700,18 +1722,43 @@ class ObserverRawLookup:
 
     @classmethod
     def load(cls, paths: Paths, t: int, device: torch.device) -> "ObserverRawLookup":
-        refs_np = np.asarray(np.load(paths.observer_refs(t), mmap_mode="r", allow_pickle=False), np.float32)
-        d1_np = np.asarray(np.load(paths.observer_d1(t), mmap_mode="r", allow_pickle=False), np.float32)
-        d2_np = np.asarray(np.load(paths.observer_d2(t), mmap_mode="r", allow_pickle=False), np.float32)
-        hidden_np = np.asarray(np.load(paths.observer_hidden(t), mmap_mode="r", allow_pickle=False), np.float32)
-        explicit_np = np.asarray(np.load(paths.observer_explicit(t), mmap_mode="r", allow_pickle=False), np.float32)
+        refs_np = np.array(
+            np.load(paths.observer_refs(t), mmap_mode="r", allow_pickle=False),
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        )
+        d1_np = np.array(
+            np.load(paths.observer_d1(t), mmap_mode="r", allow_pickle=False),
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        )
+        d2_np = np.array(
+            np.load(paths.observer_d2(t), mmap_mode="r", allow_pickle=False),
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        )
+        hidden_np = np.array(
+            np.load(paths.observer_hidden(t), mmap_mode="r", allow_pickle=False),
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        )
+        explicit_np = np.array(
+            np.load(paths.observer_explicit(t), mmap_mode="r", allow_pickle=False),
+            dtype=np.float32,
+            order="C",
+            copy=True,
+        )
         key_to_row = {reference_key(ref): i for i, ref in enumerate(refs_np)}
         return cls(
-            ref_um=torch.from_numpy(np.ascontiguousarray(refs_np)).to(device),
-            d1=torch.from_numpy(np.ascontiguousarray(d1_np)).to(device),
-            d2=torch.from_numpy(np.ascontiguousarray(d2_np)).to(device),
-            hidden=torch.from_numpy(np.ascontiguousarray(hidden_np)).to(device),
-            explicit=torch.from_numpy(np.ascontiguousarray(explicit_np)).to(device),
+            ref_um=torch.from_numpy(refs_np).to(device),
+            d1=torch.from_numpy(d1_np).to(device),
+            d2=torch.from_numpy(d2_np).to(device),
+            hidden=torch.from_numpy(hidden_np).to(device),
+            explicit=torch.from_numpy(explicit_np).to(device),
             key_to_row=key_to_row,
         )
 
@@ -1767,8 +1814,21 @@ class RuntimeFrameLoader:
                 torch.cuda.empty_cache()
 
         payload = torch_load(self.paths.graph_cache(t), map_location="cpu")
-        rag: RAGState = tree_device(payload["rag"], self.device)
-        actual: PartitionState = tree_device(payload["actual_partition"], self.device)
+
+        # Spatial preparation may persist floating RAG statistics/embeddings in
+        # FP16. Training feeds them into trainable FP32 modules, so restore the
+        # complete floating cache tree to FP32 at this boundary.
+        training_float_dtype = torch.float32
+        rag: RAGState = tree_device_training_float(
+            payload["rag"],
+            self.device,
+            training_float_dtype,
+        )
+        actual: PartitionState = tree_device_training_float(
+            payload["actual_partition"],
+            self.device,
+            training_float_dtype,
+        )
         node_manual = self.manifest.frames[t].node_manual.to(self.device)
         manual = np.load(self.paths.manual(t), mmap_mode="r", allow_pickle=False)
         observer = ObserverRawLookup.load(self.paths, t, self.device)
