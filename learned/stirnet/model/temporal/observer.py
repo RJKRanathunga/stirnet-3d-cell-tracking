@@ -40,20 +40,6 @@ def _sample_explicit_geometry(
         if isinstance(geometry, RefinedGeometryView)
         else geometry.sdf.shape[-3:]
     )
-
-    # STIRNET_OBSERVER_PRECOMPUTE_FASTPATH_V1
-    # For bounded dense tiles, pack the 11 explicit channels once and sample
-    # every reference in one vectorized gather. Full-volume and sparse-refined
-    # geometry retain the historical memory-bounded crop-per-reference path.
-    dense_voxels = int(full_shape[0]) * int(full_shape[1]) * int(full_shape[2])
-    if not isinstance(geometry, RefinedGeometryView) and dense_voxels <= 1_048_576:
-        channels = []
-        for name, probability in names:
-            field = getattr(geometry, name)[batch_index]
-            channels.append(field.sigmoid() if probability else field)
-        packed = torch.cat(channels, dim=0)
-        return _sample_local_grid(packed, refs_um, spacing_um, radius_um)
-
     sampled_rows: list[Tensor] = []
     full_center = refs_um.new_tensor([(size - 1) * 0.5 for size in full_shape])
     shape_tensor = torch.as_tensor(

@@ -165,124 +165,6 @@ def tile_blend_weight(
     )
 
 
-
-# STIRNET_OBSERVER_PRECOMPUTE_FASTPATH_V1
-def _axis_blend_weight_at_index(
-    index: int,
-    length: int,
-    halo: int,
-    *,
-    touches_low: bool,
-    touches_high: bool,
-) -> float:
-    """Scalar equivalent of _axis_blend_weight for one local voxel."""
-    halo = min(int(halo), max((int(length) - 1) // 2, 0))
-    index = int(index)
-    length = int(length)
-    if halo and not touches_low and index < halo:
-        return float(index + 1) / float(halo + 1)
-    if halo and not touches_high and index >= length - halo:
-        return float(length - index) / float(halo + 1)
-    return 1.0
-
-
-def _tile_blend_weight_at_voxel(
-    spec: DenseTileSpec,
-    volume_shape: tuple[int, int, int],
-    halo_zyx: tuple[int, int, int],
-    voxel_zyx: tuple[int, int, int],
-) -> float:
-    result = 1.0
-    for axis, (axis_slice, full, halo) in enumerate(
-        zip(spec.slices_zyx, volume_shape, halo_zyx)
-    ):
-        local = int(voxel_zyx[axis]) - int(axis_slice.start)
-        length = int(axis_slice.stop) - int(axis_slice.start)
-        result *= _axis_blend_weight_at_index(
-            local,
-            length,
-            int(halo),
-            touches_low=int(axis_slice.start) == 0,
-            touches_high=int(axis_slice.stop) == int(full),
-        )
-    return float(result)
-
-
-def assign_reference_rows_to_dense_tiles(
-    ref_um: Tensor,
-    batch_index: Tensor,
-    spacing_um: Tensor,
-    volume_shape: tuple[int, int, int],
-    specs: list[DenseTileSpec],
-    halo_zyx: tuple[int, int, int],
-) -> dict[int, list[int]]:
-    """Route refs to the same highest-blend tile without CUDA scalar syncs.
-
-    The physical reference itself is never clamped. Only the routing voxel is
-    clamped so extrapolated out-of-FOV tracklets are served by a boundary tile.
-    """
-    count = int(ref_um.shape[0])
-    if count == 0:
-        return {}
-    if ref_um.ndim != 2 or ref_um.shape[1] != 3:
-        raise ValueError("ref_um must have shape [N,3]")
-    if batch_index.shape != (count,):
-        raise ValueError("batch_index must have shape [N]")
-    if spacing_um.ndim != 2 or spacing_um.shape[1] != 3:
-        raise ValueError("spacing_um must have shape [B,3]")
-
-    # One tiny transfer replaces thousands of .item() GPU synchronizations.
-    refs_cpu = ref_um.detach().float().cpu()
-    batch_cpu = batch_index.detach().long().cpu()
-    spacing_cpu = spacing_um.detach().float().cpu()
-    shape_float = torch.tensor(volume_shape, dtype=torch.float32)
-    maximum = torch.tensor(volume_shape, dtype=torch.long) - 1
-
-    specs_by_batch: dict[int, list[tuple[int, DenseTileSpec]]] = {}
-    for spec_index, spec in enumerate(specs):
-        specs_by_batch.setdefault(int(spec.batch_index), []).append((int(spec_index), spec))
-
-    assignments: dict[int, list[int]] = {}
-    for batch_id in torch.unique(batch_cpu, sorted=True).tolist():
-        b = int(batch_id)
-        rows = torch.nonzero(batch_cpu == b, as_tuple=False).flatten()
-        if rows.numel() == 0:
-            continue
-        if b < 0 or b >= spacing_cpu.shape[0]:
-            raise IndexError(f"reference batch index out of range: {b}")
-
-        spacing = spacing_cpu[b].clamp_min(1e-6)
-        extent = (shape_float - 1.0) * spacing
-        voxels = torch.round((refs_cpu[rows] + 0.5 * extent[None]) / spacing[None]).long()
-        voxels = torch.minimum(voxels.clamp_min(0), maximum[None])
-
-        batch_specs = specs_by_batch.get(b, [])
-        if not batch_specs:
-            raise RuntimeError(f"no dense tiles exist for reference batch {b}")
-
-        for row, voxel_values in zip(rows.tolist(), voxels.tolist()):
-            voxel = tuple(int(value) for value in voxel_values)
-            best_index = None
-            best_weight = -1.0
-            for spec_index, spec in batch_specs:
-                if not all(
-                    int(spec.slices_zyx[axis].start) <= voxel[axis] < int(spec.slices_zyx[axis].stop)
-                    for axis in range(3)
-                ):
-                    continue
-                weight = _tile_blend_weight_at_voxel(spec, volume_shape, halo_zyx, voxel)
-                if weight > best_weight:
-                    best_weight = weight
-                    best_index = spec_index
-            if best_index is None:
-                raise RuntimeError(
-                    "clamped temporal reference is outside all dense tiles: "
-                    f"row={row}, voxel={voxel}"
-                )
-            assignments.setdefault(int(best_index), []).append(int(row))
-    return assignments
-
-
 def _pack_geometry(geometry: GeometryState) -> Tensor:
     return torch.cat(
         [
@@ -688,14 +570,63 @@ def stream_tiled_observation_cache(
         return cache
     shape = tuple(spatial_inputs.shape[-3:])
     specs = generate_dense_tiles(spatial_inputs.shape[0], shape, config)
-    assignments = assign_reference_rows_to_dense_tiles(
-        temporal.ref_um,
-        temporal.batch_index,
-        spacing_um,
-        shape,
-        specs,
-        config.tile_halo_zyx,
+    assignments: dict[int, list[int]] = {}
+    # STIRNET_TILED_OBSERVER_OUTSIDE_REFERENCE_V1
+    #
+    # A tracklet reference is an interpolated/extrapolated target-time
+    # position and may legitimately lie outside the current FOV. The observer
+    # sampling code itself intentionally supports this via border clamping.
+    # Clamp ONLY the voxel used to route the request to a dense tile; preserve
+    # temporal.ref_um unchanged for the actual physical sampling below.
+    maximum_voxel = (
+        torch.as_tensor(
+            shape,
+            device=temporal.ref_um.device,
+            dtype=torch.long,
+        )
+        - 1
     )
+    for row in range(count):
+        b = int(temporal.batch_index[row].item())
+        extent = (
+            torch.as_tensor(shape, device=temporal.ref_um.device).float() - 1
+        ) * spacing_um[b].float()
+        voxel_unclamped = torch.round(
+            (temporal.ref_um[row].float() + 0.5 * extent)
+            / spacing_um[b].float().clamp_min(1e-6)
+        ).long()
+        voxel = torch.minimum(
+            voxel_unclamped.clamp_min(0),
+            maximum_voxel,
+        )
+        best_index = None
+        best_weight = -1.0
+        for spec_index, spec in enumerate(specs):
+            if spec.batch_index != b:
+                continue
+            if not all(
+                int(spec.slices_zyx[axis].start) <= int(voxel[axis]) < int(spec.slices_zyx[axis].stop)
+                for axis in range(3)
+            ):
+                continue
+            local = tuple(
+                int(voxel[axis]) - int(spec.slices_zyx[axis].start)
+                for axis in range(3)
+            )
+            weight = float(
+                tile_blend_weight(
+                    spec,
+                    shape,
+                    config.tile_halo_zyx,
+                    device=spatial_inputs.device,
+                )[local].item()
+            )
+            if weight > best_weight:
+                best_weight = weight
+                best_index = spec_index
+        if best_index is None:
+            raise RuntimeError("temporal reference is outside all dense tiles")
+        assignments.setdefault(best_index, []).append(row)
 
     for spec_index, rows in assignments.items():
         spec = specs[spec_index]

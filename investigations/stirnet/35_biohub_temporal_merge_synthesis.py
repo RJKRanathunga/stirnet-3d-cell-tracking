@@ -234,7 +234,6 @@ from learned.stirnet.data.historical_instances import (
 from learned.stirnet.data.sample_builder import build_spatial_channels, robust_normalize
 from learned.stirnet.data.targets import estimate_model_dref_um, extract_instance_metadata
 from learned.stirnet.inference.tiled_dense import (
-    assign_reference_rows_to_dense_tiles,
     generate_dense_tiles,
     stream_tiled_label_feature_stats,
     tile_blend_weight,
@@ -1484,17 +1483,47 @@ def sample_raw_observer_features(
     refs = torch.from_numpy(np.asarray(refs_um, np.float32)).to(spatial_inputs.device)
     shape = tuple(int(v) for v in spatial_inputs.shape[-3:])
     specs = generate_dense_tiles(1, shape, config)
-    # STIRNET_OBSERVER_PRECOMPUTE_FASTPATH_V1
-    # Same exact highest-blend tile selection, but without a blend tensor and
-    # CUDA scalar synchronization for every reference/tile candidate.
-    assignments = assign_reference_rows_to_dense_tiles(
-        refs,
-        torch.zeros(count, device=refs.device, dtype=torch.long),
-        spacing_um,
-        shape,
-        specs,
-        config.tile_halo_zyx,
+    assignments: dict[int, list[int]] = defaultdict(list)
+    extent = (torch.as_tensor(shape, device=refs.device).float() - 1) * spacing_um[0].float()
+    maximum_voxel = (
+        torch.as_tensor(
+            shape,
+            device=refs.device,
+            dtype=torch.long,
+        )
+        - 1
     )
+
+    # STIRNET_TILED_OBSERVER_OUTSIDE_REFERENCE_V1
+    # Match production tiled observer routing. Tracklet target references may
+    # be interpolated/extrapolated outside the FOV. Clamp ONLY the routing
+    # voxel so a boundary tile is selected; keep refs[row] unchanged for the
+    # actual physical observer sample.
+    for row in range(count):
+        voxel_unclamped = torch.round(
+            (refs[row] + 0.5 * extent)
+            / spacing_um[0].float().clamp_min(1e-6)
+        ).long()
+        voxel = torch.minimum(
+            voxel_unclamped.clamp_min(0),
+            maximum_voxel,
+        )
+        best_index = None
+        best_weight = -1.0
+        for spec_index, spec in enumerate(specs):
+            if not all(
+                int(spec.slices_zyx[axis].start) <= int(voxel[axis]) < int(spec.slices_zyx[axis].stop)
+                for axis in range(3)
+            ):
+                continue
+            local = tuple(int(voxel[axis]) - int(spec.slices_zyx[axis].start) for axis in range(3))
+            weight = float(tile_blend_weight(spec, shape, config.tile_halo_zyx, device=refs.device)[local].item())
+            if weight > best_weight:
+                best_weight = weight
+                best_index = spec_index
+        if best_index is None:
+            raise RuntimeError(f"Observer reference is outside all tiles: {refs[row].tolist()}")
+        assignments[int(best_index)].append(row)
 
     d1_out = np.zeros((count, c1), np.float16)
     d2_out = np.zeros((count, c2), np.float16)
