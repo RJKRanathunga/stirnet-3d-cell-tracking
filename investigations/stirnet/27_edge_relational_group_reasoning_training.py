@@ -68,8 +68,15 @@ Checkpoint policy
 -----------------
 The frozen h100 baseline is explicitly treated as candidate step 0.  A trained
 reasoner is saved as best_reasoner.pt ONLY if it beats the baseline ranking while
-respecting the positive-merge safety guard.  This avoids the Investigation-23
-failure mode where "best trained" could still be worse than the starting model.
+respecting BOTH safety guards:
+
+    1. edge-level positive merge acceptance may not drop too far;
+    2. multicut GT-positive cut rate may not rise more than the configured
+       tolerance.
+
+The second guard prevents a reasoner from "winning" merely by becoming more
+split-aggressive.  This also avoids the Investigation-23 failure mode where
+"best trained" could still be worse than the starting model.
 
 Default real run
 ----------------
@@ -112,6 +119,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
+# STIRNET_INV27_MULTICUT_POSITIVE_CUT_SAFETY_V2
 EXPERIMENT_NAME = "27_edge_relational_group_reasoning_training"
 DEFAULT_SAMPLES = "Drosophila_1,Drosophila_2"
 DEFAULT_SPACING_XYZ = "0.20312639,0.20312639,0.79099447"
@@ -1401,25 +1409,46 @@ def validation_rank(
     baseline: dict,
     *,
     allowed_positive_drop: float,
+    allowed_multicut_positive_cut_increase: float,
     use_multicut: bool,
 ):
     baseline_pa = float(baseline["edge"]["positive_accept_rate"])
     candidate_pa = float(candidate["edge"]["positive_accept_rate"])
-    violation = max(0.0, baseline_pa - float(allowed_positive_drop) - candidate_pa)
+    positive_accept_violation = max(
+        0.0,
+        baseline_pa - float(allowed_positive_drop) - candidate_pa,
+    )
 
     if use_multicut and candidate["multicut"] is not None:
         mc = candidate["multicut"]
         multicut_failure = int(mc["solve_failure_count"] > 0)
         negative_inside = float(mc["negative_inside_rate"])
         positive_cut = float(mc["positive_cut_rate"])
+
+        baseline_mc = baseline.get("multicut")
+        if baseline_mc is None:
+            raise RuntimeError(
+                "Multicut validation is enabled but baseline multicut metrics "
+                "are unavailable"
+            )
+        baseline_positive_cut = float(baseline_mc["positive_cut_rate"])
+        positive_cut_violation = max(
+            0.0,
+            positive_cut
+            - baseline_positive_cut
+            - float(allowed_multicut_positive_cut_increase),
+        )
     else:
         multicut_failure = 0
         negative_inside = float(candidate["edge"]["false_merge_rate"])
         positive_cut = 0.0
+        positive_cut_violation = 0.0
 
     return (
-        int(violation > 0.0),
-        float(violation),
+        int(positive_accept_violation > 0.0),
+        float(positive_accept_violation),
+        int(positive_cut_violation > 0.0),
+        float(positive_cut_violation),
         int(multicut_failure),
         float(negative_inside),
         float(candidate["edge"]["false_merge_rate"]),
@@ -1512,6 +1541,15 @@ def main() -> None:
     parser.add_argument("--residual-weight", type=float, default=0.01)
     parser.add_argument("--preserve-negative-probability", type=float, default=0.10)
     parser.add_argument("--allowed-positive-drop", type=float, default=0.02)
+    parser.add_argument(
+        "--allowed-multicut-positive-cut-increase",
+        type=float,
+        default=0.02,
+        help=(
+            "Maximum absolute held-out increase in multicut GT-positive cut "
+            "rate versus frozen h100 before a checkpoint is considered unsafe."
+        ),
+    )
 
     parser.add_argument("--productive-crop-fraction", type=float, default=0.75)
     parser.add_argument("--hard-relational-fraction", type=float, default=0.25)
@@ -1542,6 +1580,10 @@ def main() -> None:
         raise ValueError("--max-logit-delta must be >0")
     if args.ranking_margin < 0:
         raise ValueError("--ranking-margin must be >=0")
+    if args.allowed_multicut_positive_cut_increase < 0:
+        raise ValueError(
+            "--allowed-multicut-positive-cut-increase must be >=0"
+        )
     for name in ("productive_crop_fraction", "hard_relational_fraction"):
         value = float(getattr(args, name))
         if not 0.0 <= value <= 1.0:
@@ -1747,6 +1789,12 @@ def main() -> None:
         f"mixed-wedges={mining['summary']['mixed_wedge_count']}"
     )
     print(f"Multicut validation       : {args.multicut_validation}")
+    print(
+        "Safety guards             : "
+        f"edge PA drop <= {args.allowed_positive_drop:.3f}; "
+        "MC positive-cut increase <= "
+        f"{args.allowed_multicut_positive_cut_increase:.3f}"
+    )
     print(f"Run directory             : {run_dir}")
     print("=" * 118, flush=True)
 
@@ -1777,6 +1825,9 @@ def main() -> None:
         base_metrics,
         base_metrics,
         allowed_positive_drop=args.allowed_positive_drop,
+        allowed_multicut_positive_cut_increase=(
+            args.allowed_multicut_positive_cut_increase
+        ),
         use_multicut=args.multicut_validation,
     )
     best_rank = tuple(resume_extra.get("best_rank", baseline_rank))
@@ -1935,6 +1986,9 @@ def main() -> None:
                 refined,
                 base_metrics,
                 allowed_positive_drop=args.allowed_positive_drop,
+                allowed_multicut_positive_cut_increase=(
+                    args.allowed_multicut_positive_cut_increase
+                ),
                 use_multicut=args.multicut_validation,
             )
             append_jsonl(
@@ -1943,9 +1997,14 @@ def main() -> None:
             )
             mc_text = ""
             if refined["multicut"] is not None:
+                baseline_pos_cut = base_metrics["multicut"]["positive_cut_rate"]
+                refined_pos_cut = refined["multicut"]["positive_cut_rate"]
+                pos_cut_delta = refined_pos_cut - baseline_pos_cut
                 mc_text = (
                     f" | MC neg-in={refined['multicut']['negative_inside_rate']:.5f} "
-                    f"pos-cut={refined['multicut']['positive_cut_rate']:.5f}"
+                    f"pos-cut={refined_pos_cut:.5f} "
+                    f"(d={pos_cut_delta:+.5f}, "
+                    f"limit=+{args.allowed_multicut_positive_cut_increase:.5f})"
                 )
             print(
                 f"\n[val {optimizer_step}] "

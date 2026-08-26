@@ -65,14 +65,17 @@ Dense CNN evaluation is therefore tiled, but the ANALYSIS is full-volume:
         -> copy one tile to GPU
         -> geometry forward
         -> blend into temporary full-volume CPU/disk-backed geometry
-        -> global production watershed + supervoxel safety guard
+        -> global production watershed
+        -> memory-bounded per-supervoxel production safety guard
         -> second tiled D0 feature reduction
         -> one global RAG
         -> one row per unique valid RAG edge
 
-The temporary geometry store uses float16 and one float32 blend-weight volume.
-For Drosophila-sized data it is roughly 5 GiB and is deleted after each sample.
-Use --work-dir to point the temporary store at another drive when needed.
+The resumable geometry store uses float16 and one float32 blend-weight volume.
+For Drosophila-sized data it is roughly 5 GiB. It is retained after failures so
+a rerun can skip the expensive dense CNN pass, then deleted after a successful
+sample unless --keep-dense-cache is supplied. Use --work-dir to point it at
+another drive when needed.
 
 The float16 store is ONLY an out-of-core representation between tiled CNN
 inference and global graph construction. CNN computation, blend multiplication,
@@ -132,6 +135,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy import ndimage as ndi
 from tqdm import tqdm
 
 
@@ -450,6 +454,105 @@ def _release_cuda() -> None:
     torch.cuda.empty_cache()
 
 
+def _close_memmap(value: Any) -> None:
+    """Flush and explicitly close a NumPy memmap (important on Windows)."""
+    if value is None:
+        return
+    try:
+        value.flush()
+    except Exception:
+        pass
+    mmap_obj = getattr(value, "_mmap", None)
+    if mmap_obj is not None:
+        try:
+            mmap_obj.close()
+        except Exception:
+            pass
+
+
+def _safe_rmtree(path: Path) -> None:
+    """Best-effort recursive cleanup after all memmap views have been released."""
+    if not path.exists():
+        return
+    gc.collect()
+    try:
+        shutil.rmtree(path)
+    except PermissionError:
+        # Windows can hold a just-released mmap briefly.
+        time.sleep(0.25)
+        gc.collect()
+        shutil.rmtree(path)
+
+
+def _dense_cache_paths(cache_dir: Path) -> dict[str, Path]:
+    return {
+        "geometry": cache_dir / "geometry_f16.dat",
+        "weight": cache_dir / "blend_weight_f32.dat",
+        "marker": cache_dir / "_DENSE_SUCCESS.json",
+        "preliminary": cache_dir / "preliminary_supervoxels_i32.dat",
+        "preliminary_marker": cache_dir / "_PRELIMINARY_WATERSHED_SUCCESS.json",
+        "final": cache_dir / "supervoxels_i32.dat",
+        "final_marker": cache_dir / "_SUPERVOXEL_GUARD_SUCCESS.json",
+    }
+
+
+def _expected_raw_file_size(
+    shape: tuple[int, ...],
+    dtype: np.dtype,
+) -> int:
+    return int(np.prod(shape)) * int(np.dtype(dtype).itemsize)
+
+
+def _load_json_if_exists(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _dense_cache_complete(
+    cache_dir: Path,
+    *,
+    shape_zyx: tuple[int, int, int],
+    cache_key: dict[str, Any],
+) -> bool:
+    paths = _dense_cache_paths(cache_dir)
+    marker = _load_json_if_exists(paths["marker"])
+    if marker is None or marker.get("cache_key") != _jsonable(cache_key):
+        return False
+
+    geometry_bytes = _expected_raw_file_size(
+        (11, *shape_zyx), np.dtype(np.float16)
+    )
+    weight_bytes = _expected_raw_file_size(
+        shape_zyx, np.dtype(np.float32)
+    )
+
+    return (
+        paths["geometry"].is_file()
+        and paths["weight"].is_file()
+        and paths["geometry"].stat().st_size == geometry_bytes
+        and paths["weight"].stat().st_size == weight_bytes
+    )
+
+
+def _label_cache_complete(
+    path: Path,
+    marker_path: Path,
+    *,
+    shape_zyx: tuple[int, int, int],
+    cache_key: dict[str, Any],
+) -> bool:
+    marker = _load_json_if_exists(marker_path)
+    if marker is None or marker.get("cache_key") != _jsonable(cache_key):
+        return False
+    expected = _expected_raw_file_size(shape_zyx, np.dtype(np.int32))
+    return path.is_file() and path.stat().st_size == expected
+
+
 # ======================================================================================
 # Full source access without a giant 5-channel tensor
 # ======================================================================================
@@ -647,33 +750,75 @@ def _compute_global_geometry_to_memmap(
     dref_cuda: torch.Tensor,
     shape_zyx: tuple[int, int, int],
     inference_cfg,
-    temp_dir: Path,
+    cache_dir: Path,
+    cache_key: dict[str, Any],
     amp_name: str,
 ) -> tuple[
     np.memmap,
     np.memmap,
     dict[str, Any],
 ]:
+    """Compute or reuse a resumable full-volume dense geometry cache."""
     from learned.stirnet.inference.tiled_dense import (
         generate_dense_tiles,
         tile_blend_weight,
     )
 
-    geometry_path = (
-        temp_dir / "geometry_f16.dat"
-    )
-    weight_path = (
-        temp_dir / "blend_weight_f32.dat"
-    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    paths = _dense_cache_paths(cache_dir)
+
+    if _dense_cache_complete(
+        cache_dir,
+        shape_zyx=shape_zyx,
+        cache_key=cache_key,
+    ):
+        print(
+            f"[dense cache] reusing completed geometry: {cache_dir}",
+            flush=True,
+        )
+        geometry_mm = np.memmap(
+            paths["geometry"],
+            mode="r+",
+            dtype=np.float16,
+            shape=(11, *shape_zyx),
+        )
+        weight_mm = np.memmap(
+            paths["weight"],
+            mode="r+",
+            dtype=np.float32,
+            shape=shape_zyx,
+        )
+        marker = _load_json_if_exists(paths["marker"]) or {}
+        report = dict(marker.get("report", {}))
+        report["reused_cache"] = True
+        return geometry_mm, weight_mm, report
+
+    # A partial/incompatible dense cache cannot safely be resumed tile-wise.
+    # Remove it before starting a clean dense pass.
+    for key in (
+        "geometry",
+        "weight",
+        "marker",
+        "preliminary",
+        "preliminary_marker",
+        "final",
+        "final_marker",
+    ):
+        try:
+            paths[key].unlink(missing_ok=True)
+        except PermissionError:
+            gc.collect()
+            time.sleep(0.2)
+            paths[key].unlink(missing_ok=True)
 
     geometry_mm = np.memmap(
-        geometry_path,
+        paths["geometry"],
         mode="w+",
         dtype=np.float16,
         shape=(11, *shape_zyx),
     )
     weight_mm = np.memmap(
-        weight_path,
+        paths["weight"],
         mode="w+",
         dtype=np.float32,
         shape=shape_zyx,
@@ -704,115 +849,118 @@ def _compute_global_geometry_to_memmap(
         file=sys.stdout,
     )
 
-    for spec in specs:
-        zyx = spec.slices_zyx
+    try:
+        for spec in specs:
+            zyx = spec.slices_zyx
 
-        tile_cpu = _full_spatial_tile(
-            source_batch,
-            zyx,
-        )
-        tile_cuda = (
-            tile_cpu[None]
-            .to(
-                "cuda",
-                non_blocking=True,
+            tile_cpu = _full_spatial_tile(
+                source_batch,
+                zyx,
             )
-        )
-
-        amp, _ = _amp_context()
-        with torch.inference_mode(), amp:
-            output = model(
-                tile_cuda,
-                spacing_cuda,
-                dref_cuda,
-                execution_stage="geometry",
+            tile_cuda = (
+                tile_cpu[None]
+                .to(
+                    "cuda",
+                    non_blocking=True,
+                )
             )
 
-        packed_cuda = (
-            _pack_geometry(output)[0]
-            .detach()
-            .float()
-        )
+            amp, _ = _amp_context()
+            with torch.inference_mode(), amp:
+                output = model(
+                    tile_cuda,
+                    spacing_cuda,
+                    dref_cuda,
+                    execution_stage="geometry",
+                )
 
-        blend_cuda = tile_blend_weight(
-            spec,
-            shape_zyx,
-            inference_cfg.tile_halo_zyx,
-            device=packed_cuda.device,
-        ).float()
+            packed_cuda = (
+                _pack_geometry(output)[0]
+                .detach()
+                .float()
+            )
 
-        weighted = (
-            packed_cuda
-            * blend_cuda[None]
-        ).cpu().numpy()
+            blend_cuda = tile_blend_weight(
+                spec,
+                shape_zyx,
+                inference_cfg.tile_halo_zyx,
+                device=packed_cuda.device,
+            ).float()
 
-        blend_np = (
-            blend_cuda
-            .cpu()
-            .numpy()
-        )
+            weighted = (
+                packed_cuda
+                * blend_cuda[None]
+            ).cpu().numpy()
 
-        target = geometry_mm[
-            :,
-            zyx[0],
-            zyx[1],
-            zyx[2],
-        ]
+            blend_np = (
+                blend_cuda
+                .cpu()
+                .numpy()
+            )
 
-        # Storage is float16; multiplication/addition is evaluated in float32.
-        target[:] = (
-            target.astype(
-                np.float32,
+            target = geometry_mm[
+                :,
+                zyx[0],
+                zyx[1],
+                zyx[2],
+            ]
+
+            # Arithmetic is float32; only the out-of-core representation is f16.
+            target[:] = (
+                target.astype(
+                    np.float32,
+                    copy=False,
+                )
+                + weighted
+            ).astype(
+                np.float16,
                 copy=False,
             )
-            + weighted
-        ).astype(
-            np.float16,
-            copy=False,
-        )
 
-        weight_target = weight_mm[
-            zyx[0],
-            zyx[1],
-            zyx[2],
-        ]
-        weight_target[:] = (
-            weight_target
-            + blend_np
-        )
+            weight_target = weight_mm[
+                zyx[0],
+                zyx[1],
+                zyx[2],
+            ]
+            weight_target[:] = (
+                weight_target
+                + blend_np
+            )
 
-        progress.set_postfix(
-            {
-                "shape": (
-                    f"{tile_cpu.shape[-3]}x"
-                    f"{tile_cpu.shape[-2]}x"
-                    f"{tile_cpu.shape[-1]}"
-                ),
-                "VRAM": (
-                    f"{torch.cuda.max_memory_allocated() / 2**30:.2f}G"
-                ),
-            },
-            refresh=False,
-        )
-        progress.update(1)
+            progress.set_postfix(
+                {
+                    "shape": (
+                        f"{tile_cpu.shape[-3]}x"
+                        f"{tile_cpu.shape[-2]}x"
+                        f"{tile_cpu.shape[-1]}"
+                    ),
+                    "VRAM": (
+                        f"{torch.cuda.max_memory_allocated() / 2**30:.2f}G"
+                    ),
+                },
+                refresh=False,
+            )
+            progress.update(1)
 
-        del (
-            output,
-            packed_cuda,
-            blend_cuda,
-            weighted,
-            blend_np,
-            tile_cuda,
-            tile_cpu,
-        )
-        torch.cuda.empty_cache()
-
-    progress.close()
+            del (
+                output,
+                packed_cuda,
+                blend_cuda,
+                weighted,
+                blend_np,
+                tile_cuda,
+                tile_cpu,
+                target,
+                weight_target,
+            )
+            torch.cuda.empty_cache()
+    finally:
+        progress.close()
 
     geometry_mm.flush()
     weight_mm.flush()
 
-    # Normalize in Z slabs to avoid a second full-volume geometry allocation.
+    # Normalize in small Z slabs so no second full-volume geometry exists.
     slab_depth = max(
         1,
         min(8, shape_zyx[0]),
@@ -830,46 +978,47 @@ def _compute_global_geometry_to_memmap(
         file=sys.stdout,
     )
 
-    for z0 in range(
-        0,
-        shape_zyx[0],
-        slab_depth,
-    ):
-        z1 = min(
+    try:
+        for z0 in range(
+            0,
             shape_zyx[0],
-            z0 + slab_depth,
-        )
+            slab_depth,
+        ):
+            z1 = min(
+                shape_zyx[0],
+                z0 + slab_depth,
+            )
 
-        denominator = (
-            np.asarray(
+            denominator = np.asarray(
                 weight_mm[z0:z1],
                 dtype=np.float32,
             )
-        )
-        denominator = np.maximum(
-            denominator,
-            1e-8,
-        )
+            denominator = np.maximum(
+                denominator,
+                1e-8,
+            )
 
-        numerator = np.asarray(
-            geometry_mm[:, z0:z1],
-            dtype=np.float32,
-        )
+            numerator = np.asarray(
+                geometry_mm[:, z0:z1],
+                dtype=np.float32,
+            )
 
-        geometry_mm[:, z0:z1] = (
-            numerator
-            / denominator[None]
-        ).astype(
-            np.float16,
-            copy=False,
-        )
+            geometry_mm[:, z0:z1] = (
+                numerator
+                / denominator[None]
+            ).astype(
+                np.float16,
+                copy=False,
+            )
 
-        normalize_progress.update(1)
+            normalize_progress.update(1)
 
-        del numerator, denominator
+            del numerator, denominator
+    finally:
+        normalize_progress.close()
 
-    normalize_progress.close()
     geometry_mm.flush()
+    weight_mm.flush()
 
     elapsed = (
         time.perf_counter()
@@ -882,25 +1031,34 @@ def _compute_global_geometry_to_memmap(
         "amp": amp_name,
         "geometry_storage_dtype": "float16",
         "geometry_file_gib": (
-            geometry_path.stat().st_size
+            paths["geometry"].stat().st_size
             / 2**30
         ),
         "weight_file_gib": (
-            weight_path.stat().st_size
+            paths["weight"].stat().st_size
             / 2**30
         ),
+        "reused_cache": False,
         "quantization_note": (
             "Tile CNN output and blend multiplication are float32; the "
             "out-of-core accumulated geometry is stored as float16."
         ),
     }
 
+    _atomic_json(
+        paths["marker"],
+        {
+            "cache_key": cache_key,
+            "report": report,
+            "completed_utc": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
     return (
         geometry_mm,
         weight_mm,
         report,
     )
-
 
 def _geometry_state_from_memmap(
     geometry_mm: np.memmap,
@@ -944,68 +1102,690 @@ def _geometry_state_from_memmap(
 # ======================================================================================
 
 
+class _NoOpSupervoxelSafetyGuard(torch.nn.Module):
+    """Temporarily bypass the global-memory guard; local guard is applied next."""
+
+    def forward(
+        self,
+        labels,
+        geometry,
+        derived_cache,
+        batch_index,
+        spacing_um,
+        dref_um,
+    ):
+        return labels
+
+
+def _global_sdf_positive_max(
+    geometry,
+    *,
+    foreground_threshold: float,
+    slab_depth: int = 8,
+) -> float:
+    """Exact derived-cache SDF normalization denominator using bounded RAM."""
+    z_size = int(geometry.sdf.shape[-3])
+    maximum = 0.0
+
+    for z0 in range(0, z_size, slab_depth):
+        z1 = min(z_size, z0 + slab_depth)
+
+        fg_logits = (
+            geometry.foreground_logits[
+                0,
+                0,
+                z0:z1,
+            ]
+            .float()
+        )
+        sdf = (
+            geometry.sdf[
+                0,
+                0,
+                z0:z1,
+            ]
+            .float()
+        )
+
+        foreground = (
+            fg_logits.sigmoid()
+            >= float(foreground_threshold)
+        )
+
+        if bool(foreground.any()):
+            local_max = float(
+                sdf.clamp_min(0)[foreground]
+                .max()
+                .item()
+            )
+            maximum = max(maximum, local_max)
+
+        del fg_logits, sdf, foreground
+
+    return max(maximum, 1e-6)
+
+
+def _geometry_crop_numpy(
+    tensor: torch.Tensor,
+    crop: tuple[slice, slice, slice],
+    *,
+    sigmoid: bool = False,
+) -> np.ndarray:
+    value = tensor[
+        0,
+        ...,
+        crop[0],
+        crop[1],
+        crop[2],
+    ].float()
+    if sigmoid:
+        value = value.sigmoid()
+    return np.asarray(
+        value.numpy(),
+        dtype=np.float32,
+    )
+
+
+def _expanded_box(
+    box: tuple[slice, slice, slice],
+    shape: tuple[int, int, int],
+    *,
+    halo: int,
+) -> tuple[slice, slice, slice]:
+    return tuple(
+        slice(
+            max(0, int(axis.start) - halo),
+            min(shape[i], int(axis.stop) + halo),
+        )
+        for i, axis in enumerate(box)
+    )
+
+
+def _target_face_slice_in_expanded(
+    box: tuple[slice, slice, slice],
+    expanded: tuple[slice, slice, slice],
+    axis: int,
+) -> tuple[slice, slice, slice]:
+    result: list[slice] = []
+    for dim in range(3):
+        lo = (
+            int(box[dim].start)
+            - int(expanded[dim].start)
+        )
+        hi = (
+            int(box[dim].stop)
+            - int(expanded[dim].start)
+        )
+        if dim == axis:
+            hi = max(lo, hi - 1)
+        result.append(slice(lo, hi))
+    return tuple(result)  # type: ignore[return-value]
+
+
+def _memory_bounded_supervoxel_guard(
+    *,
+    preliminary: np.memmap,
+    output_path: Path,
+    geometry,
+    spacing_cpu: torch.Tensor,
+    dref_cpu: torch.Tensor,
+    cfg,
+    separator_sigma_um: float,
+) -> tuple[np.memmap, dict[str, Any]]:
+    """
+    Exact per-supervoxel guard semantics with local face-evidence allocation.
+
+    The production guard's decisions are independent per preliminary
+    supervoxel. The original implementation first materializes all face
+    evidence for the whole volume, then consumes only the faces inside one
+    supervoxel at a time. Here we compute that same evidence only in a
+    one-voxel halo around each supervoxel bounding box.
+    """
+    from learned.stirnet.model.partition.supervoxel_guard import (
+        build_supervoxel_face_cuts,
+        _local_components_with_face_cuts,
+    )
+
+    shape = tuple(int(v) for v in preliminary.shape)
+    output = np.memmap(
+        output_path,
+        mode="w+",
+        dtype=np.int32,
+        shape=shape,
+    )
+    output[:] = 0
+    output.flush()
+
+    preliminary_count = int(preliminary.max())
+    if (
+        not cfg.supervoxel_guard_enabled
+        or preliminary_count <= 0
+    ):
+        # Chunked copy avoids materializing another full-volume array.
+        for z0 in range(0, shape[0], 8):
+            z1 = min(shape[0], z0 + 8)
+            output[z0:z1] = preliminary[z0:z1]
+        output.flush()
+        return output, {
+            "preliminary_count": preliminary_count,
+            "final_count": preliminary_count,
+            "split_supervoxel_count": 0,
+            "added_supervoxel_count": 0,
+            "cut_face_count": 0,
+            "suppressed_pathological_split_count": 0,
+            "mode": "disabled_copy",
+        }
+
+    spacing = (
+        spacing_cpu[0]
+        .detach()
+        .float()
+        .numpy()
+        .astype(np.float32)
+    )
+    dref = float(
+        dref_cpu[0]
+        .detach()
+        .float()
+        .item()
+    )
+
+    print(
+        "[watershed] computing global SDF normalization scalar ...",
+        flush=True,
+    )
+    sdf_positive_max = _global_sdf_positive_max(
+        geometry,
+        foreground_threshold=cfg.foreground_threshold,
+    )
+
+    # find_objects scans once and then lets us allocate only local evidence.
+    print(
+        "[watershed] locating preliminary supervoxel bounding boxes ...",
+        flush=True,
+    )
+    objects = ndi.find_objects(preliminary)
+
+    next_id = 1
+    split_count = 0
+    suppressed_count = 0
+    internal_cut_face_count = 0
+    largest_local_voxels = 0
+
+    progress = tqdm(
+        total=len(objects),
+        desc="Local SV safety guard",
+        unit="sv",
+        dynamic_ncols=True,
+        smoothing=0.10,
+        mininterval=0.5,
+        leave=True,
+        colour="green",
+        file=sys.stdout,
+    )
+
+    try:
+        for old_id, box in enumerate(objects, 1):
+            if box is None:
+                progress.update(1)
+                continue
+
+            local_labels = preliminary[box]
+            local_mask = (
+                local_labels == old_id
+            )
+            if not bool(local_mask.any()):
+                progress.update(1)
+                continue
+
+            expanded = _expanded_box(
+                box,
+                shape,
+                halo=1,
+            )
+
+            local_voxels = int(
+                np.prod(
+                    [
+                        int(axis.stop)
+                        - int(axis.start)
+                        for axis in expanded
+                    ]
+                )
+            )
+            largest_local_voxels = max(
+                largest_local_voxels,
+                local_voxels,
+            )
+
+            separator = _geometry_crop_numpy(
+                geometry.separator_logits,
+                expanded,
+                sigmoid=True,
+            )[0]
+            centroid_offset = _geometry_crop_numpy(
+                geometry.centroid_offset,
+                expanded,
+                sigmoid=False,
+            )
+            flow = _geometry_crop_numpy(
+                geometry.flow,
+                expanded,
+                sigmoid=False,
+            )
+            seed = _geometry_crop_numpy(
+                geometry.seed_logits,
+                expanded,
+                sigmoid=True,
+            )[0]
+            sdf = _geometry_crop_numpy(
+                geometry.sdf,
+                expanded,
+                sigmoid=False,
+            )[0]
+            sdf_normalized = (
+                np.maximum(sdf, 0.0)
+                / sdf_positive_max
+            ).astype(
+                np.float32,
+                copy=False,
+            )
+
+            cut_faces_expanded, _ = (
+                build_supervoxel_face_cuts(
+                    separator,
+                    centroid_offset,
+                    flow,
+                    seed,
+                    sdf_normalized,
+                    spacing,
+                    dref,
+                    cfg,
+                    separator_sigma_um=separator_sigma_um,
+                )
+            )
+
+            local_cuts: list[np.ndarray] = []
+            has_internal_cut = False
+
+            for axis in range(3):
+                face_slice = (
+                    _target_face_slice_in_expanded(
+                        box,
+                        expanded,
+                        axis,
+                    )
+                )
+                cuts = np.asarray(
+                    cut_faces_expanded[axis][face_slice],
+                    dtype=bool,
+                )
+                local_cuts.append(cuts)
+
+                lower = [slice(None)] * 3
+                upper = [slice(None)] * 3
+                lower[axis] = slice(0, -1)
+                upper[axis] = slice(1, None)
+
+                internal = (
+                    cuts
+                    & local_mask[tuple(lower)]
+                    & local_mask[tuple(upper)]
+                )
+                if bool(internal.any()):
+                    has_internal_cut = True
+                    internal_cut_face_count += int(
+                        internal.sum()
+                    )
+
+            target = output[box]
+
+            if not has_internal_cut:
+                target[local_mask] = next_id
+                output[box] = target
+                next_id += 1
+            else:
+                (
+                    components,
+                    component_count,
+                ) = _local_components_with_face_cuts(
+                    local_mask,
+                    tuple(local_cuts),  # type: ignore[arg-type]
+                )
+
+                if component_count < 2:
+                    target[local_mask] = next_id
+                    output[box] = target
+                    next_id += 1
+                else:
+                    sizes = np.bincount(
+                        components[local_mask].ravel(),
+                        minlength=component_count + 1,
+                    )[1:]
+
+                    minimum = max(
+                        int(
+                            cfg.supervoxel_guard_min_fragment_voxels
+                        ),
+                        int(
+                            np.ceil(
+                                float(local_mask.sum())
+                                * float(
+                                    cfg.supervoxel_guard_min_fragment_fraction
+                                )
+                            )
+                        ),
+                    )
+                    meaningful_count = int(
+                        np.sum(
+                            sizes >= minimum
+                        )
+                    )
+
+                    if meaningful_count < 2:
+                        target[local_mask] = next_id
+                        output[box] = target
+                        next_id += 1
+                    elif (
+                        component_count
+                        > cfg.supervoxel_guard_max_fragments
+                    ):
+                        suppressed_count += 1
+                        target[local_mask] = next_id
+                        output[box] = target
+                        next_id += 1
+                    else:
+                        split_count += 1
+                        for component_id in range(
+                            1,
+                            component_count + 1,
+                        ):
+                            target[
+                                components == component_id
+                            ] = next_id
+                            next_id += 1
+                        output[box] = target
+
+            if old_id % 32 == 0:
+                output.flush()
+
+            progress.set_postfix(
+                {
+                    "split": split_count,
+                    "out": next_id - 1,
+                    "bboxM": f"{local_voxels / 1e6:.2f}",
+                },
+                refresh=False,
+            )
+            progress.update(1)
+
+            del (
+                separator,
+                centroid_offset,
+                flow,
+                seed,
+                sdf,
+                sdf_normalized,
+                cut_faces_expanded,
+                local_cuts,
+                local_labels,
+                local_mask,
+                target,
+            )
+
+    finally:
+        progress.close()
+
+    output.flush()
+
+    final_count = next_id - 1
+    return output, {
+        "preliminary_count": preliminary_count,
+        "final_count": final_count,
+        "split_supervoxel_count": split_count,
+        "added_supervoxel_count": max(
+            final_count - preliminary_count,
+            0,
+        ),
+        "cut_face_count": internal_cut_face_count,
+        "suppressed_pathological_split_count": suppressed_count,
+        "largest_local_evidence_bbox_voxels": largest_local_voxels,
+        "sdf_positive_max": sdf_positive_max,
+        "mode": "memory_bounded_per_supervoxel_exact_local_dependency",
+        "local_face_halo_voxels": 1,
+    }
+
+
+def _copy_tensor_labels_to_memmap(
+    tensor: torch.Tensor,
+    path: Path,
+) -> np.memmap:
+    shape = tuple(int(v) for v in tensor.shape)
+    mm = np.memmap(
+        path,
+        mode="w+",
+        dtype=np.int32,
+        shape=shape,
+    )
+    slab = max(1, min(8, shape[0]))
+    for z0 in range(0, shape[0], slab):
+        z1 = min(shape[0], z0 + slab)
+        mm[z0:z1] = (
+            tensor[z0:z1]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(
+                np.int32,
+                copy=False,
+            )
+        )
+    mm.flush()
+    return mm
+
+
 def _global_watershed(
     *,
     model,
     geometry,
     spacing_cpu: torch.Tensor,
     dref_cpu: torch.Tensor,
+    shape_zyx: tuple[int, int, int],
+    cache_dir: Path,
+    cache_key: dict[str, Any],
 ) -> tuple[
     torch.Tensor,
+    np.memmap,
     dict[str, Any],
 ]:
     from learned.stirnet.model.geometry.derived import (
         build_geometry_derived_cache,
     )
 
+    paths = _dense_cache_paths(cache_dir)
     started = time.perf_counter()
 
-    print(
-        "[watershed] building full-volume derived geometry on CPU ...",
-        flush=True,
-    )
-
-    with torch.inference_mode():
-        derived = build_geometry_derived_cache(
-            geometry,
-            model.cfg.partition,
-            padding_mask=None,
+    # Fastest resume path: guarded supervoxels already completed.
+    if _label_cache_complete(
+        paths["final"],
+        paths["final_marker"],
+        shape_zyx=shape_zyx,
+        cache_key=cache_key,
+    ):
+        print(
+            "[watershed cache] reusing completed guarded supervoxels",
+            flush=True,
+        )
+        final_mm = np.memmap(
+            paths["final"],
+            mode="r+",
+            dtype=np.int32,
+            shape=shape_zyx,
+        )
+        marker = _load_json_if_exists(
+            paths["final_marker"]
+        ) or {}
+        report = dict(
+            marker.get("report", {})
+        )
+        report["reused_final_cache"] = True
+        return (
+            torch.from_numpy(final_mm),
+            final_mm,
+            report,
         )
 
-    print(
-        "[watershed] running production global watershed + safety guard ...",
-        flush=True,
-    )
+    preliminary_mm: np.memmap | None = None
 
-    with torch.inference_mode():
-        supervoxels = model.watershed(
-            geometry,
-            spacing_cpu,
-            dref_cpu,
-            None,
-            derived_cache=derived,
-        )[0].detach().cpu().long()
+    try:
+        if _label_cache_complete(
+            paths["preliminary"],
+            paths["preliminary_marker"],
+            shape_zyx=shape_zyx,
+            cache_key=cache_key,
+        ):
+            print(
+                "[watershed cache] reusing preliminary global watershed",
+                flush=True,
+            )
+            preliminary_mm = np.memmap(
+                paths["preliminary"],
+                mode="r+",
+                dtype=np.int32,
+                shape=shape_zyx,
+            )
+            preliminary_report = (
+                _load_json_if_exists(
+                    paths["preliminary_marker"]
+                )
+                or {}
+            ).get("report", {})
+        else:
+            print(
+                "[watershed] building full-volume derived geometry on CPU ...",
+                flush=True,
+            )
+            with torch.inference_mode():
+                derived = build_geometry_derived_cache(
+                    geometry,
+                    model.cfg.partition,
+                    padding_mask=None,
+                )
 
-    count = int(
-        supervoxels.max().item()
-    )
+            print(
+                "[watershed] running global production watershed "
+                "(safety guard deferred to bounded local pass) ...",
+                flush=True,
+            )
 
-    elapsed = (
-        time.perf_counter()
-        - started
-    )
+            original_guard = (
+                model.watershed.safety_guard
+            )
+            model.watershed.safety_guard = (
+                _NoOpSupervoxelSafetyGuard()
+            )
+            try:
+                with torch.inference_mode():
+                    preliminary_tensor = model.watershed(
+                        geometry,
+                        spacing_cpu,
+                        dref_cpu,
+                        None,
+                        derived_cache=derived,
+                    )[0].detach().cpu()
+            finally:
+                model.watershed.safety_guard = (
+                    original_guard
+                )
 
-    del derived
-    gc.collect()
+            # Derived geometry is the largest RAM consumer. Release it before
+            # converting the int64 watershed output to an int32 disk map.
+            del derived
+            gc.collect()
 
-    return (
-        supervoxels,
-        {
-            "seconds": elapsed,
-            "supervoxel_count": count,
-        },
-    )
+            preliminary_mm = (
+                _copy_tensor_labels_to_memmap(
+                    preliminary_tensor,
+                    paths["preliminary"],
+                )
+            )
+            preliminary_count = int(
+                preliminary_tensor.max().item()
+            )
+            del preliminary_tensor
+            gc.collect()
 
+            preliminary_report = {
+                "preliminary_supervoxel_count": preliminary_count,
+                "mode": "global_production_watershed_without_guard",
+            }
+            _atomic_json(
+                paths["preliminary_marker"],
+                {
+                    "cache_key": cache_key,
+                    "report": preliminary_report,
+                    "completed_utc": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+        print(
+            "[watershed] applying memory-bounded production safety guard ...",
+            flush=True,
+        )
+
+        final_mm, guard_report = (
+            _memory_bounded_supervoxel_guard(
+                preliminary=preliminary_mm,
+                output_path=paths["final"],
+                geometry=geometry,
+                spacing_cpu=spacing_cpu,
+                dref_cpu=dref_cpu,
+                cfg=model.cfg.partition,
+                separator_sigma_um=float(
+                    model.cfg.geometry.separator_target_sigma_um
+                ),
+            )
+        )
+
+        report = {
+            "seconds": (
+                time.perf_counter()
+                - started
+            ),
+            "preliminary": preliminary_report,
+            "guard": guard_report,
+            "supervoxel_count": int(
+                guard_report["final_count"]
+            ),
+            "reused_final_cache": False,
+        }
+
+        _atomic_json(
+            paths["final_marker"],
+            {
+                "cache_key": cache_key,
+                "report": report,
+                "completed_utc": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+        # Final guarded labels supersede the preliminary cache.
+        _close_memmap(preliminary_mm)
+        preliminary_mm = None
+        paths["preliminary"].unlink(missing_ok=True)
+        paths["preliminary_marker"].unlink(missing_ok=True)
+
+        return (
+            torch.from_numpy(final_mm),
+            final_mm,
+            report,
+        )
+
+    except BaseException:
+        # Keep any completed dense/preliminary cache for the next run.
+        if preliminary_mm is not None:
+            _close_memmap(preliminary_mm)
+        raise
 
 # ======================================================================================
 # Stream D0 statistics without any global feature pyramid
@@ -3201,6 +3981,7 @@ def _run_sample(
     temp_parent: Path,
     inference_cfg,
     amp_name: str,
+    dense_cache_key_base: dict[str, Any],
     args,
 ) -> tuple[
     list[dict[str, Any]],
@@ -3260,16 +4041,59 @@ def _run_sample(
         ]
     )
 
+    sample_cache_dir = (
+        temp_parent
+        / f"{sample}_dense_cache"
+    )
+    sample_cache_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    cache_key = {
+        **dense_cache_key_base,
+        "sample": sample,
+        "shape_zyx": list(shape_zyx),
+        "spacing_um_zyx": _jsonable(
+            source_batch["spacing_um"]
+        ),
+        "dref_um": _jsonable(
+            source_batch["dref_um"]
+        ),
+    }
+
     required_bytes = (
         _geometry_storage_bytes(
             shape_zyx
         )
     )
 
-    disk_report = _check_work_disk(
-        temp_parent,
-        required_bytes,
-    )
+    if _dense_cache_complete(
+        sample_cache_dir,
+        shape_zyx=shape_zyx,
+        cache_key=cache_key,
+    ):
+        usage = shutil.disk_usage(
+            sample_cache_dir
+        )
+        disk_report = {
+            "required_gib": (
+                required_bytes / 2**30
+            ),
+            "required_with_headroom_gib": 0.0,
+            "free_gib_before": (
+                usage.free / 2**30
+            ),
+            "dense_cache_reused": True,
+        }
+    else:
+        disk_report = _check_work_disk(
+            temp_parent,
+            required_bytes,
+        )
+        disk_report[
+            "dense_cache_reused"
+        ] = False
 
     print(
         f"[sample] shape                  : {shape_zyx}",
@@ -3285,6 +4109,10 @@ def _run_sample(
     )
     print(
         f"[sample] dref                   : {data_report['model_dref_um']:.4f} um",
+        flush=True,
+    )
+    print(
+        f"[sample] dense cache            : {sample_cache_dir}",
         flush=True,
     )
     print(
@@ -3327,14 +4155,17 @@ def _run_sample(
         )
     )
 
-    with tempfile.TemporaryDirectory(
-        prefix=f"inv28_{sample}_",
-        dir=temp_parent,
-    ) as temporary_directory:
-        temp_dir = Path(
-            temporary_directory
-        )
+    geometry_mm: np.memmap | None = None
+    weight_mm: np.memmap | None = None
+    supervoxel_mm: np.memmap | None = None
+    geometry = None
+    supervoxels = None
+    pooled_d0_cpu = None
+    rag_cpu = None
+    targets_cpu = None
+    sample_success = False
 
+    try:
         (
             geometry_mm,
             weight_mm,
@@ -3347,7 +4178,8 @@ def _run_sample(
                 dref_cuda=dref_cuda,
                 shape_zyx=shape_zyx,
                 inference_cfg=inference_cfg,
-                temp_dir=temp_dir,
+                cache_dir=sample_cache_dir,
+                cache_key=cache_key,
                 amp_name=amp_name,
             )
         )
@@ -3360,12 +4192,16 @@ def _run_sample(
 
         (
             supervoxels,
+            supervoxel_mm,
             watershed_report,
         ) = _global_watershed(
             model=model,
             geometry=geometry,
             spacing_cpu=spacing_cpu,
             dref_cpu=dref_cpu,
+            shape_zyx=shape_zyx,
+            cache_dir=sample_cache_dir,
+            cache_key=cache_key,
         )
 
         (
@@ -3468,47 +4304,74 @@ def _run_sample(
                 time.perf_counter()
                 - sample_started
             ),
+            "cache_directory": str(
+                sample_cache_dir
+            ),
         }
 
-        # Explicitly release memmap-backed tensors before Windows removes the
-        # TemporaryDirectory files.
-        del (
-            rag_cpu,
-            targets_cpu,
-            pooled_d0_cpu,
-            supervoxels,
-            geometry,
-        )
+        sample_success = True
+        return rows, sample_report
 
-        geometry_mm.flush()
-        weight_mm.flush()
+    finally:
+        # Drop all torch views before closing the backing mappings.
+        try:
+            del rag_cpu
+        except Exception:
+            pass
+        try:
+            del targets_cpu
+        except Exception:
+            pass
+        try:
+            del pooled_d0_cpu
+        except Exception:
+            pass
+        try:
+            del supervoxels
+        except Exception:
+            pass
+        try:
+            del geometry
+        except Exception:
+            pass
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        _close_memmap(supervoxel_mm)
+        _close_memmap(weight_mm)
+        _close_memmap(geometry_mm)
 
         del (
-            geometry_mm,
-            weight_mm,
+            source_batch,
+            full_raw_spatial_cpu,
+            gt_labels_cpu,
+            valid_mask_cpu,
+            spacing_cuda,
+            dref_cuda,
+            spacing_cpu,
+            dref_cpu,
         )
 
         gc.collect()
         torch.cuda.empty_cache()
 
-    # Source cache for one sample is deliberately released before the next
-    # Drosophila volume is loaded.
-    del (
-        source_batch,
-        full_raw_spatial_cpu,
-        gt_labels_cpu,
-        valid_mask_cpu,
-        spacing_cuda,
-        dref_cuda,
-        spacing_cpu,
-        dref_cpu,
-    )
-
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    return rows, sample_report
-
+        if (
+            sample_success
+            and not args.keep_dense_cache
+        ):
+            print(
+                f"[cache] sample completed; removing resumable cache {sample_cache_dir}",
+                flush=True,
+            )
+            _safe_rmtree(
+                sample_cache_dir
+            )
+        elif not sample_success:
+            print(
+                f"[cache] sample failed; keeping resumable cache at {sample_cache_dir}",
+                flush=True,
+            )
 
 # ======================================================================================
 # Main
@@ -3661,6 +4524,21 @@ def run(
         / "cache"
     )
 
+    checkpoint_stat = checkpoint.stat()
+    dense_cache_key_base = {
+        "checkpoint": str(checkpoint),
+        "checkpoint_size": int(checkpoint_stat.st_size),
+        "checkpoint_mtime_ns": int(checkpoint_stat.st_mtime_ns),
+        "checkpoint_global_step": checkpoint_payload.get("global_step"),
+        "tile_shape_zyx": list(tile_shape),
+        "tile_overlap_zyx": list(tile_overlap),
+        "tile_halo_zyx": list(tile_halo),
+        "amp": amp_name,
+        "geometry_storage_dtype": "float16",
+        "blend_weight_storage_dtype": "float32",
+        "cache_version": 2,
+    }
+
     props = torch.cuda.get_device_properties(
         0
     )
@@ -3776,6 +4654,7 @@ def run(
             temp_parent=work_root,
             inference_cfg=inference_cfg,
             amp_name=amp_name,
+            dense_cache_key_base=dense_cache_key_base,
             args=args,
         )
 
@@ -4188,8 +5067,17 @@ def _build_parser():
         "--work-dir",
         default=None,
         help=(
-            "Temporary out-of-core geometry directory. "
-            "The per-sample ~5 GiB temporary files are deleted after the sample."
+            "Out-of-core/resumable geometry directory. A completed dense pass "
+            "is kept after failures and reused on the next run."
+        ),
+    )
+    parser.add_argument(
+        "--keep-dense-cache",
+        action="store_true",
+        help=(
+            "Keep the ~5 GiB per-sample dense/supervoxel cache even after that "
+            "sample completes successfully. By default it is deleted only after "
+            "the sample audit succeeds."
         ),
     )
     parser.add_argument(
