@@ -177,6 +177,7 @@ from learned.stirnet.data.graph_builder import (
     AssociationRecord,
     DetectionRecord,
     build_temporal_graph,
+    sequence_available_time_offsets,
 )
 from learned.stirnet.data.historical_instances import (
     build_historical_instance_grid,
@@ -1601,8 +1602,8 @@ def temporal_context_report(
                 "gap": bool(values[3] > 0.5) if len(values) > 3 else False,
                 "division": bool(values[4] > 0.5) if len(values) > 4 else False,
                 "boundary": bool(values[5] > 0.5) if len(values) > 5 else False,
-                "reaches_past_window": bool(values[6] > 0.5) if len(values) > 6 else False,
-                "reaches_future_window": bool(values[7] > 0.5) if len(values) > 7 else False,
+                "past_context_fraction": float(values[6]) if len(values) > 6 else 0.0,
+                "future_context_fraction": float(values[7]) if len(values) > 7 else 0.0,
                 "uncertain": bool(values[9] > 0.5) if len(values) > 9 else False,
             }
 
@@ -3257,6 +3258,11 @@ def build_controlled_temporal_cache(
         associations,
         dref_um=dref_um,
         temporal_radius=2,
+        available_time_offsets=sequence_available_time_offsets(
+            target_time,
+            len(graph_mask_movie),
+            temporal_radius=2,
+        ),
         k_spatial_neighbors=6,
         spatial_radius_dref=2.5,
         current_labels=current_target,

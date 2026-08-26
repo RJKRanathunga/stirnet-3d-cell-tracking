@@ -22,6 +22,14 @@ DETECTION_EDGE_DIM = 15
 DETECTION_EDGE_ACCEPTED_COLUMN = 14
 HYPOTHESIS_EDGE_DIM = 22
 
+# STIRNET_TEMPORAL_WINDOW_AVAILABILITY_V1
+# Keep the 10-D status width checkpoint-compatible.  Columns 6/7 now carry
+# availability of the requested past/future context rather than claiming that
+# every target necessarily has observations out to nominal -R/+R.
+TEMPORAL_STATUS_DIM = 10
+TEMPORAL_STATUS_PAST_CONTEXT_COLUMN = 6
+TEMPORAL_STATUS_FUTURE_CONTEXT_COLUMN = 7
+
 
 @dataclass
 class DetectionRecord:
@@ -113,12 +121,75 @@ def _reference_for_tracklet(track: list[DetectionRecord]) -> np.ndarray:
     return np.asarray(future[0].position_um,np.float32)
 
 
+def sequence_available_time_offsets(
+    target_time: int,
+    frame_count: int,
+    temporal_radius: int = 2,
+) -> tuple[int, ...]:
+    """Return the observable target-relative offsets for a finite movie.
+
+    Examples for radius=2 and a 20-frame movie:
+        t=0  -> (0, 1, 2)
+        t=1  -> (-1, 0, 1, 2)
+        t=2  -> (-2, -1, 0, 1, 2)
+        t=18 -> (-2, -1, 0, 1)
+        t=19 -> (-2, -1, 0)
+
+    This describes frame AVAILABILITY, not whether a particular cell has a
+    detection in every available frame.
+    """
+    frame_count = int(frame_count)
+    target_time = int(target_time)
+    radius = max(int(temporal_radius), 0)
+    if frame_count <= 0:
+        raise ValueError("frame_count must be positive")
+    if target_time < 0 or target_time >= frame_count:
+        raise ValueError(
+            f"target_time={target_time} is outside frame_count={frame_count}"
+        )
+    start = max(0, target_time - radius)
+    stop = min(frame_count - 1, target_time + radius)
+    return tuple(frame - target_time for frame in range(start, stop + 1))
+
+
+def _resolve_available_time_offsets(
+    temporal_radius: int,
+    available_time_offsets: Iterable[int] | None,
+) -> tuple[int, ...]:
+    """Validate the observable temporal window.
+
+    ``None`` deliberately preserves the historical full [-R,+R] assumption.
+    Finite-sequence callers should pass explicit availability via
+    ``sequence_available_time_offsets``.  Temporal-context augmentation may
+    pass any subset that contains offset 0.
+    """
+    radius = max(int(temporal_radius), 0)
+    if available_time_offsets is None:
+        return tuple(range(-radius, radius + 1))
+
+    offsets = tuple(sorted({int(value) for value in available_time_offsets}))
+    if not offsets:
+        raise ValueError("available_time_offsets cannot be empty")
+    if 0 not in offsets:
+        raise ValueError(
+            "available_time_offsets must contain 0 because the target frame exists"
+        )
+    outside = [value for value in offsets if abs(value) > radius]
+    if outside:
+        raise ValueError(
+            "available_time_offsets contains offsets outside temporal_radius="
+            f"{radius}: {outside}"
+        )
+    return offsets
+
+
 def build_temporal_graph(
     records: Iterable[DetectionRecord],
     associations: Iterable[AssociationRecord],
     *,
     dref_um: float,
     temporal_radius: int = 2,
+    available_time_offsets: Iterable[int] | None = None,
     k_spatial_neighbors: int = 6,
     spatial_radius_dref: float = 2.5,
     current_labels: np.ndarray | None = None,
@@ -131,6 +202,32 @@ def build_temporal_graph(
     candidate_edge_chunk_size: int = 65_536,
 ) -> dict:
     records=list(records); associations=list(associations)
+    availability_was_explicit = available_time_offsets is not None
+    available_time_offsets = _resolve_available_time_offsets(
+        temporal_radius,
+        available_time_offsets,
+    )
+    available_time_set = frozenset(available_time_offsets)
+    available_min = int(available_time_offsets[0])
+    available_max = int(available_time_offsets[-1])
+
+    invalid_record_offsets = (
+        sorted(
+            {
+                int(record.time_offset)
+                for record in records
+                if int(record.time_offset) not in available_time_set
+            }
+        )
+        if availability_was_explicit
+        else []
+    )
+    if invalid_record_offsets:
+        raise ValueError(
+            "Detection records contain time offsets outside "
+            f"available_time_offsets: {invalid_record_offsets}"
+        )
+
     if not records:
         return {
             "graph_x":torch.zeros((0,32),dtype=torch.float32),
@@ -146,7 +243,7 @@ def build_temporal_graph(
             "node_observed_ref_um":torch.zeros((0,3),dtype=torch.float32),
             "node_time_offset":torch.zeros((0,),dtype=torch.float32),
             "temporal_ref_um":torch.zeros((0,3),dtype=torch.float32),
-            "temporal_status":torch.zeros((0,10),dtype=torch.float32),
+            "temporal_status":torch.zeros((0,TEMPORAL_STATUS_DIM),dtype=torch.float32),
             "hypothesis_edge_index":torch.zeros((2,0),dtype=torch.long),
             "hypothesis_edge_attr":torch.zeros((0,HYPOTHESIS_EDGE_DIM),dtype=torch.float32),
             "node_instance_grid":torch.zeros((0,4,12,12,12),dtype=torch.float16),
@@ -213,8 +310,18 @@ def build_temporal_graph(
     temporal_window=float(2*max(int(temporal_radius),0)+1)
     for i,r in enumerate(records):
         group=track_groups[tracklet_id[i]]; ts=[g.time_offset for g in group]
-        interior_start=(r.time_offset==min(ts) and min(ts)>-temporal_radius and not r.boundary_related)
-        interior_end=(r.time_offset==max(ts) and max(ts)<temporal_radius and not r.boundary_related)
+        # A sequence edge is not a biological/track event.  A start/end
+        # is "interior" only when an EARLIER/LATER frame actually exists.
+        interior_start=(
+            r.time_offset==min(ts)
+            and min(ts)>available_min
+            and not r.boundary_related
+        )
+        interior_end=(
+            r.time_offset==max(ts)
+            and max(ts)<available_max
+            and not r.boundary_related
+        )
         normalized_time=r.time_offset/max(temporal_radius,1)
         is_current=float(r.time_offset==0)
         is_interior_start=float(interior_start)
@@ -348,7 +455,20 @@ def build_temporal_graph(
     accepted_edge_attr=np.asarray(accepted_attrs,np.float32).reshape(-1,3)
 
     refs=np.stack([_reference_for_tracklet(g) for g in track_groups]).astype(np.float32)
-    status=np.zeros((M,10),np.float32)
+    status=np.zeros((M,TEMPORAL_STATUS_DIM),np.float32)
+
+    radius = max(int(temporal_radius), 0)
+    if radius > 0:
+        past_context_fraction = (
+            sum(offset < 0 for offset in available_time_offsets) / float(radius)
+        )
+        future_context_fraction = (
+            sum(offset > 0 for offset in available_time_offsets) / float(radius)
+        )
+    else:
+        past_context_fraction = 0.0
+        future_context_fraction = 0.0
+
     assoc_scores={m:[] for m in range(M)}
     for a in associations:
         if a.src_node_id in id_to_idx:
@@ -356,15 +476,53 @@ def build_temporal_graph(
             if a.score is not None:assoc_scores[m].append(a.score)
     for m,g in enumerate(track_groups):
         ts=sorted(r.time_offset for r in g)
-        gaps=any((b-a)>1 for a,b in zip(ts[:-1],ts[1:]))
+        ts_set=set(ts)
+
+        # Missing detections count as a track gap only when that intermediate
+        # frame was actually observable.  Intentionally absent/global-missing
+        # context must not manufacture a temporal event.
+        gaps=any(
+            offset not in ts_set
+            for offset in available_time_set
+            if min(ts) < offset < max(ts)
+        )
         boundary=any(r.boundary_related for r in g)
         division=any(r.node_id in division_nodes for r in g)
-        interior_start=min(ts)>-temporal_radius and not boundary
-        interior_end=max(ts)<temporal_radius and not boundary
-        complete=(min(ts)<=-temporal_radius and max(ts)>=temporal_radius and not gaps)
+
+        reaches_available_start=min(ts)<=available_min
+        reaches_available_end=max(ts)>=available_max
+        interior_start=min(ts)>available_min and not boundary
+        interior_end=max(ts)<available_max and not boundary
+        complete=(
+            reaches_available_start
+            and reaches_available_end
+            and not gaps
+        )
         uncertain=bool(assoc_scores[m] and np.mean(assoc_scores[m])<0.5)
-        status[m]=[complete,interior_start,interior_end,gaps,division,boundary,
-                   min(ts)<=-temporal_radius,max(ts)>=temporal_radius,0.0,uncertain]
+
+        # Stable 10-D contract:
+        #   0 complete across OBSERVABLE window
+        #   1 interior start
+        #   2 interior end
+        #   3 gap in an AVAILABLE intermediate frame
+        #   4 division-related
+        #   5 volume-boundary-related
+        #   6 fraction of requested PAST context that exists
+        #   7 fraction of requested FUTURE context that exists
+        #   8 reserved (kept at 0 for checkpoint/contract stability)
+        #   9 low-confidence association flag
+        status[m]=[
+            complete,
+            interior_start,
+            interior_end,
+            gaps,
+            division,
+            boundary,
+            past_context_fraction,
+            future_context_fraction,
+            0.0,
+            uncertain,
+        ]
 
     # Projected historical support is the primary target-component association.
     comp=np.full(M,-1,np.int64)

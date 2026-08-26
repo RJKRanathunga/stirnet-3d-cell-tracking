@@ -32,7 +32,7 @@ def load_cache(path: str | Path, map_location="cpu") -> dict:
     if version != TEMPORAL_CACHE_CONTRACT_VERSION:
         raise ValueError(
             f"STIR-Net temporal cache contract v{version} cannot be loaded as v"
-            f"{TEMPORAL_CACHE_CONTRACT_VERSION}. Rebuild under temporal_v3 so an old "
-            "accepted-edge graph is not silently treated as a complete candidate graph."
+            f"{TEMPORAL_CACHE_CONTRACT_VERSION}. Rebuild the temporal cache so stale "
+            "graph/status semantics are not silently reused."
         )
     return payload
