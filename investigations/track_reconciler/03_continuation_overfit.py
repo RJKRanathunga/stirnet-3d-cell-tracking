@@ -771,7 +771,7 @@ def fit_reliability_stats(raw: np.ndarray) -> MaskedStats:
     """
     mean = raw.mean(axis=0).astype(np.float32)
     std = raw.std(axis=0).astype(np.float32)
-    std[std < 1e-6] = 1.0
+    std[std < 1e-4] = 1.0
 
     binary_names = {"touches_boundary", "small_cell_indicator"}
     for name in binary_names:
@@ -1417,7 +1417,7 @@ def collate(
         ).to(device)
         edge_mask[batch_index, :e] = True
         gap_frames[batch_index, :e] = torch.from_numpy(
-            example.gap_frames
+            np.array(example.gap_frames, copy=True)
         ).to(device)
         pair_features[batch_index, :e] = torch.from_numpy(
             example.pair_features
