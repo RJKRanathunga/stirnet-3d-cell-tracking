@@ -1485,11 +1485,29 @@ def sample_raw_observer_features(
     specs = generate_dense_tiles(1, shape, config)
     assignments: dict[int, list[int]] = defaultdict(list)
     extent = (torch.as_tensor(shape, device=refs.device).float() - 1) * spacing_um[0].float()
+    maximum_voxel = (
+        torch.as_tensor(
+            shape,
+            device=refs.device,
+            dtype=torch.long,
+        )
+        - 1
+    )
 
-    # Exactly the same "highest blend weight containing tile" rule as the
-    # production stream_tiled_observation_cache.
+    # STIRNET_TILED_OBSERVER_OUTSIDE_REFERENCE_V1
+    # Match production tiled observer routing. Tracklet target references may
+    # be interpolated/extrapolated outside the FOV. Clamp ONLY the routing
+    # voxel so a boundary tile is selected; keep refs[row] unchanged for the
+    # actual physical observer sample.
     for row in range(count):
-        voxel = torch.round((refs[row] + 0.5 * extent) / spacing_um[0].float().clamp_min(1e-6)).long()
+        voxel_unclamped = torch.round(
+            (refs[row] + 0.5 * extent)
+            / spacing_um[0].float().clamp_min(1e-6)
+        ).long()
+        voxel = torch.minimum(
+            voxel_unclamped.clamp_min(0),
+            maximum_voxel,
+        )
         best_index = None
         best_weight = -1.0
         for spec_index, spec in enumerate(specs):

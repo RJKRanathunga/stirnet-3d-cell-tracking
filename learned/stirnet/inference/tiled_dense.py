@@ -571,15 +571,34 @@ def stream_tiled_observation_cache(
     shape = tuple(spatial_inputs.shape[-3:])
     specs = generate_dense_tiles(spatial_inputs.shape[0], shape, config)
     assignments: dict[int, list[int]] = {}
+    # STIRNET_TILED_OBSERVER_OUTSIDE_REFERENCE_V1
+    #
+    # A tracklet reference is an interpolated/extrapolated target-time
+    # position and may legitimately lie outside the current FOV. The observer
+    # sampling code itself intentionally supports this via border clamping.
+    # Clamp ONLY the voxel used to route the request to a dense tile; preserve
+    # temporal.ref_um unchanged for the actual physical sampling below.
+    maximum_voxel = (
+        torch.as_tensor(
+            shape,
+            device=temporal.ref_um.device,
+            dtype=torch.long,
+        )
+        - 1
+    )
     for row in range(count):
         b = int(temporal.batch_index[row].item())
         extent = (
             torch.as_tensor(shape, device=temporal.ref_um.device).float() - 1
         ) * spacing_um[b].float()
-        voxel = torch.round(
+        voxel_unclamped = torch.round(
             (temporal.ref_um[row].float() + 0.5 * extent)
             / spacing_um[b].float().clamp_min(1e-6)
         ).long()
+        voxel = torch.minimum(
+            voxel_unclamped.clamp_min(0),
+            maximum_voxel,
+        )
         best_index = None
         best_weight = -1.0
         for spec_index, spec in enumerate(specs):
