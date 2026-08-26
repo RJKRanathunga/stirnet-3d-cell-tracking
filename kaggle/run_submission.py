@@ -26,7 +26,8 @@ import random
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -330,6 +331,70 @@ def _count_labels(labels: np.ndarray) -> int:
     return int(np.count_nonzero(values > 0))
 
 
+# STIRNET_PARALLEL_SPATIAL_PIPELINE_V1
+#
+# Production promotion of Investigation 34:
+# keep exactly one future frame in CPU preparation while the main thread owns
+# CUDA inference for the current frame. This deliberately bounds RAM and avoids
+# concurrent CUDA access from worker threads.
+
+
+@dataclass
+class _PreparedSpatialFrame:
+    frame: int
+    preprocessed: np.ndarray
+    source_mask: np.ndarray
+    source_labels: np.ndarray
+    spatial: np.ndarray
+    dref_um: float
+    preparation_seconds: float
+
+
+def _prepare_spatial_frame(
+    sample_zarr: Path,
+    frame: int,
+    helper: Any,
+    *,
+    spacing: tuple[float, float, float],
+    segmentation_config: Any,
+) -> _PreparedSpatialFrame:
+    """Prepare one frame on CPU without touching CUDA."""
+    from src.api import (
+        create_binary_mask,
+        preprocess_volume,
+        segment_instances,
+    )
+    from src.io import load_timepoint
+
+    started = time.perf_counter()
+
+    raw = load_timepoint(sample_zarr, frame)
+    preprocessed = preprocess_volume(raw)
+    source_mask = create_binary_mask(preprocessed)
+    source_labels = segment_instances(
+        source_mask,
+        config=segmentation_config,
+    )
+    spatial, dref_um = helper.build_stage6_spatial_input(
+        preprocessed,
+        source_labels,
+        spacing,
+    )
+
+    preparation_seconds = time.perf_counter() - started
+    del raw
+
+    return _PreparedSpatialFrame(
+        frame=int(frame),
+        preprocessed=preprocessed,
+        source_mask=source_mask,
+        source_labels=source_labels,
+        spatial=spatial,
+        dref_um=float(dref_um),
+        preparation_seconds=float(preparation_seconds),
+    )
+
+
 def _process_spatial_sample(
     sample: SampleSpec,
     sample_work: Path,
@@ -338,14 +403,10 @@ def _process_spatial_sample(
     *,
     spacing: tuple[float, float, float],
 ) -> tuple[list[pd.DataFrame], tuple[Path, ...], list[dict[str, Any]]]:
-    from src.api import (
-        create_binary_mask,
-        detect_cells,
-        extract_cell_features,
-        preprocess_volume,
-        segment_instances,
-    )
-    from src.io import load_timepoint, open_sample
+    from importlib import import_module
+
+    from src.api import detect_cells, extract_cell_features
+    from src.io import open_sample
 
     image = open_sample(sample.zarr_path)
     if len(image.shape) != 4:
@@ -356,6 +417,16 @@ def _process_spatial_sample(
     if frame_count <= 0:
         raise ValueError(f"{sample.dataset}: empty time axis")
 
+    # Canonical source-instance configuration used by the Stage-6 BioHub cache
+    # and validated bit-exactly before Investigation 34.
+    segmentation_config_module = import_module(
+        "src.03_segmentation.config"
+    )
+    source_segmentation_config = replace(
+        segmentation_config_module.DEFAULT_SEGMENTATION_CONFIG,
+        enable_geometric_completion=False,
+    )
+
     segmentation_dir = sample_work / "segmentation"
     cells_dir = sample_work / "cells"
     segmentation_dir.mkdir(parents=True, exist_ok=True)
@@ -365,86 +436,150 @@ def _process_spatial_sample(
     segmentation_files: list[Path] = []
     frame_summaries: list[dict[str, Any]] = []
 
-    for frame in range(frame_count):
-        started = time.perf_counter()
-        raw = load_timepoint(sample.zarr_path, frame)
-        preprocessed = preprocess_volume(raw)
-        source_mask = create_binary_mask(preprocessed)
-        source_labels = segment_instances(source_mask)
-
-        spatial, dref_um = helper.build_stage6_spatial_input(
-            preprocessed,
-            source_labels,
-            spacing,
-        )
-        result, spatial_gpu, amp_name, inference_seconds, peak_gib = helper.run_tiled_spatial(
-            runtime.model,
-            spatial,
-            spacing,
-            dref_um,
-            device=runtime.device,
-            inference_cfg=runtime.inference_cfg,
+    # Investigation 34 established that one producer is sufficient:
+    # preparation is shorter than the CUDA spatial call and therefore remains
+    # fully hidden after the first frame. Keep the lookahead bounded to one
+    # prepared frame to cap host RAM.
+    with ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="stirnet-spatial-prep",
+    ) as prep_executor:
+        prepared_future = prep_executor.submit(
+            _prepare_spatial_frame,
+            sample.zarr_path,
+            0,
+            helper,
+            spacing=spacing,
+            segmentation_config=source_segmentation_config,
         )
 
-        before = _tensor_numpy(result.spatial_partition.labels[0], np.int32)
-        watershed = _tensor_numpy(result.supervoxel_labels[0], np.int64)
-        separator_probability = _tensor_numpy(
-            result.dense.geometry.probabilities()["separator"][0, 0],
-            np.float32,
-        )
-        final_labels, split_diag = _apply_source_core_split_only(
-            before,
-            watershed,
-            separator_probability,
-            source_mask,
-            source_labels,
-            spacing,
-            dref_um,
-        )
+        for frame in range(frame_count):
+            started = time.perf_counter()
 
-        cells = detect_cells(final_labels)
-        cells = extract_cell_features(cells, final_labels, preprocessed)
-        if cells.empty:
-            raise RuntimeError(
-                f"{sample.dataset} t={frame}: STIR-Net produced no cells; "
-                "refusing to create a structurally valid but empty submission."
+            wait_started = time.perf_counter()
+            prepared = prepared_future.result()
+            preparation_wait_seconds = time.perf_counter() - wait_started
+            if prepared.frame != frame:
+                raise RuntimeError(
+                    f"{sample.dataset}: spatial preparation ordering failure: "
+                    f"expected t={frame:03d}, got t={prepared.frame:03d}"
+                )
+
+            # Start preparing t+1 before CUDA starts processing t.
+            next_frame = frame + 1
+            if next_frame < frame_count:
+                prepared_future = prep_executor.submit(
+                    _prepare_spatial_frame,
+                    sample.zarr_path,
+                    next_frame,
+                    helper,
+                    spacing=spacing,
+                    segmentation_config=source_segmentation_config,
+                )
+
+            result, spatial_gpu, amp_name, inference_seconds, peak_gib = (
+                helper.run_tiled_spatial(
+                    runtime.model,
+                    prepared.spatial,
+                    spacing,
+                    prepared.dref_um,
+                    device=runtime.device,
+                    inference_cfg=runtime.inference_cfg,
+                )
             )
 
-        segmentation_path = segmentation_dir / f"t{frame:03d}.npy"
-        cells_path = cells_dir / f"t{frame:03d}.csv"
-        _atomic_npy(segmentation_path, final_labels)
-        _atomic_csv(cells_path, cells)
-        time_frames.append(cells)
-        segmentation_files.append(segmentation_path)
+            before = _tensor_numpy(
+                result.spatial_partition.labels[0],
+                np.int32,
+            )
+            watershed = _tensor_numpy(
+                result.supervoxel_labels[0],
+                np.int64,
+            )
+            separator_probability = _tensor_numpy(
+                result.dense.geometry.probabilities()["separator"][0, 0],
+                np.float32,
+            )
+            final_labels, split_diag = _apply_source_core_split_only(
+                before,
+                watershed,
+                separator_probability,
+                prepared.source_mask,
+                prepared.source_labels,
+                spacing,
+                prepared.dref_um,
+            )
 
-        total_seconds = time.perf_counter() - started
-        summary = {
-            "frame": frame,
-            "source_instances": _count_labels(source_labels),
-            "multicut_instances": _count_labels(before),
-            "final_instances": _count_labels(final_labels),
-            "split_candidates": split_diag["candidate_count"],
-            "splits_applied": split_diag["applied_count"],
-            "amp_dtype": amp_name,
-            "inference_seconds": float(inference_seconds),
-            "total_seconds": float(total_seconds),
-            "peak_allocated_vram_gib": float(peak_gib),
-        }
-        frame_summaries.append(summary)
-        print(
-            f"[{sample.dataset} t={frame:03d}] "
-            f"source={summary['source_instances']} -> multicut={summary['multicut_instances']} "
-            f"-> final={summary['final_instances']} | splits={summary['splits_applied']} | "
-            f"infer={inference_seconds:.2f}s total={total_seconds:.2f}s "
-            f"VRAM={peak_gib:.2f}GiB",
-            flush=True,
-        )
+            cells = detect_cells(final_labels)
+            cells = extract_cell_features(
+                cells,
+                final_labels,
+                prepared.preprocessed,
+            )
+            if cells.empty:
+                raise RuntimeError(
+                    f"{sample.dataset} t={frame}: STIR-Net produced no cells; "
+                    "refusing to create a structurally valid but empty submission."
+                )
 
-        del result, spatial_gpu, spatial, separator_probability, watershed
-        del before, final_labels, raw, preprocessed, source_mask, source_labels
-        if runtime.device.type == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
+            segmentation_path = segmentation_dir / f"t{frame:03d}.npy"
+            cells_path = cells_dir / f"t{frame:03d}.csv"
+            _atomic_npy(segmentation_path, final_labels)
+            _atomic_csv(cells_path, cells)
+            time_frames.append(cells)
+            segmentation_files.append(segmentation_path)
+
+            total_seconds = time.perf_counter() - started
+            preparation_hidden_seconds = max(
+                float(prepared.preparation_seconds)
+                - float(preparation_wait_seconds),
+                0.0,
+            )
+            preparation_hidden_fraction = (
+                preparation_hidden_seconds
+                / float(prepared.preparation_seconds)
+                if prepared.preparation_seconds > 0
+                else 0.0
+            )
+            summary = {
+                "frame": frame,
+                "source_instances": _count_labels(prepared.source_labels),
+                "multicut_instances": _count_labels(before),
+                "final_instances": _count_labels(final_labels),
+                "split_candidates": split_diag["candidate_count"],
+                "splits_applied": split_diag["applied_count"],
+                "amp_dtype": amp_name,
+                "inference_seconds": float(inference_seconds),
+                "preparation_seconds": float(prepared.preparation_seconds),
+                "preparation_wait_seconds": float(preparation_wait_seconds),
+                "preparation_hidden_seconds": float(preparation_hidden_seconds),
+                "preparation_hidden_fraction": float(
+                    preparation_hidden_fraction
+                ),
+                "total_seconds": float(total_seconds),
+                "peak_allocated_vram_gib": float(peak_gib),
+            }
+            frame_summaries.append(summary)
+            print(
+                f"[{sample.dataset} t={frame:03d}] "
+                f"source={summary['source_instances']} -> "
+                f"multicut={summary['multicut_instances']} -> "
+                f"final={summary['final_instances']} | "
+                f"splits={summary['splits_applied']} | "
+                f"prep={summary['preparation_seconds']:.2f}s "
+                f"prep_wait={summary['preparation_wait_seconds']:.2f}s "
+                f"hidden={100.0 * summary['preparation_hidden_fraction']:.1f}% | "
+                f"infer={inference_seconds:.2f}s total={total_seconds:.2f}s "
+                f"VRAM={peak_gib:.2f}GiB",
+                flush=True,
+            )
+
+            del result, spatial_gpu, prepared.spatial
+            del separator_probability, watershed, before, final_labels
+            del prepared, cells
+            if runtime.device.type == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
 
     return time_frames, tuple(segmentation_files), frame_summaries
 
