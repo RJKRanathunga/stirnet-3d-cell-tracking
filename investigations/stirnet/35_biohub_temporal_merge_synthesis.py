@@ -1,162 +1,216 @@
 from __future__ import annotations
 
 r"""
-Investigation 35 — production STIR-Net temporal training with controlled BioHub merges.
+Investigation 35 — concrete BioHub merge synthesis + direct temporal CUT/KEEP training.
 
-Goal
-----
-Train the REAL production temporal stack on target-domain BioHub motion by
-manufacturing many controlled under-segmentation failures from the refined
-20-frame BioHub instance annotations.
+This file is a COMPLETE REWRITE of Investigation 35.
 
-Unlike Investigation 31, this uses the real production:
-    InstanceTokenizer
-    HistoricalInstanceEncoder
-    TemporalGraphEncoder
-    TemporalSpatialObserver
-    InstanceTemporalReasoner
-and real frozen spatial RAG node/edge embeddings/statistics from the mature
-spatial checkpoint.
+It deliberately does not import or reuse the previous Investigation-35
+implementation, Investigation-30 temporal metadata construction, DetectionRecord,
+TemporalStatic, historical instance grids, or graph_builder.build_temporal_graph().
 
-Synthetic example
------------------
-Clean pseudo-GT:
-    A   B
+Scientific task
+---------------
+The current annotated BioHub movie already contains the true cell instances.
 
-Synthetic current spatial partition:
-    A+B
+The temporal model only needs to learn:
 
-Temporal evidence:
-    t-2      t-1       t       t+1      t+2
-     A        A       A+B       A        A
-     B        B                 B        B
+    inside one current spatial component:
+        KEEP this RAG connection
+        or
+        CUT this RAG connection because two real cells were merged
 
-The target-frame temporal graph is leak-free: clean target detections A and B
-are removed and replaced by ONE merged detection. Their temporal associations
-are rewired to that merged detection. Context frames stay clean.
+Therefore the synthetic dataset is simply:
 
-Frozen vs trainable
--------------------
-FROZEN:
-    acquisition / evidence stem / spatial backbone / geometry decoder
-    watershed / RAG builder / spatial RAG network / refinement
+    true annotated movie
+        ↓
+    randomly choose non-overlapping touching true-cell pairs
+        ↓
+    relabel each selected A|B pair as one A+B component for that frame
+        ↓
+    run Trackastra on the resulting concrete corrupted movie
+        ↓
+    use the Trackastra graph DIRECTLY as temporal input
+        ↓
+    train CUT/KEEP on the immutable atomic RAG
 
-TRAINABLE:
-    InstanceTokenizer
-    HistoricalInstanceEncoder
-    TemporalGraphEncoder
-    TemporalSpatialObserver
-    InstanceTemporalReasoner
+There is no other temporal-data synthesis stage.
 
-Preparation
+The raw movie is shared by every virtual variant. Only the temporary label movie
+changes. Each concrete variant gets an independent Trackastra graph.
+
+Temporal model contract
+-----------------------
+The repository's current TemporalGraphEncoder accepts TemporalInput:
+
+    graph_x             [N, 32]
+    graph_edge_index    [2, E]
+    graph_edge_attr     [E, 15]
+    tracklet_id         [N]
+    temporal_ref_um     [M, 3]
+    temporal_status     [M, 10]
+    temporal_batch      [M]
+
+Optional fields are intentionally omitted here:
+
+    node_history_embedding = None
+    hypothesis_edge_index  = None
+    hypothesis_edge_attr   = None
+
+The 32-D and 15-D layouts follow the current graph_builder semantic contract,
+but are assembled directly from Trackastra:
+
+    node:
+        time
+        physical position
+        component volume
+        backward/forward track velocity
+        track length
+        boundary/start/end/division status
+
+    edge:
+        delta time
+        physical displacement/distance
+        volume ratio
+        motion residual
+        Trackastra association score when available
+        relation one-hot
+        accepted flag
+
+Heavy morphology, intensity, and historical-grid fields are neutral values.
+They are not recomputed for every synthetic movie.
+
+Spatial side
+------------
+Temporal training still needs the mature frozen RAG and compact supervoxel
+statistics used by InstanceTokenizer.
+
+This rewrite creates the compact spatial cache itself when it is absent:
+
+    <output>/spatial_cache/tXXX/frozen_graph.pt
+
+The cache is rebuilt from the CURRENT repository spatial checkpoint using the
+current BioHub preprocessing, source segmentation, tiled spatial STIR-Net, RAG,
+and compact supervoxel-statistics path.
+
+The file never reads any previous temporal_static.pkl, candidate_manifest.json,
+old Trackastra graph, synthetic temporal graph, or old temporal checkpoint.
+
+Initializer
 -----------
-1. Build refined-manual + raw movies.
-2. Run Trackastra once on the refined manual movie.
-3. Recompute REAL frozen RAG embeddings/statistics over the exact Investigation-24
-   atomic supervoxels. Dense geometry uses production tiled inference, so the
-   one-time preparation is suitable for the full BioHub volume.
-4. Cache the explicit 11-channel dense geometry and 5-channel spatial input.
-5. Build adjacent high-confidence pair/triple merge candidate pools.
+The spatial checkpoint is resolved from the frozen spatial-cache metadata, or
+can be supplied explicitly with --checkpoint.
 
-During training, D1/D2/hidden-geometry observer samples are produced lazily from
-frozen spatial tiles and cached by physical reference coordinate. The trainable
-observer projections/message/gate remain live and receive gradients.
+The temporal modules therefore initialize from the spatial checkpoint, NOT from
+the old Investigation-35 temporal model.
 
-Temporal causal objective
--------------------------
-FULL temporal state:
-    - all synthetic correction edges supervised
-    - balanced preservation edges supervised
-    - weak split-head supervision
+Split-only invariant
+--------------------
+The synthetic current partition is built directly from true manual IDs:
 
-CORRUPTED state (alternating CONTENTLESS / WRONG-NEIGHBOURHOOD):
-    - corruption is applied BEFORE TemporalSpatialObserver
-    - spatial observer evidence remains available
-    - corrupted final logits must regress to synthetic spatial logits
-    - corrupted temporal gate is discouraged
-    - FULL must beat corrupted by a directional margin on correction edges
+    untouched true cell A:
+        all A supervoxels -> one current component
 
-Applying corruption before the observer is deliberately stronger than the
-Investigation-31 diagnostic: static current-frame observer evidence alone is
-not allowed to solve the synthetic merge.
+    selected touching pair A,B:
+        all A and B supervoxels -> one current A+B component
 
-Dynamic difficulty
-------------------
-    - pair merges
-    - occasional connected 3-cell merges
-    - clean preservation cases
-    - full finite context
-    - past-only context
-    - future-only context
-    - random context-frame dropout
+Unannotated RAG nodes retain their original frozen spatial grouping.
 
-Validation
-----------
-A deterministic held-out adjacent-pair pool reports:
-    FULL correction-edge accuracy
-    preservation-edge accuracy
-    exact recovery of selected merged cells
-    WRONG-NEIGHBOURHOOD correction accuracy
-    CONTENTLESS correction accuracy
-    FULL-WRONG-NEIGHBOURHOOD and FULL-CONTENTLESS causal gaps
+Temporal reasoning may modify ONLY RAG edges whose endpoints already belong to
+the same current synthetic component.
 
-This is same-movie held-out corruption validation, NOT cross-movie generalization.
+Edges between two separate current components remain immutable CUT.
 
-Recommended usage
------------------
-From repository root:
+Therefore the temporal model can:
+
+    A+B -> A | B
+
+but cannot:
+
+    A | B -> A+B
+
+Targets
+-------
+For editable internal RAG edges:
+
+    true_id[src] == true_id[dst]   -> KEEP
+    true_id[src] != true_id[dst]   -> CUT
+
+CUT edges are exactly the erased boundaries between deliberately merged true
+cells.
+
+Training loss:
+    CUT BCE
+    + preservation_weight * KEEP BCE
+    + small split-head BCE
+
+No wrong-neighbourhood loss.
+No contentless loss.
+No merge objective.
+No temporal metadata preprocessing.
+
+Observer
+--------
+This focused CUT/KEEP experiment bypasses TemporalSpatialObserver.
+
+The experiment first tests the direct question: can the Trackastra temporal graph
+teach the reasoner where a deliberately merged current component should be cut?
+No observer cache or dense temporal metadata is generated.
+
+Validation/test
+---------------
+Whole Trackastra variants are held out.
+
+Metrics:
+    CUT accuracy
+    KEEP accuracy
+    exact merge recovery
+    clean false-split rate
+    split-only violations
+    observer-cache hit rate
+
+Typical commands
+----------------
+Prepare concrete variants only:
 
     python .\investigations\stirnet\35_biohub_temporal_merge_synthesis.py --prepare-only
 
-Then train:
+After Trackastra finishes the final variant, preparation is DONE. There is no
+"[temporal metadata]" phase.
 
-    python .\investigations\stirnet\35_biohub_temporal_merge_synthesis.py
+100-step smoke test:
 
-Smoke run:
+    python .\investigations\stirnet\35_biohub_temporal_merge_synthesis.py `
+        --steps 100 `
+        --eval-every 50 `
+        --val-cases 12
 
-    python .\investigations\stirnet\35_biohub_temporal_merge_synthesis.py ^
-        --steps 100 --eval-every 50 --val-cases 8
+First training run:
 
-Default outputs
----------------
-    runs/stirnet/evaluation/35_biohub_temporal_merge_synthesis/<sample>/
-        preparation.json
-        candidate_manifest.json
-        cache/
-            manual_movie.npy
-            raw_movie.npy
-            raw_normalized/
-            trackastra/
-            temporal_static.pkl
-            spatial/tXXX/
-                frozen_graph.pt
-                spatial_inputs.npy
-                explicit_geometry.npy
-                meta.json
-        training_history.json
-        validation_history.json
-        latest.pt
-        best.pt
-        best_metrics.json
-        final.pt
+    python .\investigations\stirnet\35_biohub_temporal_merge_synthesis.py `
+        --steps 1000 `
+        --eval-every 100 `
+        --val-cases 0
 """
 
 import argparse
 import dataclasses
-import hashlib
+import gc
 import importlib.util
 import json
 import math
 import os
 import pickle
 import random
+import shutil
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -165,24 +219,17 @@ import torch.nn.functional as F
 
 
 # =============================================================================
-# Repository / production imports
+# Repository / current production modules
 # =============================================================================
 
 
 def repo_root() -> Path:
     here = Path(__file__).resolve()
-    for candidate in (here.parent, *here.parents):
+    for candidate in (here.parent, *here.parents, Path.cwd().resolve()):
         if (
-            (candidate / "learned").is_dir()
-            and (candidate / "investigations").is_dir()
-            and (candidate / "pyproject.toml").is_file()
-        ):
-            return candidate
-    cwd = Path.cwd().resolve()
-    for candidate in (cwd, *cwd.parents):
-        if (
-            (candidate / "learned").is_dir()
-            and (candidate / "investigations").is_dir()
+            (candidate / "learned" / "stirnet").is_dir()
+            and (candidate / "investigations" / "stirnet" / "data").is_dir()
+            and (candidate / "src").is_dir()
             and (candidate / "pyproject.toml").is_file()
         ):
             return candidate
@@ -206,42 +253,14 @@ def load_module(path: Path, name: str):
     return module
 
 
+# Current checkpoint hydration compatibility layer.
 INV12 = load_module(
-    ROOT / "investigations/stirnet/data/12_biohub_full_volume_spatial_inference.py",
-    "_inv12_for_inv35",
-)
-V13 = load_module(
-    ROOT / "investigations/stirnet/data/13_biohub_full_volume_spatial_results_viewer.py",
-    "_inv13_for_inv35",
-)
-INV30 = load_module(
-    ROOT / "investigations/stirnet/30_biohub_temporal_partition_overfit.py",
-    "_inv30_for_inv35",
+    ROOT / "investigations" / "stirnet" / "data"
+    / "12_biohub_full_volume_spatial_inference.py",
+    "_inv35_clean_checkpoint_helper",
 )
 
 from src.io import load_timepoint
-
-from learned.stirnet.data.graph_builder import (
-    AssociationRecord,
-    DetectionRecord,
-    build_temporal_graph,
-    sequence_available_time_offsets,
-)
-from learned.stirnet.data.historical_instances import (
-    TEMPORAL_CACHE_CONTRACT_VERSION,
-    build_historical_instance_grid,
-)
-from learned.stirnet.data.sample_builder import build_spatial_channels, robust_normalize
-from learned.stirnet.data.targets import estimate_model_dref_um, extract_instance_metadata
-from learned.stirnet.inference.tiled_dense import (
-    generate_dense_tiles,
-    stream_tiled_label_feature_stats,
-    tile_blend_weight,
-    tiled_dense_geometry,
-)
-from learned.stirnet.model.geometry.derived import build_geometry_derived_cache
-from learned.stirnet.model.partition.statistics import build_supervoxel_statistics
-from learned.stirnet.model.temporal.observer import _sample_explicit_geometry, _sample_local_grid
 from learned.stirnet.model.types import (
     GeometryState,
     PartitionState,
@@ -252,59 +271,82 @@ from learned.stirnet.model.types import (
 )
 from learned.stirnet.training import TrainingConfig
 from learned.stirnet.training.checkpoint import save_checkpoint
-from learned.stirnet.training.temporal_causal import (
-    contentless_temporal_state,
-)
 
 
 # =============================================================================
-# Defaults
+# Constants
 # =============================================================================
+
 
 SCRIPT_NAME = "35_biohub_temporal_merge_synthesis"
+OBJECTIVE_VERSION = 1
+DATASET_VERSION = 1
+
 DEFAULT_SAMPLE = "44b6_0113de3b"
-DEFAULT_FRAMES = 20
-DEFAULT_SPACING = (1.625, 0.40625, 0.40625)
-DEFAULT_SPATIAL_CHECKPOINT = ROOT / "runs/stirnet/milestones/drosophila_12_spatial_v1"
-DEFAULT_INV24 = ROOT / "runs/stirnet/evaluation/24_multicut_biohub_full_volume_visualization"
-DEFAULT_ANNOTATIONS = ROOT / "evaluation/segmentation/annotations"
-DEFAULT_OUTPUT = ROOT / "runs/stirnet/evaluation" / SCRIPT_NAME
+DEFAULT_FRAME_COUNT = 20
+DEFAULT_SPACING_ZYX_UM = (1.625, 0.40625, 0.40625)
+DEFAULT_TEMPORAL_RADIUS = 2
 
-DEFAULT_STEPS = 5000
-DEFAULT_LR = 2e-4
-DEFAULT_WEIGHT_DECAY = 1e-4
-DEFAULT_GRAD_CLIP = 1.0
-DEFAULT_ACCUMULATE = 4
-DEFAULT_FRAME_BLOCK = 8
-DEFAULT_EVAL_EVERY = 250
-DEFAULT_PRINT_EVERY = 10
-DEFAULT_VAL_CASES = 32
+# One concrete Trackastra movie already contains many simultaneous merge events.
+# Six variants are enough for a first clean training experiment and keep
+# --prepare-only short.
+DEFAULT_TRAIN_VARIANTS = 4
+DEFAULT_VAL_VARIANTS = 1
+DEFAULT_TEST_VARIANTS = 1
+DEFAULT_MERGE_FRACTION = 0.08
+DEFAULT_MAX_MERGES_PER_FRAME = 12
 
-DEFAULT_SYNTHETIC_LOGIT = 3.5
-DEFAULT_CLEAN_FRACTION = 0.40
-DEFAULT_TRIPLE_FRACTION = 0.10
-DEFAULT_VAL_FRACTION = 0.15
 DEFAULT_MIN_VOXELS = 64
 DEFAULT_MAX_VOLUME_RATIO = 3.0
-DEFAULT_MAX_DISTANCE_DREF = 2.50
-DEFAULT_TEMPORAL_NEIGHBORHOOD_DREF = 4.0
-DEFAULT_LOCAL_EDGE_RADIUS_DREF = 4.5
-DEFAULT_MAX_TRIPLES_PER_FRAME = 32
 
+DEFAULT_TRACKASTRA_MODEL = "ctc"
+DEFAULT_TRACKASTRA_MODE = "greedy"
+DEFAULT_TRACKASTRA_DEVICE = "cuda"
+
+DEFAULT_STEPS = 1000
+DEFAULT_LR = 2.0e-4
+DEFAULT_WEIGHT_DECAY = 1.0e-4
+DEFAULT_GRAD_CLIP = 1.0
+DEFAULT_ACCUMULATE_CASES = 4
+DEFAULT_EVAL_EVERY = 100
+DEFAULT_PRINT_EVERY = 10
+DEFAULT_VAL_CASES = 0
+
+DEFAULT_SYNTHETIC_LOGIT = 3.5
 DEFAULT_PRESERVE_EDGES = 512
 DEFAULT_PRESERVE_RATIO = 12
 DEFAULT_PRESERVATION_WEIGHT = 2.0
 DEFAULT_SPLIT_WEIGHT = 0.05
-DEFAULT_NOOP_WEIGHT = 0.50
-DEFAULT_CORRUPTED_GATE_WEIGHT = 0.05
-DEFAULT_MARGIN_WEIGHT = 0.50
-DEFAULT_MARGIN = 1.0
 
-# STIRNET_INV35_OBJECTIVE_V2_WRONG_NEIGHBOURHOOD
-CORRUPTIONS = ("contentless", "wrong_neighbourhood")
-OBJECTIVE_VERSION = 2
-CACHE_VERSION = 2
-OBSERVER_CACHE_VERSION = 1
+DEFAULT_SEED = 20260827
+
+NODE_DIM = 32
+EDGE_DIM = 15
+STATUS_DIM = 10
+
+# Current graph_builder.py 32-D node feature layout.
+GX_TIME = 0
+GX_POS = slice(1, 4)
+GX_LOG_VOLUME = 4
+GX_BBOX = slice(5, 8)
+GX_PCA = slice(8, 11)
+GX_ELONGATION = 11
+GX_FLATNESS = 12
+GX_SOLIDITY = 13
+GX_COMPACTNESS = 14
+GX_INTENSITY_MEAN = 15
+GX_INTENSITY_STD = 16
+GX_BACK_VEL = slice(17, 20)
+GX_FWD_VEL = slice(20, 23)
+GX_LENGTH_BEFORE = 23
+GX_LENGTH_AFTER = 24
+GX_VOLUME_BOUNDARY = 25
+GX_PATCH_BOUNDARY = 26
+GX_IS_CURRENT = 27
+GX_INTERIOR_START = 28
+GX_INTERIOR_END = 29
+GX_DIVISION = 30
+GX_BOUNDARY = 31
 
 
 # =============================================================================
@@ -317,16 +359,8 @@ def resolve(path: str | Path) -> Path:
     return value.resolve() if value.is_absolute() else (ROOT / value).resolve()
 
 
-def seed_all(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
 def duration(seconds: float) -> str:
-    seconds = max(0, int(round(seconds)))
+    seconds = max(0, int(round(float(seconds))))
     minutes, seconds = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     if hours:
@@ -334,6 +368,13 @@ def duration(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {seconds:02d}s"
     return f"{seconds}s"
+
+
+def parse_spacing(text: str) -> tuple[float, float, float]:
+    values = tuple(float(v.strip()) for v in str(text).split(","))
+    if len(values) != 3 or any(not math.isfinite(v) or v <= 0 for v in values):
+        raise ValueError("--spacing must be three positive finite Z,Y,X values")
+    return values
 
 
 def jsonable(value: Any) -> Any:
@@ -344,12 +385,12 @@ def jsonable(value: Any) -> Any:
     if isinstance(value, np.generic):
         return jsonable(value.item())
     if torch.is_tensor(value):
-        x = value.detach().cpu()
-        return jsonable(x.item()) if x.ndim == 0 else jsonable(x.tolist())
-    if isinstance(value, Path):
-        return str(value)
+        tensor = value.detach().cpu()
+        return jsonable(tensor.item()) if tensor.ndim == 0 else jsonable(tensor.tolist())
     if dataclasses.is_dataclass(value):
         return jsonable(dataclasses.asdict(value))
+    if isinstance(value, Path):
+        return str(value)
     if isinstance(value, dict):
         return {str(k): jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
@@ -361,27 +402,26 @@ def atomic_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(json.dumps(jsonable(payload), indent=2, sort_keys=True), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(jsonable(payload), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
 
 
-def atomic_npy(path: Path, array: np.ndarray) -> None:
+def atomic_pickle(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp.npy")
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp = Path(tmp_name)
     try:
-        np.save(tmp, np.asarray(array), allow_pickle=False)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-def atomic_torch(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        torch.save(payload, tmp)
+        with os.fdopen(fd, "wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
@@ -394,24 +434,31 @@ def torch_load(path: Path, map_location="cpu") -> Any:
         return torch.load(path, map_location=map_location)
 
 
-def stable_fraction(*values: Any) -> float:
-    digest = hashlib.sha256("|".join(map(str, values)).encode()).digest()
-    return int.from_bytes(digest[:8], "big") / float(2**64 - 1)
+def autocast_for(device: torch.device, dtype_name: str):
+    if device.type != "cuda" or dtype_name == "fp32":
+        return nullcontext()
+    dtype = torch.float16 if dtype_name == "fp16" else torch.bfloat16
+    return torch.autocast("cuda", dtype=dtype)
 
 
-def file_signature(path: Path) -> dict[str, Any]:
-    stat = path.stat()
-    return {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+def make_grad_scaler(device: torch.device, amp_dtype: str):
+    enabled = device.type == "cuda" and amp_dtype == "fp16"
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except TypeError:
+        return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
 def map_tree(value: Any, fn):
     if torch.is_tensor(value):
         return fn(value)
     if dataclasses.is_dataclass(value):
-        return type(value)(**{
-            field.name: map_tree(getattr(value, field.name), fn)
-            for field in dataclasses.fields(value)
-        })
+        return type(value)(
+            **{
+                field.name: map_tree(getattr(value, field.name), fn)
+                for field in dataclasses.fields(value)
+            }
+        )
     if isinstance(value, dict):
         return {k: map_tree(v, fn) for k, v in value.items()}
     if isinstance(value, list):
@@ -421,1371 +468,1865 @@ def map_tree(value: Any, fn):
     return value
 
 
-def tree_cpu(value: Any) -> Any:
-    return map_tree(value, lambda x: x.detach().cpu())
-
-
-def tree_device(value: Any, device: torch.device) -> Any:
-    return map_tree(value, lambda x: x.to(device, non_blocking=True))
-
-
-# STIRNET_INV35_FROZEN_CACHE_TRAINING_DTYPE_V1
-def tree_device_training_float(
-    value: Any,
-    device: torch.device,
-    floating_dtype: torch.dtype,
-) -> Any:
-    # Restore floating cache tensors to the dtype used by trainable modules.
-    def convert(tensor: Tensor) -> Tensor:
+def tree_to_device_fp32(value: Any, device: torch.device) -> Any:
+    def move(tensor: Tensor) -> Tensor:
         if tensor.is_floating_point():
-            return tensor.to(
-                device=device,
-                dtype=floating_dtype,
-                non_blocking=True,
-            )
-        return tensor.to(
-            device=device,
-            non_blocking=True,
-        )
-
-    return map_tree(value, convert)
+            return tensor.to(device=device, dtype=torch.float32)
+        return tensor.to(device=device)
+    return map_tree(value, move)
 
 
-def autocast_for(device: torch.device, dtype_name: str):
-    if device.type != "cuda" or dtype_name == "fp32":
-        return nullcontext()
-    dtype = torch.float16 if dtype_name == "fp16" else torch.bfloat16
-    return torch.autocast("cuda", dtype=dtype)
+def reference_key(ref_um: Sequence[float]) -> tuple[int, int, int]:
+    values = np.asarray(ref_um, np.float64)
+    return tuple(int(v) for v in np.rint(values * 10_000.0).astype(np.int64))
 
 
 # =============================================================================
-# Paths / checkpoint
+# Paths
 # =============================================================================
 
 
 @dataclass(frozen=True)
 class Paths:
     sample: str
+    run_root: Path
     output: Path
     annotations: Path
-    inv24: Path
-    stage6: Path
     zarr: Path
+    spatial_cache: Path
     checkpoint: Path
 
     @property
-    def cache(self): return self.output / "cache"
-    @property
-    def manual_movie(self): return self.cache / "manual_movie.npy"
-    @property
-    def manual_movie_meta(self): return self.cache / "manual_movie_meta.json"
-    @property
-    def raw_movie(self): return self.cache / "raw_movie.npy"
-    @property
-    def temporal_static(self): return self.cache / "temporal_static.pkl"
-    @property
-    def trackastra(self): return self.cache / "trackastra"
-    @property
-    def track_graph(self): return self.trackastra / "track_graph.pkl"
-    @property
-    def tracked_masks(self): return self.trackastra / "tracked_masks.npy"
-    @property
-    def spatial_cache(self): return self.cache / "spatial"
-    @property
-    def raw_norm_cache(self): return self.cache / "raw_normalized"
-    @property
-    def candidate_manifest(self): return self.output / "candidate_manifest.json"
+    def movie_dir(self) -> Path:
+        return self.output / "movies"
 
-    def manual(self, t): return self.annotations / f"manual_instances_t{t:03d}.npy"
-    def supervoxels(self, t): return self.inv24 / f"t{t:03d}/partition/watershed_supervoxels.npy"
-    def preprocessed(self, t): return self.stage6 / "preprocessing" / f"t{t:03d}.npy"
-    def source(self, t): return self.stage6 / "segmentation" / f"t{t:03d}.npy"
-    def raw_norm(self, t): return self.raw_norm_cache / f"t{t:03d}.npy"
-    def frame_dir(self, t): return self.spatial_cache / f"t{t:03d}"
-    def graph_cache(self, t): return self.frame_dir(t) / "frozen_graph.pt"
-    def spatial_inputs(self, t): return self.frame_dir(t) / "spatial_inputs.npy"
-    def explicit_geometry(self, t): return self.frame_dir(t) / "explicit_geometry.npy"
-    def observer_refs(self, t): return self.frame_dir(t) / "observer_ref_um.npy"
-    def observer_d1(self, t): return self.frame_dir(t) / "observer_d1_raw.npy"
-    def observer_d2(self, t): return self.frame_dir(t) / "observer_d2_raw.npy"
-    def observer_hidden(self, t): return self.frame_dir(t) / "observer_hidden_raw.npy"
-    def observer_explicit(self, t): return self.frame_dir(t) / "observer_explicit_raw.npy"
-    def observer_meta(self, t): return self.frame_dir(t) / "observer_meta.json"
-    def frame_meta(self, t): return self.frame_dir(t) / "meta.json"
+    @property
+    def raw_movie(self) -> Path:
+        return self.movie_dir / "raw.npy"
+
+    @property
+    def manual_movie(self) -> Path:
+        return self.movie_dir / "manual.npy"
+
+    @property
+    def movie_meta(self) -> Path:
+        return self.movie_dir / "meta.json"
+
+    @property
+    def touching_pairs(self) -> Path:
+        return self.output / "touching_pairs.json"
+
+    @property
+    def dataset_manifest(self) -> Path:
+        return self.output / "dataset_manifest.json"
+
+    @property
+    def variants(self) -> Path:
+        return self.output / "variants"
+
+    def variant_dir(self, index: int) -> Path:
+        return self.variants / f"variant_{index:03d}"
+
+    def merge_plan(self, index: int) -> Path:
+        return self.variant_dir(index) / "merge_plan.json"
+
+    def track_graph(self, index: int) -> Path:
+        return self.variant_dir(index) / "track_graph.pkl"
+
+    def variant_success(self, index: int) -> Path:
+        return self.variant_dir(index) / "_SUCCESS.json"
+
+    def graph_cache(self, t: int) -> Path:
+        return self.spatial_cache / f"t{t:03d}" / "frozen_graph.pt"
+
+    def spatial_meta(self, t: int) -> Path:
+        return self.spatial_cache / f"t{t:03d}" / "meta.json"
+
+    def observer_refs(self, t: int) -> Path:
+        return self.spatial_cache / f"t{t:03d}" / "observer_ref_um.npy"
+
+    def observer_d1(self, t: int) -> Path:
+        return self.spatial_cache / f"t{t:03d}" / "observer_d1_raw.npy"
+
+    def observer_d2(self, t: int) -> Path:
+        return self.spatial_cache / f"t{t:03d}" / "observer_d2_raw.npy"
+
+    def observer_hidden(self, t: int) -> Path:
+        return self.spatial_cache / f"t{t:03d}" / "observer_hidden_raw.npy"
+
+    def observer_explicit(self, t: int) -> Path:
+        return self.spatial_cache / f"t{t:03d}" / "observer_explicit_raw.npy"
+
+    @property
+    def training_history(self) -> Path:
+        return self.output / "training_history.json"
+
+    @property
+    def validation_history(self) -> Path:
+        return self.output / "validation_history.json"
+
+    @property
+    def best_metrics(self) -> Path:
+        return self.output / "best_metrics.json"
+
+    @property
+    def best(self) -> Path:
+        return self.output / "best.pt"
+
+    @property
+    def latest(self) -> Path:
+        return self.output / "latest.pt"
+
+    @property
+    def final(self) -> Path:
+        return self.output / "final.pt"
+
+    @property
+    def test_metrics(self) -> Path:
+        return self.output / "test_metrics.json"
 
 
-def resolve_checkpoint(value: Path | None) -> Path:
-    root = DEFAULT_SPATIAL_CHECKPOINT if value is None else resolve(value)
-    if root.is_file():
-        return root.resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(root)
-    for name in ("best.pt", "final.pt", "latest.pt", "checkpoint.pt"):
-        candidate = root / name
+def resolve_current_spatial_checkpoint(override: Path | None) -> Path:
+    """Resolve the current spatial checkpoint without any old Inv35 cache."""
+    if override is not None:
+        path = resolve(override)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return path
+
+    # Current BioHub spatial visualization / leaderboard-side recovery.
+    recovery = (
+        ROOT
+        / "runs"
+        / "stirnet"
+        / "investigations"
+        / "19_morphology_rag_v2_headroom_training"
+        / "recovery"
+        / "drosophila_12_morphology_rag_v2_headroom_h100"
+    )
+    for candidate in (
+        recovery / "best_checkpoint.pt",
+        recovery / "checkpoint_step_000600.pt",
+    ):
         if candidate.is_file():
             return candidate.resolve()
-    candidates = list(root.rglob("*.pt"))
-    if not candidates:
-        raise FileNotFoundError(f"No .pt checkpoint below {root}")
-    return max(candidates, key=lambda p: (p.stat().st_mtime_ns, p.name)).resolve()
+    steps = sorted(recovery.glob("checkpoint_step_*.pt"))
+    if steps:
+        return steps[-1].resolve()
+
+    # Fallback used by the earlier spatial milestone.
+    milestone = (
+        ROOT
+        / "runs"
+        / "stirnet"
+        / "milestones"
+        / "drosophila_12_spatial_v1"
+    )
+    for candidate in (
+        milestone / "best_checkpoint.pt",
+        milestone / "checkpoint_step_000500.pt",
+        milestone / "final.pt",
+    ):
+        if candidate.is_file():
+            return candidate.resolve()
+    steps = sorted(milestone.glob("checkpoint_step_*.pt"))
+    if steps:
+        return steps[-1].resolve()
+
+    raise FileNotFoundError(
+        "Could not resolve the current spatial checkpoint. "
+        "Pass --checkpoint explicitly."
+    )
 
 
-def make_paths(args) -> Paths:
-    sample = args.sample_id
-    output = resolve(args.output) if args.output else (DEFAULT_OUTPUT / sample).resolve()
-    annotations = resolve(args.annotations) if args.annotations else (DEFAULT_ANNOTATIONS / sample).resolve()
-    inv24 = resolve(args.inv24) if args.inv24 else (DEFAULT_INV24 / sample / "h100_q0p845").resolve()
-    stage6 = V13.resolve_stage6_root(sample, None if args.stage6_root is None else str(args.stage6_root))
-    zarr = V13.resolve_sample_zarr(sample, None if args.sample_zarr is None else str(args.sample_zarr))
-    return Paths(sample, output, annotations, inv24, stage6, zarr, resolve_checkpoint(args.checkpoint))
+def make_paths(args: argparse.Namespace) -> Paths:
+    sample = str(args.sample_id)
+    run_root = (
+        ROOT
+        / "runs"
+        / "stirnet"
+        / "evaluation"
+        / SCRIPT_NAME
+        / sample
+    ).resolve()
+
+    output = (
+        resolve(args.output)
+        if args.output is not None
+        else (run_root / "concrete_cutkeep_v3").resolve()
+    )
+
+    # The clean rewrite owns and recreates this cache itself.
+    spatial_cache = (
+        resolve(args.spatial_cache_root)
+        if args.spatial_cache_root is not None
+        else (output / "spatial_cache").resolve()
+    )
+
+    annotations = (
+        resolve(args.annotations)
+        if args.annotations is not None
+        else (
+            ROOT
+            / "evaluation"
+            / "segmentation"
+            / "annotations"
+            / sample
+        ).resolve()
+    )
+
+    zarr = (
+        resolve(args.sample_zarr)
+        if args.sample_zarr is not None
+        else (
+            ROOT
+            / "data"
+            / "sample"
+            / "biohub_5samples_20timepoints"
+            / "train"
+            / sample
+            / f"{sample}.zarr"
+        ).resolve()
+    )
+
+    checkpoint = resolve_current_spatial_checkpoint(args.checkpoint)
+
+    return Paths(
+        sample=sample,
+        run_root=run_root,
+        output=output,
+        annotations=annotations,
+        zarr=zarr,
+        spatial_cache=spatial_cache,
+        checkpoint=checkpoint,
+    )
 
 
 def validate_inputs(paths: Paths, frame_count: int) -> None:
-    missing = []
+    """
+    No previous Investigation-35 data is required.
+
+    Required clean inputs:
+      - manual true-instance annotations
+      - raw BioHub movie
+      - current spatial checkpoint
+    """
+    missing: list[Path] = []
+
     for t in range(frame_count):
-        for path in (paths.manual(t), paths.supervoxels(t), paths.preprocessed(t), paths.source(t)):
-            if not path.is_file(): missing.append(path)
-    if not paths.zarr.exists(): missing.append(paths.zarr)
-    if not paths.checkpoint.is_file(): missing.append(paths.checkpoint)
+        annotation = paths.annotations / f"manual_instances_t{t:03d}.npy"
+        if not annotation.is_file():
+            missing.append(annotation)
+
+    if not paths.zarr.exists() and not paths.raw_movie.is_file():
+        missing.append(paths.zarr)
+
+    if not paths.checkpoint.is_file():
+        missing.append(paths.checkpoint)
+
     if missing:
-        preview = "\n".join(f"  {p}" for p in missing[:40])
-        raise FileNotFoundError("Missing Investigation-35 inputs:\n" + preview)
-
-
-def load_spatial_model(checkpoint: Path, device: torch.device):
-    checkpoint_payload, model, _, _, _ = INV12.load_checkpoint_model_for_inference(checkpoint, device)
-    model.eval()
-    return checkpoint_payload, model
+        preview = "\n".join(f"  {path}" for path in missing[:40])
+        raise FileNotFoundError(
+            "Required clean inputs are missing:\n"
+            + preview
+            + "\n\nNo previous Investigation-35 cache is required."
+        )
 
 
 # =============================================================================
-# Movie / raw caches
+# Movie cache
 # =============================================================================
 
 
-def stack_movie(target: Path, frame_paths: Sequence[Path], *, rebuild: bool) -> Path:
-    if target.is_file() and not rebuild:
-        existing = np.load(target, mmap_mode="r")
-        if existing.shape[0] == len(frame_paths): return target
-    first = np.load(frame_paths[0], mmap_mode="r", allow_pickle=False)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    movie = np.lib.format.open_memmap(target, mode="w+", dtype=first.dtype, shape=(len(frame_paths), *first.shape))
-    for index, path in enumerate(frame_paths):
-        frame = np.load(path, mmap_mode="r", allow_pickle=False)
-        if frame.shape != first.shape: raise ValueError(f"Frame shape mismatch: {path}")
-        movie[index] = frame
-    movie.flush(); del movie
-    return target
-
-
-def build_raw_movie(paths: Paths, frame_count: int, shape: tuple[int, int, int], *, rebuild: bool) -> Path:
-    if paths.raw_movie.is_file() and not rebuild:
-        x = np.load(paths.raw_movie, mmap_mode="r")
-        if x.shape == (frame_count, *shape): return paths.raw_movie
-    first = np.asarray(load_timepoint(paths.zarr, 0))
-    if first.shape != shape: raise ValueError(f"Raw/manual shape mismatch: {first.shape} vs {shape}")
-    paths.raw_movie.parent.mkdir(parents=True, exist_ok=True)
-    movie = np.lib.format.open_memmap(paths.raw_movie, mode="w+", dtype=first.dtype, shape=(frame_count, *shape))
-    movie[0] = first
-    for t in range(1, frame_count):
-        print(f"[raw] t={t:03d}", flush=True)
-        frame = np.asarray(load_timepoint(paths.zarr, t))
-        if frame.shape != shape: raise ValueError(f"Raw shape changed at t={t}")
-        movie[t] = frame
-    movie.flush(); del movie
-    return paths.raw_movie
-
-
-def prepare_raw_norm(paths: Paths, frame_count: int, *, rebuild: bool) -> None:
-    paths.raw_norm_cache.mkdir(parents=True, exist_ok=True)
-    raw = np.load(paths.raw_movie, mmap_mode="r")
+def annotation_signatures(paths: Paths, frame_count: int) -> list[dict[str, Any]]:
+    rows = []
     for t in range(frame_count):
-        target = paths.raw_norm(t)
-        if target.is_file() and not rebuild: continue
-        print(f"[raw norm] t={t:03d}", flush=True)
-        atomic_npy(target, robust_normalize(np.asarray(raw[t])).astype(np.float32))
+        path = paths.annotations / f"manual_instances_t{t:03d}.npy"
+        stat = path.stat()
+        rows.append(
+            {
+                "path": str(path.resolve()),
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+    return rows
 
 
-def resolve_dref(paths: Paths, frame_count: int, spacing, explicit: float | None) -> tuple[float, list[float]]:
-    if explicit is not None:
-        if explicit <= 0: raise ValueError("--dref-um must be positive")
-        return float(explicit), [float(explicit)] * frame_count
-    values = []
-    for t in range(frame_count):
-        source = np.load(paths.source(t), mmap_mode="r", allow_pickle=False)
-        values.append(float(estimate_model_dref_um(np.asarray(source), tuple(spacing))))
-    return float(np.median(np.asarray(values))), values
+def build_movies(paths: Paths, frame_count: int, *, rebuild: bool) -> None:
+    signatures = annotation_signatures(paths, frame_count)
 
+    reusable = False
+    if (
+        not rebuild
+        and paths.raw_movie.is_file()
+        and paths.manual_movie.is_file()
+        and paths.movie_meta.is_file()
+    ):
+        try:
+            meta = json.loads(paths.movie_meta.read_text(encoding="utf-8"))
+            manual = np.load(paths.manual_movie, mmap_mode="r", allow_pickle=False)
+            raw = np.load(paths.raw_movie, mmap_mode="r", allow_pickle=False)
+            reusable = (
+                int(manual.shape[0]) == frame_count
+                and raw.shape == manual.shape
+                and meta.get("annotation_signatures") == signatures
+            )
+        except Exception:
+            reusable = False
 
-# =============================================================================
-# Trackastra + static temporal metadata
-# =============================================================================
-
-
-def prepare_trackastra(paths: Paths, *, model_name: str, mode: str, device: str, rebuild: bool):
-    paths.trackastra.mkdir(parents=True, exist_ok=True)
-    if paths.track_graph.is_file() and paths.tracked_masks.is_file() and not rebuild:
-        print("[trackastra] reuse")
-        with paths.track_graph.open("rb") as handle: graph = pickle.load(handle)
-        return graph, np.load(paths.tracked_masks, mmap_mode="r")
-    try:
-        from trackastra.model import Trackastra
-    except ImportError as exc:
-        raise RuntimeError("Trackastra is required once for Investigation 35 preparation") from exc
-    raw = np.load(paths.raw_movie, mmap_mode="r")
-    manual = np.load(paths.manual_movie, mmap_mode="r")
-    started = time.perf_counter()
-    model = Trackastra.from_pretrained(model_name, device=device)
-    graph, masks = model.track(raw, manual, mode=mode)
-    with paths.track_graph.open("wb") as handle: pickle.dump(graph, handle)
-    np.save(paths.tracked_masks, np.asarray(masks), allow_pickle=False)
-    del model
-    if torch.cuda.is_available(): torch.cuda.empty_cache()
-    print(f"[trackastra] nodes={graph.number_of_nodes()} edges={graph.number_of_edges()} time={duration(time.perf_counter()-started)}")
-    return graph, np.load(paths.tracked_masks, mmap_mode="r")
-
-
-@dataclass
-class TemporalStatic:
-    records: dict[int, DetectionRecord]
-    associations: list[AssociationRecord]
-    nodes_by_time: dict[int, list[int]]
-    manual_to_node: dict[int, dict[int, int]]
-    node_to_manual: dict[int, dict[int, int]]
-    maximum_node_id: int
-
-
-def one_to_one_overlap(manual: np.ndarray, tracked: np.ndarray, purity: float = 0.98):
-    m = np.asarray(manual, np.int64).reshape(-1)
-    t = np.asarray(tracked, np.int64).reshape(-1)
-    positive = (m > 0) & (t > 0)
-    if not positive.any(): return {}, {}
-    pairs, counts = np.unique(np.stack([m[positive], t[positive]], 1), axis=0, return_counts=True)
-    mc = dict(zip(*np.unique(m[m > 0], return_counts=True)))
-    tc = dict(zip(*np.unique(t[t > 0], return_counts=True)))
-    bm, bt = defaultdict(list), defaultdict(list)
-    for (mi, ti), count in zip(pairs.tolist(), counts.tolist()):
-        bm[int(mi)].append((int(ti), int(count))); bt[int(ti)].append((int(mi), int(count)))
-    m2t, t2m = {}, {}
-    for mi, rows in bm.items():
-        if len(rows) != 1: continue
-        ti, n = rows[0]
-        if len(bt[ti]) != 1 or bt[ti][0][0] != mi: continue
-        if n / max(int(mc[mi]), 1) < purity or n / max(int(tc[ti]), 1) < purity: continue
-        m2t[mi] = ti; t2m[ti] = mi
-    return m2t, t2m
-
-
-def prepare_temporal_static(paths: Paths, track_graph, tracked_movie, raw_movie, spacing, dref_um, frame_count: int, *, rebuild: bool) -> TemporalStatic:
-    if paths.temporal_static.is_file() and not rebuild:
-        print("[temporal static] reuse")
-        with paths.temporal_static.open("rb") as handle: return pickle.load(handle)
-    records = INV30.build_static_detection_records(track_graph, tracked_movie, raw_movie, tuple(spacing), float(dref_um))
-    associations = INV30.trackastra_associations(track_graph)
-    nodes_by_time = defaultdict(list)
-    time_label_to_node = {}
-    for node_id, data in track_graph.nodes(data=True):
-        node_id = int(node_id); t = int(data["time"]); label = int(data["label"])
-        nodes_by_time[t].append(node_id); time_label_to_node[(t, label)] = node_id
-    manual_movie = np.load(paths.manual_movie, mmap_mode="r")
-    manual_to_node, node_to_manual = {}, {}
-    for t in range(frame_count):
-        m2track, track2m = one_to_one_overlap(np.asarray(manual_movie[t]), np.asarray(tracked_movie[t]))
-        m2n, n2m = {}, {}
-        for mid, track_label in m2track.items():
-            node = time_label_to_node.get((t, track_label))
-            if node is not None and node in records:
-                m2n[mid] = node; n2m[node] = mid
-        manual_to_node[t] = m2n; node_to_manual[t] = n2m
-        count = int(np.unique(np.asarray(manual_movie[t])[np.asarray(manual_movie[t]) > 0]).size)
-        print(f"[temporal map t={t:03d}] {len(m2n)}/{count} manual cells mapped 1:1", flush=True)
-    result = TemporalStatic(
-        records=records,
-        associations=associations,
-        nodes_by_time={int(k): sorted(map(int, v)) for k, v in nodes_by_time.items()},
-        manual_to_node=manual_to_node,
-        node_to_manual=node_to_manual,
-        maximum_node_id=max([int(v) for v in track_graph.nodes] or [0]),
-    )
-    with paths.temporal_static.open("wb") as handle: pickle.dump(result, handle)
-    return result
-
-# =============================================================================
-# Frozen real spatial cache over exact Investigation-24 atomic supervoxels
-# =============================================================================
-
-
-def frame_cache_matches(paths: Paths, t: int, checkpoint_sig: dict, dref_um: float) -> bool:
-    required = (paths.graph_cache(t), paths.spatial_inputs(t), paths.explicit_geometry(t), paths.frame_meta(t))
-    if any(not p.is_file() for p in required): return False
-    try: meta = json.loads(paths.frame_meta(t).read_text(encoding="utf-8"))
-    except Exception: return False
-    return (
-        meta.get("cache_version") == CACHE_VERSION
-        and meta.get("checkpoint_signature") == checkpoint_sig
-        and abs(float(meta.get("dref_um", -1)) - float(dref_um)) < 1e-6
-    )
-
-
-def prepare_spatial_cache(paths: Paths, *, frame_count: int, spacing, dref_um: float, device: torch.device, amp_dtype: str, rebuild: bool) -> None:
-    paths.spatial_cache.mkdir(parents=True, exist_ok=True)
-    signature = file_signature(paths.checkpoint)
-    todo = [t for t in range(frame_count) if rebuild or not frame_cache_matches(paths, t, signature, dref_um)]
-    if not todo:
-        print("[spatial cache] all frames ready")
+    if reusable:
+        print("[movies] reuse raw + manual", flush=True)
         return
 
-    _, model = load_spatial_model(paths.checkpoint, device)
-    # Force the production bounded dense path during one-time preparation.
-    inference_cfg = dataclasses.replace(
-        model.cfg.inference,
-        mode="tiled",
-        tiled_dense_enabled=True,
+    paths.movie_dir.mkdir(parents=True, exist_ok=True)
+
+    first_manual = np.load(
+        paths.annotations / "manual_instances_t000.npy",
+        mmap_mode="r",
+        allow_pickle=False,
     )
-    spacing_t = torch.tensor([spacing], device=device, dtype=torch.float32)
-    dref_t = torch.tensor([dref_um], device=device, dtype=torch.float32)
+    first_raw = np.asarray(load_timepoint(paths.zarr, 0))
+    if first_raw.shape != first_manual.shape:
+        raise ValueError(
+            f"Raw/manual shape mismatch: {first_raw.shape} vs {first_manual.shape}"
+        )
 
-    print("=" * 118)
-    print("INVESTIGATION 35 — ONE-TIME REAL SPATIAL CACHE")
-    print(f"checkpoint : {paths.checkpoint}")
-    print(f"device     : {device}")
-    print(f"frames     : {todo}")
-    print("watershed  : exact Investigation-24 atoms; watershed itself is NOT rerun")
-    print("=" * 118)
+    manual_movie = np.lib.format.open_memmap(
+        paths.manual_movie,
+        mode="w+",
+        dtype=first_manual.dtype,
+        shape=(frame_count, *first_manual.shape),
+    )
+    raw_movie = np.lib.format.open_memmap(
+        paths.raw_movie,
+        mode="w+",
+        dtype=first_raw.dtype,
+        shape=(frame_count, *first_raw.shape),
+    )
 
-    for t in todo:
-        frame_dir = paths.frame_dir(t); frame_dir.mkdir(parents=True, exist_ok=True)
-        pre = np.asarray(np.load(paths.preprocessed(t), mmap_mode="r", allow_pickle=False), np.float32)
-        source = np.asarray(np.load(paths.source(t), mmap_mode="r", allow_pickle=False))
-        manual = np.asarray(np.load(paths.manual(t), mmap_mode="r", allow_pickle=False))
-        sv_np = np.asarray(np.load(paths.supervoxels(t), mmap_mode="r", allow_pickle=False), np.int64)
-        if not (pre.shape == source.shape == manual.shape == sv_np.shape):
-            raise ValueError(f"t={t}: spatial input / manual / SV shape mismatch")
+    for t in range(frame_count):
+        if t:
+            print(f"[movies] t={t:03d}", flush=True)
+        manual_movie[t] = np.load(
+            paths.annotations / f"manual_instances_t{t:03d}.npy",
+            mmap_mode="r",
+            allow_pickle=False,
+        )
+        raw_movie[t] = np.asarray(load_timepoint(paths.zarr, t))
 
-        spatial_np = build_spatial_channels(pre, source, tuple(spacing), float(dref_um), derive_marker=True)
-        # Float16 disk cache is only for future frozen tile replays; preparation itself uses float32.
-        atomic_npy(paths.spatial_inputs(t), spatial_np.astype(np.float16))
-        spatial = torch.from_numpy(np.ascontiguousarray(spatial_np))[None].to(device)
-        sv = torch.from_numpy(sv_np.copy()).to(device=device, dtype=torch.long)
+    manual_movie.flush()
+    raw_movie.flush()
+    del manual_movie, raw_movie
 
-        started = time.perf_counter()
-        with torch.inference_mode(), autocast_for(device, amp_dtype):
-            dense = tiled_dense_geometry(model, spatial, spacing_t, dref_t, config=inference_cfg)
-            derived = build_geometry_derived_cache(dense.geometry, model.cfg.partition)
-            streamed = stream_tiled_label_feature_stats(
-                model,
-                spatial,
-                spacing_t,
-                dref_t,
-                [sv],
-                dense.blend_weight_sum,
-                config=inference_cfg,
-            )
-            statistics = build_supervoxel_statistics(
-                [sv],
-                spatial,
-                dense.geometry,
-                spacing_t,
-                None,
-                derived=derived,
-                pooled_scales=streamed.pooled_scales,
-                pooled_counts=streamed.counts_scales,
-            )
-            dummy = spatial.new_zeros((1, model.cfg.spatial.channels[0], 1, 1, 1))
-            rag = model.rag_builder(
-                [sv],
-                dummy,
-                spatial,
-                dense.geometry,
-                spacing_t,
-                dref_t,
-                pooled_d0_by_batch=streamed.pooled_scales[0],
-                statistics_by_batch=statistics,
-                derived_cache=derived,
-                profile_prefix="inv35",
-            )
-            rag = model.rag_network(rag)
-            actual_partition = model.partitioner(
-                rag,
-                rag.spatial_edge_logits,
-                model.cfg.partition.spatial_merge_threshold,
-                stage="spatial",
-            )
-
-        explicit = torch.cat([
-            dense.geometry.foreground_logits.sigmoid(),
-            dense.geometry.surface_logits.sigmoid(),
-            dense.geometry.separator_logits.sigmoid(),
-            dense.geometry.sdf,
-            dense.geometry.flow,
-            dense.geometry.centroid_offset,
-            dense.geometry.seed_logits.sigmoid(),
-        ], dim=1)
-        atomic_npy(paths.explicit_geometry(t), explicit[0].detach().to(torch.float16).cpu().numpy())
-        atomic_torch(paths.graph_cache(t), {
-            "cache_version": CACHE_VERSION,
-            "rag": tree_cpu(rag),
-            "actual_partition": tree_cpu(actual_partition),
-        })
-        meta = {
-            "cache_version": CACHE_VERSION,
-            "checkpoint_signature": signature,
-            "timepoint": t,
-            "dref_um": float(dref_um),
-            "spacing_zyx_um": list(map(float, spacing)),
-            "node_count": int(rag.node_features.shape[0]),
-            "edge_count": int(rag.edge_index.shape[1]),
-            "actual_spatial_instances": int(actual_partition.labels[0].max().item()),
-            "tile_shape_zyx": list(inference_cfg.tile_shape_zyx),
-            "tile_overlap_zyx": list(inference_cfg.tile_overlap_zyx),
-            "tile_halo_zyx": list(inference_cfg.tile_halo_zyx),
-            "tile_batch_size": int(inference_cfg.tile_batch_size),
-            "seconds": time.perf_counter() - started,
-        }
-        atomic_json(paths.frame_meta(t), meta)
-        print(f"[spatial cache t={t:03d}] nodes={meta['node_count']} edges={meta['edge_count']} instances={meta['actual_spatial_instances']} time={duration(meta['seconds'])}", flush=True)
-
-        del spatial, sv, dense, derived, streamed, statistics, rag, actual_partition, explicit
-        if device.type == "cuda": torch.cuda.empty_cache()
-
-    del model
-    if device.type == "cuda": torch.cuda.empty_cache()
+    atomic_json(
+        paths.movie_meta,
+        {
+            "version": 1,
+            "sample_id": paths.sample,
+            "frame_count": int(frame_count),
+            "annotation_signatures": signatures,
+        },
+    )
 
 
 # =============================================================================
-# Candidate pool
+# Atomic RAG -> true-cell mapping / touching pairs
 # =============================================================================
 
 
-def sv_label_lookup(supervoxels: np.ndarray, labels: np.ndarray, *, name: str) -> np.ndarray:
+def sv_label_lookup(
+    supervoxels: np.ndarray,
+    labels: np.ndarray,
+    *,
+    name: str,
+) -> np.ndarray:
     sv = np.asarray(supervoxels, np.int64).reshape(-1)
     lab = np.asarray(labels, np.int64).reshape(-1)
+
     max_sv = int(sv.max(initial=0))
     lo = np.full(max_sv + 1, np.iinfo(np.int64).max, np.int64)
     hi = np.full(max_sv + 1, -1, np.int64)
+
     positive = sv > 0
-    np.minimum.at(lo, sv[positive], lab[positive]); np.maximum.at(hi, sv[positive], lab[positive])
+    np.minimum.at(lo, sv[positive], lab[positive])
+    np.maximum.at(hi, sv[positive], lab[positive])
+
     present = hi >= 0
     bad = present & (lo != hi)
     if bad.any():
-        raise RuntimeError(f"{name}: manual labels split atomic SVs; examples={np.flatnonzero(bad)[:20].tolist()}")
-    result = np.zeros(max_sv + 1, np.int64); result[present] = hi[present]
+        raise RuntimeError(
+            f"{name}: a true annotation boundary cuts through an atomic "
+            f"supervoxel; examples={np.flatnonzero(bad)[:20].tolist()}"
+        )
+
+    result = np.zeros(max_sv + 1, np.int64)
+    result[present] = hi[present]
+    return result
+
+
+def physically_touching_pairs(labels: np.ndarray) -> set[tuple[int, int]]:
+    data = np.asarray(labels)
+    result: set[tuple[int, int]] = set()
+
+    for axis in range(3):
+        left_slices = [slice(None)] * 3
+        right_slices = [slice(None)] * 3
+        left_slices[axis] = slice(0, -1)
+        right_slices[axis] = slice(1, None)
+
+        left = data[tuple(left_slices)]
+        right = data[tuple(right_slices)]
+        valid = (left > 0) & (right > 0) & (left != right)
+        if not valid.any():
+            continue
+
+        a = left[valid].astype(np.int64, copy=False)
+        b = right[valid].astype(np.int64, copy=False)
+        lo = np.minimum(a, b)
+        hi = np.maximum(a, b)
+        encoded = (lo << 32) | hi
+
+        for value in np.unique(encoded).tolist():
+            result.add(
+                (
+                    int(value >> 32),
+                    int(value & 0xFFFFFFFF),
+                )
+            )
+
     return result
 
 
 @dataclass(frozen=True)
-class PairCandidate:
+class TouchPair:
     frame: int
     a: int
     b: int
-    node_a: int
-    node_b: int
     interface_edges: int
     voxels_a: int
     voxels_b: int
     volume_ratio: float
-    distance_dref: float
-    split: str
 
 
-@dataclass
-class FrameCandidates:
-    frame: int
-    node_manual: Tensor
-    manual_ids: tuple[int, ...]
-    pairs: list[PairCandidate]
-    triples: list[tuple[int, int, int]]
-
-
-@dataclass
-class CandidateManifest:
-    frames: dict[int, FrameCandidates]
-    train_pairs: list[PairCandidate]
-    val_pairs: list[PairCandidate]
-
-
-def manual_stats(labels: np.ndarray, spacing) -> tuple[dict[int, int], dict[int, np.ndarray]]:
-    spacing = np.asarray(spacing, np.float32)
-    center = 0.5 * (np.asarray(labels.shape, np.float32) - 1) * spacing
-    counts, centroids = {}, {}
-    for label in np.unique(labels[labels > 0]).tolist():
-        coords = np.argwhere(labels == label)
-        counts[int(label)] = int(len(coords))
-        centroids[int(label)] = coords.astype(np.float32).mean(0) * spacing - center
-    return counts, centroids
-
-
-def node_has_context(track_graph, node_id: int, target_t: int, radius: int) -> bool:
-    for other in list(track_graph.predecessors(node_id)) + list(track_graph.successors(node_id)):
-        dt = int(track_graph.nodes[int(other)]["time"]) - target_t
-        if 0 < abs(dt) <= radius: return True
-    return False
-
-
-def reconstruct_manifest(paths: Paths, payload: dict) -> CandidateManifest:
-    frames, train, val = {}, [], []
-    for row in payload["frames"]:
-        t = int(row["frame"])
-        cache = torch_load(paths.graph_cache(t)); rag: RAGState = cache["rag"]
-        manual = np.asarray(np.load(paths.manual(t), mmap_mode="r", allow_pickle=False))
-        sv = rag.supervoxel_labels[0].detach().cpu().numpy()
-        lookup = sv_label_lookup(sv, manual, name=f"t={t} manual")
-        node_manual = torch.as_tensor(lookup[rag.node_supervoxel_id.detach().cpu().numpy()], dtype=torch.long)
-        raw_pairs = [PairCandidate(**item) for item in row["pairs"]]
-        val_keys = {tuple(map(int, key)) for key in payload.get("val_pair_keys", [])}
-        pairs = []
-        for pair in raw_pairs:
-            key = (int(pair.frame), int(pair.a), int(pair.b))
-            effective = dataclasses.replace(pair, split=("val" if key in val_keys else pair.split))
-            pairs.append(effective)
-            (val if effective.split == "val" else train).append(effective)
-        frames[t] = FrameCandidates(
-            t,
-            node_manual,
-            tuple(map(int, row["manual_ids"])),
-            pairs,
-            [tuple(map(int, triple)) for triple in row["triples"]],
-        )
-    return CandidateManifest(frames, train, val)
-
-
-def build_candidates(paths: Paths, *, track_graph, temporal_static: TemporalStatic, frame_count: int, spacing, dref_um: float, temporal_radius: int, min_voxels: int, max_volume_ratio: float, max_distance_dref: float, val_fraction: float, rebuild: bool) -> CandidateManifest:
-    expected_manual_signatures = [file_signature(paths.manual(t)) for t in range(frame_count)]
-    if paths.candidate_manifest.is_file() and not rebuild:
-        try:
-            cached_payload = json.loads(paths.candidate_manifest.read_text(encoding="utf-8"))
-            if cached_payload.get("manual_signatures") == expected_manual_signatures:
-                return reconstruct_manifest(paths, cached_payload)
-            print("[candidates] manual annotations changed; rebuilding candidate manifest")
-        except Exception:
-            print("[candidates] cached manifest is invalid; rebuilding")
-
-    frames, train_pairs, val_pairs, json_frames = {}, [], [], []
-    for t in range(frame_count):
-        cache = torch_load(paths.graph_cache(t)); rag: RAGState = cache["rag"]
-        manual = np.asarray(np.load(paths.manual(t), mmap_mode="r", allow_pickle=False))
-        sv = rag.supervoxel_labels[0].detach().cpu().numpy()
-        lookup = sv_label_lookup(sv, manual, name=f"t={t} manual")
-        node_sv = rag.node_supervoxel_id.detach().cpu().numpy()
-        node_manual_np = lookup[node_sv]
-        node_manual = torch.as_tensor(node_manual_np, dtype=torch.long)
-        counts, centroids = manual_stats(manual, spacing)
-
-        pair_edges = defaultdict(int)
-        src = rag.edge_index[0].detach().cpu().numpy(); dst = rag.edge_index[1].detach().cpu().numpy()
-        for u, v in zip(src.tolist(), dst.tolist()):
-            a, b = int(node_manual_np[u]), int(node_manual_np[v])
-            if a <= 0 or b <= 0 or a == b: continue
-            pair_edges[tuple(sorted((a, b)))] += 1
-
-        adjacency = defaultdict(set); pairs = []
-        for (a, b), edge_count in sorted(pair_edges.items()):
-            if counts.get(a, 0) < min_voxels or counts.get(b, 0) < min_voxels: continue
-            node_a = temporal_static.manual_to_node.get(t, {}).get(a)
-            node_b = temporal_static.manual_to_node.get(t, {}).get(b)
-            if node_a is None or node_b is None: continue
-            # Keep this first production training stage focused on ordinary
-            # continuation/merge phenotypes. Division topology is valuable,
-            # but mixing it into controlled merge synthesis would make the
-            # target semantics ambiguous.
-            if (
-                int(track_graph.in_degree(node_a)) > 1
-                or int(track_graph.out_degree(node_a)) > 1
-                or int(track_graph.in_degree(node_b)) > 1
-                or int(track_graph.out_degree(node_b)) > 1
-            ):
-                continue
-            if not node_has_context(track_graph, node_a, t, temporal_radius): continue
-            if not node_has_context(track_graph, node_b, t, temporal_radius): continue
-            ratio = max(counts[a] / max(counts[b], 1), counts[b] / max(counts[a], 1))
-            if ratio > max_volume_ratio: continue
-            distance = float(np.linalg.norm(centroids[a] - centroids[b]) / max(dref_um, 1e-6))
-            if distance > max_distance_dref: continue
-            split = "val" if stable_fraction("inv35", t, a, b) < val_fraction else "train"
-            pair = PairCandidate(t, a, b, int(node_a), int(node_b), int(edge_count), counts[a], counts[b], float(ratio), distance, split)
-            pairs.append(pair); (val_pairs if split == "val" else train_pairs).append(pair)
-            adjacency[a].add(b); adjacency[b].add(a)
-
-        triples = set()
-        for middle, neighbours in adjacency.items():
-            neighbours = sorted(neighbours)
-            for i in range(len(neighbours)):
-                for j in range(i + 1, len(neighbours)):
-                    triple = tuple(sorted((neighbours[i], middle, neighbours[j])))
-                    if len(set(triple)) == 3 and all(mid in temporal_static.manual_to_node.get(t, {}) for mid in triple):
-                        triples.add(triple)
-        triples = sorted(triples)
-        manual_ids = tuple(map(int, np.unique(node_manual_np[node_manual_np > 0]).tolist()))
-        frames[t] = FrameCandidates(t, node_manual, manual_ids, pairs, triples)
-        json_frames.append({
-            "frame": t,
-            "manual_ids": list(manual_ids),
-            "pairs": [dataclasses.asdict(pair) for pair in pairs],
-            "triples": [list(x) for x in triples],
-        })
-        print(f"[candidates t={t:03d}] pairs={len(pairs)} triples={len(triples)}", flush=True)
-
-    if not train_pairs: raise RuntimeError("No training merge candidates survived filtering")
-    if not val_pairs:
-        ordered = sorted(train_pairs, key=lambda p: stable_fraction("fallback-val", p.frame, p.a, p.b))
-        selected = ordered[:min(16, len(ordered))]
-        selected_keys = {(p.frame, p.a, p.b) for p in selected}
-        val_pairs = [dataclasses.replace(p, split="val") for p in selected]
-        train_pairs = [p for p in train_pairs if (p.frame, p.a, p.b) not in selected_keys]
-        # Keep per-frame rows consistent with the top-level split.
-        for frame_data in frames.values():
-            frame_data.pairs = [
-                dataclasses.replace(p, split="val")
-                if (p.frame, p.a, p.b) in selected_keys
-                else p
-                for p in frame_data.pairs
-            ]
-        for frame_row in json_frames:
-            frame_row["pairs"] = [
-                {**item, "split": ("val" if (int(item["frame"]), int(item["a"]), int(item["b"])) in selected_keys else item["split"])}
-                for item in frame_row["pairs"]
-            ]
-        print("[candidates] WARNING: no hash-held-out pairs; moved a deterministic subset to validation")
-
-    atomic_json(paths.candidate_manifest, {
-        "format_version": 1,
-        "sample_id": paths.sample,
-        "dref_um": dref_um,
-        "filters": {
-            "min_voxels": min_voxels,
-            "max_volume_ratio": max_volume_ratio,
-            "max_distance_dref": max_distance_dref,
-            "val_fraction": val_fraction,
-        },
-        "train_pair_count": len(train_pairs),
-        "val_pair_count": len(val_pairs),
-        "val_pair_keys": [[int(p.frame), int(p.a), int(p.b)] for p in val_pairs],
-        "manual_signatures": expected_manual_signatures,
-        "frames": json_frames,
-    })
-    return CandidateManifest(frames, train_pairs, val_pairs)
-
-
-# =============================================================================
-# Controlled local temporal-graph synthesis
-# =============================================================================
-
-
-def reference_key(ref_um: Sequence[float], scale: float = 10_000.0) -> tuple[int, int, int]:
-    values = np.asarray(ref_um, np.float64)
-    return tuple(int(v) for v in np.rint(values * float(scale)).astype(np.int64))
-
-
-def context_variants(target_t: int, frame_count: int, temporal_radius: int) -> list[tuple[str, tuple[int, ...]]]:
-    full = tuple(sequence_available_time_offsets(target_t, frame_count, temporal_radius))
-    past = tuple(v for v in full if v <= 0)
-    future = tuple(v for v in full if v >= 0)
-    rows: list[tuple[str, tuple[int, ...]]] = [("full", full)]
-    if len(past) > 1 and past != full:
-        rows.append(("past_only", past))
-    if len(future) > 1 and future != full:
-        rows.append(("future_only", future))
-
-    negative = [v for v in full if v < 0]
-    positive = [v for v in full if v > 0]
-    if negative:
-        drop = max(negative)  # nearest past
-        variant = tuple(v for v in full if v != drop)
-        if len(variant) > 1:
-            rows.append(("drop_nearest_past", variant))
-    if positive:
-        drop = min(positive)  # nearest future
-        variant = tuple(v for v in full if v != drop)
-        if len(variant) > 1:
-            rows.append(("drop_nearest_future", variant))
-
-    dedup: list[tuple[str, tuple[int, ...]]] = []
-    seen: set[tuple[int, ...]] = set()
-    for name, offsets in rows:
-        if offsets not in seen:
-            seen.add(offsets)
-            dedup.append((name, offsets))
-    return dedup
-
-
-def choose_context_variant(target_t: int, frame_count: int, temporal_radius: int, rng: random.Random) -> tuple[str, tuple[int, ...]]:
-    rows = context_variants(target_t, frame_count, temporal_radius)
-    by_name = {name: offsets for name, offsets in rows}
-    draw = rng.random()
-    if draw < 0.50 or len(rows) == 1:
-        return "full", by_name["full"]
-    if draw < 0.67 and "past_only" in by_name:
-        return "past_only", by_name["past_only"]
-    if draw < 0.84 and "future_only" in by_name:
-        return "future_only", by_name["future_only"]
-    dropout = [(name, offsets) for name, offsets in rows if name.startswith("drop_")]
-    if dropout:
-        return rng.choice(dropout)
-    non_full = [(name, offsets) for name, offsets in rows if name != "full"]
-    return rng.choice(non_full) if non_full else ("full", by_name["full"])
-
-
-def anchor_for_manual_ids(temporal_static: TemporalStatic, frame: int, manual_ids: Sequence[int]) -> np.ndarray:
-    rows = []
-    weights = []
-    for manual_id in manual_ids:
-        node_id = temporal_static.manual_to_node.get(int(frame), {}).get(int(manual_id))
-        if node_id is None:
-            continue
-        record = temporal_static.records[int(node_id)]
-        rows.append(np.asarray(record.position_um, np.float32))
-        weights.append(max(float(record.physical_volume_um3), 1e-6))
-    if not rows:
-        raise RuntimeError(f"No temporal target nodes for frame={frame}, manual_ids={tuple(manual_ids)}")
-    weight = np.asarray(weights, np.float64)
-    weight /= weight.sum()
-    return np.sum(np.stack(rows).astype(np.float64) * weight[:, None], axis=0).astype(np.float32)
-
-
-def member_target_nodes(temporal_static: TemporalStatic, frame: int, manual_ids: Sequence[int]) -> tuple[int, ...]:
-    nodes = []
-    for manual_id in manual_ids:
-        node_id = temporal_static.manual_to_node.get(int(frame), {}).get(int(manual_id))
-        if node_id is None:
-            raise RuntimeError(f"Manual instance {manual_id} at t={frame} has no clean Trackastra node")
-        nodes.append(int(node_id))
-    return tuple(nodes)
-
-
-def forced_lineage_nodes(track_graph, target_nodes: Sequence[int], absolute_times: set[int]) -> set[int]:
-    forced = {int(v) for v in target_nodes}
-    queue = list(forced)
-    while queue:
-        node = queue.pop()
-        neighbours = list(track_graph.predecessors(node)) + list(track_graph.successors(node))
-        for other in neighbours:
-            other = int(other)
-            if other in forced:
-                continue
-            if int(track_graph.nodes[other]["time"]) not in absolute_times:
-                continue
-            forced.add(other)
-            queue.append(other)
-    return forced
-
-
-def merged_detection_record(
-    temporal_static: TemporalStatic,
-    *,
-    frame: int,
-    member_nodes: Sequence[int],
-    node_id: int,
-) -> DetectionRecord:
-    members = [temporal_static.records[int(v)] for v in member_nodes]
-    volumes = np.asarray([max(float(r.physical_volume_um3), 1e-6) for r in members], np.float64)
-    weights = volumes / volumes.sum()
-    positions = np.stack([np.asarray(r.position_um, np.float32) for r in members])
-    position = np.sum(positions * weights[:, None], axis=0)
-
-    # Approximate the union bounding box in the same centred physical frame.
-    bbox = np.stack([np.asarray(r.bbox_um, np.float32) for r in members])
-    lower = positions - 0.5 * bbox
-    upper = positions + 0.5 * bbox
-    union_bbox = upper.max(axis=0) - lower.min(axis=0)
-
-    pca = np.stack([np.asarray(r.pca_axes_um, np.float32) for r in members])
-    pca_union = np.maximum(pca.max(axis=0), union_bbox * 0.50)
-
-    means = np.asarray([float(r.intensity_mean) for r in members], np.float64)
-    stds = np.asarray([float(r.intensity_std) for r in members], np.float64)
-    mean_i = float(np.sum(weights * means))
-    second = float(np.sum(weights * (stds**2 + means**2)))
-    std_i = float(math.sqrt(max(second - mean_i**2, 0.0)))
-
-    def weighted_vector(name: str) -> tuple[float, float, float]:
-        values = np.stack([np.asarray(getattr(r, name), np.float32) for r in members])
-        result = np.sum(values * weights[:, None], axis=0)
-        return tuple(float(v) for v in result)
-
-    def weighted_scalar(name: str) -> float:
-        values = np.asarray([float(getattr(r, name)) for r in members], np.float64)
-        return float(np.sum(weights * values))
-
-    first_grid = next((r.instance_grid for r in members if r.instance_grid is not None), None)
-    grid_size = int(torch.as_tensor(first_grid).shape[-1]) if first_grid is not None else 12
-
-    # Deliberately remove current-frame compact-history content. The target
-    # merged detection is needed for correct graph topology, but the temporal
-    # branch should learn from surrounding observations, not a hidden current
-    # morphology descriptor that disappears under a different tracker.
-    zero_grid = torch.zeros((4, grid_size, grid_size, grid_size), dtype=torch.float32)
-
-    return DetectionRecord(
-        node_id=int(node_id),
-        time_offset=0,
-        position_um=tuple(float(v) for v in position),
-        physical_volume_um3=float(volumes.sum()),
-        bbox_um=tuple(float(v) for v in union_bbox),
-        pca_axes_um=tuple(float(v) for v in pca_union),
-        elongation=weighted_scalar("elongation"),
-        flatness=weighted_scalar("flatness"),
-        solidity=weighted_scalar("solidity"),
-        compactness=weighted_scalar("compactness"),
-        intensity_mean=mean_i,
-        intensity_std=std_i,
-        backward_velocity_um=weighted_vector("backward_velocity_um"),
-        forward_velocity_um=weighted_vector("forward_velocity_um"),
-        distance_to_volume_boundary_um=min(float(r.distance_to_volume_boundary_um) for r in members),
-        distance_to_patch_boundary_um=min(float(r.distance_to_patch_boundary_um) for r in members),
-        boundary_related=any(bool(r.boundary_related) for r in members),
-        instance_grid=zero_grid,
-        history_valid=False,
-    )
-
-
-def _patch_synthetic_same_component_features(graph: dict[str, Any], merge_ids: Sequence[int]) -> dict[str, Any]:
-    if not merge_ids:
-        return graph
-    merge_set = {int(v) for v in merge_ids}
-    merged_id = min(merge_set)
-    original = torch.as_tensor(graph["best_current_component_id"], dtype=torch.long).clone()
-    remapped = original.clone()
-    mask = torch.zeros_like(remapped, dtype=torch.bool)
-    for value in merge_set:
-        mask |= remapped == int(value)
-    remapped[mask] = int(merged_id)
-    graph["best_current_component_id"] = remapped
-
-    hidx = torch.as_tensor(graph["hypothesis_edge_index"], dtype=torch.long)
-    hattr = torch.as_tensor(graph["hypothesis_edge_attr"]).clone()
-    if hidx.numel() and hattr.numel():
-        src, dst = hidx
-        synthetic_same = (remapped[src] > 0) & (remapped[src] == remapped[dst])
-        newly_same = synthetic_same & (original[src] != original[dst])
-        if bool(newly_same.any()):
-            best = torch.as_tensor(graph["best_component_overlap"], dtype=hattr.dtype)
-            confidence = torch.minimum(best[src], best[dst]).clamp(0.0, 1.0)
-            confidence = torch.where(confidence > 0, confidence, torch.ones_like(confidence))
-            hattr[newly_same, 4] = confidence[newly_same]
-            # Representative past/future volumes sum to the synthetic current
-            # merged component by construction; ratio ~1 is the intended cue.
-            hattr[newly_same, 18] = 1.0
-            hattr[newly_same, 21] = 1.0
-        graph["hypothesis_edge_attr"] = hattr
-    return graph
-
-
-def build_local_temporal_graph(
-    *,
-    temporal_static: TemporalStatic,
-    track_graph,
-    manual_labels: np.ndarray,
-    target_t: int,
+def build_touching_catalog(
+    paths: Paths,
     frame_count: int,
-    temporal_radius: int,
-    available_offsets: Sequence[int],
-    anchor_ids: Sequence[int],
-    merge_ids: Sequence[int],
-    spacing: Sequence[float],
-    dref_um: float,
-    neighbourhood_dref: float,
-    complete_candidate_graph: bool = False,
-) -> dict[str, Any]:
-    available_offsets = tuple(sorted({int(v) for v in available_offsets}))
-    if 0 not in available_offsets:
-        raise ValueError("available_offsets must contain 0")
-    absolute_times = {int(target_t) + int(v) for v in available_offsets}
-    anchor = anchor_for_manual_ids(temporal_static, target_t, anchor_ids)
-    merge_nodes = member_target_nodes(temporal_static, target_t, merge_ids) if merge_ids else ()
-    anchor_nodes = member_target_nodes(temporal_static, target_t, anchor_ids)
-    forced = forced_lineage_nodes(track_graph, anchor_nodes, absolute_times)
+    *,
+    min_voxels: int,
+    max_volume_ratio: float,
+    rebuild: bool,
+) -> dict[int, list[TouchPair]]:
+    """
+    Build merge candidates directly from manual true instances.
 
-    selected: set[int] = set()
-    radius_um = float(neighbourhood_dref) * float(dref_um)
-    for absolute_t in sorted(absolute_times):
-        for node_id in temporal_static.nodes_by_time.get(absolute_t, []):
-            record = temporal_static.records.get(int(node_id))
-            if record is None:
-                continue
-            distance = float(np.linalg.norm(np.asarray(record.position_um, np.float32) - anchor))
-            if distance <= radius_um or int(node_id) in forced:
-                selected.add(int(node_id))
-    selected.update(int(v) for v in anchor_nodes)
-
-    replacement: dict[int, int] = {}
-    merged_node_id: int | None = None
-    records: list[DetectionRecord] = []
-
-    if merge_nodes:
-        digest = int.from_bytes(
-            hashlib.sha256(
-                (f"{target_t}:" + ",".join(str(v) for v in sorted(merge_nodes))).encode("utf-8")
-            ).digest()[:4],
-            "big",
-        )
-        merged_node_id = int(temporal_static.maximum_node_id + 1 + target_t * 1_000_000 + digest % 900_000)
-        for node in merge_nodes:
-            replacement[int(node)] = merged_node_id
-
-    for node_id in sorted(selected):
-        data = track_graph.nodes[int(node_id)]
-        absolute_t = int(data["time"])
-        if absolute_t not in absolute_times:
-            continue
-        if node_id in replacement:
-            continue
-        base = temporal_static.records.get(int(node_id))
-        if base is None:
-            continue
-        records.append(replace(base, time_offset=absolute_t - int(target_t)))
-
-    if merge_nodes:
-        assert merged_node_id is not None
-        records.append(
-            merged_detection_record(
-                temporal_static,
-                frame=target_t,
-                member_nodes=merge_nodes,
-                node_id=merged_node_id,
+    No RAG is needed to synthesize concrete merge movies. Whether a selected
+    pair has an editable RAG interface is resolved later from the freshly
+    reconstructed spatial cache.
+    """
+    if paths.touching_pairs.is_file() and not rebuild:
+        payload = json.loads(paths.touching_pairs.read_text(encoding="utf-8"))
+        if int(payload.get("version", -1)) == DATASET_VERSION:
+            result = {
+                int(t): [TouchPair(**row) for row in rows]
+                for t, rows in payload["frames"].items()
+            }
+            print(
+                f"[touching pairs] reuse total="
+                f"{sum(len(rows) for rows in result.values())}",
+                flush=True,
             )
+            return result
+
+    manual_movie = np.load(
+        paths.manual_movie,
+        mmap_mode="r",
+        allow_pickle=False,
+    )
+    result: dict[int, list[TouchPair]] = {}
+    serializable: dict[str, list[dict[str, Any]]] = {}
+
+    for t in range(frame_count):
+        manual = np.asarray(manual_movie[t])
+        counts = np.bincount(
+            manual.reshape(-1).astype(np.int64, copy=False)
         )
 
-    final_ids = {int(r.node_id) for r in records}
-    associations: dict[tuple[int, int, str], AssociationRecord] = {}
-    for row in temporal_static.associations:
-        src0, dst0 = int(row.src_node_id), int(row.dst_node_id)
-        if src0 not in selected or dst0 not in selected:
-            continue
-        src = replacement.get(src0, src0)
-        dst = replacement.get(dst0, dst0)
-        if src == dst or src not in final_ids or dst not in final_ids:
-            continue
-        rewired = src != src0 or dst != dst0
-        relation = "temporal" if rewired else row.relation
-        key = (int(src), int(dst), str(relation))
-        existing = associations.get(key)
-        if existing is None:
-            associations[key] = AssociationRecord(src, dst, row.score, relation)
-        else:
-            old_score = -float("inf") if existing.score is None else float(existing.score)
-            new_score = -float("inf") if row.score is None else float(row.score)
-            if new_score > old_score:
-                associations[key] = AssociationRecord(src, dst, row.score, relation)
-
-    graph = build_temporal_graph(
-        records,
-        list(associations.values()),
-        dref_um=float(dref_um),
-        temporal_radius=int(temporal_radius),
-        available_time_offsets=available_offsets,
-        k_spatial_neighbors=6,
-        spatial_radius_dref=2.5,
-        current_labels=np.asarray(manual_labels),
-        spacing_um=tuple(float(v) for v in spacing),
-        candidate_graph_enabled=bool(complete_candidate_graph),
-    )
-    graph["temporal_batch"] = torch.zeros(len(graph["temporal_ref_um"]), dtype=torch.long)
-    graph["target_time_index"] = int(target_t)
-    graph["available_time_offsets"] = torch.tensor(available_offsets, dtype=torch.long)
-    graph["anchor_um"] = torch.as_tensor(anchor, dtype=torch.float32)
-    graph["merge_manual_ids"] = torch.tensor(tuple(int(v) for v in merge_ids), dtype=torch.long)
-    return _patch_synthetic_same_component_features(graph, merge_ids)
-
-
-# =============================================================================
-# Precompute raw spatial evidence at every temporal reference used by training
-# =============================================================================
-
-
-def observer_cache_matches(paths: Paths, t: int, *, dref_um: float, neighbourhood_dref: float) -> bool:
-    required = (
-        paths.observer_refs(t),
-        paths.observer_d1(t),
-        paths.observer_d2(t),
-        paths.observer_hidden(t),
-        paths.observer_explicit(t),
-        paths.observer_meta(t),
-    )
-    if any(not p.is_file() for p in required):
-        return False
-    try:
-        meta = json.loads(paths.observer_meta(t).read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    return (
-        int(meta.get("observer_cache_version", -1)) == OBSERVER_CACHE_VERSION
-        and abs(float(meta.get("dref_um", -1)) - float(dref_um)) < 1e-6
-        and abs(float(meta.get("neighbourhood_dref", -1)) - float(neighbourhood_dref)) < 1e-6
-        and meta.get("candidate_manifest_signature") == file_signature(paths.candidate_manifest)
-        and meta.get("checkpoint_signature") == file_signature(paths.checkpoint)
-    )
-
-
-def selected_triples(frame_data: FrameCandidates, maximum: int) -> list[tuple[int, int, int]]:
-    ordered = sorted(
-        frame_data.triples,
-        key=lambda triple: stable_fraction("inv35-triple", frame_data.frame, *triple),
-    )
-    return ordered[: max(int(maximum), 0)]
-
-
-def collect_frame_reference_superset(
-    *,
-    paths: Paths,
-    frame_data: FrameCandidates,
-    temporal_static: TemporalStatic,
-    track_graph,
-    frame_count: int,
-    temporal_radius: int,
-    spacing: Sequence[float],
-    dref_um: float,
-    neighbourhood_dref: float,
-    max_triples: int,
-    complete_candidate_graph: bool,
-) -> np.ndarray:
-    t = int(frame_data.frame)
-    manual = np.load(paths.manual(t), mmap_mode="r", allow_pickle=False)
-    keys: dict[tuple[int, int, int], np.ndarray] = {}
-    variants = context_variants(t, frame_count, temporal_radius)
-
-    def add_graph(anchor_ids: Sequence[int], merge_ids: Sequence[int], offsets: Sequence[int]) -> None:
-        graph = build_local_temporal_graph(
-            temporal_static=temporal_static,
-            track_graph=track_graph,
-            manual_labels=manual,
-            target_t=t,
-            frame_count=frame_count,
-            temporal_radius=temporal_radius,
-            available_offsets=offsets,
-            anchor_ids=anchor_ids,
-            merge_ids=merge_ids,
-            spacing=spacing,
-            dref_um=dref_um,
-            neighbourhood_dref=neighbourhood_dref,
-            complete_candidate_graph=complete_candidate_graph,
-        )
-        refs = torch.as_tensor(graph["temporal_ref_um"]).detach().cpu().numpy()
-        for ref in refs:
-            keys.setdefault(reference_key(ref), np.asarray(ref, np.float32))
-
-    # Both the positive synthetic merge and the corresponding clean close-pair
-    # negative are included in the reference superset.
-    for pair in frame_data.pairs:
-        anchor = (int(pair.a), int(pair.b))
-        for _, offsets in variants:
-            add_graph(anchor, anchor, offsets)
-            add_graph(anchor, (), offsets)
-
-    for triple in selected_triples(frame_data, max_triples):
-        for _, offsets in variants:
-            add_graph(triple, triple, offsets)
-
-    if not keys:
-        return np.zeros((0, 3), dtype=np.float32)
-    ordered = [keys[key] for key in sorted(keys)]
-    return np.stack(ordered).astype(np.float32, copy=False)
-
-
-@torch.inference_mode()
-def sample_raw_observer_features(
-    model,
-    spatial_inputs: Tensor,
-    spacing_um: Tensor,
-    dref_um: Tensor,
-    refs_um: np.ndarray,
-    *,
-    config,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Mirror production stream_tiled_observation_cache before trainable projections."""
-    count = int(len(refs_um))
-    c1 = int(model.cfg.spatial.channels[1])
-    c2 = int(model.cfg.spatial.channels[2])
-    ch = int(model.cfg.geometry.hidden_channels)
-    if count == 0:
-        return (
-            np.zeros((0, c1), np.float16),
-            np.zeros((0, c2), np.float16),
-            np.zeros((0, ch), np.float16),
-            np.zeros((0, 11), np.float16),
-        )
-
-    refs = torch.from_numpy(np.asarray(refs_um, np.float32)).to(spatial_inputs.device)
-    shape = tuple(int(v) for v in spatial_inputs.shape[-3:])
-    specs = generate_dense_tiles(1, shape, config)
-    assignments: dict[int, list[int]] = defaultdict(list)
-    extent = (torch.as_tensor(shape, device=refs.device).float() - 1) * spacing_um[0].float()
-    maximum_voxel = (
-        torch.as_tensor(
-            shape,
-            device=refs.device,
-            dtype=torch.long,
-        )
-        - 1
-    )
-
-    # STIRNET_TILED_OBSERVER_OUTSIDE_REFERENCE_V1
-    # Match production tiled observer routing. Tracklet target references may
-    # be interpolated/extrapolated outside the FOV. Clamp ONLY the routing
-    # voxel so a boundary tile is selected; keep refs[row] unchanged for the
-    # actual physical observer sample.
-    for row in range(count):
-        voxel_unclamped = torch.round(
-            (refs[row] + 0.5 * extent)
-            / spacing_um[0].float().clamp_min(1e-6)
-        ).long()
-        voxel = torch.minimum(
-            voxel_unclamped.clamp_min(0),
-            maximum_voxel,
-        )
-        best_index = None
-        best_weight = -1.0
-        for spec_index, spec in enumerate(specs):
-            if not all(
-                int(spec.slices_zyx[axis].start) <= int(voxel[axis]) < int(spec.slices_zyx[axis].stop)
-                for axis in range(3)
-            ):
+        rows: list[TouchPair] = []
+        for a, b in sorted(physically_touching_pairs(manual)):
+            vox_a = int(counts[a]) if a < len(counts) else 0
+            vox_b = int(counts[b]) if b < len(counts) else 0
+            if vox_a < int(min_voxels) or vox_b < int(min_voxels):
                 continue
-            local = tuple(int(voxel[axis]) - int(spec.slices_zyx[axis].start) for axis in range(3))
-            weight = float(tile_blend_weight(spec, shape, config.tile_halo_zyx, device=refs.device)[local].item())
-            if weight > best_weight:
-                best_weight = weight
-                best_index = spec_index
-        if best_index is None:
-            raise RuntimeError(f"Observer reference is outside all tiles: {refs[row].tolist()}")
-        assignments[int(best_index)].append(row)
 
-    d1_out = np.zeros((count, c1), np.float16)
-    d2_out = np.zeros((count, c2), np.float16)
-    hidden_out = np.zeros((count, ch), np.float16)
-    explicit_out = np.zeros((count, 11), np.float16)
-    global_center = 0.5 * (torch.as_tensor(shape, device=refs.device).float() - 1)
+            ratio = max(
+                vox_a / max(vox_b, 1),
+                vox_b / max(vox_a, 1),
+            )
+            if ratio > float(max_volume_ratio):
+                continue
 
-    for spec_index, rows in assignments.items():
-        spec = specs[spec_index]
-        tile = spatial_inputs[
-            0:1,
-            :,
-            spec.slices_zyx[0],
-            spec.slices_zyx[1],
-            spec.slices_zyx[2],
+            rows.append(
+                TouchPair(
+                    frame=int(t),
+                    a=int(a),
+                    b=int(b),
+                    interface_edges=0,
+                    voxels_a=vox_a,
+                    voxels_b=vox_b,
+                    volume_ratio=float(ratio),
+                )
+            )
+
+        result[t] = rows
+        serializable[str(t)] = [
+            dataclasses.asdict(row)
+            for row in rows
         ]
-        output = model(tile, spacing_um, dref_um, execution_stage="geometry")
-        if output.geometry.features is None:
-            raise RuntimeError("Geometry hidden features are required for TemporalSpatialObserver")
-        row_index = torch.tensor(rows, device=refs.device, dtype=torch.long)
-        tile_center = torch.tensor(
-            [0.5 * (int(axis.start) + int(axis.stop) - 1) for axis in spec.slices_zyx],
-            device=refs.device,
-            dtype=torch.float32,
-        )
-        shift_um = (tile_center - global_center) * spacing_um[0].float()
-        local_refs = refs[row_index] - shift_um
-        radius = dref_um[0].float() * float(model.cfg.temporal.observation_radius_dref)
-        radius_vec = radius.expand(len(rows))
-
-        d1 = _sample_local_grid(
-            output.decoded_spatial.d1[0],
-            local_refs,
-            output.spatial_pyramid.spacings_um[1][0],
-            radius_vec,
-        )
-        d2 = _sample_local_grid(
-            output.decoded_spatial.d2[0],
-            local_refs,
-            output.spatial_pyramid.spacings_um[2][0],
-            radius_vec,
-        )
-        hidden_spacing = (
-            spacing_um[0]
-            if output.geometry.feature_spacing_um is None
-            else output.geometry.feature_spacing_um[0]
-        )
-        hidden = _sample_local_grid(
-            output.geometry.features[0],
-            local_refs,
-            hidden_spacing,
-            radius_vec,
-        )
-        explicit = _sample_explicit_geometry(
-            output.geometry,
-            0,
-            local_refs,
-            spacing_um[0],
-            radius_vec,
+        print(
+            f"[touching pairs t={t:03d}] {len(rows)}",
+            flush=True,
         )
 
-        rows_np = np.asarray(rows, np.int64)
-        d1_out[rows_np] = d1.detach().float().cpu().numpy().astype(np.float16)
-        d2_out[rows_np] = d2.detach().float().cpu().numpy().astype(np.float16)
-        hidden_out[rows_np] = hidden.detach().float().cpu().numpy().astype(np.float16)
-        explicit_out[rows_np] = explicit.detach().float().cpu().numpy().astype(np.float16)
+    atomic_json(
+        paths.touching_pairs,
+        {
+            "version": DATASET_VERSION,
+            "sample_id": paths.sample,
+            "source": "manual_true_instances_only",
+            "min_voxels": int(min_voxels),
+            "max_volume_ratio": float(max_volume_ratio),
+            "total_pairs": int(
+                sum(len(rows) for rows in result.values())
+            ),
+            "frames": serializable,
+        },
+    )
+    return result
 
-    return d1_out, d2_out, hidden_out, explicit_out
+
+# =============================================================================
+# Variant planning
+# =============================================================================
 
 
-def prepare_observer_raw_cache(
+@dataclass(frozen=True)
+class MergeEvent:
+    frame: int
+    a: int
+    b: int
+    representative: int
+    interface_edges: int
+
+
+@dataclass(frozen=True)
+class VariantPlan:
+    index: int
+    split: str
+    events_by_frame: dict[int, tuple[MergeEvent, ...]]
+
+    @property
+    def merge_count(self) -> int:
+        return sum(len(rows) for rows in self.events_by_frame.values())
+
+
+def build_one_variant(
+    *,
+    index: int,
+    split: str,
+    catalog: dict[int, list[TouchPair]],
+    frame_count: int,
+    merge_fraction: float,
+    max_merges_per_frame: int,
+    seed: int,
+) -> VariantPlan:
+    events_by_frame: dict[int, tuple[MergeEvent, ...]] = {}
+
+    for t in range(frame_count):
+        candidates = list(catalog.get(t, ()))
+        rng = random.Random(
+            int(seed) + 1_000_003 * int(index) + 10_007 * int(t)
+        )
+        rng.shuffle(candidates)
+
+        target = min(
+            int(max_merges_per_frame),
+            max(
+                1 if candidates else 0,
+                int(round(len(candidates) * float(merge_fraction))),
+            ),
+        )
+
+        selected: list[MergeEvent] = []
+        used: set[int] = set()
+
+        for pair in candidates:
+            if len(selected) >= target:
+                break
+            if pair.a in used or pair.b in used:
+                continue
+
+            selected.append(
+                MergeEvent(
+                    frame=int(t),
+                    a=int(pair.a),
+                    b=int(pair.b),
+                    representative=min(int(pair.a), int(pair.b)),
+                    interface_edges=int(pair.interface_edges),
+                )
+            )
+            used.update((int(pair.a), int(pair.b)))
+
+        events_by_frame[t] = tuple(selected)
+
+    return VariantPlan(
+        index=int(index),
+        split=str(split),
+        events_by_frame=events_by_frame,
+    )
+
+
+def build_variant_plans(
     paths: Paths,
     *,
-    manifest: CandidateManifest,
-    temporal_static: TemporalStatic,
-    track_graph,
+    catalog: dict[int, list[TouchPair]],
     frame_count: int,
-    temporal_radius: int,
-    spacing: Sequence[float],
-    dref_um: float,
-    neighbourhood_dref: float,
-    max_triples: int,
-    device: torch.device,
-    amp_dtype: str,
-    complete_candidate_graph: bool,
+    train_variants: int,
+    val_variants: int,
+    test_variants: int,
+    merge_fraction: float,
+    max_merges_per_frame: int,
+    seed: int,
+    rebuild: bool,
+) -> list[VariantPlan]:
+    total = train_variants + val_variants + test_variants
+    splits = (
+        ["train"] * train_variants
+        + ["val"] * val_variants
+        + ["test"] * test_variants
+    )
+
+    plans = [
+        build_one_variant(
+            index=index,
+            split=splits[index],
+            catalog=catalog,
+            frame_count=frame_count,
+            merge_fraction=merge_fraction,
+            max_merges_per_frame=max_merges_per_frame,
+            seed=seed,
+        )
+        for index in range(total)
+    ]
+
+    manifest = {
+        "version": DATASET_VERSION,
+        "sample_id": paths.sample,
+        "frame_count": int(frame_count),
+        "seed": int(seed),
+        "merge_fraction": float(merge_fraction),
+        "max_merges_per_frame": int(max_merges_per_frame),
+        "plans": [
+            {
+                "index": plan.index,
+                "split": plan.split,
+                "merge_count": plan.merge_count,
+                "events_by_frame": {
+                    str(t): [
+                        dataclasses.asdict(event)
+                        for event in plan.events_by_frame.get(t, ())
+                    ]
+                    for t in range(frame_count)
+                },
+            }
+            for plan in plans
+        ],
+    }
+
+    if paths.dataset_manifest.is_file() and not rebuild:
+        previous = json.loads(paths.dataset_manifest.read_text(encoding="utf-8"))
+        if previous != manifest:
+            raise RuntimeError(
+                "Existing concrete dataset configuration differs from the "
+                "requested one. Use --rebuild-dataset."
+            )
+    else:
+        if rebuild and paths.variants.exists():
+            shutil.rmtree(paths.variants)
+        atomic_json(paths.dataset_manifest, manifest)
+
+    for plan in plans:
+        paths.variant_dir(plan.index).mkdir(parents=True, exist_ok=True)
+        atomic_json(
+            paths.merge_plan(plan.index),
+            {
+                "version": DATASET_VERSION,
+                "variant_index": int(plan.index),
+                "split": plan.split,
+                "merge_count": int(plan.merge_count),
+                "events_by_frame": {
+                    str(t): [
+                        dataclasses.asdict(event)
+                        for event in plan.events_by_frame.get(t, ())
+                    ]
+                    for t in range(frame_count)
+                },
+            },
+        )
+
+    print("\n" + "=" * 112, flush=True)
+    print("INVESTIGATION 35 — CONCRETE VARIANT PLAN", flush=True)
+    print("=" * 112, flush=True)
+    for split in ("train", "val", "test"):
+        subset = [plan for plan in plans if plan.split == split]
+        print(
+            f"{split:5s} variants={len(subset):2d} "
+            f"merge_events={sum(plan.merge_count for plan in subset)}",
+            flush=True,
+        )
+    print("=" * 112, flush=True)
+
+    return plans
+
+
+# =============================================================================
+# Concrete Trackastra variants
+# =============================================================================
+
+
+def apply_merge_events(clean: np.ndarray, events: Sequence[MergeEvent]) -> np.ndarray:
+    result = np.asarray(clean).astype(np.int32, copy=True)
+    for event in events:
+        result[result == int(event.a)] = int(event.representative)
+        result[result == int(event.b)] = int(event.representative)
+    return result
+
+
+def variant_ready(paths: Paths, plan: VariantPlan) -> bool:
+    return (
+        paths.track_graph(plan.index).is_file()
+        and paths.variant_success(plan.index).is_file()
+    )
+
+
+def edge_score(data: dict[str, Any]) -> float | None:
+    for key in ("weight", "score", "probability", "confidence"):
+        value = data.get(key)
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except Exception:
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def annotate_graph_fast(graph, tracked_masks: np.ndarray) -> None:
+    """
+    Persist only cheap information needed later.
+
+    One bincount per frame gives every detection volume. Trackastra normally
+    stores detection coordinates itself. If a Trackastra version does not,
+    centroids are recovered in one vectorized pass over the tracked mask.
+    """
+    nodes_by_time: dict[int, list[int]] = defaultdict(list)
+    for node_id, data in graph.nodes(data=True):
+        nodes_by_time[int(data["time"])].append(int(node_id))
+
+    for t, node_ids in nodes_by_time.items():
+        labels = np.asarray(tracked_masks[int(t)])
+        flat = labels.reshape(-1).astype(np.int64, copy=False)
+        counts = np.bincount(flat)
+
+        missing_coords = [
+            node_id
+            for node_id in node_ids
+            if not any(
+                key in graph.nodes[node_id]
+                for key in ("coords", "coord", "position", "centroid")
+            )
+        ]
+
+        centroid_by_label: dict[int, tuple[float, float, float]] = {}
+        if missing_coords:
+            positive = labels > 0
+            z, y, x = np.nonzero(positive)
+            ids = labels[positive].astype(np.int64, copy=False)
+            if len(ids):
+                max_id = int(ids.max(initial=0))
+                c = np.bincount(ids, minlength=max_id + 1).astype(np.float64)
+                sz = np.bincount(ids, weights=z, minlength=max_id + 1)
+                sy = np.bincount(ids, weights=y, minlength=max_id + 1)
+                sx = np.bincount(ids, weights=x, minlength=max_id + 1)
+                for label_id in np.unique(ids).tolist():
+                    label_id = int(label_id)
+                    if c[label_id] > 0:
+                        centroid_by_label[label_id] = (
+                            float(sz[label_id] / c[label_id]),
+                            float(sy[label_id] / c[label_id]),
+                            float(sx[label_id] / c[label_id]),
+                        )
+
+        for node_id in node_ids:
+            data = graph.nodes[node_id]
+            label = int(data["label"])
+            data["inv35_volume_voxels"] = (
+                int(counts[label])
+                if 0 <= label < len(counts)
+                else 1
+            )
+            if node_id in missing_coords:
+                center = centroid_by_label.get(label)
+                if center is None:
+                    raise RuntimeError(
+                        f"Could not recover Trackastra centroid for "
+                        f"t={t}, label={label}"
+                    )
+                data["inv35_coords_zyx"] = center
+
+
+def prepare_variants(
+    paths: Paths,
+    plans: Sequence[VariantPlan],
+    frame_count: int,
+    *,
+    model_name: str,
+    mode: str,
+    device: str,
     rebuild: bool,
 ) -> None:
     todo = [
-        t
-        for t in range(frame_count)
-        if rebuild or not observer_cache_matches(paths, t, dref_um=dref_um, neighbourhood_dref=neighbourhood_dref)
+        plan
+        for plan in plans
+        if rebuild or not variant_ready(paths, plan)
     ]
+
     if not todo:
-        print("[observer raw cache] all frames ready")
+        print("[Trackastra variants] all ready", flush=True)
         return
 
-    _, model = load_spatial_model(paths.checkpoint, device)
-    inference_cfg = dataclasses.replace(model.cfg.inference, mode="tiled", tiled_dense_enabled=True)
-    spacing_t = torch.tensor([spacing], device=device, dtype=torch.float32)
-    dref_t = torch.tensor([float(dref_um)], device=device, dtype=torch.float32)
+    try:
+        from trackastra.model import Trackastra
+    except ImportError as exc:
+        raise RuntimeError("Trackastra is required for Investigation 35") from exc
 
-    print("=" * 118)
-    print("INVESTIGATION 35 — PRECOMPUTE FROZEN OBSERVER RAW SAMPLES")
-    print("These samples are BEFORE the trainable observer projections/message/gate.")
-    print(f"frames : {todo}")
-    print("=" * 118)
+    raw = np.load(paths.raw_movie, mmap_mode="r", allow_pickle=False)
+    manual = np.load(paths.manual_movie, mmap_mode="r", allow_pickle=False)
 
-    for t in todo:
+    print("\n" + "=" * 112, flush=True)
+    print("INVESTIGATION 35 — TRACKASTRA ON CONCRETE MERGE MOVIES", flush=True)
+    print("=" * 112, flush=True)
+    print(f"variants : {[plan.index for plan in todo]}", flush=True)
+    print(f"model    : {model_name}", flush=True)
+    print(f"mode     : {mode}", flush=True)
+    print(f"device   : {device}", flush=True)
+    print("=" * 112, flush=True)
+
+    tracker = Trackastra.from_pretrained(model_name, device=device)
+
+    for ordinal, plan in enumerate(todo, 1):
         started = time.perf_counter()
-        refs = collect_frame_reference_superset(
-            paths=paths,
-            frame_data=manifest.frames[t],
-            temporal_static=temporal_static,
-            track_graph=track_graph,
-            frame_count=frame_count,
-            temporal_radius=temporal_radius,
-            spacing=spacing,
-            dref_um=dref_um,
-            neighbourhood_dref=neighbourhood_dref,
-            max_triples=max_triples,
-            complete_candidate_graph=complete_candidate_graph,
+        directory = paths.variant_dir(plan.index)
+        directory.mkdir(parents=True, exist_ok=True)
+
+        temporary = directory / "_labels_tmp.npy"
+        temporary.unlink(missing_ok=True)
+        synthetic = np.lib.format.open_memmap(
+            temporary,
+            mode="w+",
+            dtype=np.int32,
+            shape=manual.shape,
         )
-        spatial_np = np.asarray(np.load(paths.spatial_inputs(t), mmap_mode="r", allow_pickle=False), np.float32)
-        spatial = torch.from_numpy(np.ascontiguousarray(spatial_np))[None].to(device)
-        with torch.inference_mode(), autocast_for(device, amp_dtype):
-            d1, d2, hidden, explicit = sample_raw_observer_features(
+
+        for t in range(frame_count):
+            synthetic[t] = apply_merge_events(
+                np.asarray(manual[t]),
+                plan.events_by_frame.get(t, ()),
+            )
+        synthetic.flush()
+
+        print(
+            f"[variant {plan.index:03d} {plan.split}] "
+            f"{ordinal}/{len(todo)} merges={plan.merge_count}",
+            flush=True,
+        )
+
+        graph, tracked_masks = tracker.track(raw, synthetic, mode=mode)
+        annotate_graph_fast(graph, np.asarray(tracked_masks))
+        atomic_pickle(paths.track_graph(plan.index), graph)
+
+        elapsed = time.perf_counter() - started
+        atomic_json(
+            paths.variant_success(plan.index),
+            {
+                "version": DATASET_VERSION,
+                "variant_index": int(plan.index),
+                "split": plan.split,
+                "merge_count": int(plan.merge_count),
+                "trackastra_nodes": int(graph.number_of_nodes()),
+                "trackastra_edges": int(graph.number_of_edges()),
+                "seconds": float(elapsed),
+            },
+        )
+
+        del synthetic, graph, tracked_masks
+        temporary.unlink(missing_ok=True)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        print(
+            f"[variant {plan.index:03d}] DONE "
+            f"time={duration(elapsed)}",
+            flush=True,
+        )
+
+    del tracker
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+
+# =============================================================================
+# Rebuild compact spatial RAG/statistics from the CURRENT spatial model
+# =============================================================================
+
+
+def parse_zyx_ints(value: str, *, name: str) -> tuple[int, int, int]:
+    rows = tuple(int(token.strip()) for token in str(value).split(","))
+    if len(rows) != 3:
+        raise ValueError(f"{name} must contain three Z,Y,X integers")
+    return rows
+
+
+def spatial_frame_complete(paths: Paths, t: int) -> bool:
+    return paths.graph_cache(t).is_file() and paths.spatial_meta(t).is_file()
+
+
+def cpu_detached_tree(value: Any) -> Any:
+    return map_tree(
+        value,
+        lambda tensor: tensor.detach().cpu(),
+    )
+
+
+def atomic_torch_save(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(payload, tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def rebuild_spatial_cache(
+    paths: Paths,
+    frame_count: int,
+    *,
+    spacing: Sequence[float],
+    device: torch.device,
+    tile_shape_zyx: tuple[int, int, int],
+    tile_overlap_zyx: tuple[int, int, int],
+    tile_halo_zyx: tuple[int, int, int],
+    tile_batch_size: int,
+    rebuild: bool,
+) -> None:
+    """
+    Recreate only the mature spatial state needed by temporal training.
+
+    Per frame:
+        raw
+        -> canonical preprocessing
+        -> current source segmentation
+        -> current 5-channel STIR-Net spatial input
+        -> current tiled spatial STIR-Net
+        -> atomic supervoxels / RAG / compact statistics / spatial partition
+
+    No temporal metadata is constructed.
+    """
+    todo = [
+        t
+        for t in range(frame_count)
+        if rebuild or not spatial_frame_complete(paths, t)
+    ]
+    if not todo:
+        print("[spatial cache] all frames ready", flush=True)
+        return
+
+    from dataclasses import replace as dc_replace
+    from importlib import import_module
+
+    from src.api import (
+        create_binary_mask,
+        preprocess_volume,
+        segment_instances,
+    )
+
+    segmentation_config_module = import_module(
+        "src.03_segmentation.config"
+    )
+    source_config = dc_replace(
+        segmentation_config_module.DEFAULT_SEGMENTATION_CONFIG,
+        enable_geometric_completion=False,
+    )
+
+    print("\n" + "=" * 112, flush=True)
+    print(
+        "INVESTIGATION 35 — REBUILD CURRENT FROZEN SPATIAL CACHE",
+        flush=True,
+    )
+    print("=" * 112, flush=True)
+    print(f"checkpoint : {paths.checkpoint}", flush=True)
+    print(f"frames     : {todo}", flush=True)
+    print(f"device     : {device}", flush=True)
+    print(
+        f"tiles      : shape={tile_shape_zyx} "
+        f"overlap={tile_overlap_zyx} "
+        f"halo={tile_halo_zyx} "
+        f"batch={tile_batch_size}",
+        flush=True,
+    )
+    print("=" * 112, flush=True)
+
+    (
+        checkpoint_payload,
+        model,
+        model_cfg,
+        _train_cfg,
+        _stripped_training_config,
+    ) = INV12.load_checkpoint_model_for_inference(
+        paths.checkpoint,
+        device,
+    )
+    model.eval()
+
+    inference_cfg = INV12.build_inference_config(
+        model_cfg,
+        tile_shape_zyx=tile_shape_zyx,
+        tile_overlap_zyx=tile_overlap_zyx,
+        tile_halo_zyx=tile_halo_zyx,
+        tile_batch_size=int(tile_batch_size),
+    )
+
+    raw_movie = np.load(
+        paths.raw_movie,
+        mmap_mode="r",
+        allow_pickle=False,
+    )
+    paths.spatial_cache.mkdir(parents=True, exist_ok=True)
+
+    for ordinal, t in enumerate(todo, 1):
+        started = time.perf_counter()
+        frame_dir = paths.spatial_cache / f"t{t:03d}"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+
+        print(
+            f"[spatial cache t={t:03d}] "
+            f"{ordinal}/{len(todo)}",
+            flush=True,
+        )
+
+        raw = np.asarray(raw_movie[t])
+        preprocessed = preprocess_volume(raw)
+        source_mask = create_binary_mask(preprocessed)
+        source_labels = segment_instances(
+            source_mask,
+            config=source_config,
+        )
+
+        spatial, dref_um = INV12.build_stage6_spatial_input(
+            preprocessed,
+            source_labels,
+            tuple(float(v) for v in spacing),
+        )
+
+        result, spatial_gpu, amp_name, inference_seconds, peak_gib = (
+            INV12.run_tiled_spatial(
                 model,
                 spatial,
-                spacing_t,
-                dref_t,
-                refs,
-                config=inference_cfg,
+                tuple(float(v) for v in spacing),
+                float(dref_um),
+                device=device,
+                inference_cfg=inference_cfg,
             )
-        atomic_npy(paths.observer_refs(t), refs.astype(np.float32, copy=False))
-        atomic_npy(paths.observer_d1(t), d1)
-        atomic_npy(paths.observer_d2(t), d2)
-        atomic_npy(paths.observer_hidden(t), hidden)
-        atomic_npy(paths.observer_explicit(t), explicit)
-        meta = {
-            "observer_cache_version": OBSERVER_CACHE_VERSION,
-            "timepoint": int(t),
-            "dref_um": float(dref_um),
-            "neighbourhood_dref": float(neighbourhood_dref),
-            "reference_key_scale": 10_000.0,
-            "reference_count": int(len(refs)),
-            "candidate_manifest_signature": file_signature(paths.candidate_manifest),
-            "checkpoint_signature": file_signature(paths.checkpoint),
-            "seconds": time.perf_counter() - started,
-        }
-        atomic_json(paths.observer_meta(t), meta)
-        print(f"[observer t={t:03d}] refs={len(refs)} time={duration(meta['seconds'])}", flush=True)
-        del spatial
+        )
+
+        if result.rag.statistics is None:
+            raise RuntimeError(
+                "Current tiled spatial inference returned no compact "
+                "supervoxel statistics. These are required by "
+                "InstanceTokenizer."
+            )
+
+        atomic_torch_save(
+            paths.graph_cache(t),
+            {
+                "version": 1,
+                "rag": cpu_detached_tree(result.rag),
+                "actual_partition": cpu_detached_tree(
+                    result.spatial_partition
+                ),
+            },
+        )
+
+        atomic_json(
+            paths.spatial_meta(t),
+            {
+                "version": 1,
+                "sample_id": paths.sample,
+                "timepoint": int(t),
+                "checkpoint_signature": {
+                    "path": str(paths.checkpoint.resolve()),
+                    "global_step": int(
+                        checkpoint_payload.get("global_step", -1)
+                    ),
+                },
+                "spacing_zyx_um": [
+                    float(v)
+                    for v in spacing
+                ],
+                "dref_um": float(dref_um),
+                "source_instances": int(
+                    np.count_nonzero(
+                        np.unique(source_labels) > 0
+                    )
+                ),
+                "rag_nodes": int(
+                    result.rag.node_features.shape[0]
+                ),
+                "rag_edges": int(
+                    result.rag.edge_index.shape[1]
+                ),
+                "spatial_components": int(
+                    result.spatial_partition
+                    .component_count_per_batch
+                    .sum()
+                    .item()
+                ),
+                "amp_dtype": str(amp_name),
+                "spatial_inference_seconds": float(
+                    inference_seconds
+                ),
+                "peak_allocated_vram_gib": float(peak_gib),
+                "total_seconds": float(
+                    time.perf_counter() - started
+                ),
+            },
+        )
+
+        print(
+            f"[spatial cache t={t:03d}] DONE "
+            f"nodes={int(result.rag.node_features.shape[0])} "
+            f"edges={int(result.rag.edge_index.shape[1])} "
+            f"dref={float(dref_um):.4f}um "
+            f"infer={inference_seconds:.1f}s "
+            f"total={duration(time.perf_counter() - started)}",
+            flush=True,
+        )
+
+        del (
+            result,
+            spatial_gpu,
+            spatial,
+            preprocessed,
+            source_mask,
+            source_labels,
+        )
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        gc.collect()
 
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    gc.collect()
 
 
 # =============================================================================
-# Runtime frozen frame + trainable observer lookup
+# Direct Trackastra graph -> production TemporalInput
+# =============================================================================
+
+
+class UnionFind:
+    def __init__(self, count: int):
+        self.parent = list(range(count))
+
+    def find(self, value: int) -> int:
+        while self.parent[value] != value:
+            self.parent[value] = self.parent[self.parent[value]]
+            value = self.parent[value]
+        return value
+
+    def union(self, a: int, b: int) -> None:
+        a = self.find(a)
+        b = self.find(b)
+        if a != b:
+            self.parent[b] = a
+
+
+def get_coords_zyx(node_data: dict[str, Any]) -> np.ndarray:
+    for key in (
+        "inv35_coords_zyx",
+        "coords",
+        "coord",
+        "position",
+        "centroid",
+    ):
+        value = node_data.get(key)
+        if value is None:
+            continue
+        array = np.asarray(value, np.float32).reshape(-1)
+        if array.size == 3 and np.isfinite(array).all():
+            return array
+    raise KeyError(
+        "Trackastra node does not expose a 3-D coordinate under "
+        "coords/coord/position/centroid"
+    )
+
+
+def physical_position_um(
+    coords_zyx: Sequence[float],
+    shape_zyx: Sequence[int],
+    spacing: Sequence[float],
+) -> np.ndarray:
+    coords = np.asarray(coords_zyx, np.float32)
+    spacing_np = np.asarray(spacing, np.float32)
+    center = 0.5 * (np.asarray(shape_zyx, np.float32) - 1.0) * spacing_np
+    return coords * spacing_np - center
+
+
+def selected_nodes(
+    graph,
+    target_t: int,
+    frame_count: int,
+    radius: int,
+) -> tuple[list[int], tuple[int, ...]]:
+    start = max(0, int(target_t) - int(radius))
+    stop = min(int(frame_count) - 1, int(target_t) + int(radius))
+    offsets = tuple(t - int(target_t) for t in range(start, stop + 1))
+    allowed = set(range(start, stop + 1))
+
+    node_ids = [
+        int(node_id)
+        for node_id, data in graph.nodes(data=True)
+        if int(data["time"]) in allowed
+    ]
+    node_ids.sort(key=lambda node_id: (int(graph.nodes[node_id]["time"]), node_id))
+    return node_ids, offsets
+
+
+def build_tracklets(
+    graph,
+    node_ids: Sequence[int],
+) -> tuple[np.ndarray, list[list[int]], dict[int, int]]:
+    """
+    Match the current graph_builder one-to-one association rule:
+    accepted edge joins one tracklet only when source outdegree==1 and
+    destination indegree==1 inside the selected temporal window.
+    """
+    id_to_row = {int(node_id): row for row, node_id in enumerate(node_ids)}
+    indegree = np.zeros(len(node_ids), np.int64)
+    outdegree = np.zeros(len(node_ids), np.int64)
+    edges: list[tuple[int, int]] = []
+
+    for source, destination in graph.edges():
+        source = int(source)
+        destination = int(destination)
+        if source not in id_to_row or destination not in id_to_row:
+            continue
+        s = id_to_row[source]
+        d = id_to_row[destination]
+        outdegree[s] += 1
+        indegree[d] += 1
+        edges.append((s, d))
+
+    union = UnionFind(len(node_ids))
+    for s, d in edges:
+        if outdegree[s] == 1 and indegree[d] == 1:
+            union.union(s, d)
+
+    members: dict[int, list[int]] = defaultdict(list)
+    for row in range(len(node_ids)):
+        members[union.find(row)].append(row)
+
+    roots = sorted(
+        members,
+        key=lambda root: min(int(node_ids[row]) for row in members[root]),
+    )
+    root_to_tracklet = {root: index for index, root in enumerate(roots)}
+    tracklet_id = np.asarray(
+        [root_to_tracklet[union.find(row)] for row in range(len(node_ids))],
+        np.int64,
+    )
+    groups = [members[root] for root in roots]
+    return tracklet_id, groups, id_to_row
+
+
+def tracklet_reference(
+    rows: Sequence[int],
+    times: np.ndarray,
+    positions: np.ndarray,
+) -> np.ndarray:
+    rows = sorted(rows, key=lambda row: float(times[row]))
+    current = [row for row in rows if times[row] == 0]
+    if current:
+        return positions[current[0]].astype(np.float32, copy=True)
+
+    past = [row for row in rows if times[row] < 0]
+    future = [row for row in rows if times[row] > 0]
+
+    if past and future:
+        a = max(past, key=lambda row: times[row])
+        b = min(future, key=lambda row: times[row])
+        fraction = (0.0 - times[a]) / max(times[b] - times[a], 1e-6)
+        return (
+            positions[a] * (1.0 - fraction) + positions[b] * fraction
+        ).astype(np.float32)
+
+    if len(past) >= 2:
+        a, b = sorted(past, key=lambda row: times[row])[-2:]
+        velocity = (positions[b] - positions[a]) / max(times[b] - times[a], 1e-6)
+        return (positions[b] + velocity * (0.0 - times[b])).astype(np.float32)
+
+    if past:
+        return positions[past[-1]].astype(np.float32, copy=True)
+
+    if len(future) >= 2:
+        a, b = sorted(future, key=lambda row: times[row])[:2]
+        velocity = (positions[b] - positions[a]) / max(times[b] - times[a], 1e-6)
+        return (positions[a] - velocity * times[a]).astype(np.float32)
+
+    return positions[future[0]].astype(np.float32, copy=True)
+
+
+def local_velocity(
+    graph,
+    node_id: int,
+    positions_by_id: dict[int, np.ndarray],
+    *,
+    predecessors: bool,
+) -> np.ndarray:
+    neighbours = (
+        list(graph.predecessors(node_id))
+        if predecessors
+        else list(graph.successors(node_id))
+    )
+
+    p0 = positions_by_id[node_id]
+    t0 = int(graph.nodes[node_id]["time"])
+    rows = []
+
+    for other in neighbours:
+        other = int(other)
+        if other not in positions_by_id:
+            continue
+        dt = abs(int(graph.nodes[other]["time"]) - t0)
+        if dt <= 0:
+            continue
+        if predecessors:
+            delta = p0 - positions_by_id[other]
+        else:
+            delta = positions_by_id[other] - p0
+        rows.append(delta / float(dt))
+
+    if not rows:
+        return np.zeros(3, np.float32)
+    return np.mean(np.stack(rows), axis=0).astype(np.float32)
+
+
+def direct_temporal_input(
+    graph,
+    *,
+    target_t: int,
+    frame_count: int,
+    temporal_radius: int,
+    spacing: Sequence[float],
+    dref_um: float,
+    shape_zyx: Sequence[int],
+    device: torch.device,
+    k_spatial_neighbors: int = 6,
+    spatial_radius_dref: float = 2.5,
+) -> TemporalInput:
+    node_ids, available_offsets = selected_nodes(
+        graph,
+        target_t,
+        frame_count,
+        temporal_radius,
+    )
+
+    if not node_ids:
+        return TemporalInput(
+            graph_x=torch.zeros((0, NODE_DIM), device=device),
+            graph_edge_index=torch.zeros((2, 0), device=device, dtype=torch.long),
+            graph_edge_attr=torch.zeros((0, EDGE_DIM), device=device),
+            tracklet_id=torch.zeros((0,), device=device, dtype=torch.long),
+            temporal_ref_um=torch.zeros((0, 3), device=device),
+            temporal_status=torch.zeros((0, STATUS_DIM), device=device),
+            temporal_batch=torch.zeros((0,), device=device, dtype=torch.long),
+            node_history_embedding=None,
+            hypothesis_edge_index=None,
+            hypothesis_edge_attr=None,
+        )
+
+    id_to_row = {node_id: row for row, node_id in enumerate(node_ids)}
+
+    positions = np.stack(
+        [
+            physical_position_um(
+                get_coords_zyx(graph.nodes[node_id]),
+                shape_zyx,
+                spacing,
+            )
+            for node_id in node_ids
+        ],
+        axis=0,
+    ).astype(np.float32)
+
+    positions_by_id = {
+        node_id: positions[row]
+        for row, node_id in enumerate(node_ids)
+    }
+
+    times = np.asarray(
+        [int(graph.nodes[node_id]["time"]) - int(target_t) for node_id in node_ids],
+        np.float32,
+    )
+
+    voxel_volume = float(np.prod(np.asarray(spacing, np.float64)))
+    volumes = np.asarray(
+        [
+            max(int(graph.nodes[node_id].get("inv35_volume_voxels", 1)), 1)
+            * voxel_volume
+            for node_id in node_ids
+        ],
+        np.float32,
+    )
+    median_volume = max(float(np.median(volumes)), 1e-6)
+
+    tracklet_id, groups, _ = build_tracklets(graph, node_ids)
+
+    lengths_before = np.zeros(len(node_ids), np.float32)
+    lengths_after = np.zeros(len(node_ids), np.float32)
+    for rows in groups:
+        ts = sorted(float(times[row]) for row in rows)
+        for row in rows:
+            lengths_before[row] = sum(t <= float(times[row]) for t in ts)
+            lengths_after[row] = sum(t >= float(times[row]) for t in ts)
+
+    graph_x = np.zeros((len(node_ids), NODE_DIM), np.float32)
+    spacing_np = np.asarray(spacing, np.float32)
+    shape_np = np.asarray(shape_zyx, np.float32)
+
+    for row, node_id in enumerate(node_ids):
+        data = graph.nodes[node_id]
+        coords = get_coords_zyx(data)
+
+        graph_x[row, GX_TIME] = times[row] / max(int(temporal_radius), 1)
+        graph_x[row, GX_POS] = positions[row] / max(float(dref_um), 1e-6)
+        graph_x[row, GX_LOG_VOLUME] = math.log(
+            max(float(volumes[row]), 1e-6) / median_volume
+        )
+
+        # Neutral heavyweight fields. No morphology/intensity preprocessing.
+        graph_x[row, GX_BBOX] = 0.0
+        graph_x[row, GX_PCA] = 0.0
+        graph_x[row, GX_ELONGATION] = 0.0
+        graph_x[row, GX_FLATNESS] = 0.0
+        graph_x[row, GX_SOLIDITY] = 1.0
+        graph_x[row, GX_COMPACTNESS] = 1.0
+        graph_x[row, GX_INTENSITY_MEAN] = 0.0
+        graph_x[row, GX_INTENSITY_STD] = 0.0
+
+        backward = local_velocity(
+            graph,
+            node_id,
+            positions_by_id,
+            predecessors=True,
+        )
+        forward = local_velocity(
+            graph,
+            node_id,
+            positions_by_id,
+            predecessors=False,
+        )
+        graph_x[row, GX_BACK_VEL] = backward / max(float(dref_um), 1e-6)
+        graph_x[row, GX_FWD_VEL] = forward / max(float(dref_um), 1e-6)
+
+        graph_x[row, GX_LENGTH_BEFORE] = lengths_before[row]
+        graph_x[row, GX_LENGTH_AFTER] = lengths_after[row]
+
+        lower_um = coords * spacing_np
+        upper_um = (shape_np - 1.0 - coords) * spacing_np
+        distance_boundary = float(np.min(np.concatenate([lower_um, upper_um])))
+        boundary = distance_boundary <= 4.0
+
+        graph_x[row, GX_VOLUME_BOUNDARY] = (
+            distance_boundary / max(float(dref_um), 1e-6)
+        )
+        graph_x[row, GX_PATCH_BOUNDARY] = graph_x[row, GX_VOLUME_BOUNDARY]
+        graph_x[row, GX_IS_CURRENT] = float(times[row] == 0)
+
+        group_rows = groups[int(tracklet_id[row])]
+        group_times = [float(times[r]) for r in group_rows]
+
+        graph_x[row, GX_INTERIOR_START] = float(
+            times[row] == min(group_times)
+            and min(group_times) > min(available_offsets)
+            and not boundary
+        )
+        graph_x[row, GX_INTERIOR_END] = float(
+            times[row] == max(group_times)
+            and max(group_times) < max(available_offsets)
+            and not boundary
+        )
+        graph_x[row, GX_DIVISION] = float(
+            graph.in_degree(node_id) > 1 or graph.out_degree(node_id) > 1
+        )
+        graph_x[row, GX_BOUNDARY] = float(boundary)
+
+    # Detection graph: accepted Trackastra edges + same-frame local neighbours.
+    edge_pairs: list[tuple[int, int]] = []
+    edge_attrs: list[list[float]] = []
+    seen: set[tuple[int, int]] = set()
+
+    def add_edge(
+        source_row: int,
+        destination_row: int,
+        relation: str,
+        *,
+        score: float | None,
+        accepted: bool,
+    ) -> None:
+        pair = (int(source_row), int(destination_row))
+        if pair in seen:
+            return
+        seen.add(pair)
+
+        dt = float(times[destination_row] - times[source_row])
+        delta = positions[destination_row] - positions[source_row]
+        distance = float(np.linalg.norm(delta))
+
+        source_id = node_ids[source_row]
+        velocity = local_velocity(
+            graph,
+            source_id,
+            positions_by_id,
+            predecessors=False,
+        )
+        residual = float(
+            np.linalg.norm(delta - velocity * max(dt, 1.0))
+        )
+
+        onehot = [0.0, 0.0, 0.0, 0.0]
+        onehot[
+            {
+                "temporal_fwd": 0,
+                "temporal_rev": 1,
+                "division": 2,
+                "spatial": 3,
+            }[relation]
+        ] = 1.0
+
+        edge_attrs.append(
+            [
+                dt,
+                *(delta / max(float(dref_um), 1e-6)).tolist(),
+                distance / max(float(dref_um), 1e-6),
+                math.log(
+                    max(float(volumes[destination_row]), 1e-6)
+                    / max(float(volumes[source_row]), 1e-6)
+                ),
+                0.0,  # intensity delta
+                residual / max(float(dref_um), 1e-6),
+                0.0 if score is None else float(score),
+                float(score is not None),
+                *onehot,
+                float(accepted),
+            ]
+        )
+        edge_pairs.append(pair)
+
+    for source, destination, data in graph.edges(data=True):
+        source = int(source)
+        destination = int(destination)
+        if source not in id_to_row or destination not in id_to_row:
+            continue
+
+        s = id_to_row[source]
+        d = id_to_row[destination]
+        score = edge_score(data)
+        division = graph.out_degree(source) > 1 or graph.in_degree(destination) > 1
+
+        add_edge(
+            s,
+            d,
+            "division" if division else "temporal_fwd",
+            score=score,
+            accepted=True,
+        )
+        if not division:
+            add_edge(
+                d,
+                s,
+                "temporal_rev",
+                score=score,
+                accepted=True,
+            )
+
+    for time_offset in sorted(set(int(v) for v in times.tolist())):
+        rows = np.flatnonzero(times == float(time_offset))
+        if len(rows) < 2:
+            continue
+
+        positions_at_time = positions[rows]
+        distances = np.linalg.norm(
+            positions_at_time[:, None] - positions_at_time[None],
+            axis=-1,
+        )
+
+        for local_source, source_row in enumerate(rows.tolist()):
+            count = 0
+            for local_destination in np.argsort(distances[local_source]).tolist():
+                if local_destination == local_source:
+                    continue
+                distance = float(distances[local_source, local_destination])
+                if distance > spatial_radius_dref * float(dref_um):
+                    break
+
+                destination_row = int(rows[local_destination])
+                add_edge(
+                    int(source_row),
+                    destination_row,
+                    "spatial",
+                    score=None,
+                    accepted=False,
+                )
+                count += 1
+                if count >= k_spatial_neighbors:
+                    break
+
+    if edge_pairs:
+        edge_index = np.asarray(edge_pairs, np.int64).T
+        edge_attr = np.asarray(edge_attrs, np.float32).reshape(-1, EDGE_DIM)
+    else:
+        edge_index = np.zeros((2, 0), np.int64)
+        edge_attr = np.zeros((0, EDGE_DIM), np.float32)
+
+    references = np.stack(
+        [tracklet_reference(rows, times, positions) for rows in groups],
+        axis=0,
+    ).astype(np.float32)
+
+    status = np.zeros((len(groups), STATUS_DIM), np.float32)
+    radius = max(int(temporal_radius), 1)
+    past_fraction = sum(v < 0 for v in available_offsets) / float(radius)
+    future_fraction = sum(v > 0 for v in available_offsets) / float(radius)
+
+    for tracklet, rows in enumerate(groups):
+        ts = sorted(int(times[row]) for row in rows)
+        ts_set = set(ts)
+
+        boundary = bool(np.any(graph_x[rows, GX_BOUNDARY] > 0.5))
+        division = bool(np.any(graph_x[rows, GX_DIVISION] > 0.5))
+        gaps = any(
+            offset not in ts_set
+            for offset in available_offsets
+            if min(ts) < offset < max(ts)
+        )
+        interior_start = min(ts) > min(available_offsets) and not boundary
+        interior_end = max(ts) < max(available_offsets) and not boundary
+        complete = (
+            min(ts) <= min(available_offsets)
+            and max(ts) >= max(available_offsets)
+            and not gaps
+        )
+
+        member_ids = {node_ids[row] for row in rows}
+        scores = []
+        for source, destination, data in graph.edges(data=True):
+            if int(source) in member_ids and int(destination) in member_ids:
+                score = edge_score(data)
+                if score is not None:
+                    scores.append(score)
+        uncertain = bool(scores and float(np.mean(scores)) < 0.5)
+
+        status[tracklet] = [
+            float(complete),
+            float(interior_start),
+            float(interior_end),
+            float(gaps),
+            float(division),
+            float(boundary),
+            float(past_fraction),
+            float(future_fraction),
+            0.0,
+            float(uncertain),
+        ]
+
+    return TemporalInput(
+        graph_x=torch.from_numpy(graph_x).to(device=device, dtype=torch.float32),
+        graph_edge_index=torch.from_numpy(edge_index).to(
+            device=device,
+            dtype=torch.long,
+        ),
+        graph_edge_attr=torch.from_numpy(edge_attr).to(
+            device=device,
+            dtype=torch.float32,
+        ),
+        tracklet_id=torch.from_numpy(tracklet_id).to(
+            device=device,
+            dtype=torch.long,
+        ),
+        temporal_ref_um=torch.from_numpy(references).to(
+            device=device,
+            dtype=torch.float32,
+        ),
+        temporal_status=torch.from_numpy(status).to(
+            device=device,
+            dtype=torch.float32,
+        ),
+        temporal_batch=torch.zeros(
+            (len(groups),),
+            device=device,
+            dtype=torch.long,
+        ),
+        node_history_embedding=None,
+        hypothesis_edge_index=None,
+        hypothesis_edge_attr=None,
+    )
+
+
+# =============================================================================
+# Existing frozen observer samples — optional, no preparation
 # =============================================================================
 
 
 @dataclass
-class ObserverRawLookup:
-    ref_um: Tensor
+class ObserverLookup:
     d1: Tensor
     d2: Tensor
     hidden: Tensor
     explicit: Tensor
     key_to_row: dict[tuple[int, int, int], int]
 
-    @classmethod
-    def load(cls, paths: Paths, t: int, device: torch.device) -> "ObserverRawLookup":
-        refs_np = np.array(
-            np.load(paths.observer_refs(t), mmap_mode="r", allow_pickle=False),
-            dtype=np.float32,
-            order="C",
-            copy=True,
-        )
-        d1_np = np.array(
-            np.load(paths.observer_d1(t), mmap_mode="r", allow_pickle=False),
-            dtype=np.float32,
-            order="C",
-            copy=True,
-        )
-        d2_np = np.array(
-            np.load(paths.observer_d2(t), mmap_mode="r", allow_pickle=False),
-            dtype=np.float32,
-            order="C",
-            copy=True,
-        )
-        hidden_np = np.array(
-            np.load(paths.observer_hidden(t), mmap_mode="r", allow_pickle=False),
-            dtype=np.float32,
-            order="C",
-            copy=True,
-        )
-        explicit_np = np.array(
-            np.load(paths.observer_explicit(t), mmap_mode="r", allow_pickle=False),
-            dtype=np.float32,
-            order="C",
-            copy=True,
-        )
-        key_to_row = {reference_key(ref): i for i, ref in enumerate(refs_np)}
-        return cls(
-            ref_um=torch.from_numpy(refs_np).to(device),
-            d1=torch.from_numpy(d1_np).to(device),
-            d2=torch.from_numpy(d2_np).to(device),
-            hidden=torch.from_numpy(hidden_np).to(device),
-            explicit=torch.from_numpy(explicit_np).to(device),
-            key_to_row=key_to_row,
-        )
 
-    def rows_for(self, refs_um: Tensor) -> Tensor:
-        refs_np = refs_um.detach().float().cpu().numpy()
-        rows = []
-        for ref in refs_np:
-            key = reference_key(ref)
-            row = self.key_to_row.get(key)
-            if row is None:
-                # Float32 graph reconstruction should normally be exact under
-                # 1e-4 um quantization. The nearest fallback is diagnostic only.
-                cached = self.ref_um.detach().float().cpu().numpy()
-                if len(cached):
-                    distance = np.linalg.norm(cached - ref[None], axis=1)
-                    nearest = int(np.argmin(distance))
-                    if float(distance[nearest]) <= 5e-4:
-                        row = nearest
-                if row is None:
-                    raise KeyError(
-                        "Temporal reference was not present in the prepared observer cache: "
-                        f"ref={ref.tolist()}. Re-run with --rebuild-observer-cache."
-                    )
-            rows.append(int(row))
-        return torch.tensor(rows, device=refs_um.device, dtype=torch.long)
+def load_observer_lookup(
+    paths: Paths,
+    t: int,
+    device: torch.device,
+) -> ObserverLookup | None:
+    required = (
+        paths.observer_refs(t),
+        paths.observer_d1(t),
+        paths.observer_d2(t),
+        paths.observer_hidden(t),
+        paths.observer_explicit(t),
+    )
+    if any(not path.is_file() for path in required):
+        return None
+
+    refs = np.array(
+        np.load(paths.observer_refs(t), mmap_mode="r", allow_pickle=False),
+        dtype=np.float32,
+        order="C",
+        copy=True,
+    )
+    d1 = np.array(
+        np.load(paths.observer_d1(t), mmap_mode="r", allow_pickle=False),
+        dtype=np.float32,
+        order="C",
+        copy=True,
+    )
+    d2 = np.array(
+        np.load(paths.observer_d2(t), mmap_mode="r", allow_pickle=False),
+        dtype=np.float32,
+        order="C",
+        copy=True,
+    )
+    hidden = np.array(
+        np.load(paths.observer_hidden(t), mmap_mode="r", allow_pickle=False),
+        dtype=np.float32,
+        order="C",
+        copy=True,
+    )
+    explicit = np.array(
+        np.load(paths.observer_explicit(t), mmap_mode="r", allow_pickle=False),
+        dtype=np.float32,
+        order="C",
+        copy=True,
+    )
+
+    return ObserverLookup(
+        d1=torch.from_numpy(d1).to(device),
+        d2=torch.from_numpy(d2).to(device),
+        hidden=torch.from_numpy(hidden).to(device),
+        explicit=torch.from_numpy(explicit).to(device),
+        key_to_row={reference_key(ref): row for row, ref in enumerate(refs)},
+    )
+
+
+def observe_if_cached(
+    model,
+    temporal: TemporalState,
+    lookup: ObserverLookup | None,
+) -> tuple[TemporalState, float]:
+    if temporal.is_empty or lookup is None:
+        return temporal, 0.0
+
+    refs = temporal.ref_um.detach().float().cpu().numpy()
+    temporal_rows: list[int] = []
+    cache_rows: list[int] = []
+
+    for row, ref in enumerate(refs):
+        cached = lookup.key_to_row.get(reference_key(ref))
+        if cached is not None:
+            temporal_rows.append(int(row))
+            cache_rows.append(int(cached))
+
+    if not temporal_rows:
+        return temporal, 0.0
+
+    ti = torch.tensor(
+        temporal_rows,
+        device=temporal.tokens.device,
+        dtype=torch.long,
+    )
+    ci = torch.tensor(
+        cache_rows,
+        device=temporal.tokens.device,
+        dtype=torch.long,
+    )
+
+    observer = model.temporal_observer
+    p1 = observer.d1_proj(lookup.d1[ci])
+    p2 = observer.d2_proj(lookup.d2[ci])
+    pg = (
+        observer.geometry_proj(lookup.hidden[ci])
+        + observer.geometry_field_proj(lookup.explicit[ci])
+    )
+    message = observer.message(torch.cat([p1, p2, pg], dim=-1))
+    message = message.to(temporal.tokens.dtype)
+
+    selected = temporal.tokens[ti]
+    reliability = temporal.reliability[ti]
+    gate = observer.gate(
+        torch.cat([selected, message, reliability], dim=-1)
+    )
+    observed = observer.norm(selected + gate * message)
+
+    tokens = temporal.tokens.index_copy(0, ti, observed)
+    return (
+        replace(temporal, tokens=tokens),
+        len(temporal_rows) / max(len(refs), 1),
+    )
+
+
+# =============================================================================
+# Frozen spatial runtime / synthetic current partition
+# =============================================================================
 
 
 @dataclass
@@ -1793,164 +2334,219 @@ class RuntimeFrame:
     t: int
     rag: RAGState
     actual_partition: PartitionState
-    node_manual: Tensor
     manual: np.ndarray
-    observer: ObserverRawLookup
+    node_manual: Tensor
+    observer: None
 
 
 class RuntimeFrameLoader:
-    def __init__(self, paths: Paths, manifest: CandidateManifest, device: torch.device):
+    def __init__(self, paths: Paths, device: torch.device):
         self.paths = paths
-        self.manifest = manifest
         self.device = device
+        self.manual_movie = np.load(
+            paths.manual_movie,
+            mmap_mode="r",
+            allow_pickle=False,
+        )
         self.current: RuntimeFrame | None = None
 
     def load(self, t: int) -> RuntimeFrame:
         t = int(t)
         if self.current is not None and self.current.t == t:
             return self.current
+
         if self.current is not None:
             del self.current
             self.current = None
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        payload = torch_load(self.paths.graph_cache(t), map_location="cpu")
-
-        # Spatial preparation may persist floating RAG statistics/embeddings in
-        # FP16. Training feeds them into trainable FP32 modules, so restore the
-        # complete floating cache tree to FP32 at this boundary.
-        training_float_dtype = torch.float32
-        rag: RAGState = tree_device_training_float(
-            payload["rag"],
-            self.device,
-            training_float_dtype,
-        )
-        actual: PartitionState = tree_device_training_float(
+        payload = torch_load(self.paths.graph_cache(t))
+        rag: RAGState = tree_to_device_fp32(payload["rag"], self.device)
+        actual: PartitionState = tree_to_device_fp32(
             payload["actual_partition"],
             self.device,
-            training_float_dtype,
         )
-        node_manual = self.manifest.frames[t].node_manual.to(self.device)
-        manual = np.load(self.paths.manual(t), mmap_mode="r", allow_pickle=False)
-        observer = ObserverRawLookup.load(self.paths, t, self.device)
-        self.current = RuntimeFrame(t, rag, actual, node_manual, manual, observer)
+        if rag.statistics is None:
+            raise RuntimeError(
+                "Frozen spatial cache does not contain compact supervoxel "
+                "statistics required by the current InstanceTokenizer. "
+                "Use the full frozen_graph.pt spatial cache, not a diagnostic "
+                "rag_state.npz export."
+            )
+
+        manual = np.asarray(self.manual_movie[t])
+        supervoxels = (
+            rag.supervoxel_labels[0]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.int64, copy=False)
+        )
+        lookup = sv_label_lookup(
+            supervoxels,
+            manual,
+            name=f"runtime t={t} manual",
+        )
+        node_sv = (
+            rag.node_supervoxel_id
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.int64, copy=False)
+        )
+        node_manual = torch.as_tensor(
+            lookup[node_sv],
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        self.current = RuntimeFrame(
+            t=t,
+            rag=rag,
+            actual_partition=actual,
+            manual=manual,
+            node_manual=node_manual,
+            observer=None,
+        )
         return self.current
 
 
 @dataclass
-class SyntheticCaseState:
-    frame: int
-    merge_ids: tuple[int, ...]
-    anchor_ids: tuple[int, ...]
-    anchor_um: Tensor
+class SyntheticCase:
     rag: RAGState
     partition: PartitionState
     target_keep: Tensor
-    valid_edge_mask: Tensor
-    correction_edge_mask: Tensor
-    local_edge_mask: Tensor
-    instance_split_target: Tensor
-    component_manual_ids: tuple[tuple[int, ...], ...]
+    editable: Tensor
+    cut_mask: Tensor
+    keep_mask: Tensor
+    split_target: Tensor
+    node_current_component: Tensor
+    events: tuple[MergeEvent, ...]
 
 
-def build_synthetic_partition(
+def build_synthetic_case(
     runtime: RuntimeFrame,
+    events: Sequence[MergeEvent],
     *,
-    temporal_static: TemporalStatic,
-    merge_ids: Sequence[int],
-    anchor_ids: Sequence[int],
-    dref_um: float,
-    synthetic_spatial_logit: float,
-    local_edge_radius_dref: float,
-) -> SyntheticCaseState:
+    synthetic_logit: float,
+) -> SyntheticCase:
     rag = runtime.rag
     node_manual = runtime.node_manual
-    merge_set = {int(v) for v in merge_ids}
-    merge_tag = min(merge_set) if merge_set else None
-    actual_global = runtime.actual_partition.node_component_global
+    actual = runtime.actual_partition.node_component_global
+
+    representative: dict[int, int] = {}
+    for event in events:
+        representative[int(event.a)] = int(event.representative)
+        representative[int(event.b)] = int(event.representative)
 
     keys: list[tuple[str, int]] = []
     for node in range(int(node_manual.numel())):
-        manual_id = int(node_manual[node].item())
-        if manual_id > 0:
-            key_id = merge_tag if merge_tag is not None and manual_id in merge_set else manual_id
-            keys.append(("manual", int(key_id)))
+        true_id = int(node_manual[node].item())
+        if true_id > 0:
+            keys.append(("manual", representative.get(true_id, true_id)))
         else:
-            # Preserve unlabeled/spatial-only nodes according to the frozen
-            # spatial partition rather than fabricating pseudo-GT identities.
-            keys.append(("extra", int(actual_global[node].item())))
+            # Outside annotated supervision: preserve mature spatial grouping.
+            keys.append(("extra", int(actual[node].item())))
 
     key_to_component: dict[tuple[str, int], int] = {}
-    component_manual: list[set[int]] = []
+    component_manual_ids: list[set[int]] = []
     node_component_values: list[int] = []
+
     for node, key in enumerate(keys):
         component = key_to_component.get(key)
         if component is None:
             component = len(key_to_component)
             key_to_component[key] = component
-            component_manual.append(set())
+            component_manual_ids.append(set())
+
         node_component_values.append(component)
-        manual_id = int(node_manual[node].item())
-        if manual_id > 0:
-            component_manual[component].add(manual_id)
 
-    node_component = torch.tensor(node_component_values, device=rag.node_features.device, dtype=torch.long)
+        true_id = int(node_manual[node].item())
+        if true_id > 0:
+            component_manual_ids[component].add(true_id)
+
+    node_component = torch.tensor(
+        node_component_values,
+        device=rag.node_features.device,
+        dtype=torch.long,
+    )
     component_count = len(key_to_component)
-    src, dst = rag.edge_index
-    same_component = node_component[src] == node_component[dst]
-    positive = rag.spatial_edge_logits.new_full(rag.spatial_edge_logits.shape, float(synthetic_spatial_logit))
-    negative = rag.spatial_edge_logits.new_full(rag.spatial_edge_logits.shape, -float(synthetic_spatial_logit))
-    spatial_logits = torch.where(same_component, positive, negative)
-    synthetic_rag = replace(rag, spatial_edge_logits=spatial_logits)
 
-    # Tokenizer uses only the max label/device when compact RAG statistics are
-    # available. A tiny representative map avoids copying the native volume.
+    src, dst = rag.edge_index
+    same_current = node_component[src] == node_component[dst]
+
+    positive = rag.spatial_edge_logits.new_full(
+        rag.spatial_edge_logits.shape,
+        float(synthetic_logit),
+    )
+    negative = rag.spatial_edge_logits.new_full(
+        rag.spatial_edge_logits.shape,
+        -float(synthetic_logit),
+    )
+    synthetic_logits = torch.where(same_current, positive, negative)
+    synthetic_rag = replace(rag, spatial_edge_logits=synthetic_logits)
+
+    # InstanceTokenizer uses compact rag.statistics, so the native voxel map is
+    # not needed here. A tiny label vector only supplies component count/device.
     if component_count:
-        tiny_labels = torch.arange(1, component_count + 1, device=rag.node_features.device, dtype=torch.long).reshape(1, 1, -1)
+        tiny_labels = torch.arange(
+            1,
+            component_count + 1,
+            device=rag.node_features.device,
+            dtype=torch.long,
+        ).reshape(1, 1, -1)
     else:
-        tiny_labels = torch.zeros((1, 1, 1), device=rag.node_features.device, dtype=torch.long)
+        tiny_labels = torch.zeros(
+            (1, 1, 1),
+            device=rag.node_features.device,
+            dtype=torch.long,
+        )
+
     partition = PartitionState(
         labels=[tiny_labels],
         node_component=node_component,
         node_component_global=node_component.clone(),
-        component_count_per_batch=torch.tensor([component_count], device=rag.node_features.device, dtype=torch.long),
-        edge_logits=spatial_logits,
+        component_count_per_batch=torch.tensor(
+            [component_count],
+            device=rag.node_features.device,
+            dtype=torch.long,
+        ),
+        edge_logits=synthetic_logits,
     )
 
-    manual_src = node_manual[src]
-    manual_dst = node_manual[dst]
-    valid = (manual_src > 0) & (manual_dst > 0)
-    target_keep = valid & (manual_src == manual_dst)
-    correction = valid & (same_component != target_keep)
+    true_src = node_manual[src]
+    true_dst = node_manual[dst]
+    valid = (true_src > 0) & (true_dst > 0)
 
-    anchor_np = anchor_for_manual_ids(temporal_static, runtime.t, anchor_ids)
-    anchor = torch.as_tensor(anchor_np, device=rag.node_features.device, dtype=torch.float32)
-    midpoint = 0.5 * (rag.node_centroid_um[src].float() + rag.node_centroid_um[dst].float())
-    local_edge = torch.linalg.vector_norm(midpoint - anchor[None], dim=-1) <= float(local_edge_radius_dref) * float(dref_um)
-    local_edge |= correction
+    target_keep = valid & (true_src == true_dst)
+    editable = valid & same_current
 
-    split_target = spatial_logits.new_zeros((component_count,))
-    for component, manual_ids in enumerate(component_manual):
-        split_target[component] = float(len(manual_ids) > 1)
+    # Only deliberately erased true-cell boundaries become CUT targets.
+    cut_mask = editable & ~target_keep
+    keep_mask = editable & target_keep
 
-    return SyntheticCaseState(
-        frame=runtime.t,
-        merge_ids=tuple(int(v) for v in merge_ids),
-        anchor_ids=tuple(int(v) for v in anchor_ids),
-        anchor_um=anchor,
+    split_target = synthetic_logits.new_zeros((component_count,))
+    for component, true_ids in enumerate(component_manual_ids):
+        split_target[component] = float(len(true_ids) > 1)
+
+    return SyntheticCase(
         rag=synthetic_rag,
         partition=partition,
         target_keep=target_keep,
-        valid_edge_mask=valid,
-        correction_edge_mask=correction,
-        local_edge_mask=local_edge,
-        instance_split_target=split_target,
-        component_manual_ids=tuple(tuple(sorted(v)) for v in component_manual),
+        editable=editable,
+        cut_mask=cut_mask,
+        keep_mask=keep_mask,
+        split_target=split_target,
+        node_current_component=node_component,
+        events=tuple(events),
     )
 
 
-def dummy_geometry_and_decode(model, reference: Tensor) -> tuple[SpatialDecodeState, GeometryState]:
+def dummy_geometry_and_decode(
+    model,
+    reference: Tensor,
+) -> tuple[SpatialDecodeState, GeometryState]:
     channels = model.cfg.spatial.channels
     decoded = SpatialDecodeState(
         d0=reference.new_zeros((1, channels[0], 1, 1, 1)),
@@ -1971,66 +2567,38 @@ def dummy_geometry_and_decode(model, reference: Tensor) -> tuple[SpatialDecodeSt
     return decoded, geometry
 
 
-def temporal_input_from_graph(model, graph: dict[str, Any], device: torch.device) -> TemporalInput:
-    grid = torch.as_tensor(graph["node_instance_grid"]).to(device=device, dtype=torch.float32)
-    valid = torch.as_tensor(graph["node_history_valid"]).to(device=device, dtype=torch.bool)
-    history = model.history_encoder(grid, valid)
-    return TemporalInput(
-        graph_x=torch.as_tensor(graph["graph_x"]).to(device=device, dtype=torch.float32),
-        graph_edge_index=torch.as_tensor(graph["graph_edge_index"]).to(device=device, dtype=torch.long),
-        graph_edge_attr=torch.as_tensor(graph["graph_edge_attr"]).to(device=device, dtype=torch.float32),
-        hypothesis_edge_index=torch.as_tensor(graph["hypothesis_edge_index"]).to(device=device, dtype=torch.long),
-        hypothesis_edge_attr=torch.as_tensor(graph["hypothesis_edge_attr"]).to(device=device, dtype=torch.float32),
-        tracklet_id=torch.as_tensor(graph["tracklet_id"]).to(device=device, dtype=torch.long),
-        temporal_ref_um=torch.as_tensor(graph["temporal_ref_um"]).to(device=device, dtype=torch.float32),
-        temporal_status=torch.as_tensor(graph["temporal_status"]).to(device=device, dtype=torch.float32),
-        temporal_batch=torch.as_tensor(graph["temporal_batch"]).to(device=device, dtype=torch.long),
-        node_history_embedding=history,
-    )
-
-
-def observe_from_raw_lookup(model, temporal: TemporalState, lookup: ObserverRawLookup) -> TemporalState:
-    if temporal.is_empty:
-        return temporal
-    rows = lookup.rows_for(temporal.ref_um)
-    observer = model.temporal_observer
-    p1 = observer.d1_proj(lookup.d1[rows])
-    p2 = observer.d2_proj(lookup.d2[rows])
-    pg = observer.geometry_proj(lookup.hidden[rows]) + observer.geometry_field_proj(lookup.explicit[rows])
-    message = observer.message(torch.cat([p1, p2, pg], dim=-1))
-    message = message.to(temporal.tokens.dtype)
-    gate = observer.gate(torch.cat([temporal.tokens, message, temporal.reliability], dim=-1))
-    return replace(temporal, tokens=observer.norm(temporal.tokens + gate * message))
-
-
 @dataclass
-class ProductionTemporalForward:
-    instances: Any
-    temporal_base: TemporalState
-    full_temporal: TemporalState
-    full_reasoning: Any
-    corrupted_temporal: TemporalState
-    corrupted_reasoning: Any
+class ForwardResult:
+    reasoning: Any
+    final_logits: Tensor
+    observer_hit_rate: float
 
 
-def production_temporal_forward(
+def forward_case(
     model,
     *,
-    case: SyntheticCaseState,
-    temporal_graph: dict[str, Any],
-    observer_lookup: ObserverRawLookup,
+    runtime: RuntimeFrame,
+    case: SyntheticCase,
+    temporal_input: TemporalInput,
     spacing: Sequence[float],
     dref_um: float,
     device: torch.device,
-    corruption: str,
-    corruption_seed: int,
-    corruption_temporal_graph: dict[str, Any] | None = None,
-    corruption_translation_um: Tensor | None = None,
-) -> ProductionTemporalForward:
-    reference = case.rag.node_features
-    decoded, geometry = dummy_geometry_and_decode(model, reference)
-    spacing_t = torch.tensor([spacing], device=device, dtype=torch.float32)
-    dref_t = torch.tensor([float(dref_um)], device=device, dtype=torch.float32)
+) -> ForwardResult:
+    decoded, geometry = dummy_geometry_and_decode(
+        model,
+        case.rag.node_features,
+    )
+
+    spacing_t = torch.tensor(
+        [spacing],
+        device=device,
+        dtype=torch.float32,
+    )
+    dref_t = torch.tensor(
+        [float(dref_um)],
+        device=device,
+        dtype=torch.float32,
+    )
 
     instances = model.instance_tokenizer(
         case.partition,
@@ -2039,723 +2607,583 @@ def production_temporal_forward(
         geometry,
         spacing_t,
         dref_t,
-        profile_prefix="inv35_tokenizer",
+        profile_prefix="inv35_concrete_tokenizer",
     )
-    temporal_input = temporal_input_from_graph(model, temporal_graph, device)
-    temporal_base = model.temporal_encoder(temporal_input)
-    full_temporal = observe_from_raw_lookup(model, temporal_base, observer_lookup)
-    full_reasoning = model.instance_temporal(instances, case.rag, full_temporal, dref_t)
 
-    if corruption == "contentless":
-        corrupted_base = contentless_temporal_state(temporal_base)
-        corrupted_temporal = observe_from_raw_lookup(
-            model,
-            corrupted_base,
-            observer_lookup,
-        )
-    elif corruption == "wrong_neighbourhood":
-        if corruption_temporal_graph is None or corruption_translation_um is None:
-            raise ValueError(
-                "wrong_neighbourhood requires a donor temporal graph and "
-                "a donor->target physical translation"
-            )
-        donor_input = temporal_input_from_graph(
-            model,
-            corruption_temporal_graph,
-            device,
-        )
-        donor_base = model.temporal_encoder(donor_input)
-        # Observe at real donor cache coordinates first. Recenter only after
-        # observation, so the expensive observer cache remains fully reusable.
-        corrupted_temporal = observe_from_raw_lookup(
-            model,
-            donor_base,
-            observer_lookup,
-        )
-        translation = corruption_translation_um.to(
-            device=corrupted_temporal.ref_um.device,
-            dtype=corrupted_temporal.ref_um.dtype,
-        )
-        corrupted_temporal = replace(
-            corrupted_temporal,
-            ref_um=corrupted_temporal.ref_um + translation[None],
-        )
-    else:
-        raise ValueError(f"Unknown corruption: {corruption}")
-    corrupted_reasoning = model.instance_temporal(
+    temporal = model.temporal_encoder(temporal_input)
+    hit_rate = 0.0
+
+    reasoning = model.instance_temporal(
         instances,
         case.rag,
-        corrupted_temporal,
+        temporal,
         dref_t,
     )
-    return ProductionTemporalForward(
-        instances,
-        temporal_base,
-        full_temporal,
-        full_reasoning,
-        corrupted_temporal,
-        corrupted_reasoning,
+
+    # HARD SPLIT-ONLY INVARIANT.
+    final_logits = torch.where(
+        case.editable,
+        reasoning.final_edge_logits,
+        case.rag.spatial_edge_logits,
+    )
+
+    return ForwardResult(
+        reasoning=reasoning,
+        final_logits=final_logits,
+        observer_hit_rate=float(hit_rate),
     )
 
 
 # =============================================================================
-# Causal synthetic-merge objective
+# Loss
 # =============================================================================
+
+
+def sampled(index: Tensor, maximum: int, rng: random.Random) -> Tensor:
+    if int(index.numel()) <= int(maximum):
+        return index
+    rows = rng.sample(range(int(index.numel())), int(maximum))
+    return index[
+        torch.tensor(rows, device=index.device, dtype=torch.long)
+    ]
 
 
 @dataclass
-class SyntheticLoss:
+class LossResult:
     total: Tensor
-    edge: Tensor
-    correction: Tensor
-    preservation: Tensor
+    cut: Tensor
+    keep: Tensor
     split: Tensor
-    corrupted_noop: Tensor
-    corrupted_gate: Tensor
-    causal_margin: Tensor
-    correction_edges: int
-    preservation_edges: int
+    cut_edges: int
+    keep_edges: int
 
 
-def _sample_tensor_rows(index: Tensor, count: int, rng: random.Random) -> Tensor:
-    if count <= 0 or index.numel() == 0:
-        return index[:0]
-    if int(index.numel()) <= int(count):
-        return index
-    rows = rng.sample(range(int(index.numel())), int(count))
-    return index[torch.tensor(rows, device=index.device, dtype=torch.long)]
-
-
-def preservation_indices(
-    case: SyntheticCaseState,
-    *,
-    maximum: int,
-    correction_ratio: int,
-    rng: random.Random,
-) -> Tensor:
-    preserve = case.valid_edge_mask & case.local_edge_mask & ~case.correction_edge_mask
-    keep = torch.nonzero(preserve & case.target_keep, as_tuple=False).flatten()
-    cut = torch.nonzero(preserve & ~case.target_keep, as_tuple=False).flatten()
-    correction_count = int(case.correction_edge_mask.sum().item())
-    budget = int(maximum)
-    if correction_count > 0:
-        budget = min(budget, max(correction_count * int(correction_ratio), correction_count))
-    if budget <= 0:
-        return keep[:0]
-
-    keep_budget = budget // 2
-    cut_budget = budget - keep_budget
-    selected_keep = _sample_tensor_rows(keep, keep_budget, rng)
-    selected_cut = _sample_tensor_rows(cut, cut_budget, rng)
-    selected = torch.cat([selected_keep, selected_cut])
-    if int(selected.numel()) < budget:
-        used = torch.zeros_like(preserve)
-        if selected.numel():
-            used[selected] = True
-        remaining = torch.nonzero(preserve & ~used, as_tuple=False).flatten()
-        selected = torch.cat([
-            selected,
-            _sample_tensor_rows(remaining, budget - int(selected.numel()), rng),
-        ])
-    return selected
-
-
-def split_indices(target: Tensor, *, negative_ratio: int, rng: random.Random) -> Tensor:
-    positive = torch.nonzero(target > 0.5, as_tuple=False).flatten()
-    negative = torch.nonzero(target <= 0.5, as_tuple=False).flatten()
-    if positive.numel():
-        negative = _sample_tensor_rows(
-            negative,
-            max(int(positive.numel()) * int(negative_ratio), 8),
-            rng,
-        )
-        return torch.cat([positive, negative])
-    return _sample_tensor_rows(negative, min(int(negative.numel()), 64), rng)
-
-
-def synthetic_causal_loss(
-    case: SyntheticCaseState,
-    forward: ProductionTemporalForward,
+def training_loss(
+    case: SyntheticCase,
+    forward: ForwardResult,
     *,
     preserve_edges: int,
     preserve_ratio: int,
     preservation_weight: float,
     split_weight: float,
-    noop_weight: float,
-    corrupted_gate_weight: float,
-    margin_weight: float,
-    margin: float,
     rng: random.Random,
-) -> SyntheticLoss:
-    full = forward.full_reasoning
-    corrupted = forward.corrupted_reasoning
-    device = full.final_edge_logits.device
-    zero = full.final_edge_logits.sum() * 0.0
+) -> LossResult:
+    logits = forward.final_logits
+    zero = logits.sum() * 0.0
 
-    correction_index = torch.nonzero(
-        case.correction_edge_mask & case.local_edge_mask,
-        as_tuple=False,
-    ).flatten()
-    preserve_index = preservation_indices(
-        case,
-        maximum=preserve_edges,
-        correction_ratio=preserve_ratio,
-        rng=rng,
-    )
+    cut_index = torch.nonzero(case.cut_mask, as_tuple=False).flatten()
+    keep_index = torch.nonzero(case.keep_mask, as_tuple=False).flatten()
 
-    def bce(index: Tensor) -> Tensor:
-        if index.numel() == 0:
-            return zero
-        target = case.target_keep[index].to(full.final_edge_logits.dtype)
-        return F.binary_cross_entropy_with_logits(full.final_edge_logits[index], target)
-
-    correction_loss = bce(correction_index)
-    preservation_loss = bce(preserve_index)
-    weighted_preservation = float(preservation_weight) * preservation_loss
-    if correction_index.numel() and preserve_index.numel():
-        edge_loss = correction_loss + weighted_preservation
-    elif correction_index.numel():
-        edge_loss = correction_loss
-    else:
-        edge_loss = weighted_preservation
-
-    sidx = split_indices(case.instance_split_target, negative_ratio=8, rng=rng)
-    split_loss = (
-        F.binary_cross_entropy_with_logits(
-            full.split_logits[sidx],
-            case.instance_split_target[sidx].to(full.split_logits.dtype),
+    keep_budget = int(preserve_edges)
+    if cut_index.numel():
+        keep_budget = min(
+            keep_budget,
+            max(
+                int(cut_index.numel()) * int(preserve_ratio),
+                int(cut_index.numel()),
+            ),
         )
-        if sidx.numel()
+    keep_index = sampled(keep_index, keep_budget, rng)
+
+    cut = (
+        F.binary_cross_entropy_with_logits(
+            logits[cut_index],
+            torch.zeros_like(logits[cut_index]),
+        )
+        if cut_index.numel()
+        else zero
+    )
+    keep = (
+        F.binary_cross_entropy_with_logits(
+            logits[keep_index],
+            torch.ones_like(logits[keep_index]),
+        )
+        if keep_index.numel()
         else zero
     )
 
-    causal_valid = case.valid_edge_mask & case.local_edge_mask
-    valid_index = torch.nonzero(causal_valid, as_tuple=False).flatten()
-    if valid_index.numel():
-        corrupted_noop = F.smooth_l1_loss(
-            corrupted.final_edge_logits[valid_index],
-            case.rag.spatial_edge_logits[valid_index].detach(),
-            beta=0.5,
-        )
-        corrupted_gate = corrupted.edge_temporal_gate[valid_index].square().mean()
-    else:
-        corrupted_noop = zero
-        corrupted_gate = zero
+    positive = torch.nonzero(
+        case.split_target > 0.5,
+        as_tuple=False,
+    ).flatten()
+    negative = torch.nonzero(
+        case.split_target <= 0.5,
+        as_tuple=False,
+    ).flatten()
 
-    if correction_index.numel():
-        target = case.target_keep[correction_index].to(full.final_edge_logits.dtype)
-        direction = target.mul(2.0).sub(1.0)
-        improvement = direction * (
-            full.final_edge_logits[correction_index]
-            - corrupted.final_edge_logits[correction_index].detach()
+    if positive.numel():
+        negative = sampled(
+            negative,
+            min(int(negative.numel()), max(16, int(positive.numel()) * 8)),
+            rng,
         )
-        causal_margin = F.relu(float(margin) - improvement).mean()
+        split_index = torch.cat([positive, negative])
     else:
-        causal_margin = zero
+        split_index = sampled(
+            negative,
+            min(int(negative.numel()), 64),
+            rng,
+        )
+
+    split = (
+        F.binary_cross_entropy_with_logits(
+            forward.reasoning.split_logits[split_index],
+            case.split_target[split_index].to(
+                forward.reasoning.split_logits.dtype
+            ),
+        )
+        if split_index.numel()
+        else zero
+    )
 
     total = (
-        edge_loss
-        + float(split_weight) * split_loss
-        + float(noop_weight) * corrupted_noop
-        + float(corrupted_gate_weight) * corrupted_gate
-        + float(margin_weight) * causal_margin
+        cut
+        + float(preservation_weight) * keep
+        + float(split_weight) * split
     )
-    return SyntheticLoss(
+
+    return LossResult(
         total=total,
-        edge=edge_loss,
-        correction=correction_loss,
-        preservation=preservation_loss,
-        split=split_loss,
-        corrupted_noop=corrupted_noop,
-        corrupted_gate=corrupted_gate,
-        causal_margin=causal_margin,
-        correction_edges=int(correction_index.numel()),
-        preservation_edges=int(preserve_index.numel()),
+        cut=cut,
+        keep=keep,
+        split=split,
+        cut_edges=int(cut_index.numel()),
+        keep_edges=int(keep_index.numel()),
     )
 
 
 # =============================================================================
-# Evaluation
+# Case index / graph loading
 # =============================================================================
 
 
-@dataclass
-class EvalAccumulator35:
-    cases: int = 0
-    correction_edges: int = 0
-    full_correction_correct: int = 0
-    wrong_neighbourhood_correction_correct: int = 0
-    contentless_correction_correct: int = 0
-    preservation_edges: int = 0
-    preservation_correct: int = 0
-    selected_exact: int = 0
-    local_clean_components: int = 0
-    local_clean_split: int = 0
-    max_empty_noop_error: float = 0.0
-
-    def as_dict(self) -> dict[str, Any]:
-        corr = max(self.correction_edges, 1)
-        pres = max(self.preservation_edges, 1)
-        cases = max(self.cases, 1)
-        clean = max(self.local_clean_components, 1)
-        full = self.full_correction_correct / corr
-        wrong = self.wrong_neighbourhood_correction_correct / corr
-        contentless = self.contentless_correction_correct / corr
-        return {
-            "objective_version": OBJECTIVE_VERSION,
-            "cases": self.cases,
-            "correction_edges": self.correction_edges,
-            "full_correction_accuracy": float(full),
-            "wrong_neighbourhood_correction_accuracy": float(wrong),
-            "contentless_correction_accuracy": float(contentless),
-            "full_minus_wrong_neighbourhood": float(full - wrong),
-            "full_minus_contentless": float(full - contentless),
-            "preservation_edges": self.preservation_edges,
-            "preservation_accuracy": float(self.preservation_correct / pres),
-            "selected_component_exact_rate": float(self.selected_exact / cases),
-            "local_clean_component_split_rate": float(self.local_clean_split / clean),
-            "max_empty_noop_error": float(self.max_empty_noop_error),
-        }
+@dataclass(frozen=True)
+class VariantFrameCase:
+    variant_index: int
+    split: str
+    frame: int
+    events: tuple[MergeEvent, ...]
 
 
-def selected_component_exact(
-    runtime: RuntimeFrame,
-    case: SyntheticCaseState,
+def build_case_index(
+    plans: Sequence[VariantPlan],
+    frame_count: int,
+) -> dict[str, list[VariantFrameCase]]:
+    result = {"train": [], "val": [], "test": []}
+
+    for plan in plans:
+        for t in range(frame_count):
+            events = tuple(plan.events_by_frame.get(t, ()))
+            if events:
+                result[plan.split].append(
+                    VariantFrameCase(
+                        variant_index=int(plan.index),
+                        split=plan.split,
+                        frame=int(t),
+                        events=events,
+                    )
+                )
+
+    return result
+
+
+def load_track_graphs(paths: Paths, plans: Sequence[VariantPlan]) -> dict[int, Any]:
+    result = {}
+    for plan in plans:
+        with paths.track_graph(plan.index).open("rb") as handle:
+            result[int(plan.index)] = pickle.load(handle)
+    return result
+
+
+# =============================================================================
+# Metrics
+# =============================================================================
+
+
+def enforce_split_only_partition(
+    case: SyntheticCase,
     predicted: PartitionState,
+) -> PartitionState:
+    """
+    Intersect every predicted final component with the current synthetic
+    component. This is a hard constraint, not a soft negative edge.
+    """
+    current = case.node_current_component.detach().cpu().numpy().astype(np.int64)
+    final = (
+        predicted.node_component_global
+        .detach().cpu().numpy()
+        .astype(np.int64)
+    )
+
+    pair_to_component: dict[tuple[int, int], int] = {}
+    remapped = np.empty_like(final)
+
+    for row, pair in enumerate(zip(current.tolist(), final.tolist())):
+        key = (int(pair[0]), int(pair[1]))
+        component = pair_to_component.get(key)
+        if component is None:
+            component = len(pair_to_component)
+            pair_to_component[key] = component
+        remapped[row] = component
+
+    remapped_t = torch.as_tensor(
+        remapped,
+        device=predicted.node_component_global.device,
+        dtype=torch.long,
+    )
+    count = len(pair_to_component)
+
+    tiny = (
+        torch.arange(
+            1,
+            count + 1,
+            device=remapped_t.device,
+            dtype=torch.long,
+        ).reshape(1, 1, -1)
+        if count
+        else torch.zeros(
+            (1, 1, 1),
+            device=remapped_t.device,
+            dtype=torch.long,
+        )
+    )
+
+    return PartitionState(
+        labels=[tiny],
+        node_component=remapped_t,
+        node_component_global=remapped_t.clone(),
+        component_count_per_batch=torch.tensor(
+            [count],
+            device=remapped_t.device,
+            dtype=torch.long,
+        ),
+        edge_logits=predicted.edge_logits,
+    )
+
+
+def pair_exact_recovery(
+    runtime: RuntimeFrame,
+    predicted: PartitionState,
+    event: MergeEvent,
 ) -> bool:
-    node_manual = runtime.node_manual
-    component = predicted.node_component_global
-    selected_components: set[int] = set()
-    for manual_id in case.merge_ids:
-        rows = torch.nonzero(node_manual == int(manual_id), as_tuple=False).flatten()
+    seen: set[int] = set()
+
+    for true_id in (int(event.a), int(event.b)):
+        rows = torch.nonzero(
+            runtime.node_manual == true_id,
+            as_tuple=False,
+        ).flatten()
         if rows.numel() == 0:
             return False
-        values = torch.unique(component[rows])
-        if values.numel() != 1:
+
+        components = torch.unique(predicted.node_component_global[rows])
+        if components.numel() != 1:
             return False
-        comp = int(values.item())
-        if comp in selected_components:
+
+        component = int(components.item())
+        if component in seen:
             return False
-        selected_components.add(comp)
-        members = torch.nonzero(component == comp, as_tuple=False).flatten()
-        positive_manual = node_manual[members]
-        if bool((positive_manual != int(manual_id)).any()):
+        seen.add(component)
+
+        members = torch.nonzero(
+            predicted.node_component_global == component,
+            as_tuple=False,
+        ).flatten()
+        member_true = runtime.node_manual[members]
+        positive = member_true[member_true > 0]
+        if bool((positive != true_id).any()):
             return False
+
     return True
 
 
-def local_clean_split_counts(
+def clean_split_counts(
     runtime: RuntimeFrame,
-    case: SyntheticCaseState,
     predicted: PartitionState,
-    dref_um: float,
-    radius_dref: float,
+    events: Sequence[MergeEvent],
 ) -> tuple[int, int]:
-    node_manual = runtime.node_manual
-    component = predicted.node_component_global
-    node_distance = torch.linalg.vector_norm(runtime.rag.node_centroid_um.float() - case.anchor_um[None], dim=-1)
-    local = node_distance <= float(radius_dref) * float(dref_um)
-    total = split = 0
-    for manual_id in torch.unique(node_manual[local]).tolist():
-        manual_id = int(manual_id)
-        if manual_id <= 0 or manual_id in case.merge_ids:
+    merged_ids = {
+        int(value)
+        for event in events
+        for value in (event.a, event.b)
+    }
+
+    total = 0
+    split = 0
+    for true_id in torch.unique(runtime.node_manual).tolist():
+        true_id = int(true_id)
+        if true_id <= 0 or true_id in merged_ids:
             continue
-        rows = torch.nonzero(node_manual == manual_id, as_tuple=False).flatten()
+
+        rows = torch.nonzero(
+            runtime.node_manual == true_id,
+            as_tuple=False,
+        ).flatten()
         if rows.numel() == 0:
             continue
+
         total += 1
-        split += int(torch.unique(component[rows]).numel() > 1)
+        split += int(
+            torch.unique(predicted.node_component_global[rows]).numel() > 1
+        )
+
     return total, split
 
 
-def correction_correct(
-    reasoning,
-    case: SyntheticCaseState,
-    *,
-    merge_threshold: float,
-) -> tuple[int, int]:
-    mask = case.correction_edge_mask & case.local_edge_mask
-    count = int(mask.sum().item())
-    if not count:
-        return 0, 0
-    predicted_keep = (
-        reasoning.final_edge_logits[mask].sigmoid() >= float(merge_threshold)
-    )
-    target_keep = case.target_keep[mask]
-    return int((predicted_keep == target_keep).sum().item()), count
+def split_only_violation_count(
+    case: SyntheticCase,
+    predicted: PartitionState,
+) -> int:
+    count = 0
 
+    for final_component in torch.unique(
+        predicted.node_component_global
+    ).tolist():
+        rows = torch.nonzero(
+            predicted.node_component_global == int(final_component),
+            as_tuple=False,
+        ).flatten()
+        if rows.numel() <= 1:
+            continue
 
-def preservation_correct(
-    reasoning,
-    case: SyntheticCaseState,
-    *,
-    merge_threshold: float,
-) -> tuple[int, int]:
-    mask = case.valid_edge_mask & case.local_edge_mask & ~case.correction_edge_mask
-    count = int(mask.sum().item())
-    if not count:
-        return 0, 0
-    predicted_keep = (
-        reasoning.final_edge_logits[mask].sigmoid() >= float(merge_threshold)
-    )
-    target_keep = case.target_keep[mask]
-    return int((predicted_keep == target_keep).sum().item()), count
+        if torch.unique(case.node_current_component[rows]).numel() > 1:
+            count += 1
 
-
-def trainable_modules(model) -> tuple[Any, ...]:
-    return (
-        model.instance_tokenizer,
-        model.history_encoder,
-        model.temporal_encoder,
-        model.temporal_observer,
-        model.instance_temporal,
-    )
-
-
-def set_temporal_train_mode(model, training: bool) -> None:
-    for module in trainable_modules(model):
-        module.train(training)
+    return count
 
 
 @torch.no_grad()
-def evaluate_model35(
+def evaluate(
     model,
     *,
-    paths: Paths,
-    manifest: CandidateManifest,
+    cases: Sequence[VariantFrameCase],
+    graphs: dict[int, Any],
     loader: RuntimeFrameLoader,
-    temporal_static: TemporalStatic,
-    track_graph,
     frame_count: int,
     temporal_radius: int,
     spacing: Sequence[float],
     dref_um: float,
-    neighbourhood_dref: float,
-    local_edge_radius_dref: float,
-    synthetic_spatial_logit: float,
-    val_cases: int,
+    synthetic_logit: float,
     device: torch.device,
+    maximum_cases: int,
     seed: int,
-    complete_candidate_graph: bool,
 ) -> dict[str, Any]:
-    set_temporal_train_mode(model, False)
-    ordered = sorted(
-        manifest.val_pairs,
-        key=lambda p: stable_fraction("inv35-eval", seed, p.frame, p.a, p.b),
-    )
-    selected = ordered[: min(int(val_cases), len(ordered))]
-    if not selected:
-        raise RuntimeError("No validation pair candidates are available")
+    set_temporal_mode(model, False)
 
-    acc = EvalAccumulator35()
-    for case_index, pair in enumerate(selected):
-        runtime = loader.load(pair.frame)
-        merge_ids = (int(pair.a), int(pair.b))
-        synthetic = build_synthetic_partition(
+    ordered = list(cases)
+    rng = random.Random(int(seed))
+    rng.shuffle(ordered)
+    if maximum_cases > 0:
+        ordered = ordered[: min(maximum_cases, len(ordered))]
+
+    if not ordered:
+        raise RuntimeError("No evaluation cases")
+
+    shape = loader.manual_movie.shape[-3:]
+    threshold = float(model.cfg.partition.final_merge_threshold)
+
+    cut_total = cut_correct = 0
+    keep_total = keep_correct = 0
+    pair_total = pair_exact = 0
+    clean_total = clean_split = 0
+    violations = 0
+    observer_hits = []
+
+    for spec in ordered:
+        runtime = loader.load(spec.frame)
+        case = build_synthetic_case(
             runtime,
-            temporal_static=temporal_static,
-            merge_ids=merge_ids,
-            anchor_ids=merge_ids,
-            dref_um=dref_um,
-            synthetic_spatial_logit=synthetic_spatial_logit,
-            local_edge_radius_dref=local_edge_radius_dref,
-        )
-        graph = build_local_temporal_graph(
-            temporal_static=temporal_static,
-            track_graph=track_graph,
-            manual_labels=runtime.manual,
-            target_t=pair.frame,
-            frame_count=frame_count,
-            temporal_radius=temporal_radius,
-            available_offsets=sequence_available_time_offsets(pair.frame, frame_count, temporal_radius),
-            anchor_ids=merge_ids,
-            merge_ids=merge_ids,
-            spacing=spacing,
-            dref_um=dref_um,
-            neighbourhood_dref=neighbourhood_dref,
-            complete_candidate_graph=complete_candidate_graph,
+            spec.events,
+            synthetic_logit=synthetic_logit,
         )
 
-        # Build shared instance + temporal-base state once.
-        reference = synthetic.rag.node_features
-        decoded, geometry = dummy_geometry_and_decode(model, reference)
-        spacing_t = torch.tensor([spacing], device=device, dtype=torch.float32)
-        dref_t = torch.tensor([float(dref_um)], device=device, dtype=torch.float32)
-        instances = model.instance_tokenizer(
-            synthetic.partition,
-            synthetic.rag,
-            decoded,
-            geometry,
-            spacing_t,
-            dref_t,
-            profile_prefix="inv35_eval_tokenizer",
-        )
-        temporal_base = model.temporal_encoder(temporal_input_from_graph(model, graph, device))
-        full_temporal = observe_from_raw_lookup(model, temporal_base, runtime.observer)
-        full = model.instance_temporal(instances, synthetic.rag, full_temporal, dref_t)
-
-        evaluation_rows = manifest.frames[int(pair.frame)].pairs
-        donor_rng = random.Random(
-            int(seed) + 104_729 * int(case_index)
-        )
-        donor = choose_wrong_neighbour_pair(
-            evaluation_rows,
-            target_ids=merge_ids,
-            reference_pair=pair,
-            temporal_static=temporal_static,
-            track_graph=track_graph,
-            target_t=int(pair.frame),
-            available_offsets=sequence_available_time_offsets(
-                pair.frame,
-                frame_count,
-                temporal_radius,
-            ),
-            rng=donor_rng,
-        )
-        donor_ids = (int(donor.a), int(donor.b))
-        donor_graph = build_local_temporal_graph(
-            temporal_static=temporal_static,
-            track_graph=track_graph,
-            manual_labels=runtime.manual,
-            target_t=pair.frame,
+        temporal_input = direct_temporal_input(
+            graphs[spec.variant_index],
+            target_t=spec.frame,
             frame_count=frame_count,
             temporal_radius=temporal_radius,
-            available_offsets=sequence_available_time_offsets(
-                pair.frame,
-                frame_count,
-                temporal_radius,
-            ),
-            anchor_ids=donor_ids,
-            merge_ids=donor_ids,
             spacing=spacing,
             dref_um=dref_um,
-            neighbourhood_dref=neighbourhood_dref,
-            complete_candidate_graph=complete_candidate_graph,
-        )
-        donor_base = model.temporal_encoder(
-            temporal_input_from_graph(
-                model,
-                donor_graph,
-                device,
-            )
-        )
-        wrong_neighbourhood = observe_from_raw_lookup(
-            model,
-            donor_base,
-            runtime.observer,
-        )
-        donor_anchor = torch.as_tensor(
-            anchor_for_manual_ids(
-                temporal_static,
-                pair.frame,
-                donor_ids,
-            ),
+            shape_zyx=shape,
             device=device,
-            dtype=wrong_neighbourhood.ref_um.dtype,
         )
-        translation = synthetic.anchor_um.to(
-            wrong_neighbourhood.ref_um
-        ) - donor_anchor
-        wrong_neighbourhood = replace(
-            wrong_neighbourhood,
-            ref_um=wrong_neighbourhood.ref_um + translation[None],
+        forward = forward_case(
+            model,
+            runtime=runtime,
+            case=case,
+            temporal_input=temporal_input,
+            spacing=spacing,
+            dref_um=dref_um,
+            device=device,
         )
-        wrong = model.instance_temporal(
-            instances,
-            synthetic.rag,
-            wrong_neighbourhood,
-            dref_t,
-        )
+        observer_hits.append(forward.observer_hit_rate)
 
-        contentless_base = contentless_temporal_state(temporal_base)
-        contentless = model.instance_temporal(
-            instances,
-            synthetic.rag,
-            observe_from_raw_lookup(model, contentless_base, runtime.observer),
-            dref_t,
-        )
-        empty = model.instance_temporal(
-            instances,
-            synthetic.rag,
-            model.temporal_encoder.empty(device, full.final_edge_logits.dtype),
-            dref_t,
-        )
+        keep_prediction = torch.sigmoid(forward.final_logits) >= threshold
 
-        empty_error = (
-            float((empty.final_edge_logits - synthetic.rag.spatial_edge_logits).abs().max().item())
-            if synthetic.rag.spatial_edge_logits.numel()
-            else 0.0
-        )
-        acc.max_empty_noop_error = max(acc.max_empty_noop_error, empty_error)
-
-        final_threshold = float(model.cfg.partition.final_merge_threshold)
-        full_correct, correction_count = correction_correct(
-            full,
-            synthetic,
-            merge_threshold=final_threshold,
-        )
-        wrong_correct, _ = correction_correct(
-            wrong,
-            synthetic,
-            merge_threshold=final_threshold,
-        )
-        contentless_correct, _ = correction_correct(
-            contentless,
-            synthetic,
-            merge_threshold=final_threshold,
-        )
-        preserve_correct_count, preserve_count = preservation_correct(
-            full,
-            synthetic,
-            merge_threshold=final_threshold,
-        )
-        acc.cases += 1
-        acc.correction_edges += correction_count
-        acc.full_correction_correct += full_correct
-        acc.wrong_neighbourhood_correction_correct += wrong_correct
-        acc.contentless_correction_correct += contentless_correct
-        acc.preservation_edges += preserve_count
-        acc.preservation_correct += preserve_correct_count
+        cut_total += int(case.cut_mask.sum().item())
+        cut_correct += int((~keep_prediction[case.cut_mask]).sum().item())
+        keep_total += int(case.keep_mask.sum().item())
+        keep_correct += int(keep_prediction[case.keep_mask].sum().item())
 
         predicted = model.partitioner(
-            synthetic.rag,
-            full.final_edge_logits,
+            case.rag,
+            forward.final_logits,
             model.cfg.partition.final_merge_threshold,
             stage="final",
         )
-        acc.selected_exact += int(selected_component_exact(runtime, synthetic, predicted))
-        clean_total, clean_split = local_clean_split_counts(
+        predicted = enforce_split_only_partition(case, predicted)
+
+        for event in spec.events:
+            pair_total += 1
+            pair_exact += int(
+                pair_exact_recovery(runtime, predicted, event)
+            )
+
+        total, split = clean_split_counts(
             runtime,
-            synthetic,
             predicted,
-            dref_um,
-            local_edge_radius_dref,
+            spec.events,
         )
-        acc.local_clean_components += clean_total
-        acc.local_clean_split += clean_split
+        clean_total += total
+        clean_split += split
+        violations += split_only_violation_count(case, predicted)
 
-    metrics = acc.as_dict()
-    metrics["empty_exact_noop"] = bool(metrics["max_empty_noop_error"] == 0.0)
-    min_gap = min(
-        metrics["full_minus_wrong_neighbourhood"],
-        metrics["full_minus_contentless"],
+    cut_accuracy = cut_correct / max(cut_total, 1)
+    keep_accuracy = keep_correct / max(keep_total, 1)
+    exact_rate = pair_exact / max(pair_total, 1)
+    false_split_rate = clean_split / max(clean_total, 1)
+
+    strict = bool(
+        cut_accuracy >= 0.90
+        and keep_accuracy >= 0.98
+        and exact_rate >= 0.80
+        and false_split_rate <= 0.02
+        and violations == 0
     )
-    metrics["minimum_causal_gap"] = float(min_gap)
-    metrics["strict_pass"] = bool(
-        metrics["empty_exact_noop"]
-        and metrics["full_correction_accuracy"] >= 0.90
-        and metrics["preservation_accuracy"] >= 0.98
-        and metrics["selected_component_exact_rate"] >= 0.80
-        and metrics["local_clean_component_split_rate"] <= 0.02
-        and min_gap >= 0.15
+
+    score = float(
+        3.0 * cut_accuracy
+        + 2.0 * exact_rate
+        + 1.5 * keep_accuracy
+        - 4.0 * false_split_rate
     )
-    metrics["checkpoint_score"] = float(
-        2.5 * metrics["full_correction_accuracy"]
-        + 2.0 * metrics["selected_component_exact_rate"]
-        + 1.0 * metrics["preservation_accuracy"]
-        - 4.0 * metrics["local_clean_component_split_rate"]
-        + 1.5 * metrics["full_minus_wrong_neighbourhood"]
-        + 1.5 * metrics["full_minus_contentless"]
-    )
-    set_temporal_train_mode(model, True)
-    return metrics
 
+    set_temporal_mode(model, True)
 
-def print_eval35(step: int, metrics: dict[str, Any]) -> None:
-    print()
-    print("=" * 118)
-    print(f"INVESTIGATION 35 VALIDATION @ STEP {step}")
-    print("=" * 118)
-    print(f"FULL correction      : {metrics['full_correction_accuracy']:.4f}")
-    print(f"preservation         : {metrics['preservation_accuracy']:.4f}")
-    print(f"selected exact       : {metrics['selected_component_exact_rate']:.4f}")
-    print(f"local clean split    : {metrics['local_clean_component_split_rate']:.4f}")
-    print(
-        "WRONG-NEIGHBOR correction: "
-        f"{metrics['wrong_neighbourhood_correction_accuracy']:.4f}"
-    )
-    print(f"CONTENTLESS correction: {metrics['contentless_correction_accuracy']:.4f}")
-    print(
-        "FULL - WRONG-NEIGHBOR : "
-        f"{metrics['full_minus_wrong_neighbourhood']:+.4f}"
-    )
-    print(f"FULL - CONTENTLESS   : {metrics['full_minus_contentless']:+.4f}")
-    print(f"EMPTY exact no-op    : {metrics['empty_exact_noop']}")
-    print(f"STRICT PASS          : {metrics['strict_pass']}")
-    print(f"checkpoint score     : {metrics['checkpoint_score']:.5f}")
-    print("=" * 118)
-
-
-# =============================================================================
-# Production temporal-stage optimization / checkpointing
-# =============================================================================
-
-
-def configure_temporal_training(model, device: torch.device) -> list[Tensor]:
-    """Freeze the mature spatial system and move only temporal-stage modules.
-
-    The complete model remains checkpoint-compatible, but spatial parameters stay
-    on CPU and require no gradients.  This makes Investigation 35 a genuine
-    temporal-stage trainer rather than a hidden joint fine-tune.
-    """
-    model.cpu()
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
-
-    parameters: list[Tensor] = []
-    seen: set[int] = set()
-    for module in trainable_modules(model):
-        module.to(device)
-        module.train(True)
-        for parameter in module.parameters():
-            parameter.requires_grad_(True)
-            if id(parameter) not in seen:
-                seen.add(id(parameter))
-                parameters.append(parameter)
-
-    if not parameters:
-        raise RuntimeError("No trainable temporal-stage parameters were found")
-    return parameters
-
-
-def temporal_parameter_audit(model) -> dict[str, Any]:
-    trainable_names = [
-        name
-        for name, parameter in model.named_parameters()
-        if parameter.requires_grad
-    ]
-    allowed_prefixes = (
-        "instance_tokenizer.",
-        "history_encoder.",
-        "temporal_encoder.",
-        "temporal_observer.",
-        "instance_temporal.",
-    )
-    unexpected = [
-        name
-        for name in trainable_names
-        if not name.startswith(allowed_prefixes)
-    ]
-    if unexpected:
-        raise RuntimeError(
-            "Investigation 35 unexpectedly made spatial parameters trainable: "
-            + ", ".join(unexpected[:20])
-        )
-    counts = {}
-    for prefix in allowed_prefixes:
-        counts[prefix[:-1]] = sum(
-            int(parameter.numel())
-            for name, parameter in model.named_parameters()
-            if parameter.requires_grad and name.startswith(prefix)
-        )
-    counts["total"] = sum(counts.values())
     return {
-        "trainable_parameter_count": counts,
-        "trainable_parameter_names": trainable_names,
+        "objective_version": OBJECTIVE_VERSION,
+        "cases": int(len(ordered)),
+        "merge_pairs": int(pair_total),
+        "cut_edges": int(cut_total),
+        "keep_edges": int(keep_total),
+        "cut_accuracy": float(cut_accuracy),
+        "keep_accuracy": float(keep_accuracy),
+        "exact_merge_recovery": float(exact_rate),
+        "clean_false_split_rate": float(false_split_rate),
+        "split_only_violations": int(violations),
+        "mean_observer_cache_hit_rate": float(
+            np.mean(observer_hits) if observer_hits else 0.0
+        ),
+        "strict_pass": bool(strict),
+        "checkpoint_score": float(score),
     }
 
 
-def make_training_config(args: argparse.Namespace) -> TrainingConfig:
+def print_metrics(title: str, step: int, metrics: dict[str, Any]) -> None:
+    print("\n" + "=" * 112, flush=True)
+    print(f"{title} @ STEP {step}", flush=True)
+    print("=" * 112, flush=True)
+    print(f"CUT accuracy          : {metrics['cut_accuracy']:.4f}", flush=True)
+    print(f"KEEP accuracy         : {metrics['keep_accuracy']:.4f}", flush=True)
+    print(
+        f"exact merge recovery  : {metrics['exact_merge_recovery']:.4f}",
+        flush=True,
+    )
+    print(
+        f"clean false split     : {metrics['clean_false_split_rate']:.4f}",
+        flush=True,
+    )
+    print(
+        f"split-only violations : {metrics['split_only_violations']}",
+        flush=True,
+    )
+    print(
+        f"observer cache hit    : {metrics['mean_observer_cache_hit_rate']:.3f}",
+        flush=True,
+    )
+    print(f"STRICT PASS           : {metrics['strict_pass']}", flush=True)
+    print(
+        f"checkpoint score      : {metrics['checkpoint_score']:.5f}",
+        flush=True,
+    )
+    print("=" * 112, flush=True)
+
+
+# =============================================================================
+# Model / optimizer
+# =============================================================================
+
+
+def load_model(checkpoint: Path, device: torch.device):
+    payload, model, _, _, _ = INV12.load_checkpoint_model_for_inference(
+        checkpoint,
+        device,
+    )
+    return payload, model
+
+
+def configure_temporal_training(model) -> list[Tensor]:
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    # history_encoder is not used in this clean experiment.
+    modules = (
+        model.instance_tokenizer,
+        model.temporal_encoder,
+        model.instance_temporal,
+    )
+
+    trainable: list[Tensor] = []
+    for module in modules:
+        module.train()
+        for parameter in module.parameters():
+            parameter.requires_grad_(True)
+            trainable.append(parameter)
+
+    return trainable
+
+
+def set_temporal_mode(model, training: bool) -> None:
+    model.eval()
+    for module in (
+        model.instance_tokenizer,
+        model.temporal_encoder,
+        model.temporal_observer,
+        model.instance_temporal,
+    ):
+        module.train(bool(training))
+
+
+def parameter_audit(model) -> dict[str, int]:
+    rows = {}
+    total = 0
+    for name, module in (
+        ("instance_tokenizer", model.instance_tokenizer),
+        ("temporal_encoder", model.temporal_encoder),
+        ("instance_temporal", model.instance_temporal),
+    ):
+        count = sum(
+            p.numel()
+            for p in module.parameters()
+            if p.requires_grad
+        )
+        rows[name] = int(count)
+        total += int(count)
+    rows["total"] = int(total)
+    return rows
+
+
+def training_config(args: argparse.Namespace) -> TrainingConfig:
     config = TrainingConfig()
     config.lr = float(args.lr)
     config.weight_decay = float(args.weight_decay)
@@ -2764,87 +3192,24 @@ def make_training_config(args: argparse.Namespace) -> TrainingConfig:
     config.curriculum.fixed_stage = "instance_temporal"
     config.curriculum.instance_temporal_detached_spatial = True
     config.curriculum.instance_temporal_freeze_spatial = True
-    config.loss.temporal_causal_enabled = True
-    config.loss.temporal_causal_noop_weight = float(args.noop_weight)
-    config.loss.temporal_causal_corrupted_gate_weight = float(
-        args.corrupted_gate_weight
-    )
-    config.loss.temporal_causal_margin_weight = float(args.margin_weight)
-    config.loss.temporal_causal_margin = float(args.margin)
-    # WRONG-NEIGHBOURHOOD requires a second temporal graph and is
-    # implemented locally in Investigation 35. Keep the generic production
-    # config on its state-only CONTENTLESS corruption.
-    config.loss.temporal_causal_corruptions = ("contentless",)
-    config.loss.temporal_causal_seed = int(args.seed) + 35_000
+    config.loss.temporal_causal_enabled = False
     config.validate()
     return config
 
 
-def make_grad_scaler(device: torch.device, amp_dtype: str):
-    enabled = device.type == "cuda" and amp_dtype == "fp16"
-    try:
-        return torch.amp.GradScaler("cuda", enabled=enabled)
-    except TypeError:
-        # Compatibility with older PyTorch installations.
-        return torch.cuda.amp.GradScaler(enabled=enabled)
-
-
-def checkpoint_extra(
-    *,
-    paths: Paths,
-    args: argparse.Namespace,
-    dref_um: float,
-    metrics: dict[str, Any] | None,
-    parameter_audit: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "investigation": SCRIPT_NAME,
-        "objective_version": OBJECTIVE_VERSION,
-        "curriculum_stage": "instance_temporal",
-        "sample_id": paths.sample,
-        "spatial_checkpoint": str(paths.checkpoint),
-        "dref_um": float(dref_um),
-        "spacing_zyx_um": tuple(float(v) for v in args.spacing),
-        "synthetic_spatial_logit": float(args.synthetic_spatial_logit),
-        "temporal_neighbourhood_dref": float(args.temporal_neighbourhood_dref),
-        "local_edge_radius_dref": float(args.local_edge_radius_dref),
-        "manual_signatures": [
-            file_signature(paths.manual(t))
-            for t in range(int(args.frame_count))
-        ],
-        "parameter_audit": parameter_audit,
-        "validation_metrics": metrics or {},
-        "notes": {
-            "spatial_parameters_optimized": False,
-            "spatial_cnn_runs_during_training": False,
-            "target_frame_temporal_detection_leakage": False,
-            "corruption_location": (
-                "after TemporalGraphEncoder and before TemporalSpatialObserver"
-            ),
-            "corruptions": list(CORRUPTIONS),
-            "wrong_neighbourhood": (
-                "same-frame matched synthetic donor observed at donor "
-                "coordinates then recentered onto the target anchor"
-            ),
-            "preservation_weight": float(args.preservation_weight),
-            "full_keep_gate_penalty": False,
-        },
-    }
-
-
-def save_training_checkpoint(
+def save_training_state(
     path: Path,
     *,
     model,
     optimizer,
     scaler,
     step: int,
-    training_config: TrainingConfig,
+    config: TrainingConfig,
     paths: Paths,
     args: argparse.Namespace,
     dref_um: float,
     metrics: dict[str, Any] | None,
-    parameter_audit: dict[str, Any],
+    audit: dict[str, int],
 ) -> None:
     save_checkpoint(
         path,
@@ -2854,472 +3219,90 @@ def save_training_checkpoint(
         step=int(step),
         epoch=0,
         model_config=model.cfg,
-        training_config=training_config,
-        extra=checkpoint_extra(
-            paths=paths,
-            args=args,
-            dref_um=dref_um,
-            metrics=metrics,
-            parameter_audit=parameter_audit,
-        ),
+        training_config=config,
+        extra={
+            "investigation": SCRIPT_NAME,
+            "objective_version": OBJECTIVE_VERSION,
+            "objective": "concrete_true_instance_cut_keep",
+            "sample_id": paths.sample,
+            "dref_um": float(dref_um),
+            "initializer": str(paths.checkpoint),
+            "dataset_manifest": str(paths.dataset_manifest),
+            "parameter_audit": audit,
+            "validation_metrics": metrics or {},
+            "notes": {
+                "StaticDetectionRecord": False,
+                "TemporalStatic": False,
+                "historical_instance_grid": False,
+                "graph_builder_temporal_graph": False,
+                "hypothesis_graph": False,
+                "wrong_neighbourhood": False,
+                "contentless_loss": False,
+                "concrete_trackastra_variants": True,
+                "temporal_action": "split_only",
+                "cross_current_component_edges": "immutable_cut",
+            },
+        },
     )
 
 
-def safe_training_triples(
-    frame_data: FrameCandidates,
-    manifest: CandidateManifest,
-    maximum: int,
-) -> list[tuple[int, int, int]]:
-    """Exclude triples that contain a held-out validation pair."""
-    val_keys = {
-        (int(pair.frame), min(int(pair.a), int(pair.b)), max(int(pair.a), int(pair.b)))
-        for pair in manifest.val_pairs
-    }
-    result: list[tuple[int, int, int]] = []
-    for triple in selected_triples(frame_data, maximum):
-        a, b, c = map(int, triple)
-        pair_keys = (
-            (frame_data.frame, min(a, b), max(a, b)),
-            (frame_data.frame, min(a, c), max(a, c)),
-            (frame_data.frame, min(b, c), max(b, c)),
-        )
-        if any(key in val_keys for key in pair_keys):
+def resolve_dref(paths: Paths, frame_count: int, override: float | None) -> float:
+    if override is not None:
+        if override <= 0:
+            raise ValueError("--dref-um must be positive")
+        return float(override)
+
+    values = []
+    for t in range(frame_count):
+        meta = paths.spatial_meta(t)
+        if not meta.is_file():
             continue
-        result.append((a, b, c))
-    return result
+        try:
+            value = float(
+                json.loads(meta.read_text(encoding="utf-8"))["dref_um"]
+            )
+            if math.isfinite(value) and value > 0:
+                values.append(value)
+        except Exception:
+            pass
 
-
-def target_nodes_have_context(
-    track_graph,
-    target_nodes: Sequence[int],
-    *,
-    target_t: int,
-    available_offsets: Sequence[int],
-) -> bool:
-    absolute_times = {
-        int(target_t) + int(offset)
-        for offset in available_offsets
-        if int(offset) != 0
-    }
-    if not absolute_times:
-        return False
-    for node_id in target_nodes:
-        found = False
-        neighbours = list(track_graph.predecessors(int(node_id))) + list(
-            track_graph.successors(int(node_id))
-        )
-        for other in neighbours:
-            if int(track_graph.nodes[int(other)]["time"]) in absolute_times:
-                found = True
-                break
-        if not found:
-            return False
-    return True
-
-
-def choose_supported_context(
-    *,
-    target_t: int,
-    frame_count: int,
-    temporal_radius: int,
-    target_nodes: Sequence[int],
-    track_graph,
-    rng: random.Random,
-) -> tuple[str, tuple[int, ...]]:
-    name, offsets = choose_context_variant(
-        target_t,
-        frame_count,
-        temporal_radius,
-        rng,
-    )
-    if target_nodes_have_context(
-        track_graph,
-        target_nodes,
-        target_t=target_t,
-        available_offsets=offsets,
-    ):
-        return name, offsets
-    full = tuple(
-        sequence_available_time_offsets(
-            target_t,
-            frame_count,
-            temporal_radius,
-        )
-    )
-    return "full_fallback", full
-
-
-def pair_rows_by_frame(
-    pairs: Sequence[PairCandidate],
-) -> dict[int, list[PairCandidate]]:
-    result: dict[int, list[PairCandidate]] = defaultdict(list)
-    for pair in pairs:
-        result[int(pair.frame)].append(pair)
-    return dict(result)
-
-
-def sample_train_pair(
-    rows: Sequence[PairCandidate],
-    rng: random.Random,
-) -> PairCandidate:
-    if not rows:
-        raise RuntimeError("Cannot sample an empty training-pair list")
-    # Slightly favor pairs with a larger true interface: they are more likely
-    # to resemble a realistic under-segmentation than point-contact neighbours.
-    weights = [max(float(row.interface_edges), 1.0) ** 0.5 for row in rows]
-    return rng.choices(list(rows), weights=weights, k=1)[0]
-
-
-def _pair_matches_ids(pair: PairCandidate, ids: Sequence[int]) -> bool:
-    if len(ids) != 2:
-        return False
-    return {int(pair.a), int(pair.b)} == {int(ids[0]), int(ids[1])}
-
-
-def choose_wrong_neighbour_pair(
-    rows: Sequence[PairCandidate],
-    *,
-    target_ids: Sequence[int],
-    reference_pair: PairCandidate | None,
-    temporal_static: TemporalStatic,
-    track_graph,
-    target_t: int,
-    available_offsets: Sequence[int],
-    rng: random.Random,
-) -> PairCandidate:
-    # Choose a matched, unrelated same-frame donor temporal neighbourhood.
-    target_set = {int(v) for v in target_ids}
-
-    def supported(pair: PairCandidate) -> bool:
-        if int(pair.a) in target_set or int(pair.b) in target_set:
-            return False
-        nodes = member_target_nodes(
-            temporal_static,
-            int(target_t),
-            (int(pair.a), int(pair.b)),
-        )
-        return target_nodes_have_context(
-            track_graph,
-            nodes,
-            target_t=int(target_t),
-            available_offsets=available_offsets,
-        )
-
-    candidates = [pair for pair in rows if supported(pair)]
-    if not candidates:
-        # Defensive fallback for very small datasets. Identities must still be
-        # disjoint, but the donor may have weaker context under this variant.
-        candidates = [
-            pair
-            for pair in rows
-            if int(pair.a) not in target_set and int(pair.b) not in target_set
-        ]
-    if not candidates:
+    if not values:
         raise RuntimeError(
-            "No disjoint same-frame pair is available for the "
-            f"wrong-neighbourhood counterfactual at t={target_t}, "
-            f"target_ids={tuple(map(int, target_ids))}"
+            "Could not resolve dref_um from spatial-cache metadata. "
+            "Pass --dref-um explicitly."
         )
-
-    if reference_pair is not None:
-        # Match pair phenotype to avoid a trivial scale/distance discriminator.
-        def score(pair: PairCandidate) -> float:
-            volume = abs(
-                math.log(
-                    max(float(pair.volume_ratio), 1e-6)
-                    / max(float(reference_pair.volume_ratio), 1e-6)
-                )
-            )
-            distance = abs(
-                float(pair.distance_dref)
-                - float(reference_pair.distance_dref)
-            )
-            interface = abs(
-                math.log1p(float(pair.interface_edges))
-                - math.log1p(float(reference_pair.interface_edges))
-            )
-            return volume + distance + 0.25 * interface
-
-        candidates = sorted(candidates, key=score)[: min(12, len(candidates))]
-
-    return rng.choice(candidates)
+    return float(np.median(np.asarray(values, np.float64)))
 
 
-@dataclass(frozen=True)
-class TrainMicroSpec:
-    frame: int
-    anchor_ids: tuple[int, ...]
-    merge_ids: tuple[int, ...]
-    kind: str
-    context_name: str
-    available_offsets: tuple[int, ...]
-    corruption: str
+# =============================================================================
+# Training loop
+# =============================================================================
 
 
-def make_micro_spec(
-    *,
-    frame: int,
-    frame_data: FrameCandidates,
-    train_pairs: Sequence[PairCandidate],
-    manifest: CandidateManifest,
-    temporal_static: TemporalStatic,
-    track_graph,
-    frame_count: int,
-    temporal_radius: int,
-    max_triples: int,
-    triple_fraction: float,
-    clean: bool,
-    corruption: str,
-    rng: random.Random,
-) -> TrainMicroSpec:
-    pair = sample_train_pair(train_pairs, rng)
-    anchor_ids: tuple[int, ...] = (int(pair.a), int(pair.b))
-    merge_ids: tuple[int, ...] = ()
-    kind = "clean_close_pair"
-
-    if not clean:
-        triples = safe_training_triples(
-            frame_data,
-            manifest,
-            max_triples,
-        )
-        if triples and rng.random() < float(triple_fraction):
-            anchor_ids = tuple(map(int, rng.choice(triples)))
-            merge_ids = anchor_ids
-            kind = "synthetic_three_cell_merge"
-        else:
-            merge_ids = anchor_ids
-            kind = "synthetic_two_cell_merge"
-
-    target_nodes = member_target_nodes(
-        temporal_static,
-        frame,
-        anchor_ids,
-    )
-    context_name, offsets = choose_supported_context(
-        target_t=frame,
-        frame_count=frame_count,
-        temporal_radius=temporal_radius,
-        target_nodes=target_nodes,
-        track_graph=track_graph,
-        rng=rng,
-    )
-    return TrainMicroSpec(
-        frame=int(frame),
-        anchor_ids=anchor_ids,
-        merge_ids=merge_ids,
-        kind=kind,
-        context_name=context_name,
-        available_offsets=tuple(offsets),
-        corruption=str(corruption),
-    )
-
-
-def run_train_microcase(
-    model,
-    *,
-    runtime: RuntimeFrame,
-    spec: TrainMicroSpec,
-    train_pairs: Sequence[PairCandidate],
-    temporal_static: TemporalStatic,
-    track_graph,
-    args: argparse.Namespace,
-    dref_um: float,
-    device: torch.device,
-    rng: random.Random,
-    corruption_seed: int,
-) -> tuple[SyntheticLoss, dict[str, Any]]:
-    case = build_synthetic_partition(
-        runtime,
-        temporal_static=temporal_static,
-        merge_ids=spec.merge_ids,
-        anchor_ids=spec.anchor_ids,
-        dref_um=dref_um,
-        synthetic_spatial_logit=float(args.synthetic_spatial_logit),
-        local_edge_radius_dref=float(args.local_edge_radius_dref),
-    )
-
-    if spec.merge_ids and not bool(case.correction_edge_mask.any()):
-        raise RuntimeError(
-            "A selected positive merge has no correction RAG edge; "
-            f"t={runtime.t}, merge_ids={spec.merge_ids}. "
-            "The candidate manifest is inconsistent with the frozen graph."
-        )
-
-    temporal_graph = build_local_temporal_graph(
-        temporal_static=temporal_static,
-        track_graph=track_graph,
-        manual_labels=runtime.manual,
-        target_t=runtime.t,
-        frame_count=int(args.frame_count),
-        temporal_radius=int(args.temporal_radius),
-        available_offsets=spec.available_offsets,
-        anchor_ids=spec.anchor_ids,
-        merge_ids=spec.merge_ids,
-        spacing=args.spacing,
-        dref_um=dref_um,
-        neighbourhood_dref=float(args.temporal_neighbourhood_dref),
-        complete_candidate_graph=bool(args.complete_candidate_graph),
-    )
-
-    donor_graph = None
-    donor_translation = None
-    donor_ids: tuple[int, ...] = ()
-    if spec.corruption == "wrong_neighbourhood":
-        reference_pair = next(
-            (
-                pair
-                for pair in train_pairs
-                if _pair_matches_ids(pair, spec.anchor_ids)
-            ),
-            None,
-        )
-        donor = choose_wrong_neighbour_pair(
-            train_pairs,
-            target_ids=spec.anchor_ids,
-            reference_pair=reference_pair,
-            temporal_static=temporal_static,
-            track_graph=track_graph,
-            target_t=runtime.t,
-            available_offsets=spec.available_offsets,
-            rng=rng,
-        )
-        donor_ids = (int(donor.a), int(donor.b))
-        donor_graph = build_local_temporal_graph(
-            temporal_static=temporal_static,
-            track_graph=track_graph,
-            manual_labels=runtime.manual,
-            target_t=runtime.t,
-            frame_count=int(args.frame_count),
-            temporal_radius=int(args.temporal_radius),
-            available_offsets=spec.available_offsets,
-            anchor_ids=donor_ids,
-            merge_ids=donor_ids,
-            spacing=args.spacing,
-            dref_um=dref_um,
-            neighbourhood_dref=float(args.temporal_neighbourhood_dref),
-            complete_candidate_graph=bool(args.complete_candidate_graph),
-        )
-        donor_anchor = torch.as_tensor(
-            anchor_for_manual_ids(
-                temporal_static,
-                runtime.t,
-                donor_ids,
-            ),
-            device=device,
-            dtype=case.anchor_um.dtype,
-        )
-        donor_translation = case.anchor_um - donor_anchor
-
-    forward = production_temporal_forward(
-        model,
-        case=case,
-        temporal_graph=temporal_graph,
-        observer_lookup=runtime.observer,
-        spacing=args.spacing,
-        dref_um=dref_um,
-        device=device,
-        corruption=spec.corruption,
-        corruption_seed=int(corruption_seed),
-        corruption_temporal_graph=donor_graph,
-        corruption_translation_um=donor_translation,
-    )
-
-    loss = synthetic_causal_loss(
-        case,
-        forward,
-        preserve_edges=int(args.preserve_edges),
-        preserve_ratio=int(args.preserve_ratio),
-        preservation_weight=float(args.preservation_weight),
-        split_weight=float(args.split_weight),
-        noop_weight=float(args.noop_weight),
-        corrupted_gate_weight=float(args.corrupted_gate_weight),
-        margin_weight=float(args.margin_weight),
-        margin=float(args.margin),
-        rng=rng,
-    )
-
-    correction_mask = case.correction_edge_mask & case.local_edge_mask
-    correction_gate = (
-        float(
-            forward.full_reasoning.edge_temporal_gate[
-                correction_mask
-            ].detach().mean().cpu()
-        )
-        if bool(correction_mask.any())
-        else 0.0
-    )
-    meta = {
-        "frame": int(runtime.t),
-        "kind": spec.kind,
-        "anchor_ids": list(spec.anchor_ids),
-        "merge_ids": list(spec.merge_ids),
-        "context": spec.context_name,
-        "available_offsets": list(spec.available_offsets),
-        "corruption": spec.corruption,
-        "wrong_neighbour_ids": list(donor_ids),
-        "correction_edges": int(loss.correction_edges),
-        "preservation_edges": int(loss.preservation_edges),
-        "mean_full_correction_gate": correction_gate,
-        "temporal_nodes": int(torch.as_tensor(temporal_graph["graph_x"]).shape[0]),
-        "tracklets": int(torch.as_tensor(temporal_graph["temporal_ref_um"]).shape[0]),
-    }
-    return loss, meta
-
-
-def training_metrics_row(
-    *,
-    step: int,
-    frame: int,
-    accumulated: dict[str, float],
-    microcases: list[dict[str, Any]],
-    grad_norm: float,
-    lr: float,
-    step_seconds: float,
-    device: torch.device,
-) -> dict[str, Any]:
-    denominator = max(len(microcases), 1)
-    row = {
-        "step": int(step),
-        "frame": int(frame),
-        "loss": accumulated["total"] / denominator,
-        "edge_loss": accumulated["edge"] / denominator,
-        "correction_loss": accumulated["correction"] / denominator,
-        "preservation_loss": accumulated["preservation"] / denominator,
-        "split_loss": accumulated["split"] / denominator,
-        "corrupted_noop": accumulated["noop"] / denominator,
-        "corrupted_gate": accumulated["corrupted_gate"] / denominator,
-        "causal_margin": accumulated["margin"] / denominator,
-        "grad_norm": float(grad_norm),
-        "lr": float(lr),
-        "step_seconds": float(step_seconds),
-        "microcases": microcases,
-    }
-    if device.type == "cuda":
-        row["peak_allocated_mb"] = float(
-            torch.cuda.max_memory_allocated(device) / (1024**2)
-        )
-        row["peak_reserved_mb"] = float(
-            torch.cuda.max_memory_reserved(device) / (1024**2)
-        )
-    return row
-
-
-def train_model35(
-    model,
+def train(
     *,
     paths: Paths,
-    manifest: CandidateManifest,
-    temporal_static: TemporalStatic,
-    track_graph,
+    plans: Sequence[VariantPlan],
+    cases: dict[str, list[VariantFrameCase]],
+    frame_count: int,
+    temporal_radius: int,
+    spacing: Sequence[float],
     dref_um: float,
     device: torch.device,
     args: argparse.Namespace,
-    resume_checkpoint: dict[str, Any] | None,
-) -> dict[str, Any]:
-    training_config = make_training_config(args)
-    trainable = configure_temporal_training(model, device)
-    parameter_audit = temporal_parameter_audit(model)
+) -> None:
+    graphs = load_track_graphs(paths, plans)
+
+    checkpoint_path = (
+        resolve(args.resume)
+        if args.resume is not None
+        else paths.checkpoint
+    )
+    checkpoint_payload, model = load_model(checkpoint_path, device)
+
+    trainable = configure_temporal_training(model)
+    audit = parameter_audit(model)
+    config = training_config(args)
 
     optimizer = torch.optim.AdamW(
         trainable,
@@ -3329,300 +3312,228 @@ def train_model35(
     scaler = make_grad_scaler(device, str(args.amp_dtype))
 
     start_step = 0
-    if resume_checkpoint is not None:
-        start_step = int(resume_checkpoint.get("global_step", 0))
-        if "optimizer" in resume_checkpoint:
-            optimizer.load_state_dict(resume_checkpoint["optimizer"])
-        if "scaler" in resume_checkpoint:
+    if args.resume is not None:
+        start_step = int(checkpoint_payload.get("global_step", 0))
+        if "optimizer" in checkpoint_payload:
+            optimizer.load_state_dict(checkpoint_payload["optimizer"])
+        if "scaler" in checkpoint_payload:
             try:
-                scaler.load_state_dict(resume_checkpoint["scaler"])
+                scaler.load_state_dict(checkpoint_payload["scaler"])
             except Exception as exc:
-                print(
-                    f"[resume] scaler state was not restored: {exc}",
-                    flush=True,
-                )
-        print(f"[resume] continuing after optimizer step {start_step}")
+                print(f"[resume] scaler not restored: {exc}", flush=True)
 
-    if start_step >= int(args.steps):
-        print(
-            f"[resume] checkpoint step {start_step} already reaches --steps={args.steps}; "
-            "running validation only."
-        )
+    train_cases = list(cases["train"])
+    val_cases = list(cases["val"])
+    test_cases = list(cases["test"])
 
-    pair_by_frame = pair_rows_by_frame(manifest.train_pairs)
-    train_frames = sorted(frame for frame, rows in pair_by_frame.items() if rows)
-    if not train_frames:
-        raise RuntimeError("No frames contain training-pair candidates")
+    if not train_cases or not val_cases or not test_cases:
+        raise RuntimeError("Train/val/test case sets must all be non-empty")
 
-    frame_weights = np.asarray(
-        [max(len(pair_by_frame[frame]), 1) for frame in train_frames],
-        dtype=np.float64,
-    )
-    frame_weights /= frame_weights.sum()
+    by_frame: dict[int, list[VariantFrameCase]] = defaultdict(list)
+    for case in train_cases:
+        by_frame[int(case.frame)].append(case)
+    train_frames = sorted(by_frame)
 
-    loader = RuntimeFrameLoader(paths, manifest, device)
+    loader = RuntimeFrameLoader(paths, device)
+    shape_zyx = loader.manual_movie.shape[-3:]
+
     history: list[dict[str, Any]] = []
     validation_history: list[dict[str, Any]] = []
-    history_path = paths.output / "training_history.json"
-    validation_path = paths.output / "validation_history.json"
-
-    if history_path.is_file() and resume_checkpoint is not None:
-        try:
-            history = list(json.loads(history_path.read_text(encoding="utf-8")))
-        except Exception:
-            history = []
-    if validation_path.is_file() and resume_checkpoint is not None:
-        try:
-            validation_history = list(
-                json.loads(validation_path.read_text(encoding="utf-8"))
-            )
-        except Exception:
-            validation_history = []
-
     best_score = -float("inf")
     best_strict = False
-    best_metrics_path = paths.output / "best_metrics.json"
-    if best_metrics_path.is_file():
-        try:
-            old_best = json.loads(best_metrics_path.read_text(encoding="utf-8"))
-            if int(old_best.get("objective_version", -1)) == OBJECTIVE_VERSION:
-                best_score = float(
-                    old_best.get("checkpoint_score", -float("inf"))
-                )
-                best_strict = bool(old_best.get("strict_pass", False))
-            else:
-                print(
-                    "[best] previous best_metrics.json belongs to an older "
-                    "objective; objective-v2 best-score comparison is reset.",
-                    flush=True,
-                )
-        except Exception:
-            pass
 
-    print()
-    print("=" * 118)
-    print("INVESTIGATION 35 — PRODUCTION TEMPORAL MERGE-SYNTHESIS TRAINING")
-    print("=" * 118)
-    print(f"device                   : {device}")
-    print(f"AMP                      : {args.amp_dtype}")
-    print(f"optimizer steps          : {args.steps}")
-    print(f"microcases / step        : {args.accumulate_cases}")
-    print(f"steps / loaded frame     : {args.steps_per_frame_block}")
-    print(f"train pair candidates    : {len(manifest.train_pairs)}")
-    print(f"held-out pair candidates : {len(manifest.val_pairs)}")
-    print(f"trainable parameters     : {parameter_audit['trainable_parameter_count']['total']:,}")
-    print(f"learning rate            : {args.lr:g}")
-    print(f"synthetic spatial logit  : +/-{args.synthetic_spatial_logit:g}")
-    print(f"clean close-pair fraction: {args.clean_fraction:.2f}")
-    print(f"preservation loss weight : {args.preservation_weight:.2f}")
-    print(f"causal negatives         : {', '.join(CORRUPTIONS)}")
-    print(f"three-cell merge fraction: {args.triple_fraction:.2f}")
-    print("spatial CNN during train : NO")
-    print("spatial parameters       : FROZEN")
-    print("=" * 118)
+    print("\n" + "=" * 112, flush=True)
+    print("INVESTIGATION 35 — DIRECT TEMPORAL CUT/KEEP TRAINING", flush=True)
+    print("=" * 112, flush=True)
+    print(f"device                 : {device}", flush=True)
+    print(f"initializer             : {checkpoint_path}", flush=True)
+    print(f"optimizer steps         : {args.steps}", flush=True)
+    print(f"microcases / step       : {args.accumulate_cases}", flush=True)
+    print(f"train variant-frames    : {len(train_cases)}", flush=True)
+    print(f"val variant-frames      : {len(val_cases)}", flush=True)
+    print(f"test variant-frames     : {len(test_cases)}", flush=True)
+    print(f"trainable parameters    : {audit['total']:,}", flush=True)
+    print(f"preservation weight     : {args.preservation_weight:g}", flush=True)
+    print("temporal action         : SPLIT ONLY", flush=True)
+    print("StaticDetectionRecord   : NONE", flush=True)
+    print("TemporalStatic          : NONE", flush=True)
+    print("history grids           : NONE", flush=True)
+    print("hypothesis graph        : NONE", flush=True)
+    print("=" * 112, flush=True)
 
-    # Deterministic starting point for frame-block rotation.  The random state
-    # is intentionally a function of requested seed + step, so resuming does not
-    # depend on Python's pickled RNG internals.
-    current_frame: int | None = None
     run_started = time.perf_counter()
 
     for step in range(start_step + 1, int(args.steps) + 1):
         step_started = time.perf_counter()
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
+        rng = random.Random(int(args.seed) + 15_485_863 * int(step))
 
-        if (
-            current_frame is None
-            or (step - 1) % int(args.steps_per_frame_block) == 0
-        ):
-            # Use a step-derived generator so frame selection is reproducible
-            # even after resume.
-            block_rng = np.random.default_rng(
-                int(args.seed) + 71_003 * ((step - 1) // int(args.steps_per_frame_block))
-            )
-            current_frame = int(
-                block_rng.choice(train_frames, p=frame_weights)
-            )
+        frame = rng.choice(train_frames)
+        runtime = loader.load(frame)
+        available = by_frame[frame]
 
-        runtime = loader.load(current_frame)
         optimizer.zero_grad(set_to_none=True)
-        # Step-local RNG makes synthetic sampling exactly reproducible across
-        # resume: step N gets the same pair/context/corruption-side sampling
-        # whether reached continuously or loaded from a checkpoint.
-        step_rng = random.Random(
-            int(args.seed) + 15_485_863 * int(step)
-        )
 
-        accumulated = {
+        sums = {
             "total": 0.0,
-            "edge": 0.0,
-            "correction": 0.0,
-            "preservation": 0.0,
+            "cut": 0.0,
+            "keep": 0.0,
             "split": 0.0,
-            "noop": 0.0,
-            "corrupted_gate": 0.0,
-            "margin": 0.0,
+            "observer": 0.0,
         }
-        micro_meta: list[dict[str, Any]] = []
+        micro_rows = []
 
         for micro in range(int(args.accumulate_cases)):
-            # Every optimizer update starts with a positive correction case.
-            # With >=2 microcases it also always contains one clean close-pair
-            # preservation case.  Remaining cases follow clean_fraction.
-            if micro == 0:
-                clean = False
-            elif micro == 1 and int(args.accumulate_cases) >= 2:
-                clean = True
-            else:
-                clean = step_rng.random() < float(args.clean_fraction)
+            spec = rng.choice(available)
 
-            corruption = CORRUPTIONS[(step + micro) % len(CORRUPTIONS)]
-            spec = make_micro_spec(
-                frame=current_frame,
-                frame_data=manifest.frames[current_frame],
-                train_pairs=pair_by_frame[current_frame],
-                manifest=manifest,
-                temporal_static=temporal_static,
-                track_graph=track_graph,
-                frame_count=int(args.frame_count),
-                temporal_radius=int(args.temporal_radius),
-                max_triples=int(args.max_triples_per_frame),
-                triple_fraction=float(args.triple_fraction),
-                clean=clean,
-                corruption=corruption,
-                rng=step_rng,
+            case = build_synthetic_case(
+                runtime,
+                spec.events,
+                synthetic_logit=float(args.synthetic_spatial_logit),
+            )
+            if not bool(case.cut_mask.any()):
+                raise RuntimeError(
+                    "Synthetic merge frame contains no editable CUT RAG edge: "
+                    f"variant={spec.variant_index}, frame={spec.frame}"
+                )
+
+            temporal_input = direct_temporal_input(
+                graphs[spec.variant_index],
+                target_t=spec.frame,
+                frame_count=frame_count,
+                temporal_radius=temporal_radius,
+                spacing=spacing,
+                dref_um=dref_um,
+                shape_zyx=shape_zyx,
+                device=device,
             )
 
             with autocast_for(device, str(args.amp_dtype)):
-                loss, meta = run_train_microcase(
+                forward = forward_case(
                     model,
                     runtime=runtime,
-                    spec=spec,
-                    train_pairs=pair_by_frame[current_frame],
-                    temporal_static=temporal_static,
-                    track_graph=track_graph,
-                    args=args,
+                    case=case,
+                    temporal_input=temporal_input,
+                    spacing=spacing,
                     dref_um=dref_um,
                     device=device,
-                    rng=step_rng,
-                    corruption_seed=(
-                        int(args.seed)
-                        + 1_000_003 * int(step)
-                        + 10_007 * int(micro)
-                    ),
                 )
-                scaled_loss = loss.total / float(args.accumulate_cases)
+                loss = training_loss(
+                    case,
+                    forward,
+                    preserve_edges=int(args.preserve_edges),
+                    preserve_ratio=int(args.preserve_ratio),
+                    preservation_weight=float(args.preservation_weight),
+                    split_weight=float(args.split_weight),
+                    rng=rng,
+                )
+                scaled = loss.total / float(args.accumulate_cases)
 
-            if not bool(torch.isfinite(scaled_loss.detach())):
+            if not bool(torch.isfinite(scaled.detach())):
                 raise FloatingPointError(
-                    f"Non-finite Investigation-35 loss at step={step}, micro={micro}"
+                    f"Non-finite loss at step={step}, micro={micro}"
                 )
-            scaler.scale(scaled_loss).backward()
 
-            accumulated["total"] += float(loss.total.detach().float().cpu())
-            accumulated["edge"] += float(loss.edge.detach().float().cpu())
-            accumulated["correction"] += float(
-                loss.correction.detach().float().cpu()
+            scaler.scale(scaled).backward()
+
+            sums["total"] += float(loss.total.detach().float().cpu())
+            sums["cut"] += float(loss.cut.detach().float().cpu())
+            sums["keep"] += float(loss.keep.detach().float().cpu())
+            sums["split"] += float(loss.split.detach().float().cpu())
+            sums["observer"] += float(forward.observer_hit_rate)
+
+            micro_rows.append(
+                {
+                    "variant": int(spec.variant_index),
+                    "frame": int(spec.frame),
+                    "merges": int(len(spec.events)),
+                    "cut_edges": int(loss.cut_edges),
+                    "keep_edges": int(loss.keep_edges),
+                    "observer_hit_rate": float(forward.observer_hit_rate),
+                }
             )
-            accumulated["preservation"] += float(
-                loss.preservation.detach().float().cpu()
-            )
-            accumulated["split"] += float(loss.split.detach().float().cpu())
-            accumulated["noop"] += float(
-                loss.corrupted_noop.detach().float().cpu()
-            )
-            accumulated["corrupted_gate"] += float(
-                loss.corrupted_gate.detach().float().cpu()
-            )
-            accumulated["margin"] += float(
-                loss.causal_margin.detach().float().cpu()
-            )
-            micro_meta.append(meta)
 
         scaler.unscale_(optimizer)
-        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+        grad = torch.nn.utils.clip_grad_norm_(
             trainable,
             float(args.grad_clip),
         )
-        grad_norm = float(torch.as_tensor(grad_norm_tensor).detach().cpu())
+        grad_norm = float(torch.as_tensor(grad).detach().cpu())
         if not math.isfinite(grad_norm):
-            optimizer.zero_grad(set_to_none=True)
-            raise FloatingPointError(
-                f"Non-finite Investigation-35 gradient norm at step={step}"
-            )
+            raise FloatingPointError(f"Non-finite gradient at step={step}")
 
         scaler.step(optimizer)
         scaler.update()
 
-        row = training_metrics_row(
-            step=step,
-            frame=current_frame,
-            accumulated=accumulated,
-            microcases=micro_meta,
-            grad_norm=grad_norm,
-            lr=float(optimizer.param_groups[0]["lr"]),
-            step_seconds=time.perf_counter() - step_started,
-            device=device,
-        )
+        denominator = max(int(args.accumulate_cases), 1)
+        row = {
+            "step": int(step),
+            "frame": int(frame),
+            "loss": sums["total"] / denominator,
+            "cut_loss": sums["cut"] / denominator,
+            "keep_loss": sums["keep"] / denominator,
+            "split_loss": sums["split"] / denominator,
+            "observer_hit_rate": sums["observer"] / denominator,
+            "grad_norm": float(grad_norm),
+            "step_seconds": float(time.perf_counter() - step_started),
+            "microcases": micro_rows,
+        }
         history.append(row)
 
         if step == 1 or step % int(args.print_every) == 0:
-            elapsed = duration(time.perf_counter() - run_started)
             print(
                 f"[step {step:05d}/{args.steps}] "
-                f"t={current_frame:02d} "
+                f"t={frame:02d} "
                 f"loss={row['loss']:.5f} "
-                f"corr={row['correction_loss']:.5f} "
-                f"pres={row['preservation_loss']:.5f} "
-                f"noop={row['corrupted_noop']:.5f} "
-                f"margin={row['causal_margin']:.5f} "
-                f"negGate={row['corrupted_gate']:.5f} "
+                f"cut={row['cut_loss']:.5f} "
+                f"keep={row['keep_loss']:.5f} "
+                f"split={row['split_loss']:.5f} "
+                f"obs={row['observer_hit_rate']:.2f} "
                 f"grad={row['grad_norm']:.3f} "
-                f"elapsed={elapsed}",
+                f"elapsed={duration(time.perf_counter() - run_started)}",
                 flush=True,
             )
 
         if step % 50 == 0:
-            atomic_json(history_path, history)
+            atomic_json(paths.training_history, history)
 
         if step % int(args.eval_every) == 0 or step == int(args.steps):
-            metrics = evaluate_model35(
+            metrics = evaluate(
                 model,
-                paths=paths,
-                manifest=manifest,
+                cases=val_cases,
+                graphs=graphs,
                 loader=loader,
-                temporal_static=temporal_static,
-                track_graph=track_graph,
-                frame_count=int(args.frame_count),
-                temporal_radius=int(args.temporal_radius),
-                spacing=args.spacing,
+                frame_count=frame_count,
+                temporal_radius=temporal_radius,
+                spacing=spacing,
                 dref_um=dref_um,
-                neighbourhood_dref=float(args.temporal_neighbourhood_dref),
-                local_edge_radius_dref=float(args.local_edge_radius_dref),
-                synthetic_spatial_logit=float(args.synthetic_spatial_logit),
-                val_cases=int(args.val_cases),
+                synthetic_logit=float(args.synthetic_spatial_logit),
                 device=device,
-                seed=int(args.seed) + int(step),
-                complete_candidate_graph=bool(args.complete_candidate_graph),
+                maximum_cases=int(args.val_cases),
+                seed=int(args.seed) + step,
             )
-            print_eval35(step, metrics)
-            validation_history.append({"step": int(step), "metrics": metrics})
-            atomic_json(validation_path, validation_history)
-            atomic_json(history_path, history)
+            print_metrics("INVESTIGATION 35 VALIDATION", step, metrics)
 
-            save_training_checkpoint(
-                paths.output / "latest.pt",
+            validation_history.append(
+                {
+                    "step": int(step),
+                    "metrics": metrics,
+                }
+            )
+            atomic_json(paths.validation_history, validation_history)
+            atomic_json(paths.training_history, history)
+
+            save_training_state(
+                paths.latest,
                 model=model,
                 optimizer=optimizer,
                 scaler=scaler,
                 step=step,
-                training_config=training_config,
+                config=config,
                 paths=paths,
                 args=args,
                 dref_um=dref_um,
                 metrics=metrics,
-                parameter_audit=parameter_audit,
+                audit=audit,
             )
 
             score = float(metrics["checkpoint_score"])
@@ -3634,301 +3545,76 @@ def train_model35(
             if improved:
                 best_score = score
                 best_strict = strict
-                save_training_checkpoint(
-                    paths.output / "best.pt",
+                save_training_state(
+                    paths.best,
                     model=model,
                     optimizer=optimizer,
                     scaler=scaler,
                     step=step,
-                    training_config=training_config,
+                    config=config,
                     paths=paths,
                     args=args,
                     dref_um=dref_um,
                     metrics=metrics,
-                    parameter_audit=parameter_audit,
+                    audit=audit,
                 )
-                atomic_json(paths.output / "best_metrics.json", metrics)
+                atomic_json(paths.best_metrics, metrics)
                 print(
                     f"[best] step={step} score={score:.5f} strict={strict}",
                     flush=True,
                 )
 
-    # Validation-only resume path.
-    if start_step >= int(args.steps):
-        metrics = evaluate_model35(
-            model,
-            paths=paths,
-            manifest=manifest,
-            loader=loader,
-            temporal_static=temporal_static,
-            track_graph=track_graph,
-            frame_count=int(args.frame_count),
-            temporal_radius=int(args.temporal_radius),
-            spacing=args.spacing,
-            dref_um=dref_um,
-            neighbourhood_dref=float(args.temporal_neighbourhood_dref),
-            local_edge_radius_dref=float(args.local_edge_radius_dref),
-            synthetic_spatial_logit=float(args.synthetic_spatial_logit),
-            val_cases=int(args.val_cases),
-            device=device,
-            seed=int(args.seed) + int(start_step),
-            complete_candidate_graph=bool(args.complete_candidate_graph),
-        )
-        print_eval35(start_step, metrics)
-        validation_history.append({"step": int(start_step), "metrics": metrics})
+    atomic_json(paths.training_history, history)
+    atomic_json(paths.validation_history, validation_history)
 
     final_metrics = (
         validation_history[-1]["metrics"]
         if validation_history
         else {}
     )
-    atomic_json(history_path, history)
-    atomic_json(validation_path, validation_history)
-    save_training_checkpoint(
-        paths.output / "final.pt",
+    save_training_state(
+        paths.final,
         model=model,
         optimizer=optimizer,
         scaler=scaler,
         step=max(start_step, int(args.steps)),
-        training_config=training_config,
+        config=config,
         paths=paths,
         args=args,
         dref_um=dref_um,
         metrics=final_metrics,
-        parameter_audit=parameter_audit,
+        audit=audit,
     )
 
-    print()
-    print("=" * 118)
-    print("INVESTIGATION 35 TRAINING COMPLETE")
-    print("=" * 118)
-    print(f"best   : {paths.output / 'best.pt'}")
-    print(f"latest : {paths.output / 'latest.pt'}")
-    print(f"final  : {paths.output / 'final.pt'}")
-    print("=" * 118)
-    return final_metrics
-
-
-# =============================================================================
-# Preparation orchestration
-# =============================================================================
-
-
-def prepare_investigation35(
-    args: argparse.Namespace,
-    paths: Paths,
-) -> tuple[float, Any, TemporalStatic, CandidateManifest]:
-    validate_inputs(paths, int(args.frame_count))
-    paths.output.mkdir(parents=True, exist_ok=True)
-    paths.cache.mkdir(parents=True, exist_ok=True)
-
-    frame_count = int(args.frame_count)
-    spacing = tuple(float(v) for v in args.spacing)
-
-    current_manual_signatures = [
-        file_signature(paths.manual(t))
-        for t in range(frame_count)
-    ]
-    cached_manual_signatures = None
-    if paths.manual_movie_meta.is_file():
-        try:
-            cached_manual_signatures = json.loads(
-                paths.manual_movie_meta.read_text(encoding="utf-8")
-            ).get("manual_signatures")
-        except Exception:
-            cached_manual_signatures = None
-    manual_movie_changed = (
-        bool(args.rebuild_movies)
-        or not paths.manual_movie.is_file()
-        or cached_manual_signatures != current_manual_signatures
-    )
-    stack_movie(
-        paths.manual_movie,
-        [paths.manual(t) for t in range(frame_count)],
-        rebuild=manual_movie_changed,
-    )
-    atomic_json(
-        paths.manual_movie_meta,
-        {
-            "sample_id": paths.sample,
-            "manual_signatures": current_manual_signatures,
-        },
-    )
-    if manual_movie_changed:
-        print("[manual movie] rebuilt because source annotations changed")
-    manual_movie = np.load(paths.manual_movie, mmap_mode="r")
-    build_raw_movie(
-        paths,
-        frame_count,
-        tuple(int(v) for v in manual_movie.shape[-3:]),
-        rebuild=bool(args.rebuild_movies),
-    )
-    prepare_raw_norm(
-        paths,
-        frame_count,
-        rebuild=bool(args.rebuild_movies),
-    )
-    raw_movie = np.load(paths.raw_movie, mmap_mode="r")
-
-    dref_um, per_frame_dref = resolve_dref(
-        paths,
-        frame_count,
-        spacing,
-        args.dref_um,
-    )
-    if not math.isfinite(dref_um) or dref_um <= 0:
-        raise RuntimeError(f"Invalid resolved dref: {dref_um}")
-    print(
-        f"[scale] fixed movie dref={dref_um:.5f} um; "
-        f"source-frame range={min(per_frame_dref):.5f}..{max(per_frame_dref):.5f}",
-        flush=True,
-    )
-
-    track_graph, tracked_movie = prepare_trackastra(
-        paths,
-        model_name=str(args.trackastra_model),
-        mode=str(args.trackastra_mode),
-        device=str(args.trackastra_device),
-        rebuild=(bool(args.rebuild_trackastra) or manual_movie_changed),
-    )
-    temporal_static = prepare_temporal_static(
-        paths,
-        track_graph,
-        tracked_movie,
-        raw_movie,
-        spacing,
-        dref_um,
-        frame_count,
-        rebuild=(
-            bool(args.rebuild_trackastra)
-            or bool(args.rebuild_temporal_static)
-            or manual_movie_changed
-        ),
-    )
-
-    prepare_device = torch.device(args.prepare_device)
-    prepare_spatial_cache(
-        paths,
+    test_metrics = evaluate(
+        model,
+        cases=test_cases,
+        graphs=graphs,
+        loader=loader,
         frame_count=frame_count,
+        temporal_radius=temporal_radius,
         spacing=spacing,
         dref_um=dref_um,
-        device=prepare_device,
-        amp_dtype=str(args.prepare_amp_dtype),
-        rebuild=bool(args.rebuild_spatial_cache),
+        synthetic_logit=float(args.synthetic_spatial_logit),
+        device=device,
+        maximum_cases=0,
+        seed=int(args.seed) + 35_999_999,
     )
-
-    manifest = build_candidates(
-        paths,
-        track_graph=track_graph,
-        temporal_static=temporal_static,
-        frame_count=frame_count,
-        spacing=spacing,
-        dref_um=dref_um,
-        temporal_radius=int(args.temporal_radius),
-        min_voxels=int(args.min_voxels),
-        max_volume_ratio=float(args.max_volume_ratio),
-        max_distance_dref=float(args.max_distance_dref),
-        val_fraction=float(args.val_fraction),
-        rebuild=(
-            bool(args.rebuild_candidates)
-            or bool(args.rebuild_spatial_cache)
-            or bool(args.rebuild_trackastra)
-        ),
+    print_metrics(
+        "INVESTIGATION 35 HELD-OUT VARIANT TEST",
+        max(start_step, int(args.steps)),
+        test_metrics,
     )
+    atomic_json(paths.test_metrics, test_metrics)
 
-    prepare_observer_raw_cache(
-        paths,
-        manifest=manifest,
-        temporal_static=temporal_static,
-        track_graph=track_graph,
-        frame_count=frame_count,
-        temporal_radius=int(args.temporal_radius),
-        spacing=spacing,
-        dref_um=dref_um,
-        neighbourhood_dref=float(args.temporal_neighbourhood_dref),
-        max_triples=int(args.max_triples_per_frame),
-        device=prepare_device,
-        amp_dtype=str(args.prepare_amp_dtype),
-        complete_candidate_graph=bool(args.complete_candidate_graph),
-        rebuild=(
-            bool(args.rebuild_observer_cache)
-            or bool(args.rebuild_candidates)
-            or bool(args.rebuild_spatial_cache)
-            or bool(args.rebuild_trackastra)
-        ),
-    )
-
-    observer_counts = {}
-    for t in range(frame_count):
-        try:
-            meta = json.loads(paths.observer_meta(t).read_text(encoding="utf-8"))
-            observer_counts[f"t{t:03d}"] = int(meta.get("reference_count", 0))
-        except Exception:
-            observer_counts[f"t{t:03d}"] = -1
-
-    preparation = {
-        "format_version": 1,
-        "investigation": SCRIPT_NAME,
-        "sample_id": paths.sample,
-        "checkpoint": file_signature(paths.checkpoint),
-        "manual_signatures": [
-            file_signature(paths.manual(t))
-            for t in range(frame_count)
-        ],
-        "spacing_zyx_um": spacing,
-        "dref_um": float(dref_um),
-        "per_frame_source_dref_um": per_frame_dref,
-        "frame_count": frame_count,
-        "temporal_radius": int(args.temporal_radius),
-        "temporal_cache_contract": int(TEMPORAL_CACHE_CONTRACT_VERSION),
-        "train_pair_candidates": len(manifest.train_pairs),
-        "val_pair_candidates": len(manifest.val_pairs),
-        "observer_reference_counts": observer_counts,
-        "trackastra_model": str(args.trackastra_model),
-        "trackastra_mode": str(args.trackastra_mode),
-        "synthetic_training": {
-            "synthetic_spatial_logit": float(args.synthetic_spatial_logit),
-            "clean_fraction": float(args.clean_fraction),
-            "preservation_weight": float(args.preservation_weight),
-            "objective_version": OBJECTIVE_VERSION,
-            "corruptions": list(CORRUPTIONS),
-            "triple_fraction": float(args.triple_fraction),
-            "temporal_neighbourhood_dref": float(
-                args.temporal_neighbourhood_dref
-            ),
-            "local_edge_radius_dref": float(args.local_edge_radius_dref),
-        },
-        "trainable_modules": [
-            "instance_tokenizer",
-            "history_encoder",
-            "temporal_encoder",
-            "temporal_observer",
-            "instance_temporal",
-        ],
-        "frozen_modules": [
-            "acquisition",
-            "evidence_stem",
-            "spatial_backbone",
-            "geometry_decoder",
-            "watershed",
-            "rag_builder",
-            "rag_network",
-            "local_refiner",
-        ],
-        "training_runs_spatial_cnn": False,
-    }
-    atomic_json(paths.output / "preparation.json", preparation)
-
-    print()
-    print("=" * 118)
-    print("INVESTIGATION 35 PREPARATION READY")
-    print("=" * 118)
-    print(f"train pair candidates : {len(manifest.train_pairs)}")
-    print(f"val pair candidates   : {len(manifest.val_pairs)}")
-    print(f"dref                  : {dref_um:.5f} um")
-    print(f"cache                 : {paths.cache}")
-    print("=" * 118)
-    return dref_um, track_graph, temporal_static, manifest
+    print("\n" + "=" * 112, flush=True)
+    print("INVESTIGATION 35 TRAINING COMPLETE", flush=True)
+    print("=" * 112, flush=True)
+    print(f"best   : {paths.best}", flush=True)
+    print(f"latest : {paths.latest}", flush=True)
+    print(f"final  : {paths.final}", flush=True)
+    print(f"test   : {paths.test_metrics}", flush=True)
+    print("=" * 112, flush=True)
 
 
 # =============================================================================
@@ -3936,295 +3622,378 @@ def prepare_investigation35(
 # =============================================================================
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train the production STIR-Net temporal branch on controlled, "
-            "leak-free BioHub merge synthesis."
+            "Concrete true-instance merge synthesis + direct temporal CUT/KEEP "
+            "training. No temporal metadata preprocessing."
         )
     )
 
     parser.add_argument("--sample-id", default=DEFAULT_SAMPLE)
-    parser.add_argument("--frame-count", type=int, default=DEFAULT_FRAMES)
-    parser.add_argument("--checkpoint", type=Path, default=None)
-    parser.add_argument("--annotations", type=Path, default=None)
-    parser.add_argument("--inv24", type=Path, default=None)
-    parser.add_argument("--stage6-root", type=Path, default=None)
-    parser.add_argument("--sample-zarr", type=Path, default=None)
-    parser.add_argument("--output", type=Path, default=None)
-
+    parser.add_argument("--frame-count", type=int, default=DEFAULT_FRAME_COUNT)
     parser.add_argument(
         "--spacing",
-        type=float,
-        nargs=3,
-        default=DEFAULT_SPACING,
-        metavar=("Z", "Y", "X"),
+        default="1.625,0.40625,0.40625",
     )
+
+    parser.add_argument("--annotations", type=Path, default=None)
+    parser.add_argument("--sample-zarr", type=Path, default=None)
     parser.add_argument(
-        "--dref-um",
-        type=float,
+        "--spatial-cache-root",
+        type=Path,
         default=None,
         help=(
-            "Optional fixed non-GT dref. Default is the median dref estimated "
-            "from Stage-6 source segmentation over the movie."
+            "Directory containing tXXX/frozen_graph.pt. Default uses the "
+            "existing valid frozen spatial cache only."
         ),
     )
-    parser.add_argument("--temporal-radius", type=int, default=2)
+    parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--dref-um", type=float, default=None)
 
-    parser.add_argument("--trackastra-model", default="ctc")
-    parser.add_argument("--trackastra-mode", default="greedy")
+    parser.add_argument(
+        "--temporal-radius",
+        type=int,
+        default=DEFAULT_TEMPORAL_RADIUS,
+    )
+
+    parser.add_argument(
+        "--tile-shape-zyx",
+        default="32,128,128",
+    )
+    parser.add_argument(
+        "--tile-overlap-zyx",
+        default="8,32,32",
+    )
+    parser.add_argument(
+        "--tile-halo-zyx",
+        default="4,16,16",
+    )
+    parser.add_argument(
+        "--tile-batch-size",
+        type=int,
+        default=1,
+    )
+
+    parser.add_argument(
+        "--train-variants",
+        type=int,
+        default=DEFAULT_TRAIN_VARIANTS,
+    )
+    parser.add_argument(
+        "--val-variants",
+        type=int,
+        default=DEFAULT_VAL_VARIANTS,
+    )
+    parser.add_argument(
+        "--test-variants",
+        type=int,
+        default=DEFAULT_TEST_VARIANTS,
+    )
+    parser.add_argument(
+        "--merge-fraction",
+        type=float,
+        default=DEFAULT_MERGE_FRACTION,
+    )
+    parser.add_argument(
+        "--max-merges-per-frame",
+        type=int,
+        default=DEFAULT_MAX_MERGES_PER_FRAME,
+    )
+    parser.add_argument(
+        "--min-voxels",
+        type=int,
+        default=DEFAULT_MIN_VOXELS,
+    )
+    parser.add_argument(
+        "--max-volume-ratio",
+        type=float,
+        default=DEFAULT_MAX_VOLUME_RATIO,
+    )
+
+    parser.add_argument(
+        "--trackastra-model",
+        default=DEFAULT_TRACKASTRA_MODEL,
+    )
+    parser.add_argument(
+        "--trackastra-mode",
+        default=DEFAULT_TRACKASTRA_MODE,
+    )
     parser.add_argument(
         "--trackastra-device",
-        default=("cuda" if torch.cuda.is_available() else "cpu"),
+        default=DEFAULT_TRACKASTRA_DEVICE,
     )
 
     parser.add_argument(
-        "--prepare-device",
-        default=("cuda" if torch.cuda.is_available() else "cpu"),
-        help="Device for one-time frozen spatial/observer cache preparation.",
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
     )
     parser.add_argument(
-        "--prepare-amp-dtype",
+        "--amp-dtype",
         choices=("fp32", "fp16", "bf16"),
-        default=("fp16" if torch.cuda.is_available() else "fp32"),
+        default="fp32",
     )
-    parser.add_argument("--prepare-only", action="store_true")
-
-    parser.add_argument("--rebuild-movies", action="store_true")
-    parser.add_argument("--rebuild-trackastra", action="store_true")
-    parser.add_argument("--rebuild-temporal-static", action="store_true")
-    parser.add_argument("--rebuild-spatial-cache", action="store_true")
-    parser.add_argument("--rebuild-candidates", action="store_true")
-    parser.add_argument("--rebuild-observer-cache", action="store_true")
 
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
-    parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
-    parser.add_argument("--grad-clip", type=float, default=DEFAULT_GRAD_CLIP)
-    parser.add_argument("--accumulate-cases", type=int, default=DEFAULT_ACCUMULATE)
-    parser.add_argument("--steps-per-frame-block", type=int, default=DEFAULT_FRAME_BLOCK)
-    parser.add_argument("--eval-every", type=int, default=DEFAULT_EVAL_EVERY)
-    parser.add_argument("--print-every", type=int, default=DEFAULT_PRINT_EVERY)
-    parser.add_argument("--val-cases", type=int, default=DEFAULT_VAL_CASES)
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=DEFAULT_WEIGHT_DECAY,
+    )
+    parser.add_argument(
+        "--grad-clip",
+        type=float,
+        default=DEFAULT_GRAD_CLIP,
+    )
+    parser.add_argument(
+        "--accumulate-cases",
+        type=int,
+        default=DEFAULT_ACCUMULATE_CASES,
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=DEFAULT_EVAL_EVERY,
+    )
+    parser.add_argument(
+        "--print-every",
+        type=int,
+        default=DEFAULT_PRINT_EVERY,
+    )
+    parser.add_argument(
+        "--val-cases",
+        type=int,
+        default=DEFAULT_VAL_CASES,
+        help="0 = every held-out validation variant-frame case",
+    )
 
     parser.add_argument(
         "--synthetic-spatial-logit",
         type=float,
         default=DEFAULT_SYNTHETIC_LOGIT,
     )
-    parser.add_argument("--clean-fraction", type=float, default=DEFAULT_CLEAN_FRACTION)
-    parser.add_argument("--triple-fraction", type=float, default=DEFAULT_TRIPLE_FRACTION)
-    parser.add_argument("--val-fraction", type=float, default=DEFAULT_VAL_FRACTION)
-    parser.add_argument("--min-voxels", type=int, default=DEFAULT_MIN_VOXELS)
     parser.add_argument(
-        "--max-volume-ratio",
-        type=float,
-        default=DEFAULT_MAX_VOLUME_RATIO,
-    )
-    parser.add_argument(
-        "--max-distance-dref",
-        type=float,
-        default=DEFAULT_MAX_DISTANCE_DREF,
-    )
-    parser.add_argument(
-        "--temporal-neighbourhood-dref",
-        type=float,
-        default=DEFAULT_TEMPORAL_NEIGHBORHOOD_DREF,
-    )
-    parser.add_argument(
-        "--local-edge-radius-dref",
-        type=float,
-        default=DEFAULT_LOCAL_EDGE_RADIUS_DREF,
-    )
-    parser.add_argument(
-        "--max-triples-per-frame",
+        "--preserve-edges",
         type=int,
-        default=DEFAULT_MAX_TRIPLES_PER_FRAME,
+        default=DEFAULT_PRESERVE_EDGES,
     )
-
-    parser.add_argument("--preserve-edges", type=int, default=DEFAULT_PRESERVE_EDGES)
-    parser.add_argument("--preserve-ratio", type=int, default=DEFAULT_PRESERVE_RATIO)
+    parser.add_argument(
+        "--preserve-ratio",
+        type=int,
+        default=DEFAULT_PRESERVE_RATIO,
+    )
     parser.add_argument(
         "--preservation-weight",
         type=float,
         default=DEFAULT_PRESERVATION_WEIGHT,
-        help=(
-            "Weight applied to preservation BCE after its own mean reduction. "
-            "Default 2.0 counters collateral over-splitting."
-        ),
     )
-    parser.add_argument("--split-weight", type=float, default=DEFAULT_SPLIT_WEIGHT)
-    parser.add_argument("--noop-weight", type=float, default=DEFAULT_NOOP_WEIGHT)
     parser.add_argument(
-        "--corrupted-gate-weight",
+        "--split-weight",
         type=float,
-        default=DEFAULT_CORRUPTED_GATE_WEIGHT,
+        default=DEFAULT_SPLIT_WEIGHT,
     )
-    parser.add_argument("--margin-weight", type=float, default=DEFAULT_MARGIN_WEIGHT)
-    parser.add_argument("--margin", type=float, default=DEFAULT_MARGIN)
+
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
 
     parser.add_argument(
-        "--complete-candidate-graph",
+        "--rebuild-movies",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--rebuild-dataset",
+        action="store_true",
+        help="Regenerate plans and rerun concrete Trackastra variants.",
+    )
+
+    parser.add_argument(
+        "--rebuild-spatial-cache",
         action="store_true",
         help=(
-            "Use the expensive complete temporal candidate graph. Default uses "
-            "accepted Trackastra links plus local graph-builder candidates."
+            "Re-run the current spatial model and replace the compact "
+            "per-frame RAG/statistics cache."
         ),
     )
     parser.add_argument(
-        "--device",
-        default=("cuda" if torch.cuda.is_available() else "cpu"),
+        "--prepare-only",
+        action="store_true",
+        help="Build concrete Trackastra variants and stop immediately.",
     )
-    parser.add_argument(
-        "--amp-dtype",
-        choices=("fp32", "fp16", "bf16"),
-        default="fp32",
-        help="Temporal-stage training precision. fp32 is the conservative default.",
-    )
-    parser.add_argument("--seed", type=int, default=35)
-    parser.add_argument("--resume", type=Path, default=None)
 
-    args = parser.parse_args()
+    return parser
 
+
+def validate_args(args: argparse.Namespace) -> None:
     if args.frame_count < 3:
-        parser.error("--frame-count must be >= 3")
+        raise ValueError("--frame-count must be >= 3")
     if args.temporal_radius < 1:
-        parser.error("--temporal-radius must be >= 1")
+        raise ValueError("--temporal-radius must be positive")
+    if min(args.train_variants, args.val_variants, args.test_variants) < 1:
+        raise ValueError("train/val/test variant counts must all be >= 1")
+    if not (0.0 < args.merge_fraction <= 1.0):
+        raise ValueError("--merge-fraction must lie in (0,1]")
+    if args.max_merges_per_frame < 1:
+        raise ValueError("--max-merges-per-frame must be >= 1")
     if args.steps < 1:
-        parser.error("--steps must be positive")
-    if args.lr <= 0:
-        parser.error("--lr must be positive")
-    if args.weight_decay < 0:
-        parser.error("--weight-decay cannot be negative")
-    if args.grad_clip <= 0:
-        parser.error("--grad-clip must be positive")
+        raise ValueError("--steps must be positive")
     if args.accumulate_cases < 1:
-        parser.error("--accumulate-cases must be positive")
-    if args.steps_per_frame_block < 1:
-        parser.error("--steps-per-frame-block must be positive")
-    if args.eval_every < 1 or args.print_every < 1 or args.val_cases < 1:
-        parser.error("evaluation/print counts must be positive")
-    if args.synthetic_spatial_logit <= 0:
-        parser.error("--synthetic-spatial-logit must be positive")
-    if not 0.0 <= args.clean_fraction < 1.0:
-        parser.error("--clean-fraction must be in [0,1)")
-    if not 0.0 <= args.triple_fraction <= 1.0:
-        parser.error("--triple-fraction must be in [0,1]")
-    if not 0.0 < args.val_fraction < 1.0:
-        parser.error("--val-fraction must be in (0,1)")
-    if args.min_voxels < 1:
-        parser.error("--min-voxels must be positive")
-    if args.max_volume_ratio < 1.0:
-        parser.error("--max-volume-ratio must be >= 1")
-    if args.max_distance_dref <= 0:
-        parser.error("--max-distance-dref must be positive")
-    if args.temporal_neighbourhood_dref <= 0 or args.local_edge_radius_dref <= 0:
-        parser.error("temporal/local physical radii must be positive")
-    if args.max_triples_per_frame < 0:
-        parser.error("--max-triples-per-frame cannot be negative")
-    if args.preserve_edges < 0 or args.preserve_ratio < 1:
-        parser.error("preservation sampling values are invalid")
-    if any(
-        value < 0
-        for value in (
-            args.preservation_weight,
-            args.split_weight,
-            args.noop_weight,
-            args.corrupted_gate_weight,
-            args.margin_weight,
-            args.margin,
-        )
-    ):
-        parser.error("loss weights / margin cannot be negative")
-    if any(float(v) <= 0 for v in args.spacing):
-        parser.error("--spacing must contain three positive values")
-
-    return args
+        raise ValueError("--accumulate-cases must be positive")
+    if args.eval_every < 1 or args.print_every < 1:
+        raise ValueError("--eval-every/--print-every must be positive")
 
 
-# =============================================================================
-# Main
-# =============================================================================
-
-
-def main() -> None:
-    args = parse_args()
-    seed_all(int(args.seed))
-
-    if int(TEMPORAL_CACHE_CONTRACT_VERSION) < 4:
-        raise RuntimeError(
-            "Investigation 35 requires the finite-window temporal availability "
-            "patch (temporal cache contract v4 or newer)."
-        )
+def main() -> int:
+    args = build_parser().parse_args()
+    validate_args(args)
+    spacing = parse_spacing(args.spacing)
 
     paths = make_paths(args)
-    print("=" * 118)
-    print("INVESTIGATION 35 — BIOHUB CONTROLLED TEMPORAL MERGE TRAINING")
-    print("=" * 118)
-    print(f"repository : {ROOT}")
-    print(f"sample     : {paths.sample}")
-    print(f"checkpoint : {paths.checkpoint}")
-    print(f"output     : {paths.output}")
-    print("=" * 118)
-
-    dref_um, track_graph, temporal_static, manifest = prepare_investigation35(
-        args,
-        paths,
-    )
-
-    if args.prepare_only:
-        print("Stopped after --prepare-only. No training was run.")
-        return
+    validate_inputs(paths, int(args.frame_count))
+    paths.output.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA training was requested but CUDA is unavailable")
-    if (
-        device.type == "cuda"
-        and args.amp_dtype == "bf16"
-        and hasattr(torch.cuda, "is_bf16_supported")
-        and not torch.cuda.is_bf16_supported()
-    ):
-        raise RuntimeError(
-            "--amp-dtype bf16 was requested but this CUDA device does not support BF16"
+        raise RuntimeError("CUDA requested but unavailable")
+
+    tile_shape = parse_zyx_ints(
+        args.tile_shape_zyx,
+        name="--tile-shape-zyx",
+    )
+    tile_overlap = parse_zyx_ints(
+        args.tile_overlap_zyx,
+        name="--tile-overlap-zyx",
+    )
+    tile_halo = parse_zyx_ints(
+        args.tile_halo_zyx,
+        name="--tile-halo-zyx",
+    )
+
+    print("\n" + "=" * 112, flush=True)
+    print(
+        "INVESTIGATION 35 — CLEAN CONCRETE MERGE SYNTHESIS + TEMPORAL CUT/KEEP",
+        flush=True,
+    )
+    print("=" * 112, flush=True)
+    print(f"repository    : {ROOT}", flush=True)
+    print(f"sample        : {paths.sample}", flush=True)
+    print(f"checkpoint    : {paths.checkpoint}", flush=True)
+    print(f"output        : {paths.output}", flush=True)
+    print(f"spatial cache : {paths.spatial_cache}", flush=True)
+    print("=" * 112, flush=True)
+
+    # 1. Raw + true manual movie.
+    build_movies(
+        paths,
+        int(args.frame_count),
+        rebuild=bool(args.rebuild_movies),
+    )
+
+    # 2. True touching-cell candidates. No RAG needed.
+    catalog = build_touching_catalog(
+        paths,
+        int(args.frame_count),
+        min_voxels=int(args.min_voxels),
+        max_volume_ratio=float(args.max_volume_ratio),
+        rebuild=bool(args.rebuild_dataset),
+    )
+
+    # 3. Concrete merge plans.
+    plans = build_variant_plans(
+        paths,
+        catalog=catalog,
+        frame_count=int(args.frame_count),
+        train_variants=int(args.train_variants),
+        val_variants=int(args.val_variants),
+        test_variants=int(args.test_variants),
+        merge_fraction=float(args.merge_fraction),
+        max_merges_per_frame=int(args.max_merges_per_frame),
+        seed=int(args.seed),
+        rebuild=bool(args.rebuild_dataset),
+    )
+
+    # 4. Trackastra on the concrete corrupted movies.
+    prepare_variants(
+        paths,
+        plans,
+        int(args.frame_count),
+        model_name=str(args.trackastra_model),
+        mode=str(args.trackastra_mode),
+        device=str(args.trackastra_device),
+        rebuild=bool(args.rebuild_dataset),
+    )
+
+    # 5. Recreate mature spatial RAG/statistics from the CURRENT spatial model.
+    #    This is the only cache required by InstanceTokenizer.
+    rebuild_spatial_cache(
+        paths,
+        int(args.frame_count),
+        spacing=spacing,
+        device=device,
+        tile_shape_zyx=tile_shape,
+        tile_overlap_zyx=tile_overlap,
+        tile_halo_zyx=tile_halo,
+        tile_batch_size=int(args.tile_batch_size),
+        rebuild=bool(args.rebuild_spatial_cache),
+    )
+
+    dref_um = resolve_dref(
+        paths,
+        int(args.frame_count),
+        args.dref_um,
+    )
+
+    case_index = build_case_index(
+        plans,
+        int(args.frame_count),
+    )
+
+    print("\n" + "=" * 112, flush=True)
+    print("INVESTIGATION 35 — DATASET READY", flush=True)
+    print("=" * 112, flush=True)
+    for split in ("train", "val", "test"):
+        split_cases = case_index[split]
+        merge_events = sum(
+            len(case.events)
+            for case in split_cases
         )
+        print(
+            f"{split:5s} variant-frames={len(split_cases):3d} "
+            f"merge_events={merge_events}",
+            flush=True,
+        )
+    print(f"movie dref            : {dref_um:.5f} um", flush=True)
+    print("StaticDetectionRecord : NONE", flush=True)
+    print("TemporalStatic        : NONE", flush=True)
+    print("temporal metadata pass: NONE", flush=True)
+    print("history grids         : NONE", flush=True)
+    print("hypothesis graph      : NONE", flush=True)
+    print("temporal observer     : BYPASSED", flush=True)
+    print("=" * 112, flush=True)
 
-    # Always hydrate the architecture from the mature spatial checkpoint.  A
-    # resume checkpoint then replaces its complete model state, preserving exact
-    # architecture validation while keeping the spatial source of truth explicit.
-    _, model = load_spatial_model(paths.checkpoint, torch.device("cpu"))
-    resume_checkpoint = None
-    if args.resume is not None:
-        resume_path = resolve(args.resume)
-        if not resume_path.is_file():
-            raise FileNotFoundError(resume_path)
-        resume_checkpoint = torch_load(resume_path, map_location="cpu")
-        architecture = resume_checkpoint.get("architecture")
-        if architecture is not None and architecture != "spatial_first_v2":
-            raise ValueError(
-                f"Resume checkpoint has unexpected architecture: {architecture!r}"
-            )
-        model.load_state_dict(resume_checkpoint["model"], strict=True)
-        extra = dict(resume_checkpoint.get("extra", {}))
-        old_investigation = extra.get("investigation")
-        if old_investigation not in {None, SCRIPT_NAME}:
-            raise ValueError(
-                "--resume points to a checkpoint from a different experiment: "
-                f"{old_investigation!r}"
-            )
+    if args.prepare_only:
+        print(
+            "Stopped after --prepare-only. Concrete Trackastra variants and "
+            "the freshly reconstructed spatial cache are ready.",
+            flush=True,
+        )
+        return 0
 
-    train_model35(
-        model,
+    train(
         paths=paths,
-        manifest=manifest,
-        temporal_static=temporal_static,
-        track_graph=track_graph,
+        plans=plans,
+        cases=case_index,
+        frame_count=int(args.frame_count),
+        temporal_radius=int(args.temporal_radius),
+        spacing=spacing,
         dref_um=dref_um,
         device=device,
         args=args,
-        resume_checkpoint=resume_checkpoint,
     )
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
