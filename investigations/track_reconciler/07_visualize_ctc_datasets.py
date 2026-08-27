@@ -121,9 +121,107 @@ class VolumeSpec:
     dtype: np.dtype
 
 
-def dataset_paths(dataset: str, sequence: str, root_override: str | None, gt_override: str | None) -> Paths:
-    root = resolve(root_override) if root_override else (ROOT / "data" / "external" / DATASET_DIR[dataset]).resolve()
-    gt_root = resolve(gt_override) if gt_override else root / f"{sequence}_GT"
+def _looks_like_dataset_root(path: Path, sequence: str) -> bool:
+    return (path / sequence).is_dir()
+
+
+def _infer_dataset_root_from_gt_override(
+    path: Path,
+    sequence: str,
+) -> tuple[Path | None, Path]:
+    path = path.resolve()
+
+    if path.name.upper() == f"{sequence}_GT":
+        return path.parent, path
+
+    if path.name == sequence and path.is_dir():
+        dataset_root = path.parent
+        return dataset_root, dataset_root / f"{sequence}_GT"
+
+    if _looks_like_dataset_root(path, sequence):
+        return path, path / f"{sequence}_GT"
+
+    return None, path
+
+
+def _auto_detect_packaged_dataset_root(
+    base_root: Path,
+    dataset: str,
+    sequence: str,
+) -> Path:
+    if _looks_like_dataset_root(base_root, sequence):
+        return base_root
+
+    candidates = [
+        base_root / f"{DATASET_DIR[dataset]}_train",
+        base_root / f"{DATASET_NAME[dataset]}_train",
+    ]
+
+    if base_root.is_dir():
+        candidates.extend(
+            child
+            for child in base_root.iterdir()
+            if child.is_dir() and child.name.lower().endswith("_train")
+        )
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if _looks_like_dataset_root(candidate, sequence):
+            print(
+                f"[paths] auto-detected CTC training package: {candidate}",
+                flush=True,
+            )
+            return candidate
+
+    return base_root
+
+
+def dataset_paths(
+    dataset: str,
+    sequence: str,
+    root_override: str | None,
+    gt_override: str | None,
+) -> Paths:
+    default_root = (
+        ROOT / "data" / "external" / DATASET_DIR[dataset]
+    ).resolve()
+
+    explicit_root = resolve(root_override) if root_override else None
+
+    inferred_root: Path | None = None
+    explicit_gt: Path | None = None
+    if gt_override:
+        inferred_root, explicit_gt = _infer_dataset_root_from_gt_override(
+            resolve(gt_override),
+            sequence,
+        )
+
+    if explicit_root is not None:
+        root = explicit_root
+    elif inferred_root is not None:
+        root = inferred_root
+        print(
+            f"[paths] inferred raw dataset root from --gt-root: {root}",
+            flush=True,
+        )
+    else:
+        root = _auto_detect_packaged_dataset_root(
+            default_root,
+            dataset,
+            sequence,
+        )
+
+    root = _auto_detect_packaged_dataset_root(root, dataset, sequence)
+
+    if explicit_gt is not None:
+        gt_root = explicit_gt
+    else:
+        gt_root = root / f"{sequence}_GT"
+
     return Paths(
         key=dataset,
         root=root,
@@ -313,8 +411,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dataset", required=True, help="ce or sim")
     parser.add_argument("--sequence", choices=("01", "02"), default="01")
-    parser.add_argument("--dataset-root", default=None)
-    parser.add_argument("--gt-root", default=None, help="Override sequence GT directory, e.g. ...\\01_GT")
+    parser.add_argument(
+        "--dataset-root",
+        default=None,
+        help=(
+            "Override the CTC dataset/package root containing 01/, 01_GT/, "
+            "02/, 02_GT/. Nested *_train packages are auto-detected."
+        ),
+    )
+    parser.add_argument(
+        "--gt-root",
+        default=None,
+        help=(
+            "Flexible path hint: dataset root, raw sequence directory "
+            "(e.g. ...\\01), or sequence GT directory "
+            "(e.g. ...\\01_GT). If --dataset-root is omitted, the raw "
+            "dataset root is inferred when possible."
+        ),
+    )
     parser.add_argument("--start-frame", type=int, default=None)
     parser.add_argument("--end-frame", type=int, default=None)
     parser.add_argument("--spacing", default=None, help="Z,Y,X micrometres")
