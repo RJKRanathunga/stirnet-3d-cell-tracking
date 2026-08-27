@@ -32,25 +32,58 @@ def parental_softmax(
     if mask.shape != logits.shape or mask.dtype != torch.bool:
         raise ValueError("mask must be bool [B,E]")
 
-    probs = torch.zeros_like(logits)
-    no_parent = torch.ones_like(logits)
+    # Probability normalization is deliberately performed in float32 for
+    # low-precision logits. CUDA autocast promotes logsumexp/exp to float32
+    # anyway; matching the output dtype avoids BF16/FP16 indexed-assignment
+    # errors and improves numerical precision for the downstream focal loss.
+    probability_dtype = (
+        torch.float32
+        if logits.dtype in (torch.float16, torch.bfloat16)
+        else logits.dtype
+    )
+    probs = torch.zeros(
+        logits.shape,
+        device=logits.device,
+        dtype=probability_dtype,
+    )
+    no_parent = torch.ones(
+        logits.shape,
+        device=logits.device,
+        dtype=probability_dtype,
+    )
+
     for batch in range(logits.shape[0]):
         active = torch.nonzero(mask[batch], as_tuple=False).flatten()
         if active.numel() == 0:
             continue
+
         # Python grouping is fine because local reconciliation graphs are small;
         # all probability computations themselves remain differentiable tensors.
         groups: dict[tuple[int, int], list[int]] = {}
         for idx in active.tolist():
             key = (int(target_index[batch, idx]), int(gap_frames[batch, idx]))
             groups.setdefault(key, []).append(idx)
+
         for indices in groups.values():
-            ids = torch.tensor(indices, device=logits.device, dtype=torch.long)
-            local = logits[batch, ids]
-            zero = torch.zeros(1, device=logits.device, dtype=logits.dtype)
-            log_denom = torch.logsumexp(torch.cat((zero, local)), dim=0)
+            ids = torch.tensor(
+                indices,
+                device=logits.device,
+                dtype=torch.long,
+            )
+            local = logits[batch, ids].to(probability_dtype)
+            zero = torch.zeros(
+                1,
+                device=logits.device,
+                dtype=probability_dtype,
+            )
+            log_denom = torch.logsumexp(
+                torch.cat((zero, local)),
+                dim=0,
+            )
             local_p = torch.exp(local - log_denom)
             q = torch.exp(-log_denom)
+
             probs[batch, ids] = local_p
             no_parent[batch, ids] = q
+
     return probs, no_parent
