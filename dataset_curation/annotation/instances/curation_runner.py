@@ -1,15 +1,21 @@
 from __future__ import annotations
 
-from pathlib import Path
-
+import napari
 import numpy as np
 
-from dataset_curation.catalog import VolumeRecord
-from dataset_curation.errors import ArtifactError
+from dataset_curation.annotation.instances.io import (
+    load_suspect_instance_frames,
+    parse_timepoint_selection,
+    validate_stacks,
+)
+from dataset_curation.annotation.instances.session import AnnotationSession
+from dataset_curation.annotation.instances.viewer import make_viewer
 from dataset_curation.annotation.selection import (
     ensure_annotation_binding,
     touch_annotation_session,
 )
+from dataset_curation.catalog import VolumeRecord
+from dataset_curation.errors import ArtifactError
 
 
 def _select_frames(
@@ -33,14 +39,7 @@ def run_instance_annotation(
     suspect_threshold: float = 0.70,
     resume: bool = True,
 ) -> None:
-    """
-    Open the exact current merged-cell annotator on a curation inference run.
-
-    This reuses AnnotationSession + make_viewer from the preserved annotator,
-    but loads the standardized external-drive inference artifacts directly.
-    """
-    from dataset_curation._compat import instance_annotator as impl
-
+    """Open one inference-ready volume in the production instance annotator."""
     paths = record.paths
 
     if not paths.inference_complete(
@@ -88,7 +87,7 @@ def run_instance_annotation(
 
     frame_count = int(raw_movie.shape[0])
     available = list(range(frame_count))
-    timepoints = impl.parse_timepoint_selection(
+    timepoints = parse_timepoint_selection(
         timepoint_selection,
         available,
     )
@@ -109,7 +108,7 @@ def run_instance_annotation(
 
     foreground = instances > 0
 
-    impl.validate_stacks(
+    validate_stacks(
         raw,
         supervoxels,
         instances,
@@ -126,7 +125,7 @@ def run_instance_annotation(
     suspect_root = paths.suspect_scores(run_id)
     if suspect_root.is_dir():
         try:
-            suspect_instances, stats = impl.load_suspect_instance_frames(
+            suspect_instances, stats = load_suspect_instance_frames(
                 suspect_root=suspect_root,
                 timepoints=timepoints,
                 instances=instances,
@@ -137,11 +136,8 @@ def run_instance_annotation(
                 f"{stats['displayed_instances']} displayed instances"
             )
         except FileNotFoundError as exc:
-            print(
-                "[suspects] incomplete suspect cache; layer disabled."
-            )
+            print("[suspects] incomplete suspect cache; layer disabled.")
             print(exc)
-            suspect_instances = None
 
     ensure_annotation_binding(
         record,
@@ -158,7 +154,7 @@ def run_instance_annotation(
     output_dir = paths.instance_annotations(annotation_set)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    session = impl.AnnotationSession(
+    session = AnnotationSession(
         sample_id=record.volume_id,
         timepoints=timepoints,
         supervoxels=supervoxels,
@@ -170,16 +166,16 @@ def run_instance_annotation(
     print("=" * 88)
     print("DATASET CURATION — INSTANCE ANNOTATION")
     print("=" * 88)
-    print(f"split            : {record.split}")
-    print(f"volume           : {record.volume_id}")
-    print(f"source           : {paths.zarr}")
-    print(f"inference run    : {paths.inference_run(run_id)}")
-    print(f"timepoints       : {timepoints}")
-    print(f"annotations      : {output_dir}")
-    print(f"resume           : {bool(resume)}")
+    print(f"split          : {record.split}")
+    print(f"volume         : {record.volume_id}")
+    print(f"source         : {paths.zarr}")
+    print(f"inference run  : {paths.inference_run(run_id)}")
+    print(f"timepoints     : {timepoints}")
+    print(f"annotations    : {output_dir}")
+    print(f"resume         : {bool(resume)}")
     print("=" * 88)
 
-    impl.make_viewer(
+    make_viewer(
         sample_id=record.volume_id,
         timepoints=timepoints,
         raw=raw,
@@ -189,5 +185,4 @@ def run_instance_annotation(
         session=session,
         suspect_instances=suspect_instances,
     )
-
-    impl.napari.run()
+    napari.run()

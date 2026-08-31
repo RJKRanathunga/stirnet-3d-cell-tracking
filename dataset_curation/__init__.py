@@ -1,6 +1,10 @@
+"""BioHub inference-assisted dataset curation."""
 
-"Persistent human-in-the-loop dataset curation."
+from .catalog import BioHubCatalog, VolumeRecord
+from .paths import BioHubVolumePaths
 
-from .workspace.sample import CurationSample
-
-__all__ = ["CurationSample"]
+__all__ = [
+    "BioHubCatalog",
+    "BioHubVolumePaths",
+    "VolumeRecord",
+]

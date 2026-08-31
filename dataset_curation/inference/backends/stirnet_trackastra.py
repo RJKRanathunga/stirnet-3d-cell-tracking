@@ -547,7 +547,3 @@ class StirNetTrackastraBackend:
         )
 
         return output
-
-
-# Backwards-compatible symbol used by the first dataset_curation migration.
-Investigation36Backend = StirNetTrackastraBackend

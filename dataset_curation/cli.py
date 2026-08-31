@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from pathlib import Path
 
-from dataset_curation._repo import repo_root
 from dataset_curation.annotation.instances.curation_runner import (
     run_instance_annotation,
+)
+from dataset_curation.annotation.tracks.curation_runner import (
+    run_track_annotation,
 )
 from dataset_curation.annotation.selection import (
     annotation_started,
@@ -18,8 +19,8 @@ from dataset_curation.annotation.selection import (
 from dataset_curation.catalog import BioHubCatalog, VolumeRecord
 from dataset_curation.config import BIOHUB_DATA_ROOT
 from dataset_curation.errors import ArtifactError
-from dataset_curation.inference.backends.investigation36 import (
-    Investigation36Backend,
+from dataset_curation.inference.backends.stirnet_trackastra import (
+    StirNetTrackastraBackend,
 )
 
 
@@ -206,7 +207,7 @@ def cmd_infer(args) -> None:
     print(f"force     : {bool(args.force)}")
     print("=" * 96)
 
-    backend = Investigation36Backend()
+    backend = StirNetTrackastraBackend()
     failures: list[tuple[str, str]] = []
     completed = 0
     skipped = 0
@@ -313,47 +314,19 @@ def cmd_annotate_tracks(args) -> None:
         args,
         kind="tracks",
     )
-    paths = record.paths
-
-    ensure_annotation_binding(
-        record,
-        run_id=args.run_id,
-        annotation_set=args.annotation_set,
-    )
-    touch_annotation_session(
-        record,
-        kind="tracks",
-        annotation_set=args.annotation_set,
-        run_id=args.run_id,
-    )
-
-    source = paths.inference_run(args.run_id)
-    output = paths.track_annotations(args.annotation_set)
-    output.mkdir(parents=True, exist_ok=True)
-
-    command = [
-        sys.executable,
-        "-m",
-        "dataset_curation._compat.track_annotator",
-        "--sample-id", record.volume_id,
-        "--source-root", str(source),
-        "--output-dir", str(output),
-    ]
-    if args.no_resume_data:
-        command.append("--no-resume")
-    command.extend(_extra(args.extra))
 
     print(
         f"[annotation] selected {record.split}/{record.volume_id} "
         f"for track annotation"
     )
-    print("[dataset_curation] " + " ".join(command), flush=True)
-    subprocess.run(
-        command,
-        cwd=repo_root(),
-        check=True,
-    )
 
+    run_track_annotation(
+        record,
+        run_id=args.run_id,
+        annotation_set=args.annotation_set,
+        max_ray_distance_um=float(args.max_ray_distance_um),
+        resume=not bool(args.no_resume_data),
+    )
 
 def _add_data_root(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
@@ -525,11 +498,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ignore persisted track corrections for the selected volume.",
     )
     tracks.add_argument(
-        "extra",
-        nargs=argparse.REMAINDER,
+        "--max-ray-distance-um",
+        type=float,
+        default=8.0,
         help=(
-            "Additional track-annotator arguments after `--`, e.g. "
-            "-- --max-ray-distance-um 10."
+            "Maximum centroid-to-ray distance in normal track picking mode. "
+            "Use <=0 to disable the distance guard."
         ),
     )
     tracks.set_defaults(func=cmd_annotate_tracks)

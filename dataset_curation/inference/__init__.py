@@ -1,3 +1,5 @@
+"""Dataset-curation inference adapters."""
 
-from .pipeline import run_current_inference
-__all__ = ["run_current_inference"]
+from .backends.stirnet_trackastra import StirNetTrackastraBackend
+
+__all__ = ["StirNetTrackastraBackend"]

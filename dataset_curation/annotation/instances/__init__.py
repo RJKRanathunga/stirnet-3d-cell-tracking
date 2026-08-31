@@ -1,3 +1,11 @@
+from .curation_runner import run_instance_annotation
+from .session import AnnotationSession, UndoResult
+from .split import AnnotationError, SplitResult
 
-from .session import AnnotationSession, SplitResult, UndoResult
-__all__ = ["AnnotationSession", "SplitResult", "UndoResult"]
+__all__ = [
+    "AnnotationError",
+    "AnnotationSession",
+    "SplitResult",
+    "UndoResult",
+    "run_instance_annotation",
+]

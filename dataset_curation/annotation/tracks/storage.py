@@ -1,3 +1,115 @@
+from __future__ import annotations
 
-from dataset_curation._compat.track_annotator import OutputPaths, SourcePaths
-__all__ = ["SourcePaths", "OutputPaths"]
+"""Track annotation artifact paths and JSON/CSV serialization."""
+
+from dataset_curation.annotation.tracks.graph import (
+    AnnotationError,
+    Edge,
+    Node,
+    _canonical_edge,
+)
+
+import json
+
+import os
+
+from dataclasses import dataclass
+
+from pathlib import Path
+
+from typing import Any, Iterable
+
+import pandas as pd
+
+@dataclass(frozen=True)
+class SourcePaths:
+    root: Path
+
+    @property
+    def raw(self) -> Path:
+        return self.root / "movies" / "raw.npy"
+
+    @property
+    def binary_mask(self) -> Path:
+        return self.root / "movies" / "binary_mask.npy"
+
+    @property
+    def final_instances(self) -> Path:
+        return self.root / "movies" / "final_instances.npy"
+
+    @property
+    def cells_csv(self) -> Path:
+        return self.root / "cells_all.csv"
+
+    @property
+    def tracked_masks(self) -> Path:
+        return self.root / "trackastra" / "tracked_masks.npy"
+
+    @property
+    def napari_tracks(self) -> Path:
+        return self.root / "trackastra" / "napari_tracks.npy"
+
+    @property
+    def napari_graph(self) -> Path:
+        return self.root / "trackastra" / "napari_graph.json"
+
+    @property
+    def tracks_csv(self) -> Path:
+        return self.root / "trackastra" / "tracks.csv"
+
+@dataclass(frozen=True)
+class OutputPaths:
+    root: Path
+
+    @property
+    def state_json(self) -> Path:
+        return self.root / "track_annotations.json"
+
+    @property
+    def corrected_edges_csv(self) -> Path:
+        return self.root / "corrected_edges.csv"
+
+    @property
+    def overrides_csv(self) -> Path:
+        return self.root / "edge_overrides.csv"
+
+    @property
+    def completed_nodes_csv(self) -> Path:
+        return self.root / "completed_nodes.csv"
+
+def _atomic_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+def _atomic_csv(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        frame.to_csv(tmp, index=False)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+def _node_json(node: Node) -> list[int]:
+    return [int(node[0]), int(node[1])]
+
+def _edge_json(edge: Edge) -> list[list[int]]:
+    return [_node_json(edge[0]), _node_json(edge[1])]
+
+def _parse_node(value: Any) -> Node:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise AnnotationError(f"Invalid serialized node: {value!r}")
+    return int(value[0]), int(value[1])
+
+def _parse_edge(value: Any) -> Edge:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise AnnotationError(f"Invalid serialized edge: {value!r}")
+    return _canonical_edge(_parse_node(value[0]), _parse_node(value[1]))
