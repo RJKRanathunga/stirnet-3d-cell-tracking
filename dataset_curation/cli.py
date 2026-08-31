@@ -1,15 +1,11 @@
 from __future__ import annotations
 
+# DATASET_CURATION_LAZY_RUNTIME_IMPORTS_V1
+
 import argparse
 import sys
 from pathlib import Path
 
-from dataset_curation.annotation.instances.curation_runner import (
-    run_instance_annotation,
-)
-from dataset_curation.annotation.tracks.curation_runner import (
-    run_track_annotation,
-)
 from dataset_curation.annotation.selection import (
     annotation_started,
     ensure_annotation_binding,
@@ -19,9 +15,6 @@ from dataset_curation.annotation.selection import (
 from dataset_curation.catalog import BioHubCatalog, VolumeRecord
 from dataset_curation.config import BIOHUB_DATA_ROOT
 from dataset_curation.errors import ArtifactError
-from dataset_curation.inference.backends.stirnet_trackastra import (
-    StirNetTrackastraBackend,
-)
 
 
 def _extra(values) -> list[str]:
@@ -187,6 +180,10 @@ def _inference_selection(args, catalog: BioHubCatalog) -> list[VolumeRecord]:
 
 
 def cmd_infer(args) -> None:
+    from dataset_curation.inference.backends.stirnet_trackastra import (
+        StirNetTrackastraBackend,
+    )
+
     catalog = _catalog(args)
     selected = _inference_selection(args, catalog)
 
@@ -289,6 +286,10 @@ def _choose_annotation_record(
 
 
 def cmd_annotate_instances(args) -> None:
+    from dataset_curation.annotation.instances.curation_runner import (
+        run_instance_annotation,
+    )
+
     record = _choose_annotation_record(
         args,
         kind="instances",
@@ -310,6 +311,10 @@ def cmd_annotate_instances(args) -> None:
 
 
 def cmd_annotate_tracks(args) -> None:
+    from dataset_curation.annotation.tracks.curation_runner import (
+        run_track_annotation,
+    )
+
     record = _choose_annotation_record(
         args,
         kind="tracks",

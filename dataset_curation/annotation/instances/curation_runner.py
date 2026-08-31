@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import napari
+# DATASET_CURATION_LAZY_RUNTIME_IMPORTS_V1
+
 import numpy as np
 
 from dataset_curation.annotation.instances.io import (
@@ -9,7 +10,6 @@ from dataset_curation.annotation.instances.io import (
     validate_stacks,
 )
 from dataset_curation.annotation.instances.session import AnnotationSession
-from dataset_curation.annotation.instances.viewer import make_viewer
 from dataset_curation.annotation.selection import (
     ensure_annotation_binding,
     touch_annotation_session,
@@ -39,6 +39,9 @@ def run_instance_annotation(
     suspect_threshold: float = 0.70,
     resume: bool = True,
 ) -> None:
+    import napari
+    from dataset_curation.annotation.instances.viewer import make_viewer
+
     """Open one inference-ready volume in the production instance annotator."""
     paths = record.paths
 

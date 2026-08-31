@@ -1,11 +1,4 @@
-from .curation_runner import run_instance_annotation
-from .session import AnnotationSession, UndoResult
-from .split import AnnotationError, SplitResult
+"""Instance-annotation implementation.
 
-__all__ = [
-    "AnnotationError",
-    "AnnotationSession",
-    "SplitResult",
-    "UndoResult",
-    "run_instance_annotation",
-]
+UI modules are intentionally not imported at package import time.
+"""

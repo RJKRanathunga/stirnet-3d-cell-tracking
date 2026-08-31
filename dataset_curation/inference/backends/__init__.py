@@ -1,3 +1,4 @@
-from .stirnet_trackastra import StirNetTrackastraBackend
+"""Production inference backends.
 
-__all__ = ["StirNetTrackastraBackend"]
+Import a concrete backend explicitly at its call site.
+"""

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_LAZY_RUNTIME_IMPORTS_V1
+
 from dataset_curation.annotation.selection import (
     ensure_annotation_binding,
     touch_annotation_session,
@@ -8,7 +10,6 @@ from dataset_curation.annotation.tracks.storage import (
     OutputPaths,
     SourcePaths,
 )
-from dataset_curation.annotation.tracks.viewer import open_viewer
 from dataset_curation.catalog import VolumeRecord
 from dataset_curation.config import DEFAULT_SPACING_ZYX_UM
 from dataset_curation.errors import ArtifactError
@@ -25,6 +26,8 @@ def run_track_annotation(
     max_ray_distance_um: float = DEFAULT_MAX_RAY_DISTANCE_UM,
     resume: bool = True,
 ) -> None:
+    from dataset_curation.annotation.tracks.viewer import open_viewer
+
     """Open one inference-ready volume in the production track annotator."""
     paths = record.paths
 

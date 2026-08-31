@@ -1,5 +1,4 @@
-"""Dataset-curation inference adapters."""
+"""Dataset-curation inference package.
 
-from .backends.stirnet_trackastra import StirNetTrackastraBackend
-
-__all__ = ["StirNetTrackastraBackend"]
+Concrete backends are imported only by commands that execute them.
+"""
