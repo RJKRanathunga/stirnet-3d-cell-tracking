@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # DATASET_CURATION_LAZY_RUNTIME_IMPORTS_V1
+# DATASET_CURATION_COMPACT_CACHE_V1
 
 from dataset_curation.annotation.selection import (
     ensure_annotation_binding,
@@ -26,9 +27,9 @@ def run_track_annotation(
     max_ray_distance_um: float = DEFAULT_MAX_RAY_DISTANCE_UM,
     resume: bool = True,
 ) -> None:
+    """Open one inference-ready volume in the production track annotator."""
     from dataset_curation.annotation.tracks.viewer import open_viewer
 
-    """Open one inference-ready volume in the production track annotator."""
     paths = record.paths
 
     if not paths.inference_complete(
@@ -40,23 +41,37 @@ def run_track_annotation(
             f"inference run {run_id!r}."
         )
 
-    source = SourcePaths(paths.inference_run(run_id))
-    output = OutputPaths(paths.track_annotations(annotation_set))
-    output.root.mkdir(parents=True, exist_ok=True)
+    source = SourcePaths(
+        paths.inference_run(run_id)
+    )
+    output = OutputPaths(
+        paths.track_annotations(
+            annotation_set
+        )
+    )
+    output.root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     required = (
-        source.raw,
-        source.binary_mask,
         source.final_instances,
         source.cells_csv,
         source.napari_graph,
         source.tracks_csv,
     )
-    missing = [path for path in required if not path.is_file()]
+    missing = [
+        path
+        for path in required
+        if not path.is_file()
+    ]
     if missing:
         raise ArtifactError(
             "Track annotation artifacts are incomplete:\n"
-            + "\n".join(f"  {path}" for path in missing)
+            + "\n".join(
+                f"  {path}"
+                for path in missing
+            )
         )
 
     ensure_annotation_binding(
@@ -76,6 +91,7 @@ def run_track_annotation(
     print("=" * 88)
     print(f"split          : {record.split}")
     print(f"volume         : {record.volume_id}")
+    print(f"source Zarr    : {paths.zarr}")
     print(f"inference run  : {paths.inference_run(run_id)}")
     print(f"annotations    : {output.root}")
     print(f"resume         : {bool(resume)}")
@@ -83,9 +99,12 @@ def run_track_annotation(
 
     open_viewer(
         source=source,
+        source_zarr=paths.zarr,
         output=output,
         sample_id=record.volume_id,
         spacing_zyx=DEFAULT_SPACING_ZYX_UM,
-        max_ray_distance_um=float(max_ray_distance_um),
+        max_ray_distance_um=float(
+            max_ray_distance_um
+        ),
         resume=bool(resume),
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # DATASET_CURATION_LAZY_RUNTIME_IMPORTS_V1
+# DATASET_CURATION_COMPACT_CACHE_V1
 
 import numpy as np
 
@@ -14,6 +15,9 @@ from dataset_curation.annotation.selection import (
     ensure_annotation_binding,
     touch_annotation_session,
 )
+from dataset_curation.annotation.source_data import (
+    load_raw_and_binary_frames,
+)
 from dataset_curation.catalog import VolumeRecord
 from dataset_curation.errors import ArtifactError
 
@@ -22,10 +26,19 @@ def _select_frames(
     array: np.ndarray,
     timepoints: tuple[int, ...],
 ) -> np.ndarray:
-    if timepoints == tuple(range(int(array.shape[0]))):
+    if timepoints == tuple(
+        range(
+            int(array.shape[0])
+        )
+    ):
         return np.asarray(array)
     return np.stack(
-        [np.asarray(array[int(t)]) for t in timepoints],
+        [
+            np.asarray(
+                array[int(t)]
+            )
+            for t in timepoints
+        ],
         axis=0,
     )
 
@@ -39,10 +52,10 @@ def run_instance_annotation(
     suspect_threshold: float = 0.70,
     resume: bool = True,
 ) -> None:
+    """Open one inference-ready volume in the production instance annotator."""
     import napari
     from dataset_curation.annotation.instances.viewer import make_viewer
 
-    """Open one inference-ready volume in the production instance annotator."""
     paths = record.paths
 
     if not paths.inference_complete(
@@ -55,28 +68,23 @@ def run_instance_annotation(
         )
 
     required = (
-        paths.raw(run_id),
-        paths.binary_mask(run_id),
         paths.supervoxels(run_id),
         paths.final_instances(run_id),
     )
-    missing = [path for path in required if not path.is_file()]
+    missing = [
+        path
+        for path in required
+        if not path.is_file()
+    ]
     if missing:
         raise ArtifactError(
             "Instance annotation artifacts are incomplete:\n"
-            + "\n".join(f"  {path}" for path in missing)
+            + "\n".join(
+                f"  {path}"
+                for path in missing
+            )
         )
 
-    raw_movie = np.load(
-        paths.raw(run_id),
-        mmap_mode="r",
-        allow_pickle=False,
-    )
-    binary_movie = np.load(
-        paths.binary_mask(run_id),
-        mmap_mode="r",
-        allow_pickle=False,
-    )
     supervoxel_movie = np.load(
         paths.supervoxels(run_id),
         mmap_mode="r",
@@ -88,26 +96,59 @@ def run_instance_annotation(
         allow_pickle=False,
     )
 
-    frame_count = int(raw_movie.shape[0])
-    available = list(range(frame_count))
+    if (
+        supervoxel_movie.ndim != 4
+        or instance_movie.ndim != 4
+        or supervoxel_movie.shape != instance_movie.shape
+    ):
+        raise ArtifactError(
+            "Persisted supervoxel/final-instance movies do not align: "
+            f"{supervoxel_movie.shape} vs {instance_movie.shape}"
+        )
+
+    frame_count = int(
+        instance_movie.shape[0]
+    )
+    if (
+        record.frame_count is not None
+        and frame_count != int(record.frame_count)
+    ):
+        raise ArtifactError(
+            f"Persisted frame count {frame_count} does not match "
+            f"catalog frame count {record.frame_count}."
+        )
+
+    available = list(
+        range(frame_count)
+    )
     timepoints = parse_timepoint_selection(
         timepoint_selection,
         available,
     )
 
-    raw = _select_frames(raw_movie, timepoints)
-    stage6_binary_mask = _select_frames(
-        binary_movie,
-        timepoints,
-    ).astype(np.uint8, copy=False)
+    # Raw intensity and the exact production binary mask are reconstructed only
+    # for the frames the annotator actually opens.
+    raw, stage6_binary_mask = (
+        load_raw_and_binary_frames(
+            paths.zarr,
+            timepoints,
+        )
+    )
+
     supervoxels = _select_frames(
         supervoxel_movie,
         timepoints,
-    ).astype(np.int32, copy=False)
+    ).astype(
+        np.int32,
+        copy=False,
+    )
     instances = _select_frames(
         instance_movie,
         timepoints,
-    ).astype(np.int32, copy=False)
+    ).astype(
+        np.int32,
+        copy=False,
+    )
 
     foreground = instances > 0
 
@@ -125,21 +166,27 @@ def run_instance_annotation(
         )
 
     suspect_instances = None
-    suspect_root = paths.suspect_scores(run_id)
+    suspect_root = paths.suspect_scores(
+        run_id
+    )
     if suspect_root.is_dir():
         try:
             suspect_instances, stats = load_suspect_instance_frames(
                 suspect_root=suspect_root,
                 timepoints=timepoints,
                 instances=instances,
-                threshold=float(suspect_threshold),
+                threshold=float(
+                    suspect_threshold
+                ),
             )
             print(
                 "[suspects] loaded "
                 f"{stats['displayed_instances']} displayed instances"
             )
         except FileNotFoundError as exc:
-            print("[suspects] incomplete suspect cache; layer disabled.")
+            print(
+                "[suspects] incomplete suspect cache; layer disabled."
+            )
             print(exc)
 
     ensure_annotation_binding(
@@ -154,8 +201,13 @@ def run_instance_annotation(
         run_id=run_id,
     )
 
-    output_dir = paths.instance_annotations(annotation_set)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = paths.instance_annotations(
+        annotation_set
+    )
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     session = AnnotationSession(
         sample_id=record.volume_id,

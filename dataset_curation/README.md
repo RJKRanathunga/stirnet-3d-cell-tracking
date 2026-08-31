@@ -68,3 +68,20 @@ python -m dataset_curation annotate-tracks --next
 python -m dataset_curation annotate-tracks --resume
 python -m dataset_curation annotate-tracks --id 44b6_0c582fdc
 ```
+
+## Compact persistent cache
+
+Full-volume intermediate data is not duplicated below `preprocessed/`.
+
+The only persistent 4-D spatial movies are:
+
+```text
+movies/supervoxels.npy      uint16
+movies/final_instances.npy  uint16
+```
+
+The writer validates every frame before casting and fails if a label ID exceeds `65535`.
+
+Raw intensity remains in the canonical source Zarr. Preprocessed intensity, binary masks, source-instance labels, the 5-channel STIR-Net tensor, and dense network outputs are frame-local ephemeral objects.
+
+Trackastra reads the source Zarr lazily through Dask and does not persist a full `tracked_masks.npy` movie. Human annotation reconstructs raw/binary data from the source Zarr only when needed.

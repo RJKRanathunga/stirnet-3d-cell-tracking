@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_COMPACT_CACHE_V1
+
 """Napari picking and UI for Trackastra association correction."""
 
 from dataset_curation.annotation.tracks.graph import (
@@ -16,6 +18,12 @@ from dataset_curation.annotation.tracks.storage import (
 
 from dataset_curation.annotation.tracks.session import (
     TrackAnnotationSession,
+)
+
+from dataset_curation.annotation.source_data import (
+    BinaryMaskFrameCache,
+    estimate_contrast_limits,
+    open_source_movie,
 )
 
 import colorsys
@@ -44,19 +52,22 @@ except ImportError:
     QSizePolicy = None
 
 def _validate_source_arrays(
-    raw: np.ndarray,
-    binary_mask: np.ndarray,
+    raw,
     instances: np.ndarray,
 ) -> None:
-    if raw.ndim != 4:
-        raise AnnotationError(f"raw.npy must be (T,Z,Y,X), got {raw.shape}")
-    if binary_mask.shape != raw.shape:
+    raw_shape = tuple(int(v) for v in raw.shape)
+    if len(raw_shape) != 4:
         raise AnnotationError(
-            f"binary mask shape {binary_mask.shape} != raw shape {raw.shape}"
+            f"Raw source must be (T,Z,Y,X), got {raw_shape}"
         )
-    if instances.shape != raw.shape:
+    if instances.ndim != 4:
         raise AnnotationError(
-            f"final instances shape {instances.shape} != raw shape {raw.shape}"
+            f"Final instances must be (T,Z,Y,X), got {instances.shape}"
+        )
+    if tuple(int(v) for v in instances.shape) != raw_shape:
+        raise AnnotationError(
+            "Raw source/final-instance shape mismatch: "
+            f"{raw_shape} vs {instances.shape}"
         )
 
 def _normalize_cells(cells: pd.DataFrame) -> pd.DataFrame:
@@ -184,14 +195,14 @@ class DetectionPicker:
         *,
         cells: pd.DataFrame,
         instances: np.ndarray,
-        binary_mask: np.ndarray,
+        binary_mask_frame,
         spacing_zyx: tuple[float, float, float],
         max_ray_distance_um: float,
         session: TrackAnnotationSession,
     ) -> None:
         self.cells = cells
         self.instances = instances
-        self.binary_mask = binary_mask
+        self.binary_mask_frame = binary_mask_frame
         self.spacing = np.asarray(spacing_zyx, dtype=np.float64)
         self.max_ray_distance_um = float(max_ray_distance_um)
         self.session = session
@@ -272,19 +283,33 @@ class DetectionPicker:
                 raise AnnotationError(
                     "Could not resolve a 3-D camera ray for Binary Mask picking."
                 )
+            binary_mask = self.binary_mask_frame(frame)
             hit = _first_foreground_point_along_ray(
-                self.binary_mask,
-                binary_ray[0],
-                binary_ray[1],
+                binary_mask,
+                binary_ray[0][-3:],
+                binary_ray[1][-3:],
             )
             if hit is None:
-                raise AnnotationError("The click ray did not hit Binary Mask foreground.")
+                raise AnnotationError(
+                    "The click ray did not hit Binary Mask foreground."
+                )
 
-            index = np.rint(hit).astype(np.int64)
-            index[0] = int(frame)
-            shape = np.asarray(self.instances.shape, dtype=np.int64)
+            index = np.rint(hit[-3:]).astype(np.int64)
+            shape = np.asarray(
+                self.instances.shape[-3:],
+                dtype=np.int64,
+            )
             index = np.clip(index, 0, shape - 1)
-            instance_id = int(self.instances[tuple(index.tolist())])
+            instance_id = int(
+                self.instances[
+                    (
+                        int(frame),
+                        int(index[0]),
+                        int(index[1]),
+                        int(index[2]),
+                    )
+                ]
+            )
 
             if instance_id > 0:
                 node = (frame, instance_id)
@@ -384,16 +409,24 @@ def _make_label_shrinkable(widget) -> None:
 def open_viewer(
     *,
     source: SourcePaths,
+    source_zarr,
     output: OutputPaths,
     sample_id: str,
     spacing_zyx: tuple[float, float, float],
     max_ray_distance_um: float,
     resume: bool,
 ) -> None:
-    raw = np.load(source.raw, mmap_mode="r", allow_pickle=False)
-    binary_mask = np.load(source.binary_mask, mmap_mode="r", allow_pickle=False)
-    instances = np.load(source.final_instances, mmap_mode="r", allow_pickle=False)
-    _validate_source_arrays(raw, binary_mask, instances)
+    raw = open_source_movie(source_zarr)
+    instances = np.load(
+        source.final_instances,
+        mmap_mode="r",
+        allow_pickle=False,
+    )
+    _validate_source_arrays(raw, instances)
+    binary_cache = BinaryMaskFrameCache(
+        source_zarr,
+        max_frames=3,
+    )
 
     cells = _normalize_cells(pd.read_csv(source.cells_csv))
     tracks = _normalize_tracks(pd.read_csv(source.tracks_csv))
@@ -428,7 +461,7 @@ def open_viewer(
     picker = DetectionPicker(
         cells=cells,
         instances=instances,
-        binary_mask=binary_mask,
+        binary_mask_frame=binary_cache.frame,
         spacing_zyx=spacing_zyx,
         max_ray_distance_um=max_ray_distance_um,
         session=session,
@@ -438,7 +471,7 @@ def open_viewer(
     spatial_shape = tuple(int(v) for v in raw.shape[-3:])
 
     viewer = napari.Viewer(ndisplay=3)
-    low, high = np.percentile(np.asarray(raw), [1.0, 99.8])
+    low, high = estimate_contrast_limits(raw)
     raw_layer = viewer.add_image(
         raw,
         name="Raw Volume",
@@ -448,9 +481,9 @@ def open_viewer(
         contrast_limits=[float(low), float(high)],
     )
     binary_layer = viewer.add_labels(
-        binary_mask,
-        name="Binary Mask",
-        scale=scale_tzyx,
+        np.zeros(spatial_shape, dtype=np.uint8),
+        name="Binary Mask - reconstructed current frame",
+        scale=spacing_zyx,
         visible=False,
         opacity=0.35,
     )
@@ -463,16 +496,6 @@ def open_viewer(
         scale=spacing_zyx,
         opacity=0.62,
     )
-
-    if source.tracked_masks.is_file():
-        tracked_masks = np.load(source.tracked_masks, mmap_mode="r", allow_pickle=False)
-        viewer.add_labels(
-            tracked_masks,
-            name="Trackastra Tracked Masks (original)",
-            scale=scale_tzyx,
-            visible=False,
-            opacity=0.45,
-        )
 
     if source.napari_tracks.is_file():
         original_tracks = np.load(source.napari_tracks, mmap_mode="r", allow_pickle=False)
@@ -558,6 +581,18 @@ def open_viewer(
 
     def current_frame() -> int:
         return int(round(viewer.dims.current_step[0]))
+
+    last_binary_frame = [-1]
+
+    def refresh_binary_layer() -> None:
+        if not bool(binary_layer.visible):
+            return
+        frame = current_frame()
+        if frame == last_binary_frame[0]:
+            return
+        binary_layer.data = binary_cache.frame(frame)
+        binary_layer.refresh()
+        last_binary_frame[0] = frame
 
     def refresh_selection_layers() -> None:
         frame = current_frame()
@@ -758,11 +793,21 @@ def open_viewer(
         if frame == last_frame[0]:
             return
         last_frame[0] = frame
+        refresh_binary_layer()
         refresh_current_candidate_cells()
         refresh_selection_layers()
         refresh_status_labels()
 
     viewer.dims.events.current_step.connect(on_dims_change)
+
+    def on_binary_visibility_change(_event=None) -> None:
+        if bool(binary_layer.visible):
+            last_binary_frame[0] = -1
+            refresh_binary_layer()
+
+    binary_layer.events.visible.connect(
+        on_binary_visibility_change
+    )
 
     # Initial state and resume selection highlights.
     refresh_all(force_candidate=True)
@@ -771,7 +816,8 @@ def open_viewer(
     print("BIOHUB TRACK ANNOTATOR")
     print("=" * 96)
     print(f"sample             : {sample_id}")
-    print(f"source             : {source.root}")
+    print(f"source Zarr        : {source_zarr}")
+    print(f"inference artifacts: {source.root}")
     print(f"output             : {output.root}")
     print(f"detections         : {len(valid_nodes)}")
     print(f"Trackastra edges   : {len(base_edges)}")

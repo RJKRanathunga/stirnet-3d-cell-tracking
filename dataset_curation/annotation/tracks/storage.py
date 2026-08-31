@@ -2,6 +2,14 @@ from __future__ import annotations
 
 """Track annotation artifact paths and JSON/CSV serialization."""
 
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
 from dataset_curation.annotation.tracks.graph import (
     AnnotationError,
     Edge,
@@ -9,29 +17,12 @@ from dataset_curation.annotation.tracks.graph import (
     _canonical_edge,
 )
 
-import json
-
-import os
-
-from dataclasses import dataclass
-
-from pathlib import Path
-
-from typing import Any, Iterable
-
-import pandas as pd
 
 @dataclass(frozen=True)
 class SourcePaths:
+    """Persistent inference artifacts required by track annotation."""
+
     root: Path
-
-    @property
-    def raw(self) -> Path:
-        return self.root / "movies" / "raw.npy"
-
-    @property
-    def binary_mask(self) -> Path:
-        return self.root / "movies" / "binary_mask.npy"
 
     @property
     def final_instances(self) -> Path:
@@ -40,10 +31,6 @@ class SourcePaths:
     @property
     def cells_csv(self) -> Path:
         return self.root / "cells_all.csv"
-
-    @property
-    def tracked_masks(self) -> Path:
-        return self.root / "trackastra" / "tracked_masks.npy"
 
     @property
     def napari_tracks(self) -> Path:
@@ -56,6 +43,7 @@ class SourcePaths:
     @property
     def tracks_csv(self) -> Path:
         return self.root / "trackastra" / "tracks.csv"
+
 
 @dataclass(frozen=True)
 class OutputPaths:
@@ -77,39 +65,111 @@ class OutputPaths:
     def completed_nodes_csv(self) -> Path:
         return self.root / "completed_nodes.csv"
 
-def _atomic_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+
+def _atomic_json(
+    path: Path,
+    payload: Any,
+) -> None:
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.tmp"
+    )
     try:
         tmp.write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
+            json.dumps(
+                payload,
+                indent=2,
+                sort_keys=True,
+            ),
             encoding="utf-8",
         )
-        os.replace(tmp, path)
+        os.replace(
+            tmp,
+            path,
+        )
     finally:
-        tmp.unlink(missing_ok=True)
+        tmp.unlink(
+            missing_ok=True
+        )
 
-def _atomic_csv(path: Path, frame: pd.DataFrame) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+
+def _atomic_csv(
+    path: Path,
+    frame: pd.DataFrame,
+) -> None:
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.tmp"
+    )
     try:
-        frame.to_csv(tmp, index=False)
-        os.replace(tmp, path)
+        frame.to_csv(
+            tmp,
+            index=False,
+        )
+        os.replace(
+            tmp,
+            path,
+        )
     finally:
-        tmp.unlink(missing_ok=True)
+        tmp.unlink(
+            missing_ok=True
+        )
 
-def _node_json(node: Node) -> list[int]:
-    return [int(node[0]), int(node[1])]
 
-def _edge_json(edge: Edge) -> list[list[int]]:
-    return [_node_json(edge[0]), _node_json(edge[1])]
+def _node_json(
+    node: Node,
+) -> list[int]:
+    return [
+        int(node[0]),
+        int(node[1]),
+    ]
 
-def _parse_node(value: Any) -> Node:
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise AnnotationError(f"Invalid serialized node: {value!r}")
+
+def _edge_json(
+    edge: Edge,
+) -> list[list[int]]:
+    return [
+        _node_json(edge[0]),
+        _node_json(edge[1]),
+    ]
+
+
+def _parse_node(
+    value: Any,
+) -> Node:
+    if (
+        not isinstance(
+            value,
+            (list, tuple),
+        )
+        or len(value) != 2
+    ):
+        raise AnnotationError(
+            f"Invalid serialized node: {value!r}"
+        )
     return int(value[0]), int(value[1])
 
-def _parse_edge(value: Any) -> Edge:
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise AnnotationError(f"Invalid serialized edge: {value!r}")
-    return _canonical_edge(_parse_node(value[0]), _parse_node(value[1]))
+
+def _parse_edge(
+    value: Any,
+) -> Edge:
+    if (
+        not isinstance(
+            value,
+            (list, tuple),
+        )
+        or len(value) != 2
+    ):
+        raise AnnotationError(
+            f"Invalid serialized edge: {value!r}"
+        )
+    return _canonical_edge(
+        _parse_node(value[0]),
+        _parse_node(value[1]),
+    )

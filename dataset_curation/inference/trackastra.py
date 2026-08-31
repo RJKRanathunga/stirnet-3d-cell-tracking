@@ -6,13 +6,12 @@ from pathlib import Path
 import pickle
 import time
 
+import dask.array as da
 import numpy as np
 import pandas as pd
 import torch
 
-from dataset_curation.io.atomic import (
-    atomic_json,
-)
+from dataset_curation.io.atomic import atomic_json
 
 
 def _atomic_csv(
@@ -41,6 +40,79 @@ def _atomic_csv(
         )
 
 
+def _dask_from_source_zarr(
+    sample_zarr: Path,
+):
+    from src.io import open_sample
+
+    source = open_sample(
+        sample_zarr
+    )
+    shape = tuple(
+        int(v)
+        for v in source.shape
+    )
+    if len(shape) != 4:
+        raise ValueError(
+            f"Raw source must be (T,Z,Y,X), got {shape}"
+        )
+
+    source_chunks = getattr(
+        source,
+        "chunks",
+        None,
+    )
+    if (
+        source_chunks is None
+        or len(source_chunks) != 4
+    ):
+        source_chunks = (
+            1,
+            *shape[1:],
+        )
+
+    raw = da.from_array(
+        source,
+        chunks=source_chunks,
+        asarray=False,
+        fancy=False,
+    )
+    return source, raw
+
+
+def _dask_from_label_memmap(
+    path: Path,
+):
+    labels = np.load(
+        path,
+        mmap_mode="r",
+        allow_pickle=False,
+    )
+    if labels.ndim != 4:
+        raise ValueError(
+            f"Final instances must be (T,Z,Y,X), got {labels.shape}"
+        )
+    if labels.dtype != np.dtype(np.uint16):
+        raise TypeError(
+            f"Expected compact uint16 final instances, got {labels.dtype}"
+        )
+
+    chunks = (
+        1,
+        *tuple(
+            int(v)
+            for v in labels.shape[1:]
+        ),
+    )
+    lazy = da.from_array(
+        labels,
+        chunks=chunks,
+        asarray=False,
+        fancy=False,
+    )
+    return labels, lazy
+
+
 def run_trackastra(
     paths,
     *,
@@ -50,18 +122,13 @@ def run_trackastra(
     device: str = "cuda",
     rebuild: bool = False,
 ) -> None:
-    """Production curation adapter around the external Trackastra package."""
-    if (
-        paths.tracking_complete(run_id)
-        and not rebuild
-    ):
-        print(
-            "[trackastra] reusing cached "
-            "graph/masks/tracks",
-            flush=True,
-        )
-        return
+    """
+    Production curation adapter around Trackastra.
 
+    Trackastra 0.5.5 supports Dask-backed large-array inference, so the raw
+    movie is read lazily from the canonical source Zarr instead of being copied
+    into preprocessed/<volume>/movies/raw.npy.
+    """
     output = paths.trackastra_root(
         run_id
     )
@@ -70,10 +137,32 @@ def run_trackastra(
         exist_ok=True,
     )
 
-    try:
-        from trackastra.model import (
-            Trackastra,
+    # The compact contract never persists a full relabeled Trackastra mask
+    # movie. Remove one even when the small graph/tracks cache can be reused.
+    stale_tracked_masks = (
+        output
+        / "tracked_masks.npy"
+    )
+    if stale_tracked_masks.is_file():
+        stale_tracked_masks.unlink()
+        print(
+            f"[cache] removed obsolete tracked mask movie: "
+            f"{stale_tracked_masks}",
+            flush=True,
         )
+
+    if (
+        paths.tracking_complete(run_id)
+        and not rebuild
+    ):
+        print(
+            "[trackastra] reusing cached graph/tracks",
+            flush=True,
+        )
+        return
+
+    try:
+        from trackastra.model import Trackastra
         from trackastra.tracking.utils import (
             graph_to_napari_tracks,
         )
@@ -84,43 +173,36 @@ def run_trackastra(
             "the configured Trackastra package."
         ) from exc
 
-    raw_movie = np.load(
-        paths.raw(run_id),
-        mmap_mode="r",
-        allow_pickle=False,
+    source_handle, raw_movie = (
+        _dask_from_source_zarr(
+            paths.zarr
+        )
     )
-    final_movie = np.load(
-        paths.final_instances(run_id),
-        mmap_mode="r",
-        allow_pickle=False,
+    final_handle, final_movie = (
+        _dask_from_label_memmap(
+            paths.final_instances(
+                run_id
+            )
+        )
     )
+
+    if tuple(raw_movie.shape) != tuple(final_movie.shape):
+        raise ValueError(
+            "Raw source/final-instance movie shape mismatch: "
+            f"{raw_movie.shape} vs {final_movie.shape}"
+        )
 
     print("", flush=True)
     print("=" * 96, flush=True)
-    print(
-        "DATASET CURATION — TRACKASTRA",
-        flush=True,
-    )
+    print("DATASET CURATION — TRACKASTRA", flush=True)
     print("=" * 96, flush=True)
+    print(f"model     : {model_name}", flush=True)
+    print(f"mode      : {mode}", flush=True)
+    print(f"device    : {device}", flush=True)
+    print(f"raw       : {paths.zarr} (lazy Dask/Zarr)", flush=True)
     print(
-        f"model     : {model_name}",
-        flush=True,
-    )
-    print(
-        f"mode      : {mode}",
-        flush=True,
-    )
-    print(
-        f"device    : {device}",
-        flush=True,
-    )
-    print(
-        f"raw       : {paths.raw(run_id)}",
-        flush=True,
-    )
-    print(
-        f"instances : "
-        f"{paths.final_instances(run_id)}",
+        f"instances : {paths.final_instances(run_id)} "
+        "(uint16 memmap/Dask)",
         flush=True,
     )
     print("=" * 96, flush=True)
@@ -130,12 +212,10 @@ def run_trackastra(
         model_name,
         device=device,
     )
-    track_graph, tracked_masks = (
-        model.track(
-            raw_movie,
-            final_movie,
-            mode=mode,
-        )
+    track_graph, tracked_masks = model.track(
+        raw_movie,
+        final_movie,
+        mode=mode,
     )
     seconds = (
         time.perf_counter()
@@ -149,12 +229,6 @@ def run_trackastra(
             track_graph,
             handle,
         )
-
-    np.save(
-        paths.tracked_masks(run_id),
-        np.asarray(tracked_masks),
-        allow_pickle=False,
-    )
 
     (
         napari_tracks,
@@ -186,7 +260,10 @@ def run_trackastra(
 
     serializable_graph = {
         str(int(child)): (
-            [int(value) for value in parent]
+            [
+                int(value)
+                for value in parent
+            ]
             if isinstance(
                 parent,
                 (list, tuple, set),
@@ -240,18 +317,13 @@ def run_trackastra(
     )
 
     summary = {
-        "model": str(
-            model_name
-        ),
-        "mode": str(
-            mode
-        ),
-        "device": str(
-            device
-        ),
-        "seconds": float(
-            seconds
-        ),
+        "model": str(model_name),
+        "mode": str(mode),
+        "device": str(device),
+        "seconds": float(seconds),
+        "raw_input": "source_zarr_dask",
+        "instance_input": "uint16_memmap_dask",
+        "tracked_masks_persisted": False,
         "graph_nodes": int(
             track_graph.number_of_nodes()
         ),
@@ -273,13 +345,18 @@ def run_trackastra(
         ),
     }
     atomic_json(
-        paths.trackastra_summary(
-            run_id
-        ),
+        paths.trackastra_summary(run_id),
         summary,
     )
 
-    del model, tracked_masks
+    del (
+        model,
+        tracked_masks,
+        raw_movie,
+        final_movie,
+        source_handle,
+        final_handle,
+    )
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -288,8 +365,7 @@ def run_trackastra(
         f"[trackastra] "
         f"nodes={summary['graph_nodes']} "
         f"edges={summary['graph_edges']} "
-        f"tracklets="
-        f"{summary['napari_tracklets']} "
+        f"tracklets={summary['napari_tracklets']} "
         f"time={seconds:.1f}s",
         flush=True,
     )

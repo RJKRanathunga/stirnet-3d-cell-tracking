@@ -7,6 +7,7 @@ import numpy as np
 
 
 VALID_SPLITS = ("train", "test")
+PERSISTED_LABEL_DTYPE = np.dtype(np.uint16)
 
 
 def validate_split(split: str) -> str:
@@ -74,18 +75,6 @@ class BioHubVolumePaths:
     def movies(self, run_id: str = "current") -> Path:
         return self.inference_run(run_id) / "movies"
 
-    def raw(self, run_id: str = "current") -> Path:
-        return self.movies(run_id) / "raw.npy"
-
-    def preprocessed(self, run_id: str = "current") -> Path:
-        return self.movies(run_id) / "preprocessed.npy"
-
-    def binary_mask(self, run_id: str = "current") -> Path:
-        return self.movies(run_id) / "binary_mask.npy"
-
-    def source_instances(self, run_id: str = "current") -> Path:
-        return self.movies(run_id) / "source_instances.npy"
-
     def supervoxels(self, run_id: str = "current") -> Path:
         return self.movies(run_id) / "supervoxels.npy"
 
@@ -106,9 +95,6 @@ class BioHubVolumePaths:
 
     def track_graph(self, run_id: str = "current") -> Path:
         return self.trackastra_root(run_id) / "track_graph.pkl"
-
-    def tracked_masks(self, run_id: str = "current") -> Path:
-        return self.trackastra_root(run_id) / "tracked_masks.npy"
 
     def napari_tracks(self, run_id: str = "current") -> Path:
         return self.trackastra_root(run_id) / "napari_tracks.npy"
@@ -171,24 +157,28 @@ class BioHubVolumePaths:
             return True
 
     @staticmethod
-    def _movie_has_frames(
+    def _label_movie_is_valid(
         path: Path,
         frame_count: int | None,
     ) -> bool:
         if not path.is_file():
             return False
-        if frame_count is None:
-            return True
         try:
             array = np.load(
                 path,
                 mmap_mode="r",
                 allow_pickle=False,
             )
-            return (
-                array.ndim == 4
-                and int(array.shape[0]) == int(frame_count)
-            )
+            if array.ndim != 4:
+                return False
+            if array.dtype != PERSISTED_LABEL_DTYPE:
+                return False
+            if (
+                frame_count is not None
+                and int(array.shape[0]) != int(frame_count)
+            ):
+                return False
+            return True
         except Exception:
             return False
 
@@ -198,13 +188,14 @@ class BioHubVolumePaths:
         *,
         frame_count: int | None = None,
     ) -> bool:
-        # supervoxels.npy is part of the contract because fresh inference must
-        # be immediately usable by the merged-cell annotator.
+        """
+        Compact persistent spatial contract.
+
+        Raw imagery remains in source Zarr. Preprocessed intensities, binary
+        masks, source instances and the 5-channel STIR-Net input are ephemeral.
+        Only uint16 atomic supervoxels + final spatial instances are persisted.
+        """
         required = (
-            self.raw(run_id),
-            self.preprocessed(run_id),
-            self.binary_mask(run_id),
-            self.source_instances(run_id),
             self.supervoxels(run_id),
             self.final_instances(run_id),
             self.cells_csv(run_id),
@@ -214,11 +205,11 @@ class BioHubVolumePaths:
             return False
 
         return (
-            self._movie_has_frames(
+            self._label_movie_is_valid(
                 self.final_instances(run_id),
                 frame_count,
             )
-            and self._movie_has_frames(
+            and self._label_movie_is_valid(
                 self.supervoxels(run_id),
                 frame_count,
             )
@@ -230,7 +221,6 @@ class BioHubVolumePaths:
     ) -> bool:
         required = (
             self.track_graph(run_id),
-            self.tracked_masks(run_id),
             self.napari_tracks(run_id),
             self.napari_graph(run_id),
             self.tracks_csv(run_id),
