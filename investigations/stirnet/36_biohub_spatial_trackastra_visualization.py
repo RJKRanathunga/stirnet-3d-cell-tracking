@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# EXTERNAL_BIOHUB_CURATION_V1: persist annotation-ready atomic supervoxels
+
 r"""
 Investigation 36 — current spatial STIR-Net + Trackastra visualization on the
 20-frame BioHub sample.
@@ -311,6 +313,10 @@ class OutputPaths:
         return self.movies / "source_instances.npy"
 
     @property
+    def supervoxels(self) -> Path:
+        return self.movies / "supervoxels.npy"
+
+    @property
     def final_instances(self) -> Path:
         return self.movies / "final_instances.npy"
 
@@ -357,6 +363,7 @@ def spatial_cache_complete(paths: OutputPaths, frame_count: int) -> bool:
         paths.preprocessed,
         paths.binary_mask,
         paths.source_instances,
+        paths.supervoxels,
         paths.final_instances,
         paths.cells_csv,
         paths.spatial_success,
@@ -530,6 +537,11 @@ def run_spatial_movie(
         dtype=np.int32,
         shape=movie_shape,
     )
+    supervoxel_movie = _create_movie(
+        output.supervoxels,
+        dtype=np.int32,
+        shape=movie_shape,
+    )
     final_movie = _create_movie(
         output.final_instances,
         dtype=np.int32,
@@ -658,6 +670,12 @@ def run_spatial_movie(
                 np.int32,
                 copy=False,
             )
+            # Persist the exact atomic watershed supervoxels used by
+            # the current merged-cell annotation algorithm.
+            supervoxel_movie[frame] = watershed.astype(
+                np.int32,
+                copy=False,
+            )
             final_movie[frame] = final_labels.astype(np.int32, copy=False)
 
             cells_frame = cells.copy()
@@ -732,9 +750,11 @@ def run_spatial_movie(
     preprocessed_movie.flush()
     binary_movie.flush()
     source_movie.flush()
+    supervoxel_movie.flush()
     final_movie.flush()
 
-    del raw_movie, preprocessed_movie, binary_movie, source_movie, final_movie
+    del raw_movie, preprocessed_movie, binary_movie
+    del source_movie, supervoxel_movie, final_movie
 
     combined_cells = pd.concat(cells_all, ignore_index=True)
     atomic_csv(output.cells_csv, combined_cells)
@@ -1391,6 +1411,8 @@ def main() -> int:
                 f"Incomplete Trackastra cache below {output.trackastra_dir}"
             )
     else:
+        spatial_reran = False
+
         if args.overwrite_spatial and output.root.exists():
             # Spatial results and Trackastra are coupled.  A new spatial movie
             # invalidates the old Trackastra graph, so remove the whole cache.
@@ -1425,15 +1447,18 @@ def main() -> int:
                 tile_batch_size=int(args.tile_batch_size),
                 device=spatial_device,
             )
+            spatial_reran = True
 
-        # A Trackastra rebuild is automatically needed after --overwrite-spatial.
+        # Any new spatial movie invalidates the old Trackastra graph.
         run_trackastra(
             output=output,
             model_name=args.trackastra_model,
             mode=args.trackastra_mode,
             device=args.trackastra_device,
             rebuild=bool(
-                args.rebuild_trackastra or args.overwrite_spatial
+                args.rebuild_trackastra
+                or args.overwrite_spatial
+                or spatial_reran
             ),
         )
 
@@ -1445,6 +1470,7 @@ def main() -> int:
     print(f"frames       : {args.frame_count}", flush=True)
     print(f"output       : {output.root}", flush=True)
     print(f"spatial      : {output.final_instances}", flush=True)
+    print(f"supervoxels  : {output.supervoxels}", flush=True)
     print(f"cells        : {output.cells_csv}", flush=True)
     print(f"track graph  : {output.track_graph}", flush=True)
     print(f"tracked mask : {output.tracked_masks}", flush=True)

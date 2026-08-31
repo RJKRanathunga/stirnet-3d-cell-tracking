@@ -1,280 +1,550 @@
-
 from __future__ import annotations
 
 import argparse
-import runpy
 import subprocess
 import sys
 from pathlib import Path
 
 from dataset_curation._repo import repo_root
-from dataset_curation.config import DEFAULT_DATASET
+from dataset_curation.annotation.instances.curation_runner import (
+    run_instance_annotation,
+)
+from dataset_curation.annotation.selection import (
+    annotation_started,
+    ensure_annotation_binding,
+    select_annotation_volume,
+    touch_annotation_session,
+)
+from dataset_curation.catalog import BioHubCatalog, VolumeRecord
+from dataset_curation.config import BIOHUB_DATA_ROOT
 from dataset_curation.errors import ArtifactError
-from dataset_curation.inference.pipeline import run_current_inference
-from dataset_curation.io.atomic import atomic_json, read_json
-from dataset_curation.workspace.sample import CurationSample, _now
+from dataset_curation.inference.backends.investigation36 import (
+    Investigation36Backend,
+)
 
-def _extra(values):
-    values = list(values)
+
+def _extra(values) -> list[str]:
+    values = list(values or [])
     return values[1:] if values and values[0] == "--" else values
 
-def _sample(args):
-    return CurationSample.open(
-        sample_id=args.sample_id,
-        root=args.root,
-        dataset=args.dataset,
+
+def _catalog(args) -> BioHubCatalog:
+    catalog = BioHubCatalog(args.data_root)
+    catalog.validate_root()
+    catalog.ensure_output_roots()
+    return catalog
+
+
+def _record_status(
+    record: VolumeRecord,
+    *,
+    run_id: str,
+    annotation_set: str,
+) -> tuple[str, str, str]:
+    paths = record.paths
+    complete = paths.inference_complete(
+        run_id,
+        frame_count=record.frame_count,
     )
+    if complete:
+        inference = "complete"
+    elif paths.has_any_preprocessed_data(run_id):
+        inference = "partial"
+    else:
+        inference = "missing"
 
-def _run_module(module: str, arguments: list[str]) -> None:
-    command = [sys.executable, "-m", module, *arguments]
-    print("[dataset_curation] " + " ".join(command), flush=True)
-    subprocess.run(command, cwd=repo_root(), check=True)
-
-def _inference_payload(sample, run_id: str) -> dict:
-    path = sample.layout.inference_manifest(run_id)
-    return read_json(path) if path.is_file() else {}
-
-def _merge_artifacts(sample, run_id: str, artifacts: dict, *, backend=None) -> None:
-    path = sample.layout.inference_manifest(run_id)
-    old = read_json(path) if path.is_file() else {}
-    merged = dict(old.get("artifacts", {}))
-    merged.update(artifacts)
-    atomic_json(
-        path,
-        {
-            "schema_version": 1,
-            "kind": "inference_run",
-            "sample_id": sample.layout.sample_id,
-            "run_id": run_id,
-            "backend": backend or old.get("backend", "registered_existing_artifacts"),
-            "immutable_base_prediction": True,
-            "source_zarr": str(sample.source_zarr),
-            "command": old.get("command"),
-            "artifacts": merged,
-            "spacing_zyx_um": old.get("spacing_zyx_um", list(sample.spacing_zyx_um)),
-            "created_at": old.get("created_at", _now()),
-            "updated_at": _now(),
-        },
+    instances = (
+        "started"
+        if annotation_started(
+            record,
+            kind="instances",
+            annotation_set=annotation_set,
+        )
+        else "-"
     )
-
-def _existing_path(value: str | None):
-    if value is None:
-        return None
-    path = Path(value).expanduser()
-    path = path.resolve() if path.is_absolute() else (repo_root() / path).resolve()
-    if not path.exists():
-        raise FileNotFoundError(path)
-    return str(path)
-
-def cmd_setup(args):
-    sample = CurationSample.create(
-        sample_id=args.sample_id,
-        source_zarr=args.source_zarr,
-        root=args.root,
-        dataset=args.dataset,
-        spacing_zyx_um=tuple(args.spacing),
+    tracks = (
+        "started"
+        if annotation_started(
+            record,
+            kind="tracks",
+            annotation_set=annotation_set,
+        )
+        else "-"
     )
-    print(f"sample root : {sample.layout.sample_root}")
-    print(f"manifest    : {sample.layout.sample_manifest}")
-    print(f"source zarr : {sample.source_zarr}")
+    return inference, instances, tracks
 
-def cmd_infer(args):
-    sample = _sample(args)
-    output = run_current_inference(
-        sample,
-        run_id=args.run_id,
-        extra_args=_extra(args.extra),
+
+def cmd_status(args) -> None:
+    catalog = _catalog(args)
+
+    if args.split == "all":
+        records = catalog.discover_all()
+    else:
+        records = catalog.discover(args.split)
+
+    if args.limit is not None:
+        records = records[: max(int(args.limit), 0)]
+
+    headers = (
+        "SPLIT",
+        "VOLUME",
+        "FRAMES",
+        "SPARSE_GT",
+        "INFERENCE",
+        "INST_ANN",
+        "TRACK_ANN",
     )
-    print(f"inference   : {output}")
-    print(f"manifest    : {sample.layout.inference_manifest(args.run_id)}")
+    rows = []
 
-def cmd_register_spatial(args):
-    sample = _sample(args)
-    sample.ensure_inference_run(args.run_id)
-    source = {
-        "instances_root": _existing_path(args.instances_root),
-        "supervoxels_root": _existing_path(args.supervoxels_root),
-        "stage6_root": _existing_path(args.stage6_root),
-        "zarr": _existing_path(args.zarr) if args.zarr else str(sample.source_zarr),
-    }
-    _merge_artifacts(
-        sample,
-        args.run_id,
-        {"instance_annotation_source": source},
-        backend="registered_existing_spatial",
-    )
-    print("registered instance-annotation source:")
-    for key, value in source.items():
-        print(f"  {key:18s}: {value}")
-
-def cmd_suspects(args):
-    sample = _sample(args)
-    manifest = _inference_payload(sample, args.run_id)
-    source = manifest.get("artifacts", {}).get("instance_annotation_source")
-    if not source:
-        raise ArtifactError(
-            "No instance-annotation source is registered for this run. "
-            "Run `python -m dataset_curation register-spatial ...` first."
+    for record in records:
+        inference, instances, tracks = _record_status(
+            record,
+            run_id=args.run_id,
+            annotation_set=args.annotation_set,
+        )
+        rows.append(
+            (
+                record.split,
+                record.volume_id,
+                str(record.frame_count or "?"),
+                "yes" if record.has_ground_truth else "no",
+                inference,
+                instances,
+                tracks,
+            )
         )
 
-    output = sample.layout.inference_run(args.run_id) / "suspects"
-    output.mkdir(parents=True, exist_ok=True)
-    command = [
-        "--sample-id", sample.layout.sample_id,
-        "--output-dir", str(output),
-        "--inv25", source["instances_root"],
-        "--inv24", source["supervoxels_root"],
-        "--zarr", source["zarr"],
-        *_extra(args.extra),
+    widths = [
+        max(
+            len(headers[index]),
+            *(len(row[index]) for row in rows),
+        )
+        if rows
+        else len(headers[index])
+        for index in range(len(headers))
     ]
-    _run_module("dataset_curation._compat.merge_suspect_exporter", command)
-    _merge_artifacts(sample, args.run_id, {"suspects": str(output)})
-    print(f"suspects    : {output}")
 
-def cmd_annotate_instances(args):
-    sample = _sample(args)
-    sample.ensure_annotation_set(
-        args.annotation_set,
-        base_inference_run=args.run_id,
-    )
-    manifest = _inference_payload(sample, args.run_id)
-    artifacts = manifest.get("artifacts", {})
-    source = artifacts.get("instance_annotation_source")
-    if not source:
-        raise ArtifactError(
-            "The current instance annotator requires the exact current "
-            "Inv25/Inv24/Stage-6 input contract. Register it first with "
-            "`python -m dataset_curation register-spatial ...`."
+    def line(values):
+        return "  ".join(
+            str(value).ljust(widths[index])
+            for index, value in enumerate(values)
         )
 
-    command = [
-        "--sample-id", sample.layout.sample_id,
-        "--spatial-root", source["instances_root"],
-        "--supervoxel-root", source["supervoxels_root"],
-        "--stage6-root", source["stage6_root"],
-        "--zarr-path", source["zarr"],
-        "--output-dir", str(sample.layout.instance_annotations(args.annotation_set)),
-    ]
-    if artifacts.get("suspects"):
-        command += ["--suspect-root", artifacts["suspects"]]
-    command += _extra(args.extra)
-    _run_module("dataset_curation._compat.instance_annotator", command)
+    print(f"BioHub root: {catalog.data_root}")
+    print(line(headers))
+    print(line(tuple("-" * width for width in widths)))
+    for row in rows:
+        print(line(row))
 
-def cmd_annotate_tracks(args):
-    sample = _sample(args)
-    sample.ensure_annotation_set(
-        args.annotation_set,
-        base_inference_run=args.run_id,
-    )
-    source = sample.layout.inference_run(args.run_id)
-    required = [
-        source / "movies" / "raw.npy",
-        source / "movies" / "binary_mask.npy",
-        source / "movies" / "final_instances.npy",
-        source / "cells_all.csv",
-        source / "trackastra" / "napari_graph.json",
-        source / "trackastra" / "tracks.csv",
-    ]
-    missing = [path for path in required if not path.is_file()]
-    if missing:
-        raise ArtifactError(
-            "Track annotation requires an Investigation-36-compatible "
-            "inference run. Missing:\\n"
-            + "\\n".join(f"  {path}" for path in missing)
-        )
-    command = [
-        "--sample-id", sample.layout.sample_id,
-        "--source-root", str(source),
-        "--output-dir", str(sample.layout.track_annotations(args.annotation_set)),
-        *_extra(args.extra),
-    ]
-    _run_module("dataset_curation._compat.track_annotator", command)
-
-def cmd_annotate_points(args):
+    print()
+    print(f"volumes: {len(rows)}")
     print(
-        "Running the exact historical point annotator. Its current repository "
-        "version uses its existing hard-coded sample/timepoint configuration."
+        "SPARSE_GT only reports presence of ground_truth_nodes.csv + "
+        "ground_truth_edges.csv. It is not used as full-volume GT."
     )
-    runpy.run_module("dataset_curation._compat.point_annotator", run_name="__main__")
 
-def cmd_status(args):
-    sample = _sample(args)
-    runs = (
-        sorted(path.name for path in sample.layout.inference.iterdir() if path.is_dir())
-        if sample.layout.inference.is_dir()
-        else []
-    )
-    sets = (
-        sorted(path.name for path in sample.layout.annotations.iterdir() if path.is_dir())
-        if sample.layout.annotations.is_dir()
-        else []
-    )
-    print(f"sample          : {sample.layout.sample_root}")
-    print(f"source          : {sample.source_zarr}")
-    print(f"inference runs  : {runs}")
-    print(f"annotation sets : {sets}")
 
-def build_parser():
+def _inference_selection(args, catalog: BioHubCatalog) -> list[VolumeRecord]:
+    records = catalog.discover(args.split)
+    by_id = {record.volume_id: record for record in records}
+
+    if args.id:
+        selected = []
+        missing = []
+        for volume_id in args.id:
+            record = by_id.get(volume_id)
+            if record is None:
+                missing.append(volume_id)
+            else:
+                selected.append(record)
+        if missing:
+            raise KeyError(
+                f"Unknown {args.split} volume IDs: {missing}"
+            )
+        return selected
+
+    candidates = (
+        records
+        if args.force
+        else [
+            record
+            for record in records
+            if not record.paths.inference_complete(
+                args.run_id,
+                frame_count=record.frame_count,
+            )
+        ]
+    )
+
+    if args.all_volumes:
+        return candidates
+
+    count = 1 if args.count is None else int(args.count)
+    if count < 1:
+        raise ValueError("--count must be >= 1")
+    return candidates[:count]
+
+
+def cmd_infer(args) -> None:
+    catalog = _catalog(args)
+    selected = _inference_selection(args, catalog)
+
+    if not selected:
+        print(
+            f"No inference work is pending for split {args.split!r}, "
+            f"run {args.run_id!r}."
+        )
+        return
+
+    print("=" * 96)
+    print("BIOHUB BATCH INFERENCE")
+    print("=" * 96)
+    print(f"data root : {catalog.data_root}")
+    print(f"split     : {args.split}")
+    print(f"run id    : {args.run_id}")
+    print(f"selected  : {len(selected)}")
+    print(f"force     : {bool(args.force)}")
+    print("=" * 96)
+
+    backend = Investigation36Backend()
+    failures: list[tuple[str, str]] = []
+    completed = 0
+    skipped = 0
+
+    for index, record in enumerate(selected, start=1):
+        already_complete = record.paths.inference_complete(
+            args.run_id,
+            frame_count=record.frame_count,
+        )
+
+        if already_complete and not args.force:
+            print(
+                f"[{index}/{len(selected)}] SKIP "
+                f"{record.volume_id}: already complete"
+            )
+            skipped += 1
+            continue
+
+        print()
+        print(
+            f"[{index}/{len(selected)}] RUN "
+            f"{record.split}/{record.volume_id}"
+        )
+
+        try:
+            backend.run_volume(
+                record,
+                run_id=args.run_id,
+                force=bool(args.force),
+                extra_args=_extra(args.extra),
+            )
+            completed += 1
+        except Exception as exc:
+            failures.append(
+                (
+                    record.volume_id,
+                    f"{type(exc).__name__}: {exc}",
+                )
+            )
+            print(
+                f"[FAILED] {record.volume_id}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            if args.fail_fast:
+                raise
+
+    print()
+    print("=" * 96)
+    print("BATCH SUMMARY")
+    print("=" * 96)
+    print(f"completed : {completed}")
+    print(f"skipped   : {skipped}")
+    print(f"failed    : {len(failures)}")
+    for volume_id, message in failures:
+        print(f"  {volume_id}: {message}")
+    print("=" * 96)
+
+    if failures:
+        raise SystemExit(1)
+
+
+def _choose_annotation_record(
+    args,
+    *,
+    kind: str,
+) -> VolumeRecord:
+    catalog = _catalog(args)
+    return select_annotation_volume(
+        catalog,
+        split=args.split,
+        kind=kind,
+        run_id=args.run_id,
+        annotation_set=args.annotation_set,
+        volume_id=args.id,
+        resume=bool(args.resume),
+        next_volume=bool(args.next),
+    )
+
+
+def cmd_annotate_instances(args) -> None:
+    record = _choose_annotation_record(
+        args,
+        kind="instances",
+    )
+
+    print(
+        f"[annotation] selected {record.split}/{record.volume_id} "
+        f"for instance annotation"
+    )
+
+    run_instance_annotation(
+        record,
+        run_id=args.run_id,
+        annotation_set=args.annotation_set,
+        timepoint_selection=args.timepoints,
+        suspect_threshold=float(args.suspect_threshold),
+        resume=not bool(args.no_resume_data),
+    )
+
+
+def cmd_annotate_tracks(args) -> None:
+    record = _choose_annotation_record(
+        args,
+        kind="tracks",
+    )
+    paths = record.paths
+
+    ensure_annotation_binding(
+        record,
+        run_id=args.run_id,
+        annotation_set=args.annotation_set,
+    )
+    touch_annotation_session(
+        record,
+        kind="tracks",
+        annotation_set=args.annotation_set,
+        run_id=args.run_id,
+    )
+
+    source = paths.inference_run(args.run_id)
+    output = paths.track_annotations(args.annotation_set)
+    output.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        sys.executable,
+        "-m",
+        "dataset_curation._compat.track_annotator",
+        "--sample-id", record.volume_id,
+        "--source-root", str(source),
+        "--output-dir", str(output),
+    ]
+    if args.no_resume_data:
+        command.append("--no-resume")
+    command.extend(_extra(args.extra))
+
+    print(
+        f"[annotation] selected {record.split}/{record.volume_id} "
+        f"for track annotation"
+    )
+    print("[dataset_curation] " + " ".join(command), flush=True)
+    subprocess.run(
+        command,
+        cwd=repo_root(),
+        check=True,
+    )
+
+
+def _add_data_root(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=None,
+        help=(
+            "Advanced override. Default is the hard-coded external root "
+            f"{BIOHUB_DATA_ROOT}."
+        ),
+    )
+
+
+def _add_annotation_selector(
+    parser: argparse.ArgumentParser,
+) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--id",
+        help="Open this exact volume ID.",
+    )
+    group.add_argument(
+        "--next",
+        action="store_true",
+        help=(
+            "Open the first inference-ready volume whose annotation "
+            "session has never been started. This is the default."
+        ),
+    )
+    group.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Open the most recently touched existing annotation "
+            "session for this annotation type."
+        ),
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m dataset_curation",
-        description="Persistent inference-assisted cell dataset curation.",
+        description=(
+            "External-drive BioHub inference and one-volume-at-a-time "
+            "annotation workflow."
+        ),
     )
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--sample-id", required=True)
-    common.add_argument("--dataset", default=DEFAULT_DATASET)
-    common.add_argument("--root", default=None)
 
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True,
+    )
 
-    p = sub.add_parser("setup", parents=[common])
-    p.add_argument("--source-zarr", required=True)
-    p.add_argument(
-        "--spacing",
-        nargs=3,
+    status = sub.add_parser(
+        "status",
+        help="List discovered volumes and curation state.",
+    )
+    _add_data_root(status)
+    status.add_argument(
+        "--split",
+        choices=("train", "test", "all"),
+        default="train",
+    )
+    status.add_argument("--run-id", default="current")
+    status.add_argument("--annotation-set", default="main")
+    status.add_argument("--limit", type=int, default=None)
+    status.set_defaults(func=cmd_status)
+
+    infer = sub.add_parser(
+        "infer",
+        help="Run inference on missing/selected volumes.",
+    )
+    _add_data_root(infer)
+    infer.add_argument(
+        "--split",
+        choices=("train", "test"),
+        default="train",
+    )
+    selection = infer.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--id",
+        action="append",
+        help=(
+            "Run a specific volume. Repeat --id to select multiple IDs."
+        ),
+    )
+    selection.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        help=(
+            "Run this many volumes that do not already have a complete "
+            "inference cache."
+        ),
+    )
+    selection.add_argument(
+        "--all",
+        dest="all_volumes",
+        action="store_true",
+        help="Run every volume with missing inference.",
+    )
+    infer.add_argument("--run-id", default="current")
+    infer.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute even if the selected cache is complete.",
+    )
+    infer.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Stop the batch at the first failed volume.",
+    )
+    infer.add_argument(
+        "extra",
+        nargs=argparse.REMAINDER,
+        help=(
+            "Additional Investigation-36 arguments after `--`, for example "
+            "-- --checkpoint <path>."
+        ),
+    )
+    infer.set_defaults(func=cmd_infer)
+
+    instances = sub.add_parser(
+        "annotate-instances",
+        help="Open one volume in the merged-cell instance annotator.",
+    )
+    _add_data_root(instances)
+    instances.add_argument(
+        "--split",
+        choices=("train", "test"),
+        default="train",
+    )
+    _add_annotation_selector(instances)
+    instances.add_argument("--run-id", default="current")
+    instances.add_argument("--annotation-set", default="main")
+    instances.add_argument(
+        "--timepoints",
+        default="all",
+        help="all, 0-19, or comma/range selection.",
+    )
+    instances.add_argument(
+        "--suspect-threshold",
         type=float,
-        default=(1.625, 0.40625, 0.40625),
-        metavar=("Z", "Y", "X"),
+        default=0.70,
     )
-    p.set_defaults(func=cmd_setup)
+    instances.add_argument(
+        "--no-resume-data",
+        action="store_true",
+        help="Ignore persisted corrections inside the selected volume.",
+    )
+    instances.set_defaults(func=cmd_annotate_instances)
 
-    p = sub.add_parser("infer", parents=[common])
-    p.add_argument("--run-id", default="current")
-    p.add_argument("extra", nargs=argparse.REMAINDER)
-    p.set_defaults(func=cmd_infer)
+    tracks = sub.add_parser(
+        "annotate-tracks",
+        help="Open one volume in the Trackastra association annotator.",
+    )
+    _add_data_root(tracks)
+    tracks.add_argument(
+        "--split",
+        choices=("train", "test"),
+        default="train",
+    )
+    _add_annotation_selector(tracks)
+    tracks.add_argument("--run-id", default="current")
+    tracks.add_argument("--annotation-set", default="main")
+    tracks.add_argument(
+        "--no-resume-data",
+        action="store_true",
+        help="Ignore persisted track corrections for the selected volume.",
+    )
+    tracks.add_argument(
+        "extra",
+        nargs=argparse.REMAINDER,
+        help=(
+            "Additional track-annotator arguments after `--`, e.g. "
+            "-- --max-ray-distance-um 10."
+        ),
+    )
+    tracks.set_defaults(func=cmd_annotate_tracks)
 
-    p = sub.add_parser("register-spatial", parents=[common])
-    p.add_argument("--run-id", default="current")
-    p.add_argument("--instances-root", required=True)
-    p.add_argument("--supervoxels-root", required=True)
-    p.add_argument("--stage6-root", required=True)
-    p.add_argument("--zarr", default=None)
-    p.set_defaults(func=cmd_register_spatial)
-
-    p = sub.add_parser("suspects", parents=[common])
-    p.add_argument("--run-id", default="current")
-    p.add_argument("extra", nargs=argparse.REMAINDER)
-    p.set_defaults(func=cmd_suspects)
-
-    p = sub.add_parser("annotate-instances", parents=[common])
-    p.add_argument("--run-id", default="current")
-    p.add_argument("--annotation-set", default="main")
-    p.add_argument("extra", nargs=argparse.REMAINDER)
-    p.set_defaults(func=cmd_annotate_instances)
-
-    p = sub.add_parser("annotate-tracks", parents=[common])
-    p.add_argument("--run-id", default="current")
-    p.add_argument("--annotation-set", default="main")
-    p.add_argument("extra", nargs=argparse.REMAINDER)
-    p.set_defaults(func=cmd_annotate_tracks)
-
-    p = sub.add_parser("annotate-points", parents=[common])
-    p.set_defaults(func=cmd_annotate_points)
-
-    p = sub.add_parser("status", parents=[common])
-    p.set_defaults(func=cmd_status)
     return parser
 
-def main():
+
+def main() -> int:
     args = build_parser().parse_args()
+
+    # If no selector was supplied to an annotation command, `--next` is the
+    # effective default.
+    if args.command in {"annotate-instances", "annotate-tracks"}:
+        if not args.id and not args.resume and not args.next:
+            args.next = True
+
     args.func(args)
     return 0

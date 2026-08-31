@@ -1,135 +1,243 @@
-
 # dataset_curation
 
-`dataset_curation` is the persistent human-in-the-loop curation layer for the
-cell-tracking project.
+`dataset_curation` is the human-in-the-loop inference and annotation workflow
+for the BioHub cell-tracking dataset.
 
-## Current tasks migrated
+## External data root
 
-Current repository sources are preserved under `_compat/` during the first
-behavior-preserving migration:
-
-- `evaluation/segmentation/scripts/02_supervoxel_instance_annotator.py`
-  - merged-instance correction using atomic supervoxel seed groups,
-  - weighted contact-graph expansion,
-  - ray picking, Napari UI, Save/Undo/Reset, resumable corrected labels.
-- `evaluation/segmentation/scripts/03_biohub_merge_suspect_export.py`
-  - leak-free causal merge-suspect inference and threshold-independent scores.
-- `evaluation/segmentation/scripts/annotate_points.py`
-  - historical raw/binary-boundary point annotation workflow.
-- `evaluation/track_annotation/01_track_annotator.py`
-  - Trackastra Connect/Break/Complete Track correction using
-    `(frame, spatial_instance_id)` nodes and resumable graph overrides.
-
-The old paths become thin wrappers, so existing commands remain valid.
-
-## Persistent layout
+The production root is hard-coded as:
 
 ```text
-<curation-root>/<dataset>/<sample-id>/
-    sample.json
-    prepared/
-    inference/
-        <run-id>/
-            manifest.json
-            movies/
-            trackastra/
-            ...
-    annotations/
-        <annotation-set>/
-            manifest.json
-            instances/
-            tracks/
-            points/
+E:\data\biohub
 ```
 
-Inference artifacts are base predictions. Human corrections are stored in a
-separate annotation set that is bound to one inference run, preventing old
-annotations from silently being applied to a newer prediction with different
-instance IDs.
+Normal commands therefore do not require a data-path argument. An advanced
+`--data-root` override exists only for recovery/testing if the drive letter
+changes.
 
-By default the root is `data/curation/`. Set
-`CELL_TRACKING_CURATION_ROOT` or pass `--root` to keep large artifacts on
-another drive.
+The expected layout is:
 
-## Register a source movie
+```text
+E:\data\biohub\
+├── source\
+│   ├── train\
+│   │   └── <volume-id>\
+│   │       ├── <volume-id>.zarr\
+│   │       ├── ground_truth\
+│   │       │   ├── ground_truth_nodes.csv
+│   │       │   └── ground_truth_edges.csv
+│   │       └── README.txt
+│   └── test\
+│       └── <volume-id>\
+│           └── <volume-id>.zarr\
+│
+├── preprocessed\
+│   ├── train\
+│   │   └── <volume-id>\
+│   │       └── current\
+│   │           ├── movies\
+│   │           │   ├── raw.npy
+│   │           │   ├── preprocessed.npy
+│   │           │   ├── binary_mask.npy
+│   │           │   ├── source_instances.npy
+│   │           │   ├── supervoxels.npy
+│   │           │   └── final_instances.npy
+│   │           ├── trackastra\
+│   │           ├── cells_all.csv
+│   │           └── curation_manifest.json
+│   └── test\
+│       └── ...
+│
+└── annotations\
+    ├── train\
+    │   └── <volume-id>\
+    │       └── main\
+    │           ├── manifest.json
+    │           ├── instances\
+    │           └── tracks\
+    └── test\
+        └── ...
+```
+
+`source/` is treated as read-only. Generated inference/preprocessing data never
+go inside source sample directories.
+
+`README.txt` is ignored by discovery and is never used as a source of dataset
+metadata.
+
+The train `ground_truth/` CSVs are sparse graph supervision. Their presence is
+reported by `status`, but they are **not** treated as complete full-volume GT and
+are never used to decide whether inference is complete. Test volumes do not
+need a `ground_truth/` directory.
+
+## Inspect downloaded volumes
 
 ```powershell
-python -m dataset_curation setup `
-    --sample-id 44b6_0113de3b `
-    --source-zarr <path-to-sample.zarr>
+python -m dataset_curation status
 ```
 
-## Run current STIR-Net + Trackastra inference
+Train and test together:
 
-The backend calls the existing
-`investigations/stirnet/36_biohub_spatial_trackastra_visualization.py`
-implementation. Model code is not duplicated.
+```powershell
+python -m dataset_curation status --split all
+```
+
+Example columns:
+
+```text
+SPLIT  VOLUME          FRAMES  SPARSE_GT  INFERENCE  INST_ANN  TRACK_ANN
+train  44b6_0c582fdc   100     yes        missing    -         -
+```
+
+## Batch inference
+
+Run inference on the next 5 volumes that do **not** already have a complete
+preprocessed/inference cache:
+
+```powershell
+python -m dataset_curation infer --split train --count 5
+```
+
+Run one exact volume:
 
 ```powershell
 python -m dataset_curation infer `
-    --sample-id 44b6_0113de3b `
-    --run-id current `
-    -- --frame-count 20
+    --split train `
+    --id 44b6_0c582fdc
 ```
 
-The output is written directly below the named curation inference run.
-
-## Track annotation
+Run several exact IDs:
 
 ```powershell
-python -m dataset_curation annotate-tracks `
-    --sample-id 44b6_0113de3b `
-    --run-id current `
-    --annotation-set main
+python -m dataset_curation infer `
+    --split train `
+    --id 44b6_0c582fdc `
+    --id 44b6_12dfb391
 ```
 
-This uses the current `evaluation/track_annotation/01_track_annotator.py`
-behavior, but writes the resumable state below the curation annotation set.
-
-## Current instance-annotation contract
-
-The current instance annotator consumes:
-- Investigation-25 final split-only instances,
-- Investigation-24 atomic watershed supervoxels,
-- Stage-6 preprocessing/masking/segmentation,
-- raw Zarr.
-
-Register those exact existing artifacts once:
+Run every currently missing train volume:
 
 ```powershell
-python -m dataset_curation register-spatial `
-    --sample-id 44b6_0113de3b `
-    --run-id current `
-    --instances-root <inv25-sample-variant-root> `
-    --supervoxels-root <inv24-h100-root> `
-    --stage6-root <stage6-sample-root>
+python -m dataset_curation infer --split train --all
 ```
 
-Generate/reuse merge-suspect scores:
+Test volumes use the same command:
 
 ```powershell
-python -m dataset_curation suspects `
-    --sample-id 44b6_0113de3b `
-    --run-id current `
-    -- --timepoints all
+python -m dataset_curation infer --split test --all
 ```
 
-Open/resume instance correction:
+The selector considers the **number of pending volumes**, not the first N
+source directories. For example, `--count 5` selects 5 volumes that actually
+need work even if earlier IDs are already complete.
+
+A complete volume is skipped automatically. A partial cache is not considered
+complete and is sent back through the existing Investigation-36 cache logic.
+Batch processing continues to later volumes after a failure; add `--fail-fast`
+to stop immediately.
+
+Force a fresh inference for an exact volume:
+
+```powershell
+python -m dataset_curation infer `
+    --split train `
+    --id 44b6_0c582fdc `
+    --force
+```
+
+Extra Investigation-36 arguments can be forwarded after `--`:
+
+```powershell
+python -m dataset_curation infer `
+    --split train `
+    --count 3 `
+    -- --checkpoint <checkpoint-path>
+```
+
+The Zarr time dimension is read from Zarr metadata, so a 100-frame full volume
+is automatically passed to inference as 100 frames.
+
+## Annotation: one volume at a time
+
+### Instance correction
+
+Open the next inference-ready volume that has never had an instance-annotation
+session opened:
+
+```powershell
+python -m dataset_curation annotate-instances --next
+```
+
+Because `--next` is the default, this is equivalent:
+
+```powershell
+python -m dataset_curation annotate-instances
+```
+
+Resume the most recently opened instance-annotation session:
+
+```powershell
+python -m dataset_curation annotate-instances --resume
+```
+
+Open a specific volume:
 
 ```powershell
 python -m dataset_curation annotate-instances `
-    --sample-id 44b6_0113de3b `
-    --run-id current `
-    --annotation-set main `
-    -- --timepoints all --suspect-threshold 0.70
+    --id 44b6_0c582fdc
 ```
 
-## Why `_compat/` exists
+Limit the loaded frames when desired:
 
-This first migration changes architecture without rewriting the scientific or
-annotation behavior. The public package boundaries already separate workspace,
-inference, instance sessions/splitting, track graph/session, and point viewer
-responsibilities. Once regression fixtures are established, the large
-compatibility implementations can be decomposed physically behind the same
-public interfaces without changing outputs or user interaction.
+```powershell
+python -m dataset_curation annotate-instances `
+    --id 44b6_0c582fdc `
+    --timepoints 0-19
+```
+
+The current supervoxel split algorithm, ray picking, Save, Undo, Reset/Escape,
+unique colors, and resumable correction files are reused unchanged.
+
+A `_session.json` marker is written when the viewer is opened. This is
+intentional: if you inspect an entire volume and find **zero corrections**, it
+still counts as already reviewed for `--next`. If the session was interrupted,
+`--resume` reopens it.
+
+### Track correction
+
+Next fresh track-annotation volume:
+
+```powershell
+python -m dataset_curation annotate-tracks --next
+```
+
+Resume the most recently opened track annotation:
+
+```powershell
+python -m dataset_curation annotate-tracks --resume
+```
+
+Exact volume:
+
+```powershell
+python -m dataset_curation annotate-tracks `
+    --id 44b6_0c582fdc
+```
+
+The existing Trackastra Connect/Break/Complete Track, arbitrary-gap edges,
+division one-to-many edges, binary-mask picking, undo history, and persistent
+graph overrides are reused.
+
+## Why supervoxels are now part of inference output
+
+The current STIR-Net spatial inference already computes atomic watershed
+supervoxels. Investigation 36 previously discarded that tensor after each
+frame. Dataset curation needs it for merged-cell correction, so the cache now
+persists:
+
+```text
+movies/supervoxels.npy
+```
+
+This means newly inferred full BioHub volumes are annotation-ready without
+registering old Investigation-24/25 output directories.
