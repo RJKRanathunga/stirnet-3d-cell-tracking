@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# PROMOTE_STIRNET_PRODUCTION_INFERENCE_V1
+
 """Build a reproducible, private Kaggle inference bundle from the repository root.
 
 The bundle is deliberately assembled from the committed Git tree rather than by
@@ -10,7 +12,6 @@ submission.
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import os
 import shutil
@@ -37,8 +38,6 @@ DEFAULT_CHECKPOINT_CANDIDATES = (
 ARCHIVE_PATHS = (
     "learned",
     "src",
-    "investigations/stirnet/data/04_nis3d_geometry_checkpoint_eval.py",
-    "investigations/stirnet/data/12_biohub_full_volume_spatial_inference.py",
     "pyproject.toml",
     "requirements.txt",
 )
@@ -157,50 +156,34 @@ def load_checkpoint(path: Path) -> dict[str, Any]:
 
 
 
-def validate_checkpoint_model_compatibility(root: Path, checkpoint: Path) -> None:
-    """Strictly load the selected checkpoint with the exact current inference code.
+def validate_checkpoint_model_compatibility(
+    root: Path,
+    checkpoint: Path,
+) -> None:
+    """Strictly load the checkpoint through the production inference API."""
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
 
-    This is deliberately performed before any bundle is written. It catches stale
-    checkpoints whose serialized ModelConfig still hydrates but whose parameter
-    topology no longer matches the committed STIR-Net implementation.
-    """
-
-    helper_path = (
-        root
-        / "investigations"
-        / "stirnet"
-        / "data"
-        / "12_biohub_full_volume_spatial_inference.py"
+    from learned.stirnet.inference import (
+        SpatialInferenceConfig,
+        load_spatial_runtime,
     )
-    if not helper_path.is_file():
-        raise FileNotFoundError(helper_path)
 
-    module_name = "_stirnet_kaggle_bundle_checkpoint_preflight"
-    spec = importlib.util.spec_from_file_location(module_name, helper_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not import checkpoint preflight helper: {helper_path}")
-    helper = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = helper
-    try:
-        spec.loader.exec_module(helper)
-        loaded = helper.load_checkpoint_model_for_inference(
-            checkpoint,
-            torch.device("cpu"),
-        )
-        # Return shape is (checkpoint, model, model_cfg, train_cfg, compatibility_used).
-        model = loaded[1]
-        model_cfg = loaded[2]
-        compatibility_used = bool(loaded[4])
-        morphology_enabled = bool(model_cfg.partition.rag_morphology_enabled)
-        del model, loaded
-    finally:
-        sys.modules.pop(module_name, None)
+    runtime = load_spatial_runtime(
+        checkpoint,
+        device=torch.device("cpu"),
+        config=SpatialInferenceConfig(),
+    )
+    morphology_enabled = bool(
+        runtime.model_cfg.partition.rag_morphology_enabled
+    )
+    del runtime
 
     print(
         "[bundle] strict load     : OK "
-        f"(morphology={morphology_enabled}, "
-        f"training-config-compat={compatibility_used})"
+        f"(morphology={morphology_enabled}, production-inference-api=True)"
     )
+
 
 def write_inference_checkpoint(source: Path, destination: Path) -> dict[str, Any]:
     payload = load_checkpoint(source)

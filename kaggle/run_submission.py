@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# PROMOTE_STIRNET_PRODUCTION_INFERENCE_V1
+
 """Kaggle inference entry point for the spatial-only STIR-Net leaderboard baseline.
 
 This runner intentionally freezes the scientific boundary at:
@@ -26,7 +28,6 @@ import random
 import shutil
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,22 +68,11 @@ class SampleSpec:
     zarr_path: Path
 
 
-@dataclass(frozen=True)
-class ModelRuntime:
-    model: Any
-    model_cfg: Any
-    checkpoint_step: int
-    inference_cfg: Any
-    device: torch.device
-    checkpoint_sha256: str
-
-
 def _repo_root_from(path: str | Path) -> Path:
     root = Path(path).expanduser().resolve()
     required = (
         root / "learned" / "stirnet",
         root / "src",
-        root / "investigations" / "stirnet" / "data",
         root / "pyproject.toml",
     )
     missing = [str(value) for value in required if not value.exists()]
@@ -210,221 +200,42 @@ def _load_model_runtime(
     checkpoint: Path,
     *,
     device: torch.device,
+    spacing: tuple[float, float, float],
     tile_shape: tuple[int, int, int],
     tile_overlap: tuple[int, int, int],
     tile_halo: tuple[int, int, int],
     tile_batch_size: int,
-) -> tuple[ModelRuntime, Any]:
-    helper = _load_module(
-        repo_root / "investigations" / "stirnet" / "data" / "12_biohub_full_volume_spatial_inference.py",
-        "_kaggle_stirnet_spatial_helper",
+):
+    """Load the shared production STIR-Net runtime."""
+    from learned.stirnet.inference import (
+        SpatialInferenceConfig,
+        load_spatial_runtime,
     )
-    (
-        payload,
-        model,
-        model_cfg,
-        _train_cfg,
-        stripped_training_config,
-    ) = helper.load_checkpoint_model_for_inference(checkpoint, device)
-    model.eval()
-    inference_cfg = helper.build_inference_config(
-        model_cfg,
-        tile_shape_zyx=tile_shape,
-        tile_overlap_zyx=tile_overlap,
-        tile_halo_zyx=tile_halo,
-        tile_batch_size=tile_batch_size,
+
+    config = SpatialInferenceConfig(
+        spacing_zyx_um=tuple(float(v) for v in spacing),
+        tile_shape_zyx=tuple(int(v) for v in tile_shape),
+        tile_overlap_zyx=tuple(int(v) for v in tile_overlap),
+        tile_halo_zyx=tuple(int(v) for v in tile_halo),
+        tile_batch_size=int(tile_batch_size),
     )
-    print(
-        f"[checkpoint] step={int(payload['global_step'])} "
-        f"training_config_compat={'stripped' if stripped_training_config else 'native'}",
-        flush=True,
-    )
-    runtime = ModelRuntime(
-        model=model,
-        model_cfg=model_cfg,
-        checkpoint_step=int(payload["global_step"]),
-        inference_cfg=inference_cfg,
+    runtime = load_spatial_runtime(
+        checkpoint,
         device=device,
-        checkpoint_sha256=_sha256(checkpoint),
+        config=config,
     )
-    return runtime, helper
-
-
-def _tensor_numpy(value: Any, dtype=None) -> np.ndarray:
-    tensor = torch.as_tensor(value).detach()
-    if tensor.dtype == torch.bfloat16:
-        tensor = tensor.float()
-    array = tensor.cpu().numpy()
-    return array.astype(dtype, copy=False) if dtype is not None else array
-
-
-def _strict_refinement_check(before: np.ndarray, after: np.ndarray) -> None:
-    """The split-only postfilter may split a multicut component, never merge two."""
-    positive = after > 0
-    if not bool(positive.any()):
-        return
-    pairs = np.unique(
-        np.stack(
-            [
-                after[positive].astype(np.int64, copy=False),
-                before[positive].astype(np.int64, copy=False),
-            ],
-            axis=1,
-        ),
-        axis=0,
-    )
-    parent_by_child: dict[int, int] = {}
-    for child, parent in pairs.tolist():
-        child = int(child)
-        parent = int(parent)
-        old = parent_by_child.get(child)
-        if old is not None and old != parent:
-            raise RuntimeError(
-                "Source-core split-only invariant failed: output label "
-                f"{child} contains multicut labels {old} and {parent}."
-            )
-        parent_by_child[child] = parent
-
-
-def _apply_source_core_split_only(
-    before: np.ndarray,
-    watershed: np.ndarray,
-    separator_probability: np.ndarray,
-    source_mask: np.ndarray,
-    source_labels: np.ndarray,
-    spacing: tuple[float, float, float],
-    dref_um: float,
-) -> tuple[np.ndarray, dict[str, int]]:
-    from learned.stirnet.model.config import InferenceConfig
-    from learned.stirnet.model.postprocess.source_core_split import SourceCoreSplitOnlyFilter
-
-    cfg = InferenceConfig()
-    # This is the production default established by Investigation 25: Stage-6
-    # source instance IDs are independent split-only anchors.  They do not feed
-    # back into the learned RAG or signed multicut solve.
-    cfg.source_core_split_anchor_mode = "prefer_source_instances"
-    filt = SourceCoreSplitOnlyFilter(cfg)
-    with torch.inference_mode():
-        state = filt(
-            [torch.as_tensor(before, dtype=torch.long)],
-            torch.as_tensor((source_mask > 0)[None], dtype=torch.float32),
-            torch.as_tensor(separator_probability[None], dtype=torch.float32),
-            torch.tensor([spacing], dtype=torch.float32),
-            torch.tensor([float(dref_um)], dtype=torch.float32),
-            supervoxel_labels=[torch.as_tensor(watershed, dtype=torch.long)],
-            source_instance_labels=torch.as_tensor(
-                source_labels[None], dtype=torch.long
-            ),
-        )
-    after = state.labels[0].detach().cpu().numpy().astype(np.int32, copy=False)
-    _strict_refinement_check(before, after)
-    diagnostics = {
-        "candidate_count": int(state.candidate_count),
-        "applied_count": int(state.applied_count),
-        "skipped_too_many_cores": int(state.skipped_too_many_cores),
-    }
-    return after, diagnostics
-
-
-def _count_labels(labels: np.ndarray) -> int:
-    values = np.unique(labels)
-    return int(np.count_nonzero(values > 0))
-
-
-# STIRNET_PARALLEL_SPATIAL_PIPELINE_V1
-#
-# Production promotion of Investigation 34:
-# keep exactly one future frame in CPU preparation while the main thread owns
-# CUDA inference for the current frame. This deliberately bounds RAM and avoids
-# concurrent CUDA access from worker threads.
-
-
-@dataclass
-class _PreparedSpatialFrame:
-    frame: int
-    preprocessed: np.ndarray
-    source_mask: np.ndarray
-    source_labels: np.ndarray
-    spatial: np.ndarray
-    dref_um: float
-    preparation_seconds: float
-
-
-def _prepare_spatial_frame(
-    sample_zarr: Path,
-    frame: int,
-    helper: Any,
-    *,
-    spacing: tuple[float, float, float],
-    segmentation_config: Any,
-) -> _PreparedSpatialFrame:
-    """Prepare one frame on CPU without touching CUDA."""
-    from src.api import (
-        create_binary_mask,
-        preprocess_volume,
-        segment_instances,
-    )
-    from src.io import load_timepoint
-
-    started = time.perf_counter()
-
-    raw = load_timepoint(sample_zarr, frame)
-    preprocessed = preprocess_volume(raw)
-    source_mask = create_binary_mask(preprocessed)
-    source_labels = segment_instances(
-        source_mask,
-        config=segmentation_config,
-    )
-    spatial, dref_um = helper.build_stage6_spatial_input(
-        preprocessed,
-        source_labels,
-        spacing,
-    )
-
-    preparation_seconds = time.perf_counter() - started
-    del raw
-
-    return _PreparedSpatialFrame(
-        frame=int(frame),
-        preprocessed=preprocessed,
-        source_mask=source_mask,
-        source_labels=source_labels,
-        spatial=spatial,
-        dref_um=float(dref_um),
-        preparation_seconds=float(preparation_seconds),
-    )
+    return runtime, config
 
 
 def _process_spatial_sample(
     sample: SampleSpec,
     sample_work: Path,
-    runtime: ModelRuntime,
-    helper: Any,
-    *,
-    spacing: tuple[float, float, float],
+    runtime,
+    spatial_config,
 ) -> tuple[list[pd.DataFrame], tuple[Path, ...], list[dict[str, Any]]]:
-    from importlib import import_module
-
-    from src.api import detect_cells, extract_cell_features
-    from src.io import open_sample
-
-    image = open_sample(sample.zarr_path)
-    if len(image.shape) != 4:
-        raise ValueError(
-            f"{sample.dataset}: expected T,Z,Y,X image, got shape={image.shape}"
-        )
-    frame_count = int(image.shape[0])
-    if frame_count <= 0:
-        raise ValueError(f"{sample.dataset}: empty time axis")
-
-    # Canonical source-instance configuration used by the Stage-6 BioHub cache
-    # and validated bit-exactly before Investigation 34.
-    segmentation_config_module = import_module(
-        "src.03_segmentation.config"
-    )
-    source_segmentation_config = replace(
-        segmentation_config_module.DEFAULT_SEGMENTATION_CONFIG,
-        enable_geometric_completion=False,
+    """Kaggle persistence adapter over the shared production spatial engine."""
+    from learned.stirnet.inference import (
+        run_parallel_spatial_volume,
     )
 
     segmentation_dir = sample_work / "segmentation"
@@ -434,154 +245,33 @@ def _process_spatial_sample(
 
     time_frames: list[pd.DataFrame] = []
     segmentation_files: list[Path] = []
-    frame_summaries: list[dict[str, Any]] = []
 
-    # Investigation 34 established that one producer is sufficient:
-    # preparation is shorter than the CUDA spatial call and therefore remains
-    # fully hidden after the first frame. Keep the lookahead bounded to one
-    # prepared frame to cap host RAM.
-    with ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="stirnet-spatial-prep",
-    ) as prep_executor:
-        prepared_future = prep_executor.submit(
-            _prepare_spatial_frame,
-            sample.zarr_path,
-            0,
-            helper,
-            spacing=spacing,
-            segmentation_config=source_segmentation_config,
+    def consume_frame(result) -> None:
+        segmentation_path = (
+            segmentation_dir / f"t{int(result.frame):03d}.npy"
         )
+        cells_path = (
+            cells_dir / f"t{int(result.frame):03d}.csv"
+        )
+        _atomic_npy(segmentation_path, result.final_labels)
+        _atomic_csv(cells_path, result.cells)
+        time_frames.append(result.cells.copy())
+        segmentation_files.append(segmentation_path)
 
-        for frame in range(frame_count):
-            started = time.perf_counter()
+    volume_result = run_parallel_spatial_volume(
+        sample.zarr_path,
+        runtime,
+        config=spatial_config,
+        sample_id=sample.dataset,
+        on_frame=consume_frame,
+        require_nonempty_cells=True,
+    )
 
-            wait_started = time.perf_counter()
-            prepared = prepared_future.result()
-            preparation_wait_seconds = time.perf_counter() - wait_started
-            if prepared.frame != frame:
-                raise RuntimeError(
-                    f"{sample.dataset}: spatial preparation ordering failure: "
-                    f"expected t={frame:03d}, got t={prepared.frame:03d}"
-                )
-
-            # Start preparing t+1 before CUDA starts processing t.
-            next_frame = frame + 1
-            if next_frame < frame_count:
-                prepared_future = prep_executor.submit(
-                    _prepare_spatial_frame,
-                    sample.zarr_path,
-                    next_frame,
-                    helper,
-                    spacing=spacing,
-                    segmentation_config=source_segmentation_config,
-                )
-
-            result, spatial_gpu, amp_name, inference_seconds, peak_gib = (
-                helper.run_tiled_spatial(
-                    runtime.model,
-                    prepared.spatial,
-                    spacing,
-                    prepared.dref_um,
-                    device=runtime.device,
-                    inference_cfg=runtime.inference_cfg,
-                )
-            )
-
-            before = _tensor_numpy(
-                result.spatial_partition.labels[0],
-                np.int32,
-            )
-            watershed = _tensor_numpy(
-                result.supervoxel_labels[0],
-                np.int64,
-            )
-            separator_probability = _tensor_numpy(
-                result.dense.geometry.probabilities()["separator"][0, 0],
-                np.float32,
-            )
-            final_labels, split_diag = _apply_source_core_split_only(
-                before,
-                watershed,
-                separator_probability,
-                prepared.source_mask,
-                prepared.source_labels,
-                spacing,
-                prepared.dref_um,
-            )
-
-            cells = detect_cells(final_labels)
-            cells = extract_cell_features(
-                cells,
-                final_labels,
-                prepared.preprocessed,
-            )
-            if cells.empty:
-                raise RuntimeError(
-                    f"{sample.dataset} t={frame}: STIR-Net produced no cells; "
-                    "refusing to create a structurally valid but empty submission."
-                )
-
-            segmentation_path = segmentation_dir / f"t{frame:03d}.npy"
-            cells_path = cells_dir / f"t{frame:03d}.csv"
-            _atomic_npy(segmentation_path, final_labels)
-            _atomic_csv(cells_path, cells)
-            time_frames.append(cells)
-            segmentation_files.append(segmentation_path)
-
-            total_seconds = time.perf_counter() - started
-            preparation_hidden_seconds = max(
-                float(prepared.preparation_seconds)
-                - float(preparation_wait_seconds),
-                0.0,
-            )
-            preparation_hidden_fraction = (
-                preparation_hidden_seconds
-                / float(prepared.preparation_seconds)
-                if prepared.preparation_seconds > 0
-                else 0.0
-            )
-            summary = {
-                "frame": frame,
-                "source_instances": _count_labels(prepared.source_labels),
-                "multicut_instances": _count_labels(before),
-                "final_instances": _count_labels(final_labels),
-                "split_candidates": split_diag["candidate_count"],
-                "splits_applied": split_diag["applied_count"],
-                "amp_dtype": amp_name,
-                "inference_seconds": float(inference_seconds),
-                "preparation_seconds": float(prepared.preparation_seconds),
-                "preparation_wait_seconds": float(preparation_wait_seconds),
-                "preparation_hidden_seconds": float(preparation_hidden_seconds),
-                "preparation_hidden_fraction": float(
-                    preparation_hidden_fraction
-                ),
-                "total_seconds": float(total_seconds),
-                "peak_allocated_vram_gib": float(peak_gib),
-            }
-            frame_summaries.append(summary)
-            print(
-                f"[{sample.dataset} t={frame:03d}] "
-                f"source={summary['source_instances']} -> "
-                f"multicut={summary['multicut_instances']} -> "
-                f"final={summary['final_instances']} | "
-                f"splits={summary['splits_applied']} | "
-                f"prep={summary['preparation_seconds']:.2f}s "
-                f"prep_wait={summary['preparation_wait_seconds']:.2f}s "
-                f"hidden={100.0 * summary['preparation_hidden_fraction']:.1f}% | "
-                f"infer={inference_seconds:.2f}s total={total_seconds:.2f}s "
-                f"VRAM={peak_gib:.2f}GiB",
-                flush=True,
-            )
-
-            del result, spatial_gpu, prepared.spatial
-            del separator_probability, watershed, before, final_labels
-            del prepared, cells
-            if runtime.device.type == "cuda":
-                torch.cuda.empty_cache()
-            gc.collect()
-
-    return time_frames, tuple(segmentation_files), frame_summaries
+    return (
+        time_frames,
+        tuple(segmentation_files),
+        list(volume_result.frame_summaries),
+    )
 
 
 def _run_tracking_stack(
@@ -852,7 +542,7 @@ def _validate_submission_in_process(
 def _runtime_manifest(
     *,
     args: argparse.Namespace,
-    runtime: ModelRuntime,
+    runtime: Any,
     samples: list[SampleSpec],
     repo_root: Path,
 ) -> dict[str, Any]:
@@ -976,10 +666,11 @@ def main() -> int:
     submission_path = args.submission.expanduser().resolve()
     submission_path.parent.mkdir(parents=True, exist_ok=True)
 
-    runtime, helper = _load_model_runtime(
+    runtime, spatial_config = _load_model_runtime(
         repo_root,
         checkpoint,
         device=device,
+        spacing=args.spacing_values,
         tile_shape=args.tile_shape_values,
         tile_overlap=args.tile_overlap_values,
         tile_halo=args.tile_halo_values,
@@ -1021,8 +712,7 @@ def main() -> int:
             sample,
             sample_work,
             runtime,
-            helper,
-            spacing=args.spacing_values,
+            spatial_config,
         )
         stage7, stage8, stage10, stage11 = _run_tracking_stack(
             sample,
