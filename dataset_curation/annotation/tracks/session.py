@@ -86,6 +86,7 @@ class TrackAnnotationSession:
         self.history: list[dict[str, Any]] = []
         self._analysis_cache: dict[str, Any] | None = None
         self._analysis_rebuilds = 0
+        self._defer_derived_persistence = False
 
         # Manual completion is intentionally gone. Remove its old export if a
         # previous experimental unified session left one behind.
@@ -111,6 +112,37 @@ class TrackAnnotationSession:
 
     def _invalidate_analysis(self) -> None:
         self._analysis_cache = None
+
+    def set_deferred_derived_persistence(
+        self,
+        enabled: bool,
+    ) -> None:
+        """
+        Keep canonical JSON crash-safe while allowing derived CSV work to move
+        off the Napari GUI thread.
+        """
+        self._defer_derived_persistence = bool(
+            enabled
+        )
+
+
+    def _edge_is_active(
+        self,
+        edge: Edge,
+    ) -> bool:
+        edge = _canonical_edge(
+            edge[0],
+            edge[1],
+        )
+        return (
+            edge[0] in self.valid_nodes
+            and edge[1] in self.valid_nodes
+            and edge not in self.broken_edges
+            and (
+                edge in self.base_edges
+                or edge in self.forced_edges
+            )
+        )
 
     def _analysis(self) -> dict[str, Any]:
         cached = self._analysis_cache
@@ -434,7 +466,7 @@ class TrackAnnotationSession:
         previous_forced = edge in self.forced_edges
         previous_broken = edge in self.broken_edges
 
-        if edge in self.active_edges and not previous_broken:
+        if self._edge_is_active(edge) and not previous_broken:
             raise AnnotationError(
                 "That connection is already active in the corrected graph."
             )
@@ -466,7 +498,7 @@ class TrackAnnotationSession:
                 "Undo Birth before changing a parent-to-daughter edge."
             )
 
-        if edge not in self.active_edges:
+        if not self._edge_is_active(edge):
             raise AnnotationError(
                 "That connection is already absent from the corrected graph."
             )
@@ -716,6 +748,8 @@ class TrackAnnotationSession:
             exist_ok=True,
         )
 
+        # This is the canonical annotation state. It is intentionally small and
+        # is always written synchronously so a rapid annotation remains crash-safe.
         payload = {
             "schema_version": self.SCHEMA_VERSION,
             "sample_id": self.sample_id,
@@ -749,27 +783,39 @@ class TrackAnnotationSession:
                 for node in self.selections
             ],
             "history": self.history,
-            "automatic_hidden_nodes": int(
-                len(self.hidden_nodes)
-            ),
-            "unresolved_start_nodes": [
-                _node_json(node)
-                for node in sorted(
-                    self.unresolved_start_nodes
-                )
-            ],
-            "unresolved_end_nodes": [
-                _node_json(node)
-                for node in sorted(
-                    self.unresolved_end_nodes
-                )
-            ],
         }
+
+        # These fields are diagnostics only; the loader never needs them to
+        # reconstruct canonical state. Keep producing them in ordinary/session
+        # usage, but avoid forcing O(V+E) analysis on the interactive GUI path.
+        if not self._defer_derived_persistence:
+            payload.update(
+                {
+                    "automatic_hidden_nodes": int(
+                        len(self.hidden_nodes)
+                    ),
+                    "unresolved_start_nodes": [
+                        _node_json(node)
+                        for node in sorted(
+                            self.unresolved_start_nodes
+                        )
+                    ],
+                    "unresolved_end_nodes": [
+                        _node_json(node)
+                        for node in sorted(
+                            self.unresolved_end_nodes
+                        )
+                    ],
+                }
+            )
+
         _atomic_json(
             self.output.state_json,
             payload,
         )
-        self._export_tables()
+
+        if not self._defer_derived_persistence:
+            self._export_tables()
 
     def _export_tables(self) -> None:
         birth_edges = self.birth_edges

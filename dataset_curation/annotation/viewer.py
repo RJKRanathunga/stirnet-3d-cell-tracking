@@ -13,6 +13,12 @@ import napari
 import numpy as np
 import pandas as pd
 
+from dataset_curation.annotation.background_refresh import (
+    TrackRefreshCoordinator,
+    TrackRefreshResult,
+    capture_track_refresh_snapshot,
+)
+
 from dataset_curation.annotation.instances.centers import (
     frame_instance_centers,
     supervoxel_interior_points,
@@ -63,8 +69,10 @@ except ImportError as exc:
     ) from exc
 
 try:
+    from qtpy.QtCore import QTimer
     from qtpy.QtWidgets import QSizePolicy
 except ImportError:
+    QTimer = None
     QSizePolicy = None
 
 
@@ -625,6 +633,34 @@ def make_viewer(
         )
     )
 
+    # The initial session load remains fully synchronous so all existing
+    # exports are known-good. From this point onward the GUI writes only the
+    # small canonical JSON synchronously; derived tables/graph materialization
+    # are handled by one serialized background worker.
+    track_status_cache = {
+        "visible_edges": len(
+            track_session.visible_edges
+        ),
+        "hidden_nodes": len(
+            track_session.hidden_nodes
+        ),
+        "unresolved_starts": len(
+            track_session.unresolved_start_nodes
+        ),
+        "unresolved_ends": len(
+            track_session.unresolved_end_nodes
+        ),
+    }
+    track_session.set_deferred_derived_persistence(
+        True
+    )
+    background_coordinator = (
+        TrackRefreshCoordinator()
+    )
+    background_generation = {
+        "value": 0,
+    }
+
     # ------------------------------------------------------------------
     # Unified annotation controls
     # ------------------------------------------------------------------
@@ -672,6 +708,9 @@ def make_viewer(
     frame_label = Label(value="")
     selection_label = Label(value="")
     graph_label = Label(value="")
+    background_label = Label(
+        value="Background: idle"
+    )
     status_label = Label(
         value=(
             "Spatial mode: click visible supervoxels. "
@@ -737,6 +776,7 @@ def make_viewer(
         frame_label,
         selection_label,
         graph_label,
+        background_label,
         status_label,
     ):
         _make_label_shrinkable(widget)
@@ -749,6 +789,7 @@ def make_viewer(
             frame_label,
             selection_label,
             graph_label,
+            background_label,
             ignore_button,
             box1,
             box2,
@@ -934,12 +975,9 @@ def make_viewer(
     def invalidate_frame_metadata(frame: int) -> None:
         frame = int(frame)
         corrected_color_cache.pop(frame, None)
-        for key in [
-            key
-            for key in sv_metadata_cache
-            if key[0] == frame
-        ]:
-            del sv_metadata_cache[key]
+        # Supervoxels are immutable. Their cache key already includes the
+        # hallucinated-ID set, so Split/Merge must not throw away expensive
+        # supervoxel interior-point metadata.
 
     def _diagnostic_frame_for_key(
         key: str,
@@ -1185,9 +1223,194 @@ def make_viewer(
         )
         hidden_track_centers_layer.refresh()
 
+        track_status_cache.update(
+            {
+                "visible_edges": len(
+                    track_session.visible_edges
+                ),
+                "hidden_nodes": len(
+                    track_session.hidden_nodes
+                ),
+                "unresolved_starts": len(
+                    track_session.unresolved_start_nodes
+                ),
+                "unresolved_ends": len(
+                    track_session.unresolved_end_nodes
+                ),
+            }
+        )
+
         refresh_diagnostic_layers(
             current_diagnostics
         )
+
+    def request_background_track_refresh(
+        reason: str,
+    ) -> None:
+        background_generation["value"] += 1
+        generation = int(
+            background_generation["value"]
+        )
+
+        snapshot = capture_track_refresh_snapshot(
+            generation=generation,
+            reason=str(reason),
+            track_session=track_session,
+            track_centers=track_centers,
+        )
+        background_coordinator.request(
+            snapshot
+        )
+        background_label.value = (
+            f"Background: updating… generation {generation} ({reason})"
+        )
+
+
+    def _apply_background_track_result(
+        result: TrackRefreshResult,
+    ) -> None:
+        nonlocal all_tracks_layer
+        nonlocal active_tracks_layer
+        nonlocal hidden_tracks_layer
+        nonlocal current_tracks
+        nonlocal current_diagnostics
+
+        current_tracks = result.current_tracks
+        current_diagnostics = result.diagnostics
+
+        track_status_cache.update(
+            {
+                "visible_edges": int(
+                    result.visible_edge_count
+                ),
+                "hidden_nodes": int(
+                    result.hidden_node_count
+                ),
+                "unresolved_starts": int(
+                    result.unresolved_start_count
+                ),
+                "unresolved_ends": int(
+                    result.unresolved_end_count
+                ),
+            }
+        )
+
+        all_visible = False
+        if all_tracks_layer is not None:
+            try:
+                all_visible = bool(
+                    all_tracks_layer.visible
+                )
+            except Exception:
+                pass
+
+        all_tracks_layer = _sync_tracks_layer(
+            viewer,
+            all_tracks_layer,
+            result.all_tracks_array,
+            name="Tracks - all",
+            scale_tzyx=scale_tzyx,
+            tail_length=TRACK_HISTORY_FRAMES,
+            visible=all_visible,
+        )
+
+        all_centers_layer.data = (
+            result.all_points_array
+        )
+        try:
+            all_centers_layer.properties = (
+                result.all_properties
+            )
+        except Exception:
+            pass
+        all_centers_layer.refresh()
+
+        active_visible = True
+        if active_tracks_layer is not None:
+            try:
+                active_visible = bool(
+                    active_tracks_layer.visible
+                )
+            except Exception:
+                pass
+
+        active_tracks_layer = _sync_tracks_layer(
+            viewer,
+            active_tracks_layer,
+            result.active_tracks_array,
+            name="Corrected Tracks - active",
+            scale_tzyx=scale_tzyx,
+            tail_length=TRACK_HISTORY_FRAMES,
+            visible=active_visible,
+        )
+
+        hidden_visible = False
+        if hidden_tracks_layer is not None:
+            try:
+                hidden_visible = bool(
+                    hidden_tracks_layer.visible
+                )
+            except Exception:
+                pass
+
+        hidden_tracks_layer = _sync_tracks_layer(
+            viewer,
+            hidden_tracks_layer,
+            result.hidden_tracks_array,
+            name="Hidden tracks",
+            scale_tzyx=scale_tzyx,
+            tail_length=TRACK_HISTORY_FRAMES,
+            visible=hidden_visible,
+        )
+
+        hidden_track_centers_layer.data = (
+            result.hidden_points_array
+        )
+        hidden_track_centers_layer.refresh()
+
+        refresh_diagnostic_layers(
+            current_diagnostics
+        )
+        refresh_status()
+
+
+    def poll_background_track_refresh() -> None:
+        try:
+            result = background_coordinator.poll()
+        except Exception as exc:
+            background_label.value = (
+                "Background: ERROR — " + str(exc)
+            )
+            print()
+            print("[background annotation refresh error]")
+            print(exc)
+            return
+
+        if result is None:
+            return
+
+        latest = int(
+            background_coordinator.latest_generation
+        )
+
+        if int(result.generation) != latest:
+            background_label.value = (
+                f"Background: updating… generation {latest}"
+            )
+            return
+
+        _apply_background_track_result(
+            result
+        )
+
+        if background_coordinator.busy:
+            background_label.value = (
+                f"Background: updating… generation {latest}"
+            )
+        else:
+            background_label.value = (
+                f"Background: idle — applied generation {latest}"
+            )
 
     def refresh_current_frame_layers(
         *,
@@ -1196,6 +1419,11 @@ def make_viewer(
     ) -> None:
         frame = current_frame()
         corrected = spatial_session.frame(frame)
+
+        if spatial_authority_changed:
+            invalidate_frame_metadata(
+                frame
+            )
 
         hallucinated = spatial_session.hallucinated_supervoxels(
             frame
@@ -1284,14 +1512,6 @@ def make_viewer(
                 frame,
                 centers.keys(),
             )
-            invalidate_frame_metadata(
-                frame
-            )
-            # Rebuild the corrected mapping once after invalidation.
-            corrected_mapping = label_color_dict(
-                corrected
-            )
-            corrected_color_cache[frame] = corrected_mapping
         else:
             centers = dict(
                 centers_by_frame.get(
@@ -1400,14 +1620,14 @@ def make_viewer(
             )
         )
         graph_label.value = (
-            f"Tracks: visible edges={len(track_session.visible_edges)} | "
-            f"hidden nodes={len(track_session.hidden_nodes)} | "
+            f"Tracks: visible edges={track_status_cache['visible_edges']} | "
+            f"hidden nodes={track_status_cache['hidden_nodes']} | "
             f"manual continues={len(track_session.forced_edges - track_session.birth_edges)} | "
             f"manual breaks={len(track_session.broken_edges)} | "
             f"births={len(track_session.birth_events)} | "
             f"ignored review={len(track_session.ignored_events)} | "
-            f"unresolved starts={len(track_session.unresolved_start_nodes)} | "
-            f"unresolved ends={len(track_session.unresolved_end_nodes)}"
+            f"unresolved starts={track_status_cache['unresolved_starts']} | "
+            f"unresolved ends={track_status_cache['unresolved_ends']}"
         )
 
         try:
@@ -1700,7 +1920,7 @@ def make_viewer(
 
         clear_spatial_selection()
         clear_track_selection()
-        refresh_track_graph_layers()
+        request_background_track_refresh("ignore")
         refresh_status()
 
         if added:
@@ -1739,9 +1959,10 @@ def make_viewer(
 
         clear_spatial_selection()
         refresh_current_frame_layers(
-            refresh_tracks=True,
+            refresh_tracks=False,
             spatial_authority_changed=True,
         )
+        request_background_track_refresh("split")
         refresh_status()
         status_label.value = (
             f"SPLIT saved at t={result.timepoint}: "
@@ -1770,9 +1991,10 @@ def make_viewer(
 
         clear_spatial_selection()
         refresh_current_frame_layers(
-            refresh_tracks=True,
+            refresh_tracks=False,
             spatial_authority_changed=True,
         )
+        request_background_track_refresh("merge")
         refresh_status()
         status_label.value = (
             f"MERGE saved at t={result.timepoint}: "
@@ -1808,9 +2030,10 @@ def make_viewer(
 
         clear_spatial_selection()
         refresh_current_frame_layers(
-            refresh_tracks=True,
+            refresh_tracks=False,
             spatial_authority_changed=True,
         )
+        request_background_track_refresh("hallucination")
         refresh_status()
         status_label.value = (
             f"HALLUCINATION saved: t={record['timepoint']} "
@@ -1831,9 +2054,10 @@ def make_viewer(
         )
         clear_spatial_selection()
         refresh_current_frame_layers(
-            refresh_tracks=True,
+            refresh_tracks=False,
             spatial_authority_changed=True,
         )
+        request_background_track_refresh("undo-spatial")
         refresh_status()
         status_label.value = (
             f"Undid spatial {result.operation_type} at "
@@ -1849,7 +2073,7 @@ def make_viewer(
             show_error(exc)
             return
         refresh_track_selection_layers()
-        refresh_track_graph_layers()
+        request_background_track_refresh("continue")
         refresh_status()
         status_label.value = (
             f"CONTINUE: t={edge[0][0]} id={edge[0][1]} -> "
@@ -1866,7 +2090,7 @@ def make_viewer(
             show_error(exc)
             return
         refresh_track_selection_layers()
-        refresh_track_graph_layers()
+        request_background_track_refresh("break")
         refresh_status()
         status_label.value = (
             f"BREAK: t={edge[0][0]} id={edge[0][1]} -> "
@@ -1883,7 +2107,7 @@ def make_viewer(
             return
 
         refresh_track_selection_layers()
-        refresh_track_graph_layers()
+        request_background_track_refresh("birth")
         refresh_status()
 
         parent = event["parent"]
@@ -1920,7 +2144,7 @@ def make_viewer(
             focus,
         )
         refresh_track_selection_layers()
-        refresh_track_graph_layers()
+        request_background_track_refresh("undo-track")
         refresh_status()
         status_label.value = (
             f"Undid last track {op.get('type', 'operation')}."
@@ -1979,6 +2203,45 @@ def make_viewer(
     undo_track_button.changed.connect(
         lambda *_: undo_track()
     )
+
+    if QTimer is None:
+        raise RuntimeError(
+            "Qt QTimer is required for asynchronous annotation refresh."
+        )
+
+    background_timer = QTimer()
+    background_timer.setInterval(40)
+    background_timer.timeout.connect(
+        poll_background_track_refresh
+    )
+    background_timer.start()
+
+    # Keep Python references alive for the lifetime of the Napari viewer.
+    viewer._dataset_curation_background_timer = (
+        background_timer
+    )
+    viewer._dataset_curation_background_coordinator = (
+        background_coordinator
+    )
+
+
+    def _shutdown_background_refresh(*_args) -> None:
+        try:
+            background_timer.stop()
+        except Exception:
+            pass
+        try:
+            background_coordinator.shutdown()
+        except Exception:
+            pass
+
+
+    try:
+        viewer.window._qt_window.destroyed.connect(
+            _shutdown_background_refresh
+        )
+    except Exception:
+        pass
 
     def reset_all_selections(_source=None) -> None:
         clear_spatial_selection()
@@ -2144,6 +2407,8 @@ def make_viewer(
     print("spatial controls    : Save Split | Save Merge | Hallucination | Undo Spatial")
     print("track controls      : Continue Track | Break Track | Birth | Undo Track")
     print("common control      : Ignore -> tracks/ignored_events.csv (pending review)")
+    print("background refresh  : serialized + latest-state coalescing")
+    print("canonical save      : synchronous JSON; derived CSV/layers asynchronous")
     print("track completion    : automatic; complete components move to Hidden tracks")
     print("ray picking         : always derived from Raw BioHub")
     print("3-D contours        : disabled; translucent SV fills avoid Napari warning")
