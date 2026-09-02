@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import json
 import pandas as pd
 
 from dataset_curation.annotation.tracks.current import (
@@ -128,3 +129,78 @@ def test_viewer_has_one_common_ignore_button():
     assert "def ignore_selected() -> None:" in viewer
     assert "ignore_button.changed.connect(" in viewer
     assert "current_instance_for_supervoxel(" in viewer
+
+def test_schema3_resume_preserves_existing_annotations(
+    tmp_path: Path,
+):
+    nodes = {
+        (0, 1),
+        (1, 1),
+        (3, 2),
+        (4, 2),
+    }
+    output = OutputPaths(
+        tmp_path / "tracks"
+    )
+    common = {
+        "sample_id": "schema3-upgrade-test",
+        "source_root": tmp_path / "source",
+        "output": output,
+        "valid_nodes": nodes,
+        "base_edges": {
+            ((0, 1), (1, 1)),
+            ((3, 2), (4, 2)),
+        },
+        "frame_count": 5,
+        "boundary_entry_nodes": set(),
+        "boundary_exit_nodes": set(),
+    }
+
+    original = TrackAnnotationSession(
+        **common,
+        resume=False,
+    )
+
+    original.add_selection((1, 1))
+    original.add_selection((3, 2))
+    continued = original.connect_selected()
+
+    state = json.loads(
+        output.state_json.read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["schema_version"] == 4
+    assert state["forced_edges"]
+    assert state["history"]
+
+    state["schema_version"] = 3
+    state.pop("ignored_events", None)
+    output.state_json.write_text(
+        json.dumps(
+            state,
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    resumed = TrackAnnotationSession(
+        **common,
+        resume=True,
+    )
+
+    assert continued in resumed.forced_edges
+    assert resumed.broken_edges == original.broken_edges
+    assert resumed.birth_events == original.birth_events
+    assert resumed.history == original.history
+    assert resumed.ignored_events == []
+
+    migrated = json.loads(
+        output.state_json.read_text(
+            encoding="utf-8"
+        )
+    )
+    assert migrated["schema_version"] == 4
+    assert migrated["ignored_events"] == []
+    assert output.ignored_events_csv.is_file()

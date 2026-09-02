@@ -992,18 +992,26 @@ class TrackAnnotationSession:
                 encoding="utf-8"
             )
         )
-        if int(
+        loaded_schema = int(
             payload.get(
                 "schema_version",
                 -1,
             )
-        ) != self.SCHEMA_VERSION:
+        )
+
+        # Schema 4 is an additive extension of schema 3: it adds
+        # ignored_events only. A schema-3 annotation is therefore interpreted
+        # exactly as the same annotation with ignored_events == [].
+        if loaded_schema not in {
+            3,
+            self.SCHEMA_VERSION,
+        }:
             raise AnnotationError(
                 f"Unsupported track annotation schema in "
                 f"{self.output.state_json}: "
                 f"{payload.get('schema_version')!r}. "
-                "This annotator intentionally does not carry old manual-"
-                "completion compatibility."
+                "Only the lossless schema-3 -> schema-4 Ignore upgrade "
+                "is supported."
             )
 
         if str(
