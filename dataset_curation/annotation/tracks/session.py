@@ -83,6 +83,8 @@ class TrackAnnotationSession:
         self.birth_events: list[dict[str, Any]] = []
         self.selections: list[Node] = []
         self.history: list[dict[str, Any]] = []
+        self._analysis_cache: dict[str, Any] | None = None
+        self._analysis_rebuilds = 0
 
         # Manual completion is intentionally gone. Remove its old export if a
         # previous experimental unified session left one behind.
@@ -106,80 +108,123 @@ class TrackAnnotationSession:
         self._validate_node(edge[0])
         self._validate_node(edge[1])
 
-    @property
-    def active_edges(self) -> set[Edge]:
-        candidate = (
-            self.base_edges
-            | self.forced_edges
-        ) - self.broken_edges
-        return {
+    def _invalidate_analysis(self) -> None:
+        self._analysis_cache = None
+
+    def _analysis(self) -> dict[str, Any]:
+        cached = self._analysis_cache
+        if cached is not None:
+            return cached
+
+        candidate = (self.base_edges | self.forced_edges) - self.broken_edges
+        active_edges: set[Edge] = {
             edge
             for edge in candidate
-            if edge[0] in self.valid_nodes
-            and edge[1] in self.valid_nodes
+            if edge[0] in self.valid_nodes and edge[1] in self.valid_nodes
         }
 
-    def _component_sets(self) -> list[set[Node]]:
         adjacency: dict[Node, set[Node]] = defaultdict(set)
-        for left, right in self.active_edges:
+        incoming: set[Node] = set()
+        outgoing: set[Node] = set()
+
+        for left, right in active_edges:
             adjacency[left].add(right)
             adjacency[right].add(left)
+            outgoing.add(left)
+            incoming.add(right)
 
         remaining = set(self.valid_nodes)
-        components: list[set[Node]] = []
+        components: list[frozenset[Node]] = []
+        hidden_nodes: set[Node] = set()
+        unresolved_starts: set[Node] = set()
+        unresolved_ends: set[Node] = set()
 
         while remaining:
-            seed = min(remaining)
-            visited = {seed}
+            seed = next(iter(remaining))
+            visited: set[Node] = {seed}
             queue: deque[Node] = deque([seed])
 
             while queue:
                 node = queue.popleft()
                 for neighbour in adjacency.get(node, ()):
-                    if (
-                        neighbour in remaining
-                        and neighbour not in visited
-                    ):
+                    if neighbour in remaining and neighbour not in visited:
                         visited.add(neighbour)
                         queue.append(neighbour)
 
             remaining.difference_update(visited)
-            components.append(visited)
+            component = frozenset(visited)
+            components.append(component)
 
-        return components
+            starts = {node for node in component if node not in incoming}
+            ends = {node for node in component if node not in outgoing}
+
+            bad_starts = {
+                node for node in starts if not self._legitimate_start(node)
+            }
+            bad_ends = {
+                node for node in ends if not self._legitimate_end(node)
+            }
+
+            unresolved_starts.update(bad_starts)
+            unresolved_ends.update(bad_ends)
+
+            if component and not bad_starts and not bad_ends:
+                hidden_nodes.update(component)
+
+        hidden_edges = {
+            edge
+            for edge in active_edges
+            if edge[0] in hidden_nodes and edge[1] in hidden_nodes
+        }
+        visible_edges = active_edges - hidden_edges
+
+        result: dict[str, Any] = {
+            'active_edges': active_edges,
+            'components': tuple(components),
+            'incoming': incoming,
+            'outgoing': outgoing,
+            'hidden_nodes': hidden_nodes,
+            'hidden_edges': hidden_edges,
+            'visible_edges': visible_edges,
+            'unresolved_start_nodes': unresolved_starts,
+            'unresolved_end_nodes': unresolved_ends,
+        }
+        self._analysis_cache = result
+        self._analysis_rebuilds += 1
+
+        print(
+            '[tracks] graph analysis '
+            f'#{self._analysis_rebuilds}: '
+            f'nodes={len(self.valid_nodes)} '
+            f'edges={len(active_edges)} '
+            f'components={len(components)} '
+            f'hidden_nodes={len(hidden_nodes)} '
+            f'unresolved_starts={len(unresolved_starts)} '
+            f'unresolved_ends={len(unresolved_ends)}',
+            flush=True,
+        )
+        return result
+
+    @property
+    def active_edges(self) -> set[Edge]:
+        return self._analysis()['active_edges']
+
+    def _component_sets(self) -> list[set[Node]]:
+        return [set(component) for component in self._analysis()['components']]
 
     def _component_temporal_endpoints(
         self,
         component: set[Node],
     ) -> tuple[set[Node], set[Node]]:
-        incoming: set[Node] = set()
-        outgoing: set[Node] = set()
-
-        for left, right in self.active_edges:
-            if (
-                left in component
-                and right in component
-            ):
-                outgoing.add(left)
-                incoming.add(right)
-
-        starts = {
-            node
-            for node in component
-            if node not in incoming
-        }
-        ends = {
-            node
-            for node in component
-            if node not in outgoing
-        }
+        analysis = self._analysis()
+        incoming = analysis['incoming']
+        outgoing = analysis['outgoing']
+        starts = {node for node in component if node not in incoming}
+        ends = {node for node in component if node not in outgoing}
         return starts, ends
 
     def _legitimate_start(self, node: Node) -> bool:
-        return (
-            int(node[0]) == 0
-            or node in self.boundary_entry_nodes
-        )
+        return int(node[0]) == 0 or node in self.boundary_entry_nodes
 
     def _legitimate_end(self, node: Node) -> bool:
         return (
@@ -189,84 +234,30 @@ class TrackAnnotationSession:
 
     @property
     def unresolved_start_nodes(self) -> set[Node]:
-        result: set[Node] = set()
-        for component in self._component_sets():
-            starts, _ = self._component_temporal_endpoints(
-                component
-            )
-            result.update(
-                node
-                for node in starts
-                if not self._legitimate_start(node)
-            )
-        return result
+        return self._analysis()['unresolved_start_nodes']
 
     @property
     def unresolved_end_nodes(self) -> set[Node]:
-        result: set[Node] = set()
-        for component in self._component_sets():
-            _, ends = self._component_temporal_endpoints(
-                component
-            )
-            result.update(
-                node
-                for node in ends
-                if not self._legitimate_end(node)
-            )
-        return result
+        return self._analysis()['unresolved_end_nodes']
 
-    def _component_complete(
-        self,
-        component: set[Node],
-    ) -> bool:
-        starts, ends = self._component_temporal_endpoints(
-            component
-        )
-        return (
-            bool(component)
-            and all(
-                self._legitimate_start(node)
-                for node in starts
-            )
-            and all(
-                self._legitimate_end(node)
-                for node in ends
-            )
-        )
+    def _component_complete(self, component: set[Node]) -> bool:
+        return bool(component) and component <= self._analysis()['hidden_nodes']
 
     @property
     def hidden_nodes(self) -> set[Node]:
-        result: set[Node] = set()
-        for component in self._component_sets():
-            if self._component_complete(component):
-                result.update(component)
-        return result
+        return self._analysis()['hidden_nodes']
 
     @property
     def visible_nodes(self) -> set[Node]:
-        return self.valid_nodes - self.hidden_nodes
+        return self.valid_nodes - self._analysis()['hidden_nodes']
 
     @property
     def hidden_edges(self) -> set[Edge]:
-        hidden = self.hidden_nodes
-        return {
-            edge
-            for edge in self.active_edges
-            if edge[0] in hidden
-            and edge[1] in hidden
-        }
+        return self._analysis()['hidden_edges']
 
     @property
     def visible_edges(self) -> set[Edge]:
-        hidden = self.hidden_nodes
-        return {
-            edge
-            for edge in self.active_edges
-            if not (
-                edge[0] in hidden
-                and edge[1] in hidden
-            )
-        }
+        return self._analysis()['visible_edges']
 
     @property
     def birth_edges(self) -> set[Edge]:
@@ -311,6 +302,7 @@ class TrackAnnotationSession:
 
         self.valid_nodes.difference_update(old_nodes)
         self.valid_nodes.update(new_nodes)
+        self._invalidate_analysis()
 
         self.selections = [
             node
@@ -336,11 +328,9 @@ class TrackAnnotationSession:
             )
 
         self.selections.append(node)
-        self.persist()
 
     def reset_selections(self) -> None:
         self.selections.clear()
-        self.persist()
 
     def _selected_edge(self) -> Edge:
         if len(self.selections) != 2:
@@ -367,6 +357,7 @@ class TrackAnnotationSession:
 
         self.forced_edges.add(edge)
         self.broken_edges.discard(edge)
+        self._invalidate_analysis()
         self.history.append(
             {
                 "type": "connect",
@@ -398,6 +389,7 @@ class TrackAnnotationSession:
 
         self.broken_edges.add(edge)
         self.forced_edges.discard(edge)
+        self._invalidate_analysis()
         self.history.append(
             {
                 "type": "break",
@@ -521,6 +513,7 @@ class TrackAnnotationSession:
             self.broken_edges.discard(edge)
 
         self.birth_events.append(event)
+        self._invalidate_analysis()
         self.history.append(
             {
                 "type": "birth",
@@ -628,6 +621,7 @@ class TrackAnnotationSession:
                 f"Unknown track operation type: {op_type!r}"
             )
 
+        self._invalidate_analysis()
         self.selections.clear()
         self.persist()
         return op

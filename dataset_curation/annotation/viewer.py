@@ -242,9 +242,11 @@ def make_viewer(
         *tuple(float(v) for v in spacing_zyx),
     )
 
+    print("[viewer] creating Napari window...", flush=True)
     viewer = napari.Viewer(
         ndisplay=3
     )
+    print("[viewer] Napari window created", flush=True)
     viewer.dims.axis_labels = (
         "time",
         "z",
@@ -253,6 +255,7 @@ def make_viewer(
     )
 
     low, high = estimate_contrast_limits(raw)
+    print("[viewer] adding lazy raw Zarr layer...", flush=True)
     raw_layer = viewer.add_image(
         raw,
         name="Raw BioHub",
@@ -264,6 +267,8 @@ def make_viewer(
             float(high),
         ],
     )
+
+    print("[viewer] raw layer ready", flush=True)
 
     binary_layer = viewer.add_labels(
         np.zeros(
@@ -417,9 +422,12 @@ def make_viewer(
         blending="additive",
     )
 
+    print("[viewer] spatial annotation layers ready", flush=True)
+
     # ------------------------------------------------------------------
     # Notebook-09 Trackastra visualization
     # ------------------------------------------------------------------
+    print("[viewer] adding Trackastra diagnostic layers...", flush=True)
     all_tracks_array, all_points_array, all_properties = (
         track_frame_arrays(original_tracks)
     )
@@ -520,6 +528,9 @@ def make_viewer(
         visible=False,
     )
 
+    print("[viewer] Trackastra diagnostic layers ready", flush=True)
+    print("[viewer] analyzing corrected tracking graph...", flush=True)
+
     active_tracks_layer = _sync_tracks_layer(
         viewer,
         None,
@@ -557,6 +568,8 @@ def make_viewer(
         face_color="gray",
     )
     hidden_track_centers_layer.visible = False
+
+    print("[viewer] corrected tracking graph layers ready", flush=True)
 
     diagnostic_categories = (
         diagnostic_node_categories(
@@ -1658,6 +1671,7 @@ def make_viewer(
     except Exception:
         pass
 
+    print("[viewer] initializing current-frame overlays...", flush=True)
     last_frame["value"] = current_frame()
     refresh_current_frame_layers()
     refresh_status()
