@@ -32,6 +32,7 @@ from dataset_curation.annotation.layers import (
 )
 from dataset_curation.annotation.tracks.current import (
     build_current_track_table,
+    diagnostic_events_for_node,
     filter_diagnostic_rows_for_frame,
     persist_current_track_table,
     prepare_current_endpoint_groups,
@@ -461,6 +462,8 @@ def make_viewer(
         boundary_entry_nodes=track_session.boundary_entry_nodes,
         boundary_exit_nodes=track_session.boundary_exit_nodes,
         hidden_nodes=track_session.hidden_nodes,
+        ignored_start_nodes=track_session.ignored_start_nodes,
+        ignored_end_nodes=track_session.ignored_end_nodes,
     )
 
     all_tracks_array, all_points_array, all_properties = (
@@ -672,7 +675,7 @@ def make_viewer(
     status_label = Label(
         value=(
             "Spatial mode: click visible supervoxels. "
-            "Use Save Split, Save Merge, or Hallucination."
+            "Use Save Split, Save Merge, Hallucination, or Ignore."
         )
     )
 
@@ -681,6 +684,9 @@ def make_viewer(
     )
     tracking_mode_button = PushButton(
         text="Tracking mode"
+    )
+    ignore_button = PushButton(
+        text="Ignore"
     )
 
     box1 = LineEdit(label="Instance 1")
@@ -743,6 +749,7 @@ def make_viewer(
             frame_label,
             selection_label,
             graph_label,
+            ignore_button,
             box1,
             box2,
             box3,
@@ -1102,6 +1109,8 @@ def make_viewer(
             boundary_entry_nodes=track_session.boundary_entry_nodes,
             boundary_exit_nodes=track_session.boundary_exit_nodes,
             hidden_nodes=track_session.hidden_nodes,
+            ignored_start_nodes=track_session.ignored_start_nodes,
+            ignored_end_nodes=track_session.ignored_end_nodes,
         )
 
         all_visible = False
@@ -1396,6 +1405,7 @@ def make_viewer(
             f"manual continues={len(track_session.forced_edges - track_session.birth_edges)} | "
             f"manual breaks={len(track_session.broken_edges)} | "
             f"births={len(track_session.birth_events)} | "
+            f"ignored review={len(track_session.ignored_events)} | "
             f"unresolved starts={len(track_session.unresolved_start_nodes)} | "
             f"unresolved ends={len(track_session.unresolved_end_nodes)}"
         )
@@ -1403,6 +1413,19 @@ def make_viewer(
         try:
             undo_spatial_button.enabled = (
                 spatial_session.can_undo()
+            )
+            ignore_button.enabled = (
+                (
+                    mode["value"] == MODE_SPATIAL
+                    and any(
+                        value is not None
+                        for value in selected_seed_ids
+                    )
+                )
+                or (
+                    mode["value"] == MODE_TRACKING
+                    and len(track_session.selections) == 1
+                )
             )
             continue_track_button.enabled = (
                 len(track_session.selections)
@@ -1469,7 +1492,7 @@ def make_viewer(
             status_label.value = (
                 "Spatial mode: click supervoxels. Save Split separates one "
                 "instance; Save Merge joins the current instances containing "
-                "the selected supervoxels; Hallucination removes one SV."
+                "the selected supervoxels; Hallucination removes one SV; Ignore defers an edge case for later analysis."
             )
         else:
             clear_spatial_selection()
@@ -1479,7 +1502,7 @@ def make_viewer(
             status_label.value = (
                 "Tracking mode: select two cells for Continue/Break, or "
                 "select one parent in an earlier frame and two daughters in "
-                "the next frame for Birth. Track selections survive time changes."
+                "the next frame for Birth. Select one cell and press Ignore to defer a broken/new edge case for later analysis. Track selections survive time changes."
             )
         refresh_status()
 
@@ -1602,6 +1625,99 @@ def make_viewer(
         status_label.value = (
             f"Selected track cell t={frame}, id={instance_id}."
         )
+
+    def _selected_node_for_ignore() -> tuple[Node, str]:
+        frame = current_frame()
+
+        if mode["value"] == MODE_SPATIAL:
+            selected_sv_ids = [
+                int(value)
+                for value in selected_seed_ids
+                if value is not None
+            ]
+            if not selected_sv_ids:
+                raise AnnotationError(
+                    "Select a spatial supervoxel first, then press Ignore."
+                )
+
+            instance_ids = {
+                int(
+                    spatial_session.current_instance_for_supervoxel(
+                        frame,
+                        sv_id,
+                    )
+                )
+                for sv_id in selected_sv_ids
+            }
+            instance_ids.discard(0)
+
+            if not instance_ids:
+                raise AnnotationError(
+                    "The selected spatial supervoxels are currently background."
+                )
+            if len(instance_ids) != 1:
+                raise AnnotationError(
+                    "Ignore is ambiguous because the selected supervoxels belong "
+                    "to multiple corrected instances. Reset and select one instance."
+                )
+
+            return (
+                (
+                    int(frame),
+                    int(next(iter(instance_ids))),
+                ),
+                MODE_SPATIAL,
+            )
+
+        if len(track_session.selections) != 1:
+            raise AnnotationError(
+                "Tracking Ignore requires exactly one selected cell."
+            )
+
+        return (
+            track_session.selections[0],
+            MODE_TRACKING,
+        )
+
+
+    def ignore_selected() -> None:
+        try:
+            node, source_mode = _selected_node_for_ignore()
+            related_events = diagnostic_events_for_node(
+                current_diagnostics,
+                node,
+                current_frame=current_frame(),
+                horizon_frames=DIAGNOSTIC_HORIZON_FRAMES,
+            )
+            added = track_session.ignore_events(
+                selected_node=node,
+                source_mode=source_mode,
+                events=related_events,
+            )
+        except Exception as exc:
+            show_error(exc)
+            return
+
+        clear_spatial_selection()
+        clear_track_selection()
+        refresh_track_graph_layers()
+        refresh_status()
+
+        if added:
+            event_types = ", ".join(
+                str(record.get("event_type"))
+                for record in added
+            )
+            status_label.value = (
+                f"IGNORE: t={node[0]} id={node[1]} marked for later analysis "
+                f"({event_types}). Related broken/new events are hidden. "
+                "Review queue: tracks/ignored_events.csv."
+            )
+        else:
+            status_label.value = (
+                f"IGNORE: t={node[0]} id={node[1]} was already marked "
+                "for later analysis."
+            )
 
     def save_split() -> None:
         try:
@@ -1820,6 +1936,9 @@ def make_viewer(
             MODE_TRACKING
         )
     )
+    ignore_button.changed.connect(
+        lambda *_: ignore_selected()
+    )
     save_split_button.changed.connect(
         lambda *_: save_split()
     )
@@ -2024,6 +2143,7 @@ def make_viewer(
     print(f"track tail          : {TRACK_HISTORY_FRAMES} time units max history")
     print("spatial controls    : Save Split | Save Merge | Hallucination | Undo Spatial")
     print("track controls      : Continue Track | Break Track | Birth | Undo Track")
+    print("common control      : Ignore -> tracks/ignored_events.csv (pending review)")
     print("track completion    : automatic; complete components move to Hidden tracks")
     print("ray picking         : always derived from Raw BioHub")
     print("3-D contours        : disabled; translucent SV fills avoid Napari warning")

@@ -155,6 +155,8 @@ def prepare_current_endpoint_groups(
     boundary_entry_nodes: set[Node],
     boundary_exit_nodes: set[Node],
     hidden_nodes: set[Node],
+    ignored_start_nodes: set[Node] | None = None,
+    ignored_end_nodes: set[Node] | None = None,
 ) -> EndpointTrackGroups:
     """
     Diagnose the CURRENT corrected tracklets, not the original Trackastra CSV.
@@ -164,6 +166,13 @@ def prepare_current_endpoint_groups(
     tracklet is what appears in Broken Tracks. If no break remains and the
     component is complete, it disappears into Hidden tracks.
     """
+    ignored_start_nodes = set(
+        ignored_start_nodes or ()
+    )
+    ignored_end_nodes = set(
+        ignored_end_nodes or ()
+    )
+
     if tracks.empty:
         empty = tracks.copy()
         return EndpointTrackGroups(
@@ -214,12 +223,18 @@ def prepare_current_endpoint_groups(
         if start_node in hidden_nodes and end_node in hidden_nodes:
             continue
 
-        if start_node in unresolved_start_nodes:
+        if (
+            start_node in unresolved_start_nodes
+            and start_node not in ignored_start_nodes
+        ):
             new_failure_ids.append(track_id)
         elif start_node in boundary_entry_nodes:
             boundary_entry_ids.append(track_id)
 
-        if end_node in unresolved_end_nodes:
+        if (
+            end_node in unresolved_end_nodes
+            and end_node not in ignored_end_nodes
+        ):
             broken_ids.append(track_id)
         elif end_node in boundary_exit_nodes:
             boundary_exit_ids.append(track_id)
@@ -303,3 +318,74 @@ def filter_diagnostic_rows_for_frame(
         & (frame["frame"] >= lower)
         & (frame["frame"] <= current_frame)
     ].copy()
+
+def diagnostic_events_for_node(
+    groups: EndpointTrackGroups,
+    node: Node,
+    *,
+    current_frame: int | None = None,
+    horizon_frames: int | None = None,
+) -> list[tuple[str, Node]]:
+    node = (
+        int(node[0]),
+        int(node[1]),
+    )
+
+    result: list[tuple[str, Node]] = []
+
+    for category, full_frame, endpoint_kind in (
+        ("new", groups.new_failure_tracks, "start"),
+        ("broken", groups.ended_failure_tracks, "end"),
+    ):
+        if full_frame.empty:
+            continue
+
+        visible_frame = full_frame
+        if (
+            current_frame is not None
+            and horizon_frames is not None
+        ):
+            visible_frame = filter_diagnostic_rows_for_frame(
+                full_frame,
+                category=category,
+                current_frame=int(current_frame),
+                horizon_frames=int(horizon_frames),
+            )
+
+        if visible_frame.empty:
+            continue
+
+        matches = visible_frame.loc[
+            (visible_frame["frame"].astype(int) == node[0])
+            & (visible_frame["cell_id"].astype(int) == node[1])
+        ]
+        if matches.empty:
+            continue
+
+        for raw_track_id in matches["track_id"].unique().tolist():
+            track = full_frame.loc[
+                full_frame["track_id"] == raw_track_id
+            ]
+            if track.empty:
+                continue
+
+            ordered = track.sort_values(
+                ["frame", "cell_id"],
+                kind="stable",
+            )
+            row = (
+                ordered.iloc[0]
+                if endpoint_kind == "start"
+                else ordered.iloc[-1]
+            )
+            result.append(
+                (
+                    category,
+                    (
+                        int(row["frame"]),
+                        int(row["cell_id"]),
+                    ),
+                )
+            )
+
+    return list(dict.fromkeys(result))

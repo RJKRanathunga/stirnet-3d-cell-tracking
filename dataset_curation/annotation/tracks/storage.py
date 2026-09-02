@@ -43,6 +43,11 @@ class OutputPaths:
         """Canonical annotation-owned corrected track table."""
         return self.root / "current_tracks.csv"
 
+    @property
+    def ignored_events_csv(self) -> Path:
+        """Edge cases intentionally deferred for later human review."""
+        return self.root / "ignored_events.csv"
+
 
 def _atomic_json(
     path: Path,

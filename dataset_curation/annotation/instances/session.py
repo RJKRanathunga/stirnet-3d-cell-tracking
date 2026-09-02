@@ -273,6 +273,17 @@ class AnnotationSession:
             int(sv_id),
         )
 
+    def current_instance_for_supervoxel(
+        self,
+        local_t: int,
+        sv_id: int,
+    ) -> int:
+        """Return the current corrected instance containing a supervoxel."""
+        return self._parent_instance_for_sv(
+            int(local_t),
+            int(sv_id),
+        )
+
     def _expected_supervoxels(
         self,
         local_t: int,

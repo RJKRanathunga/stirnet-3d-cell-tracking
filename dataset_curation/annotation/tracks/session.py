@@ -39,7 +39,7 @@ class TrackAnnotationSession:
     new unresolved internal start/end, so that component becomes visible again.
     """
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(
         self,
@@ -81,6 +81,7 @@ class TrackAnnotationSession:
         self.forced_edges: set[Edge] = set()
         self.broken_edges: set[Edge] = set()
         self.birth_events: list[dict[str, Any]] = []
+        self.ignored_events: list[dict[str, Any]] = []
         self.selections: list[Node] = []
         self.history: list[dict[str, Any]] = []
         self._analysis_cache: dict[str, Any] | None = None
@@ -277,6 +278,89 @@ class TrackAnnotationSession:
                     )
                 )
         return result
+
+    @property
+    def ignored_start_nodes(self) -> set[Node]:
+        return {
+            _parse_node(event["endpoint"])
+            for event in self.ignored_events
+            if str(event.get("event_type")) == "new"
+        }
+
+
+    @property
+    def ignored_end_nodes(self) -> set[Node]:
+        return {
+            _parse_node(event["endpoint"])
+            for event in self.ignored_events
+            if str(event.get("event_type")) == "broken"
+        }
+
+
+    def ignore_events(
+        self,
+        *,
+        selected_node: Node,
+        source_mode: str,
+        events: Iterable[tuple[str, Node]],
+    ) -> list[dict[str, Any]]:
+        selected_node = (
+            int(selected_node[0]),
+            int(selected_node[1]),
+        )
+        self._validate_node(selected_node)
+
+        source_mode = str(source_mode)
+        if source_mode not in {"spatial", "tracking"}:
+            raise AnnotationError(
+                f"Unsupported Ignore source mode: {source_mode!r}."
+            )
+
+        normalized: list[tuple[str, Node]] = []
+        for event_type, endpoint in events:
+            event_type = str(event_type)
+            if event_type not in {"broken", "new"}:
+                continue
+            endpoint = (
+                int(endpoint[0]),
+                int(endpoint[1]),
+            )
+            self._validate_node(endpoint)
+            normalized.append((event_type, endpoint))
+
+        if not normalized:
+            normalized = [("instance", selected_node)]
+
+        existing = {
+            (
+                str(event.get("event_type")),
+                _parse_node(event["endpoint"]),
+            )
+            for event in self.ignored_events
+            if "endpoint" in event
+        }
+
+        added: list[dict[str, Any]] = []
+        for event_type, endpoint in normalized:
+            key = (event_type, endpoint)
+            if key in existing:
+                continue
+
+            record = {
+                "event_type": event_type,
+                "endpoint": _node_json(endpoint),
+                "selected_node": _node_json(selected_node),
+                "source_mode": source_mode,
+                "review_status": "pending",
+            }
+            self.ignored_events.append(record)
+            added.append(record)
+            existing.add(key)
+
+        if added:
+            self.persist()
+
+        return added
 
     def set_frame_nodes(
         self,
@@ -659,6 +743,7 @@ class TrackAnnotationSession:
                 )
             ],
             "birth_events": self.birth_events,
+            "ignored_events": self.ignored_events,
             "selections": [
                 _node_json(node)
                 for node in self.selections
@@ -859,6 +944,48 @@ class TrackAnnotationSession:
             ),
         )
 
+        ignored_rows: list[dict[str, Any]] = []
+        for event_id, event in enumerate(
+            self.ignored_events,
+            start=1,
+        ):
+            endpoint = _parse_node(event["endpoint"])
+            selected = _parse_node(
+                event.get(
+                    "selected_node",
+                    event["endpoint"],
+                )
+            )
+            ignored_rows.append(
+                {
+                    "event_id": int(event_id),
+                    "event_type": str(event.get("event_type", "instance")),
+                    "event_frame": int(endpoint[0]),
+                    "event_cell_id": int(endpoint[1]),
+                    "selected_frame": int(selected[0]),
+                    "selected_cell_id": int(selected[1]),
+                    "source_mode": str(event.get("source_mode", "tracking")),
+                    "review_status": str(event.get("review_status", "pending")),
+                }
+            )
+
+        _atomic_csv(
+            self.output.ignored_events_csv,
+            pd.DataFrame(
+                ignored_rows,
+                columns=[
+                    "event_id",
+                    "event_type",
+                    "event_frame",
+                    "event_cell_id",
+                    "selected_frame",
+                    "selected_cell_id",
+                    "source_mode",
+                    "review_status",
+                ],
+            ),
+        )
+
     def _load(self) -> None:
         payload = json.loads(
             self.output.state_json.read_text(
@@ -942,6 +1069,44 @@ class TrackAnnotationSession:
                 raise AnnotationError(
                     "Every birth event must contain exactly two daughters."
                 )
+
+        raw_ignored_events = payload.get(
+            "ignored_events",
+            [],
+        )
+        if not isinstance(raw_ignored_events, list):
+            raise AnnotationError(
+                "ignored_events must be a list."
+            )
+
+        self.ignored_events = []
+        for raw_event in raw_ignored_events:
+            event_type = str(raw_event.get("event_type", ""))
+            if event_type not in {"broken", "new", "instance"}:
+                raise AnnotationError(
+                    f"Invalid ignored event type: {event_type!r}."
+                )
+
+            endpoint = _parse_node(raw_event["endpoint"])
+            selected_node = _parse_node(
+                raw_event.get(
+                    "selected_node",
+                    raw_event["endpoint"],
+                )
+            )
+            self.ignored_events.append(
+                {
+                    "event_type": event_type,
+                    "endpoint": _node_json(endpoint),
+                    "selected_node": _node_json(selected_node),
+                    "source_mode": str(
+                        raw_event.get("source_mode", "tracking")
+                    ),
+                    "review_status": str(
+                        raw_event.get("review_status", "pending")
+                    ),
+                }
+            )
 
         self.selections = [
             _parse_node(value)
