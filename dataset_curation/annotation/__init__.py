@@ -1,1 +1,1 @@
-"Annotation package."
+"""Unified BioHub spatial + tracking curation."""

@@ -57,7 +57,7 @@ def test_compact_spatial_contract_accepts_only_uint16_labels(
     )
 
 
-def test_compact_paths_do_not_expose_full_volume_ephemeral_movies(
+def test_compact_paths_do_not_expose_ephemeral_full_volume_movies(
     tmp_path: Path,
 ):
     paths = BioHubVolumePaths(
@@ -72,7 +72,10 @@ def test_compact_paths_do_not_expose_full_volume_ephemeral_movies(
         "source_instances",
         "tracked_masks",
     ):
-        assert not hasattr(paths, name)
+        assert not hasattr(
+            paths,
+            name,
+        )
 
 
 def test_tracking_complete_does_not_require_tracked_masks(
@@ -84,7 +87,9 @@ def test_tracking_complete_does_not_require_tracked_masks(
         "sample",
     )
     run_id = "current"
-    paths.trackastra_root(run_id).mkdir(
+    paths.trackastra_root(
+        run_id
+    ).mkdir(
         parents=True,
         exist_ok=True,
     )
@@ -98,35 +103,54 @@ def test_tracking_complete_does_not_require_tracked_masks(
     ):
         path.write_bytes(b"x")
 
-    assert paths.tracking_complete(run_id)
+    assert paths.tracking_complete(
+        run_id
+    )
     assert not (
-        paths.trackastra_root(run_id)
+        paths.trackastra_root(
+            run_id
+        )
         / "tracked_masks.npy"
     ).exists()
 
 
-def test_production_sources_do_not_persist_ephemeral_movies():
-    root = Path(__file__).resolve().parents[2]
+def test_unified_annotation_preserves_compact_source_contract():
+    root = Path(
+        __file__
+    ).resolve().parents[2]
 
     sink = (
         root
         / "dataset_curation"
         / "inference"
         / "spatial_sink.py"
-    ).read_text(encoding="utf-8")
+    ).read_text(
+        encoding="utf-8"
+    )
     trackastra = (
         root
         / "dataset_curation"
         / "inference"
         / "trackastra.py"
-    ).read_text(encoding="utf-8")
-    instance_runner = (
+    ).read_text(
+        encoding="utf-8"
+    )
+    runner = (
         root
         / "dataset_curation"
         / "annotation"
-        / "instances"
         / "curation_runner.py"
-    ).read_text(encoding="utf-8")
+    ).read_text(
+        encoding="utf-8"
+    )
+    source_data = (
+        root
+        / "dataset_curation"
+        / "annotation"
+        / "source_data.py"
+    ).read_text(
+        encoding="utf-8"
+    )
 
     assert "open_memmap" in sink
     assert "dtype=PERSISTED_LABEL_DTYPE" in sink
@@ -135,10 +159,12 @@ def test_production_sources_do_not_persist_ephemeral_movies():
     assert "self._binary" not in sink
     assert "self._source" not in sink
 
-    assert "np.save(\\n        paths.tracked_masks" not in trackastra
+    assert "tracked_masks_persisted" in trackastra
     assert "_dask_from_source_zarr" in trackastra
     assert "paths.zarr" in trackastra
 
-    assert "paths.raw(" not in instance_runner
-    assert "paths.binary_mask(" not in instance_runner
-    assert "load_raw_and_binary_frames" in instance_runner
+    assert "open_source_movie" in runner
+    assert "mmap_mode=\"r\"" in runner
+    assert "load_raw_and_binary_frames" not in runner
+    assert "BinaryMaskFrameCache" in source_data
+    assert "load_raw_and_binary_frames" not in source_data

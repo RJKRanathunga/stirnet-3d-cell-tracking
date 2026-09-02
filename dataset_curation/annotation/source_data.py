@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+"""Lazy source-Zarr access and RAM-only binary-mask reconstruction."""
+
 from collections import OrderedDict
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 
@@ -13,7 +14,9 @@ def open_source_movie(
     """Open the canonical raw BioHub movie lazily from source Zarr."""
     from src.io import open_sample
 
-    return open_sample(Path(sample_zarr))
+    return open_sample(
+        Path(sample_zarr)
+    )
 
 
 def _binary_mask_for_raw(
@@ -37,67 +40,11 @@ def _binary_mask_for_raw(
     )
 
 
-def load_raw_and_binary_frames(
-    sample_zarr: str | Path,
-    timepoints: Iterable[int],
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Load only selected raw frames and reconstruct their binary masks.
-
-    No full raw/preprocessed/binary movie is copied into the curation cache.
-    """
-    from src.io import load_timepoint
-
-    selected = tuple(
-        int(t)
-        for t in timepoints
-    )
-    if not selected:
-        raise ValueError(
-            "At least one timepoint is required"
-        )
-
-    raw_frames: list[np.ndarray] = []
-    binary_frames: list[np.ndarray] = []
-
-    for index, frame in enumerate(
-        selected,
-        start=1,
-    ):
-        print(
-            f"[annotation source] reconstructing raw/binary "
-            f"t={frame:03d} ({index}/{len(selected)})",
-            flush=True,
-        )
-        raw = np.asarray(
-            load_timepoint(
-                Path(sample_zarr),
-                frame,
-            )
-        )
-        raw_frames.append(raw)
-        binary_frames.append(
-            _binary_mask_for_raw(raw)
-        )
-
-    return (
-        np.stack(
-            raw_frames,
-            axis=0,
-        ),
-        np.stack(
-            binary_frames,
-            axis=0,
-        ),
-    )
-
-
 class BinaryMaskFrameCache:
     """
-    Small RAM-only LRU cache for exact reconstructed binary masks.
+    Small RAM-only LRU cache for exact Stage-6 masks.
 
-    This is used by the track annotator so changing timepoints does not require
-    a permanently stored 4-D binary_mask.npy movie.
+    Binary masks are never persisted as another full 4-D movie.
     """
 
     def __init__(
@@ -148,7 +95,9 @@ class BinaryMaskFrameCache:
             None,
         )
         if cached is not None:
-            self._cache[frame] = cached
+            self._cache[
+                frame
+            ] = cached
             return cached
 
         print(
@@ -161,13 +110,17 @@ class BinaryMaskFrameCache:
         mask = _binary_mask_for_raw(
             raw
         )
-        self._cache[frame] = mask
+        self._cache[
+            frame
+        ] = mask
 
-        while len(self._cache) > self.max_frames:
+        while (
+            len(self._cache)
+            > self.max_frames
+        ):
             self._cache.popitem(
                 last=False
             )
-
         return mask
 
 
@@ -236,5 +189,7 @@ def estimate_contrast_limits(
         high = low + 1.0
     if high <= low:
         high = low + 1.0
-
-    return float(low), float(high)
+    return (
+        float(low),
+        float(high),
+    )

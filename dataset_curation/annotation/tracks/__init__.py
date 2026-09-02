@@ -1,4 +1,1 @@
-"""Track-annotation implementation.
-
-UI modules are intentionally not imported at package import time.
-"""
+"""Tracking graph primitives used by unified curation."""

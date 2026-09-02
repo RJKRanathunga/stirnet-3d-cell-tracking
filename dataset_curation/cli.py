@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # DATASET_CURATION_LAZY_RUNTIME_IMPORTS_V1
+# DATASET_CURATION_UNIFIED_ANNOTATION_V1
 
 import argparse
 import sys
@@ -8,24 +9,33 @@ from pathlib import Path
 
 from dataset_curation.annotation.selection import (
     annotation_started,
-    ensure_annotation_binding,
     select_annotation_volume,
-    touch_annotation_session,
 )
 from dataset_curation.catalog import BioHubCatalog, VolumeRecord
 from dataset_curation.config import BIOHUB_DATA_ROOT
-from dataset_curation.errors import ArtifactError
 
 
 def _extra(values) -> list[str]:
     values = list(values or [])
-    return values[1:] if values and values[0] == "--" else values
+    return (
+        values[1:]
+        if values
+        and values[0] == "--"
+        else values
+    )
 
 
-def _catalog(args) -> BioHubCatalog:
-    catalog = BioHubCatalog(args.data_root)
+def _catalog(
+    args,
+    *,
+    ensure_outputs: bool = True,
+) -> BioHubCatalog:
+    catalog = BioHubCatalog(
+        args.data_root
+    )
     catalog.validate_root()
-    catalog.ensure_output_roots()
+    if ensure_outputs:
+        catalog.ensure_output_roots()
     return catalog
 
 
@@ -34,7 +44,7 @@ def _record_status(
     *,
     run_id: str,
     annotation_set: str,
-) -> tuple[str, str, str]:
+) -> tuple[str, str]:
     paths = record.paths
     complete = paths.inference_complete(
         run_id,
@@ -42,30 +52,25 @@ def _record_status(
     )
     if complete:
         inference = "complete"
-    elif paths.has_any_preprocessed_data(run_id):
+    elif paths.has_any_preprocessed_data(
+        run_id
+    ):
         inference = "partial"
     else:
         inference = "missing"
 
-    instances = (
+    curation = (
         "started"
         if annotation_started(
             record,
-            kind="instances",
             annotation_set=annotation_set,
         )
         else "-"
     )
-    tracks = (
-        "started"
-        if annotation_started(
-            record,
-            kind="tracks",
-            annotation_set=annotation_set,
-        )
-        else "-"
+    return (
+        inference,
+        curation,
     )
-    return inference, instances, tracks
 
 
 def cmd_status(args) -> None:
@@ -74,10 +79,17 @@ def cmd_status(args) -> None:
     if args.split == "all":
         records = catalog.discover_all()
     else:
-        records = catalog.discover(args.split)
+        records = catalog.discover(
+            args.split
+        )
 
     if args.limit is not None:
-        records = records[: max(int(args.limit), 0)]
+        records = records[
+            : max(
+                int(args.limit),
+                0,
+            )
+        ]
 
     headers = (
         "SPLIT",
@@ -85,75 +97,122 @@ def cmd_status(args) -> None:
         "FRAMES",
         "SPARSE_GT",
         "INFERENCE",
-        "INST_ANN",
-        "TRACK_ANN",
+        "CURATION",
     )
     rows = []
 
     for record in records:
-        inference, instances, tracks = _record_status(
-            record,
-            run_id=args.run_id,
-            annotation_set=args.annotation_set,
+        inference, curation = (
+            _record_status(
+                record,
+                run_id=args.run_id,
+                annotation_set=args.annotation_set,
+            )
         )
         rows.append(
             (
                 record.split,
                 record.volume_id,
-                str(record.frame_count or "?"),
-                "yes" if record.has_ground_truth else "no",
+                str(
+                    record.frame_count
+                    or "?"
+                ),
+                (
+                    "yes"
+                    if record.has_ground_truth
+                    else "no"
+                ),
                 inference,
-                instances,
-                tracks,
+                curation,
             )
         )
 
     widths = [
-        max(
-            len(headers[index]),
-            *(len(row[index]) for row in rows),
+        (
+            max(
+                len(headers[index]),
+                *(
+                    len(row[index])
+                    for row in rows
+                ),
+            )
+            if rows
+            else len(
+                headers[index]
+            )
         )
-        if rows
-        else len(headers[index])
-        for index in range(len(headers))
+        for index in range(
+            len(headers)
+        )
     ]
 
     def line(values):
         return "  ".join(
-            str(value).ljust(widths[index])
-            for index, value in enumerate(values)
+            str(value).ljust(
+                widths[index]
+            )
+            for index, value in enumerate(
+                values
+            )
         )
 
-    print(f"BioHub root: {catalog.data_root}")
+    print(
+        f"BioHub root: "
+        f"{catalog.data_root}"
+    )
     print(line(headers))
-    print(line(tuple("-" * width for width in widths)))
+    print(
+        line(
+            tuple(
+                "-" * width
+                for width in widths
+            )
+        )
+    )
     for row in rows:
         print(line(row))
 
     print()
-    print(f"volumes: {len(rows)}")
     print(
-        "SPARSE_GT only reports presence of ground_truth_nodes.csv + "
-        "ground_truth_edges.csv. It is not used as full-volume GT."
+        f"volumes: {len(rows)}"
+    )
+    print(
+        "SPARSE_GT only reports presence of sparse ground-truth CSVs. "
+        "It is not interpreted as full-volume GT."
     )
 
 
-def _inference_selection(args, catalog: BioHubCatalog) -> list[VolumeRecord]:
-    records = catalog.discover(args.split)
-    by_id = {record.volume_id: record for record in records}
+def _inference_selection(
+    args,
+    catalog: BioHubCatalog,
+) -> list[VolumeRecord]:
+    records = catalog.discover(
+        args.split
+    )
+    by_id = {
+        record.volume_id: record
+        for record in records
+    }
 
     if args.id:
         selected = []
         missing = []
         for volume_id in args.id:
-            record = by_id.get(volume_id)
+            record = by_id.get(
+                volume_id
+            )
             if record is None:
-                missing.append(volume_id)
+                missing.append(
+                    volume_id
+                )
             else:
-                selected.append(record)
+                selected.append(
+                    record
+                )
         if missing:
             raise KeyError(
-                f"Unknown {args.split} volume IDs: {missing}"
+                f"Unknown {args.split} volume IDs: "
+                f"{missing}"
             )
         return selected
 
@@ -173,9 +232,15 @@ def _inference_selection(args, catalog: BioHubCatalog) -> list[VolumeRecord]:
     if args.all_volumes:
         return candidates
 
-    count = 1 if args.count is None else int(args.count)
+    count = (
+        1
+        if args.count is None
+        else int(args.count)
+    )
     if count < 1:
-        raise ValueError("--count must be >= 1")
+        raise ValueError(
+            "--count must be >= 1"
+        )
     return candidates[:count]
 
 
@@ -185,40 +250,69 @@ def cmd_infer(args) -> None:
     )
 
     catalog = _catalog(args)
-    selected = _inference_selection(args, catalog)
+    selected = (
+        _inference_selection(
+            args,
+            catalog,
+        )
+    )
 
     if not selected:
         print(
-            f"No inference work is pending for split {args.split!r}, "
-            f"run {args.run_id!r}."
+            f"No inference work is pending for split "
+            f"{args.split!r}, run {args.run_id!r}."
         )
         return
 
     print("=" * 96)
     print("BIOHUB BATCH INFERENCE")
     print("=" * 96)
-    print(f"data root : {catalog.data_root}")
-    print(f"split     : {args.split}")
-    print(f"run id    : {args.run_id}")
-    print(f"selected  : {len(selected)}")
-    print(f"force     : {bool(args.force)}")
+    print(
+        f"data root : "
+        f"{catalog.data_root}"
+    )
+    print(
+        f"split     : {args.split}"
+    )
+    print(
+        f"run id    : {args.run_id}"
+    )
+    print(
+        f"selected  : {len(selected)}"
+    )
+    print(
+        f"force     : "
+        f"{bool(args.force)}"
+    )
     print("=" * 96)
 
-    backend = StirNetTrackastraBackend()
-    failures: list[tuple[str, str]] = []
+    backend = (
+        StirNetTrackastraBackend()
+    )
+    failures: list[
+        tuple[str, str]
+    ] = []
     completed = 0
     skipped = 0
 
-    for index, record in enumerate(selected, start=1):
-        already_complete = record.paths.inference_complete(
-            args.run_id,
-            frame_count=record.frame_count,
+    for index, record in enumerate(
+        selected,
+        start=1,
+    ):
+        already_complete = (
+            record.paths.inference_complete(
+                args.run_id,
+                frame_count=record.frame_count,
+            )
         )
-
-        if already_complete and not args.force:
+        if (
+            already_complete
+            and not args.force
+        ):
             print(
-                f"[{index}/{len(selected)}] SKIP "
-                f"{record.volume_id}: already complete"
+                f"[{index}/{len(selected)}] "
+                f"SKIP {record.volume_id}: "
+                "already complete"
             )
             skipped += 1
             continue
@@ -233,20 +327,28 @@ def cmd_infer(args) -> None:
             backend.run_volume(
                 record,
                 run_id=args.run_id,
-                force=bool(args.force),
-                extra_args=_extra(args.extra),
+                force=bool(
+                    args.force
+                ),
+                extra_args=_extra(
+                    args.extra
+                ),
             )
             completed += 1
         except Exception as exc:
             failures.append(
                 (
                     record.volume_id,
-                    f"{type(exc).__name__}: {exc}",
+                    (
+                        f"{type(exc).__name__}: "
+                        f"{exc}"
+                    ),
                 )
             )
             print(
                 f"[FAILED] {record.volume_id}: "
-                f"{type(exc).__name__}: {exc}",
+                f"{type(exc).__name__}: "
+                f"{exc}",
                 file=sys.stderr,
             )
             if args.fail_fast:
@@ -256,27 +358,34 @@ def cmd_infer(args) -> None:
     print("=" * 96)
     print("BATCH SUMMARY")
     print("=" * 96)
-    print(f"completed : {completed}")
-    print(f"skipped   : {skipped}")
-    print(f"failed    : {len(failures)}")
+    print(
+        f"completed : {completed}"
+    )
+    print(
+        f"skipped   : {skipped}"
+    )
+    print(
+        f"failed    : {len(failures)}"
+    )
     for volume_id, message in failures:
-        print(f"  {volume_id}: {message}")
+        print(
+            f"  {volume_id}: {message}"
+        )
     print("=" * 96)
 
     if failures:
         raise SystemExit(1)
 
 
-def _choose_annotation_record(
-    args,
-    *,
-    kind: str,
-) -> VolumeRecord:
+def cmd_annotate(args) -> None:
+    from dataset_curation.annotation.curation_runner import (
+        run_annotation,
+    )
+
     catalog = _catalog(args)
-    return select_annotation_volume(
+    record = select_annotation_volume(
         catalog,
         split=args.split,
-        kind=kind,
         run_id=args.run_id,
         annotation_set=args.annotation_set,
         volume_id=args.id,
@@ -284,56 +393,76 @@ def _choose_annotation_record(
         next_volume=bool(args.next),
     )
 
-
-def cmd_annotate_instances(args) -> None:
-    from dataset_curation.annotation.instances.curation_runner import (
-        run_instance_annotation,
-    )
-
-    record = _choose_annotation_record(
-        args,
-        kind="instances",
-    )
-
     print(
-        f"[annotation] selected {record.split}/{record.volume_id} "
-        f"for instance annotation"
+        f"[annotation] selected "
+        f"{record.split}/{record.volume_id}"
     )
 
-    run_instance_annotation(
+    run_annotation(
         record,
         run_id=args.run_id,
         annotation_set=args.annotation_set,
-        timepoint_selection=args.timepoints,
-        suspect_threshold=float(args.suspect_threshold),
-        resume=not bool(args.no_resume_data),
+        boundary_margin_um=float(
+            args.boundary_margin_um
+        ),
+        resume=not bool(
+            args.no_resume_data
+        ),
     )
 
 
-def cmd_annotate_tracks(args) -> None:
-    from dataset_curation.annotation.tracks.curation_runner import (
-        run_track_annotation,
+def _find_source_record(
+    catalog: BioHubCatalog,
+    *,
+    volume_id: str,
+    split: str | None,
+) -> VolumeRecord:
+    if split is not None:
+        return catalog.get(
+            volume_id,
+            split=split,
+        )
+
+    matches = [
+        record
+        for record in catalog.discover_all()
+        if record.volume_id
+        == str(volume_id)
+    ]
+    if not matches:
+        raise KeyError(
+            f"Volume {volume_id!r} was not found in train or test."
+        )
+    if len(matches) > 1:
+        raise KeyError(
+            f"Volume {volume_id!r} exists in multiple splits. "
+            "Pass --split train or --split test."
+        )
+    return matches[0]
+
+
+def cmd_view_source(args) -> None:
+    from dataset_curation.visualization.source_viewer import (
+        view_source_volume,
     )
 
-    record = _choose_annotation_record(
+    catalog = _catalog(
         args,
-        kind="tracks",
+        ensure_outputs=False,
+    )
+    record = _find_source_record(
+        catalog,
+        volume_id=args.id,
+        split=args.split,
+    )
+    view_source_volume(
+        record
     )
 
-    print(
-        f"[annotation] selected {record.split}/{record.volume_id} "
-        f"for track annotation"
-    )
 
-    run_track_annotation(
-        record,
-        run_id=args.run_id,
-        annotation_set=args.annotation_set,
-        max_ray_distance_um=float(args.max_ray_distance_um),
-        resume=not bool(args.no_resume_data),
-    )
-
-def _add_data_root(parser: argparse.ArgumentParser) -> None:
+def _add_data_root(
+    parser: argparse.ArgumentParser,
+) -> None:
     parser.add_argument(
         "--data-root",
         type=Path,
@@ -348,7 +477,9 @@ def _add_data_root(parser: argparse.ArgumentParser) -> None:
 def _add_annotation_selector(
     parser: argparse.ArgumentParser,
 ) -> None:
-    group = parser.add_mutually_exclusive_group()
+    group = (
+        parser.add_mutually_exclusive_group()
+    )
     group.add_argument(
         "--id",
         help="Open this exact volume ID.",
@@ -357,7 +488,7 @@ def _add_annotation_selector(
         "--next",
         action="store_true",
         help=(
-            "Open the first inference-ready volume whose annotation "
+            "Open the first inference-ready volume whose unified curation "
             "session has never been started. This is the default."
         ),
     )
@@ -365,8 +496,7 @@ def _add_annotation_selector(
         "--resume",
         action="store_true",
         help=(
-            "Open the most recently touched existing annotation "
-            "session for this annotation type."
+            "Open the most recently touched unified curation session."
         ),
     )
 
@@ -375,11 +505,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m dataset_curation",
         description=(
-            "External-drive BioHub inference and one-volume-at-a-time "
-            "annotation workflow."
+            "BioHub inference, unified cell/track curation, and source viewing."
         ),
     )
-
     sub = parser.add_subparsers(
         dest="command",
         required=True,
@@ -392,13 +520,29 @@ def build_parser() -> argparse.ArgumentParser:
     _add_data_root(status)
     status.add_argument(
         "--split",
-        choices=("train", "test", "all"),
+        choices=(
+            "train",
+            "test",
+            "all",
+        ),
         default="train",
     )
-    status.add_argument("--run-id", default="current")
-    status.add_argument("--annotation-set", default="main")
-    status.add_argument("--limit", type=int, default=None)
-    status.set_defaults(func=cmd_status)
+    status.add_argument(
+        "--run-id",
+        default="current",
+    )
+    status.add_argument(
+        "--annotation-set",
+        default="main",
+    )
+    status.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+    )
+    status.set_defaults(
+        func=cmd_status
+    )
 
     infer = sub.add_parser(
         "infer",
@@ -407,10 +551,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_data_root(infer)
     infer.add_argument(
         "--split",
-        choices=("train", "test"),
+        choices=(
+            "train",
+            "test",
+        ),
         default="train",
     )
-    selection = infer.add_mutually_exclusive_group()
+    selection = (
+        infer.add_mutually_exclusive_group()
+    )
     selection.add_argument(
         "--id",
         action="append",
@@ -431,98 +580,127 @@ def build_parser() -> argparse.ArgumentParser:
         "--all",
         dest="all_volumes",
         action="store_true",
-        help="Run every volume with missing inference.",
+        help=(
+            "Run every volume with missing inference."
+        ),
     )
-    infer.add_argument("--run-id", default="current")
+    infer.add_argument(
+        "--run-id",
+        default="current",
+    )
     infer.add_argument(
         "--force",
         action="store_true",
-        help="Recompute even if the selected cache is complete.",
+        help=(
+            "Recompute even if the selected cache is complete."
+        ),
     )
     infer.add_argument(
         "--fail-fast",
         action="store_true",
-        help="Stop the batch at the first failed volume.",
+        help=(
+            "Stop the batch at the first failed volume."
+        ),
     )
     infer.add_argument(
         "extra",
         nargs=argparse.REMAINDER,
         help=(
-            "Additional Investigation-36 arguments after `--`, for example "
-            "-- --checkpoint <path>."
+            "Additional production STIR-Net backend arguments after `--`, "
+            "for example `-- --checkpoint <path>`."
         ),
     )
-    infer.set_defaults(func=cmd_infer)
+    infer.set_defaults(
+        func=cmd_infer
+    )
 
-    instances = sub.add_parser(
-        "annotate-instances",
-        help="Open one volume in the merged-cell instance annotator.",
-    )
-    _add_data_root(instances)
-    instances.add_argument(
-        "--split",
-        choices=("train", "test"),
-        default="train",
-    )
-    _add_annotation_selector(instances)
-    instances.add_argument("--run-id", default="current")
-    instances.add_argument("--annotation-set", default="main")
-    instances.add_argument(
-        "--timepoints",
-        default="all",
-        help="all, 0-19, or comma/range selection.",
-    )
-    instances.add_argument(
-        "--suspect-threshold",
-        type=float,
-        default=0.70,
-    )
-    instances.add_argument(
-        "--no-resume-data",
-        action="store_true",
-        help="Ignore persisted corrections inside the selected volume.",
-    )
-    instances.set_defaults(func=cmd_annotate_instances)
-
-    tracks = sub.add_parser(
-        "annotate-tracks",
-        help="Open one volume in the Trackastra association annotator.",
-    )
-    _add_data_root(tracks)
-    tracks.add_argument(
-        "--split",
-        choices=("train", "test"),
-        default="train",
-    )
-    _add_annotation_selector(tracks)
-    tracks.add_argument("--run-id", default="current")
-    tracks.add_argument("--annotation-set", default="main")
-    tracks.add_argument(
-        "--no-resume-data",
-        action="store_true",
-        help="Ignore persisted track corrections for the selected volume.",
-    )
-    tracks.add_argument(
-        "--max-ray-distance-um",
-        type=float,
-        default=8.0,
+    annotate = sub.add_parser(
+        "annotate",
         help=(
-            "Maximum centroid-to-ray distance in normal track picking mode. "
-            "Use <=0 to disable the distance guard."
+            "Open unified spatial + Trackastra curation for one volume."
         ),
     )
-    tracks.set_defaults(func=cmd_annotate_tracks)
+    _add_data_root(annotate)
+    annotate.add_argument(
+        "--split",
+        choices=(
+            "train",
+            "test",
+        ),
+        default="train",
+    )
+    _add_annotation_selector(
+        annotate
+    )
+    annotate.add_argument(
+        "--run-id",
+        default="current",
+    )
+    annotate.add_argument(
+        "--annotation-set",
+        default="main",
+    )
+    annotate.add_argument(
+        "--boundary-margin-um",
+        type=float,
+        default=4.0,
+        help=(
+            "Boundary margin used by notebook-09 broken/new track diagnostics."
+        ),
+    )
+    annotate.add_argument(
+        "--no-resume-data",
+        action="store_true",
+        help=(
+            "Ignore persisted unified spatial/track state for this volume."
+        ),
+    )
+    annotate.set_defaults(
+        func=cmd_annotate
+    )
+
+    source = sub.add_parser(
+        "view-source",
+        help=(
+            "Open one raw source Zarr in Napari without requiring inference."
+        ),
+    )
+    _add_data_root(source)
+    source.add_argument(
+        "--id",
+        required=True,
+        help="Volume ID to visualize.",
+    )
+    source.add_argument(
+        "--split",
+        choices=(
+            "train",
+            "test",
+        ),
+        default=None,
+        help=(
+            "Optional split. If omitted, both source partitions are searched."
+        ),
+    )
+    source.set_defaults(
+        func=cmd_view_source
+    )
 
     return parser
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    args = (
+        build_parser()
+        .parse_args()
+    )
 
-    # If no selector was supplied to an annotation command, `--next` is the
-    # effective default.
-    if args.command in {"annotate-instances", "annotate-tracks"}:
-        if not args.id and not args.resume and not args.next:
+    if args.command == "annotate":
+        if (
+            not args.id
+            and not args.resume
+            and not args.next
+        ):
             args.next = True
 
     args.func(args)

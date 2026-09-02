@@ -13,56 +13,90 @@ def _imports(path: Path) -> set[str]:
         filename=str(path),
     )
     result: set[str] = set()
-
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            result.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                result.add(node.module)
-
+            result.update(
+                alias.name
+                for alias in node.names
+            )
+        elif isinstance(
+            node,
+            ast.ImportFrom,
+        ) and node.module:
+            result.add(node.module)
     return result
 
 
-def test_no_compat_or_workspace_architecture_remains():
+def test_no_legacy_or_separate_annotation_ui_remains():
     package = ROOT / "dataset_curation"
 
-    assert not (package / "_compat").exists()
-    assert not (package / "workspace").exists()
-    assert not (package / "preprocessing").exists()
-    assert not (package / "io" / "legacy.py").exists()
     assert not (
-        package / "inference" / "backends" / "investigation36.py"
+        package / "_compat"
     ).exists()
-    assert not (package / "annotation" / "points").exists()
+    assert not (
+        package / "workspace"
+    ).exists()
+    assert not (
+        package / "preprocessing"
+    ).exists()
+    assert not (
+        package
+        / "io"
+        / "legacy.py"
+    ).exists()
+    assert not (
+        package
+        / "inference"
+        / "backends"
+        / "investigation36.py"
+    ).exists()
 
-    obsolete_entrypoints = (
-        ROOT
-        / "evaluation"
-        / "segmentation"
-        / "scripts"
-        / "02_supervoxel_instance_annotator.py",
-        ROOT
-        / "evaluation"
-        / "segmentation"
-        / "scripts"
-        / "03_biohub_merge_suspect_export.py",
-        ROOT
-        / "evaluation"
-        / "segmentation"
-        / "scripts"
-        / "annotate_points.py",
-        ROOT
-        / "evaluation"
-        / "track_annotation"
-        / "01_track_annotator.py",
+    obsolete_unified_ui = (
+        package
+        / "annotation"
+        / "instances"
+        / "viewer.py",
+        package
+        / "annotation"
+        / "instances"
+        / "curation_runner.py",
+        package
+        / "annotation"
+        / "instances"
+        / "io.py",
+        package
+        / "annotation"
+        / "tracks"
+        / "viewer.py",
+        package
+        / "annotation"
+        / "tracks"
+        / "curation_runner.py",
     )
-    assert not any(path.exists() for path in obsolete_entrypoints)
+    assert not any(
+        path.exists()
+        for path in obsolete_unified_ui
+    )
+
+    assert (
+        package
+        / "annotation"
+        / "viewer.py"
+    ).is_file()
+    assert (
+        package
+        / "annotation"
+        / "curation_runner.py"
+    ).is_file()
+    assert (
+        package
+        / "visualization"
+        / "source_viewer.py"
+    ).is_file()
 
 
 def test_dataset_curation_has_no_legacy_runtime_imports():
     package = ROOT / "dataset_curation"
-
     forbidden_prefixes = (
         "dataset_curation._compat",
         "dataset_curation.workspace",
@@ -73,17 +107,67 @@ def test_dataset_curation_has_no_legacy_runtime_imports():
     )
 
     offenders: list[str] = []
-
     for path in package.rglob("*.py"):
         if "__pycache__" in path.parts:
             continue
         for module in _imports(path):
             if any(
-                module == prefix or module.startswith(prefix + ".")
+                module == prefix
+                or module.startswith(
+                    prefix + "."
+                )
                 for prefix in forbidden_prefixes
             ):
                 offenders.append(
                     f"{path.relative_to(ROOT)} -> {module}"
                 )
 
-    assert not offenders, "\n".join(offenders)
+    assert not offenders, "\n".join(
+        offenders
+    )
+
+
+def test_unified_viewer_has_requested_layer_and_control_contract():
+    viewer = (
+        ROOT
+        / "dataset_curation"
+        / "annotation"
+        / "viewer.py"
+    ).read_text(
+        encoding="utf-8"
+    )
+
+    required = (
+        "Supervoxel IDs",
+        "Cell instance centers",
+        "Broken Tracks",
+        "Broken Track Centers",
+        "New Tracks",
+        "New Track Centers",
+        "Boundary Entry Tracks",
+        "Boundary Exit Tracks",
+        "Hidden tracks",
+        "Hallucination",
+        "Continue Track",
+        "Break Track",
+        "Complete Track",
+    )
+    for token in required:
+        assert token in viewer
+
+    assert "SV number leader lines" not in viewer
+    assert "add_shapes" not in viewer
+
+
+def test_cli_exposes_only_unified_annotation_entrypoint():
+    cli = (
+        ROOT
+        / "dataset_curation"
+        / "cli.py"
+    ).read_text(
+        encoding="utf-8"
+    )
+    assert '"annotate"' in cli
+    assert '"view-source"' in cli
+    assert "annotate-instances" not in cli
+    assert "annotate-tracks" not in cli

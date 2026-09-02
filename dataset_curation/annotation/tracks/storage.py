@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Track annotation artifact paths and JSON/CSV serialization."""
+"""Track-annotation output paths and atomic serialization."""
 
 import json
 import os
@@ -16,33 +16,6 @@ from dataset_curation.annotation.tracks.graph import (
     Node,
     _canonical_edge,
 )
-
-
-@dataclass(frozen=True)
-class SourcePaths:
-    """Persistent inference artifacts required by track annotation."""
-
-    root: Path
-
-    @property
-    def final_instances(self) -> Path:
-        return self.root / "movies" / "final_instances.npy"
-
-    @property
-    def cells_csv(self) -> Path:
-        return self.root / "cells_all.csv"
-
-    @property
-    def napari_tracks(self) -> Path:
-        return self.root / "trackastra" / "napari_tracks.npy"
-
-    @property
-    def napari_graph(self) -> Path:
-        return self.root / "trackastra" / "napari_graph.json"
-
-    @property
-    def tracks_csv(self) -> Path:
-        return self.root / "trackastra" / "tracks.csv"
 
 
 @dataclass(frozen=True)
@@ -153,7 +126,10 @@ def _parse_node(
         raise AnnotationError(
             f"Invalid serialized node: {value!r}"
         )
-    return int(value[0]), int(value[1])
+    return (
+        int(value[0]),
+        int(value[1]),
+    )
 
 
 def _parse_edge(
