@@ -153,13 +153,22 @@ def test_unified_viewer_has_requested_layer_and_control_contract():
         "Hallucination",
         "Continue Track",
         "Break Track",
-        "Complete Track",
+        "Birth",
     )
     for token in required:
         assert token in viewer
 
+    # Automatic track completion replaced the old manual Complete Track action.
+    assert "Complete Track" not in viewer
+    assert "complete_track_button" not in viewer
+
+    # Supervoxel leader lines and unsupported 3-D Labels contours are gone.
     assert "SV number leader lines" not in viewer
     assert "add_shapes" not in viewer
+    assert ".contour =" not in viewer
+
+    # Unified picking must use the Raw BioHub ray for both annotation modes.
+    assert "ray_pick_label_from_raw" in viewer
 
 
 def test_cli_exposes_only_unified_annotation_entrypoint():
@@ -220,4 +229,3 @@ def test_unified_viewer_never_constructs_empty_napari_tracks():
     assert 'name="Corrected Tracks - active"' in viewer
     assert 'name="Hidden tracks"' in viewer
     assert "group.track_layer = (" in viewer
-
