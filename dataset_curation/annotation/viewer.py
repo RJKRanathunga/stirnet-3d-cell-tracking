@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_RAW_RAY_BIRTH_AUTOHIDE_V1
+
 # DATASET_CURATION_EMPTY_TRACKS_SAFE_V1
 
 """Unified Napari viewer for spatial and track annotation."""
@@ -23,10 +25,10 @@ from dataset_curation.annotation.instances.split import AnnotationError
 from dataset_curation.annotation.layers import (
     apply_label_color_dict,
     edges_to_tracks_array,
-    filter_track_rows_for_completed,
+    filter_diagnostic_track_rows,
     label_color_dict,
     nodes_to_points_array,
-    ray_pick_frontmost_label,
+    ray_pick_label_from_raw,
     track_frame_arrays,
 )
 from dataset_curation.annotation.source_data import (
@@ -62,7 +64,6 @@ except ImportError:
 
 MODE_SPATIAL = "spatial"
 MODE_TRACKING = "tracking"
-SUPERVOXEL_CONTOUR_WIDTH = 1
 
 _CATEGORY_RGBA = {
     "default": (1.0, 1.0, 1.0, 1.0),
@@ -294,18 +295,15 @@ def make_viewer(
         initial_supervoxels,
         name="Atomic supervoxel boundaries",
         scale=spacing_zyx,
-        opacity=0.95,
+        opacity=0.35,
     )
     apply_label_color_dict(
         supervoxel_layer,
         label_color_dict(initial_supervoxels),
     )
-    try:
-        supervoxel_layer.contour = (
-            SUPERVOXEL_CONTOUR_WIDTH
-        )
-    except Exception:
-        supervoxel_layer.opacity = 0.25
+    # Napari does not render Labels.contour in 3-D. Deliberately use
+    # translucent label fills instead of assigning contour and triggering
+    # repeated "Contours are not displayed during 3D rendering" warnings.
 
     sv_points, sv_properties = (
         supervoxel_interior_points(
@@ -402,6 +400,18 @@ def make_viewer(
         name="Track Cell B selection",
         scale=spacing_zyx,
         colormap="magenta",
+        contrast_limits=(0, 1),
+        opacity=0.88,
+        blending="additive",
+    )
+    track_selection_c_layer = viewer.add_image(
+        np.zeros(
+            spatial_shape,
+            dtype=np.uint8,
+        ),
+        name="Track Cell C selection",
+        scale=spacing_zyx,
+        colormap="cyan",
         contrast_limits=(0, 1),
         opacity=0.88,
         blending="additive",
@@ -628,8 +638,8 @@ def make_viewer(
     break_track_button = PushButton(
         text="Break Track"
     )
-    complete_track_button = PushButton(
-        text="Complete Track"
+    birth_button = PushButton(
+        text="Birth"
     )
     reset_track_button = PushButton(
         text="Reset Track"
@@ -665,7 +675,7 @@ def make_viewer(
             undo_spatial_button,
             continue_track_button,
             break_track_button,
-            complete_track_button,
+            birth_button,
             reset_track_button,
             undo_track_button,
             status_label,
@@ -765,8 +775,10 @@ def make_viewer(
         )
         track_selection_a_layer.data = zero
         track_selection_b_layer.data = zero
+        track_selection_c_layer.data = zero
         track_selection_a_layer.refresh()
         track_selection_b_layer.refresh()
+        track_selection_c_layer.refresh()
 
     def refresh_track_selection_layers() -> None:
         frame = current_frame()
@@ -781,6 +793,7 @@ def make_viewer(
             (
                 track_selection_a_layer,
                 track_selection_b_layer,
+                track_selection_c_layer,
             )
         ):
             if (
@@ -844,11 +857,18 @@ def make_viewer(
             )
 
     def refresh_diagnostic_layers() -> None:
-        for group in diagnostic_layers.values():
+        for key, group in diagnostic_layers.items():
             filtered = (
-                filter_track_rows_for_completed(
+                filter_diagnostic_track_rows(
                     group.frame,
-                    track_session.completed_nodes,
+                    category=key,
+                    hidden_nodes=track_session.hidden_nodes,
+                    unresolved_start_nodes=(
+                        track_session.unresolved_start_nodes
+                    ),
+                    unresolved_end_nodes=(
+                        track_session.unresolved_end_nodes
+                    ),
                 )
             )
             tracks_array, points_array, properties = (
@@ -1126,8 +1146,11 @@ def make_viewer(
         graph_label.value = (
             f"Tracks: visible edges={len(track_session.visible_edges)} | "
             f"hidden nodes={len(track_session.hidden_nodes)} | "
-            f"manual continues={len(track_session.forced_edges)} | "
-            f"manual breaks={len(track_session.broken_edges)}"
+            f"manual continues={len(track_session.forced_edges - track_session.birth_edges)} | "
+            f"manual breaks={len(track_session.broken_edges)} | "
+            f"births={len(track_session.birth_events)} | "
+            f"unresolved starts={len(track_session.unresolved_start_nodes)} | "
+            f"unresolved ends={len(track_session.unresolved_end_nodes)}"
         )
 
         try:
@@ -1142,10 +1165,9 @@ def make_viewer(
                 len(track_session.selections)
                 == 2
             )
-            complete_track_button.enabled = (
-                bool(
-                    track_session.selections
-                )
+            birth_button.enabled = (
+                len(track_session.selections)
+                == 3
             )
             undo_track_button.enabled = (
                 bool(
@@ -1176,7 +1198,7 @@ def make_viewer(
             for widget in (
                 continue_track_button,
                 break_track_button,
-                complete_track_button,
+                birth_button,
                 reset_track_button,
                 undo_track_button,
             ):
@@ -1206,8 +1228,9 @@ def make_viewer(
                 "Mode: Tracking"
             )
             status_label.value = (
-                "Tracking mode: click cell A, move in time, click cell B, "
-                "then Continue Track or Break Track."
+                "Tracking mode: select two cells for Continue/Break, or "
+                "select one parent in an earlier frame and two daughters in "
+                "the next frame for Birth. Track selections survive time changes."
             )
         refresh_status()
 
@@ -1249,8 +1272,11 @@ def make_viewer(
             == MODE_SPATIAL
         ):
             sv_id = (
-                ray_pick_frontmost_label(
-                    supervoxel_layer,
+                ray_pick_label_from_raw(
+                    raw_layer,
+                    np.asarray(
+                        supervoxel_layer.data
+                    ),
                     event,
                 )
             )
@@ -1297,8 +1323,11 @@ def make_viewer(
             return
 
         instance_id = (
-            ray_pick_frontmost_label(
-                corrected_layer,
+            ray_pick_label_from_raw(
+                raw_layer,
+                spatial_session.frame(
+                    frame
+                ),
                 event,
             )
         )
@@ -1437,21 +1466,27 @@ def make_viewer(
             f"t={edge[1][0]} id={edge[1][1]}."
         )
 
-    def complete_track() -> None:
+    def mark_birth() -> None:
         try:
-            nodes = (
-                track_session.complete_selected_components()
+            event = (
+                track_session.birth_selected()
             )
         except Exception as exc:
             show_error(exc)
             return
+
         refresh_track_selection_layers()
         refresh_track_graph_layers()
         refresh_status()
+
+        parent = event["parent"]
+        daughters = event["daughters"]
         status_label.value = (
-            f"Completed {len(nodes)} detections. "
-            "The track is removed from active/diagnostic layers and is "
-            "available in Hidden tracks."
+            f"BIRTH: parent t={parent[0]} id={parent[1]} -> "
+            f"daughters t={daughters[0][0]} "
+            f"id={daughters[0][1]}, id={daughters[1][1]}. "
+            "The two parent-to-daughter edges are now part of the corrected "
+            "graph."
         )
 
     def undo_track() -> None:
@@ -1519,8 +1554,8 @@ def make_viewer(
     break_track_button.changed.connect(
         lambda *_: break_track()
     )
-    complete_track_button.changed.connect(
-        lambda *_: complete_track()
+    birth_button.changed.connect(
+        lambda *_: mark_birth()
     )
     reset_track_button.changed.connect(
         lambda *_: (
@@ -1573,8 +1608,14 @@ def make_viewer(
         if now == last_frame["value"]:
             return
 
-        clear_spatial_selection()
-        clear_track_selection()
+        if (
+            mode["value"]
+            == MODE_SPATIAL
+        ):
+            clear_spatial_selection()
+
+        # Tracking selections deliberately survive a time change. Continue,
+        # Break and Birth all require selecting detections across frames.
         last_frame["value"] = now
         last_binary_frame["value"] = -1
         refresh_current_frame_layers()
@@ -1589,7 +1630,7 @@ def make_viewer(
             )
         else:
             status_label.value = (
-                "Frame changed. Track selections were cleared."
+                "Frame changed. Track selections were preserved."
             )
 
     viewer.dims.events.current_step.connect(
@@ -1633,8 +1674,10 @@ def make_viewer(
     print("cell centers        : dynamic corrected-instance centers")
     print("track diagnostics   : notebook-09 broken/new/boundary groups")
     print("spatial controls    : Save Split | Hallucination | Undo Spatial")
-    print("track controls      : Continue Track | Break Track | Complete Track")
-    print("completed tracks    : Hidden tracks layer")
+    print("track controls      : Continue Track | Break Track | Birth | Undo Track")
+    print("track completion    : automatic; complete components move to Hidden tracks")
+    print("ray picking         : always derived from Raw BioHub")
+    print("3-D contours        : disabled; translucent SV fills avoid Napari warning")
     print("=" * 96)
 
     return viewer

@@ -144,23 +144,6 @@ def apply_label_color_dict(
     )
 
 
-def _coerce_positive_label_value(value) -> int:
-    if value is None:
-        return 0
-    array = np.asarray(value)
-    if array.size != 1:
-        return 0
-    try:
-        result = int(array.reshape(-1)[0])
-    except (
-        TypeError,
-        ValueError,
-        OverflowError,
-    ):
-        return 0
-    return result if result > 0 else 0
-
-
 def _first_nonzero_label_along_ray(
     labels: np.ndarray,
     start_point: np.ndarray,
@@ -168,6 +151,12 @@ def _first_nonzero_label_along_ray(
     *,
     samples_per_voxel: float = 4.0,
 ) -> int:
+    """
+    Traverse a spatial label volume from camera-near to camera-far.
+
+    The caller is responsible for deriving the ray from the RAW image layer.
+    This deliberately does not ask a Labels layer for a rendered value.
+    """
     data = np.asarray(labels)
     start = np.asarray(
         start_point,
@@ -178,9 +167,11 @@ def _first_nonzero_label_along_ray(
         dtype=np.float64,
     ).reshape(-1)
 
-    if start.shape != end.shape:
-        return 0
-    if start.size != data.ndim:
+    if data.ndim != 3:
+        raise ValueError(
+            f"Ray picking expects a 3-D ZYX label frame, got {data.shape}."
+        )
+    if start.shape != (3,) or end.shape != (3,):
         return 0
     if (
         not np.all(np.isfinite(start))
@@ -234,16 +225,31 @@ def _first_nonzero_label_along_ray(
         )
         if value > 0:
             return value
+
     return 0
 
 
-def ray_pick_frontmost_label(
-    layer,
+def ray_pick_label_from_raw(
+    raw_layer,
+    labels_zyx: np.ndarray,
     event,
 ) -> int:
     """
-    Pick the camera-nearest positive label from a current-frame 3-D layer.
+    Select the first positive spatial label hit by the RAW-volume camera ray.
+
+    The ray always comes from ``Raw BioHub``. In spatial mode the same ray is
+    tested against the current supervoxel frame; in tracking mode it is tested
+    against the current corrected-instance frame.
+
+    This keeps click geometry independent of which overlay is active, visible,
+    translucent, or rendered differently by a Napari version.
     """
+    labels = np.asarray(labels_zyx)
+    if labels.ndim != 3:
+        raise ValueError(
+            f"Expected current-frame labels (Z,Y,X), got {labels.shape}."
+        )
+
     view_direction = getattr(
         event,
         "view_direction",
@@ -260,23 +266,8 @@ def ray_pick_frontmost_label(
         and dims_displayed is not None
     ):
         try:
-            value = layer.get_value(
-                event.position,
-                view_direction=view_direction,
-                dims_displayed=dims_displayed,
-                world=True,
-            )
-            label_id = _coerce_positive_label_value(
-                value
-            )
-            if label_id > 0:
-                return label_id
-        except Exception:
-            pass
-
-        try:
             start_point, end_point = (
-                layer.get_ray_intersections(
+                raw_layer.get_ray_intersections(
                     position=event.position,
                     view_direction=view_direction,
                     dims_displayed=dims_displayed,
@@ -286,7 +277,7 @@ def ray_pick_frontmost_label(
         except TypeError:
             try:
                 start_point, end_point = (
-                    layer.get_ray_intersections(
+                    raw_layer.get_ray_intersections(
                         event.position,
                         view_direction,
                         dims_displayed,
@@ -309,36 +300,58 @@ def ray_pick_frontmost_label(
             and end_point is not None
         ):
             start = np.asarray(
-                start_point
+                start_point,
+                dtype=np.float64,
             ).reshape(-1)
             end = np.asarray(
-                end_point
+                end_point,
+                dtype=np.float64,
             ).reshape(-1)
-            if start.size != np.asarray(
-                layer.data
-            ).ndim:
-                start = start[
-                    -np.asarray(layer.data).ndim:
-                ]
-                end = end[
-                    -np.asarray(layer.data).ndim:
-                ]
-            return _first_nonzero_label_along_ray(
-                np.asarray(layer.data),
-                start,
-                end,
-            )
 
+            if (
+                start.size >= 3
+                and end.size >= 3
+            ):
+                return _first_nonzero_label_along_ray(
+                    labels,
+                    start[-3:],
+                    end[-3:],
+                )
+
+    # 2-D compatibility path: convert the canvas/world click through the raw
+    # layer and sample only the spatial coordinates.
     try:
-        value = layer.get_value(
-            event.position,
-            world=True,
-        )
-        return _coerce_positive_label_value(
-            value
-        )
+        data_position = np.asarray(
+            raw_layer.world_to_data(
+                event.position
+            ),
+            dtype=np.float64,
+        ).reshape(-1)
     except Exception:
         return 0
+
+    if data_position.size < 3:
+        return 0
+
+    index = np.rint(
+        data_position[-3:]
+    ).astype(np.int64)
+    shape = np.asarray(
+        labels.shape,
+        dtype=np.int64,
+    )
+    if (
+        np.any(index < 0)
+        or np.any(index >= shape)
+    ):
+        return 0
+
+    value = int(
+        labels[
+            tuple(index.tolist())
+        ]
+    )
+    return value if value > 0 else 0
 
 
 def edges_to_tracks_array(
@@ -428,11 +441,11 @@ def nodes_to_points_array(
     )
 
 
-def filter_track_rows_for_completed(
+def filter_track_rows_for_hidden(
     frame: pd.DataFrame,
-    completed_nodes: set[Node],
+    hidden_nodes: set[Node],
 ) -> pd.DataFrame:
-    if frame.empty or not completed_nodes:
+    if frame.empty or not hidden_nodes:
         return frame.copy()
 
     keep = [
@@ -440,7 +453,7 @@ def filter_track_rows_for_completed(
             int(row.frame),
             int(row.cell_id),
         )
-        not in completed_nodes
+        not in hidden_nodes
         for row in frame.itertuples(
             index=False
         )
@@ -451,6 +464,76 @@ def filter_track_rows_for_completed(
             dtype=bool,
         )
     ].copy()
+
+
+def filter_diagnostic_track_rows(
+    frame: pd.DataFrame,
+    *,
+    category: str,
+    hidden_nodes: set[Node],
+    unresolved_start_nodes: set[Node],
+    unresolved_end_nodes: set[Node],
+) -> pd.DataFrame:
+    """
+    Remove diagnostic tracks whose ORIGINAL endpoint is no longer unresolved.
+
+    After Continue/Birth resolves one gap, that old red/lime diagnostic
+    disappears even if the resulting component still contains another break.
+    """
+    if frame.empty:
+        return frame.copy()
+
+    if category not in {
+        "new",
+        "broken",
+    }:
+        return filter_track_rows_for_hidden(
+            frame,
+            hidden_nodes,
+        )
+
+    unresolved = (
+        unresolved_start_nodes
+        if category == "new"
+        else unresolved_end_nodes
+    )
+
+    pieces: list[pd.DataFrame] = []
+    for _track_id, original_group in frame.groupby(
+        "track_id",
+        sort=False,
+    ):
+        ordered = original_group.sort_values(
+            "frame"
+        )
+        endpoint = (
+            ordered.iloc[0]
+            if category == "new"
+            else ordered.iloc[-1]
+        )
+        node = (
+            int(endpoint["frame"]),
+            int(endpoint["cell_id"]),
+        )
+        if node not in unresolved:
+            continue
+
+        visible_piece = filter_track_rows_for_hidden(
+            original_group,
+            hidden_nodes,
+        )
+        if not visible_piece.empty:
+            pieces.append(
+                visible_piece
+            )
+
+    if not pieces:
+        return frame.iloc[0:0].copy()
+
+    return pd.concat(
+        pieces,
+        ignore_index=True,
+    )
 
 
 def track_frame_arrays(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_RAW_RAY_BIRTH_AUTOHIDE_V1
+
 # DATASET_CURATION_CANONICAL_SKIP_V1
 
 """One-volume unified spatial + tracking curation runner."""
@@ -291,15 +293,6 @@ def run_annotation(
         )
     )
 
-    track_session = TrackAnnotationSession(
-        sample_id=record.volume_id,
-        source_root=paths.preprocessed_root,
-        output=track_output,
-        valid_nodes=valid_nodes,
-        base_edges=base_edges,
-        resume=resume_unified_state,
-    )
-
     diagnostics = (
         prepare_endpoint_track_groups(
             tracks,
@@ -310,6 +303,43 @@ def run_annotation(
                 boundary_margin_um
             ),
         )
+    )
+
+    boundary_entry_nodes = {
+        (
+            int(row.frame),
+            int(row.cell_id),
+        )
+        for row in diagnostics.new_track_endpoints.itertuples(
+            index=False
+        )
+        if bool(
+            row.is_boundary_endpoint
+        )
+    }
+    boundary_exit_nodes = {
+        (
+            int(row.frame),
+            int(row.cell_id),
+        )
+        for row in diagnostics.ended_track_endpoints.itertuples(
+            index=False
+        )
+        if bool(
+            row.is_boundary_endpoint
+        )
+    }
+
+    track_session = TrackAnnotationSession(
+        sample_id=record.volume_id,
+        source_root=paths.preprocessed_root,
+        output=track_output,
+        valid_nodes=valid_nodes,
+        base_edges=base_edges,
+        frame_count=frame_count,
+        boundary_entry_nodes=boundary_entry_nodes,
+        boundary_exit_nodes=boundary_exit_nodes,
+        resume=resume_unified_state,
     )
 
     binary_cache = BinaryMaskFrameCache(

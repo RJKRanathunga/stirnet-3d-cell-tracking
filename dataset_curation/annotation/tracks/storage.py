@@ -35,8 +35,8 @@ class OutputPaths:
         return self.root / "edge_overrides.csv"
 
     @property
-    def completed_nodes_csv(self) -> Path:
-        return self.root / "completed_nodes.csv"
+    def birth_events_csv(self) -> Path:
+        return self.root / "birth_events.csv"
 
 
 def _atomic_json(
