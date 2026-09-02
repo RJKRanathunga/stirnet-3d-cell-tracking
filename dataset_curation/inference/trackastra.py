@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_CANONICAL_SKIP_V1
+
 import gc
 import os
 from pathlib import Path
@@ -116,7 +118,6 @@ def _dask_from_label_memmap(
 def run_trackastra(
     paths,
     *,
-    run_id: str = "current",
     model_name: str = "ctc",
     mode: str = "greedy",
     device: str = "cuda",
@@ -129,9 +130,7 @@ def run_trackastra(
     movie is read lazily from the canonical source Zarr instead of being copied
     into preprocessed/<volume>/movies/raw.npy.
     """
-    output = paths.trackastra_root(
-        run_id
-    )
+    output = paths.trackastra_root
     output.mkdir(
         parents=True,
         exist_ok=True,
@@ -152,7 +151,7 @@ def run_trackastra(
         )
 
     if (
-        paths.tracking_complete(run_id)
+        paths.tracking_complete()
         and not rebuild
     ):
         print(
@@ -180,9 +179,7 @@ def run_trackastra(
     )
     final_handle, final_movie = (
         _dask_from_label_memmap(
-            paths.final_instances(
-                run_id
-            )
+            paths.final_instances
         )
     )
 
@@ -201,7 +198,7 @@ def run_trackastra(
     print(f"device    : {device}", flush=True)
     print(f"raw       : {paths.zarr} (lazy Dask/Zarr)", flush=True)
     print(
-        f"instances : {paths.final_instances(run_id)} "
+        f"instances : {paths.final_instances} "
         "(uint16 memmap/Dask)",
         flush=True,
     )
@@ -222,9 +219,7 @@ def run_trackastra(
         - started
     )
 
-    with paths.track_graph(
-        run_id
-    ).open("wb") as handle:
+    with paths.track_graph.open("wb") as handle:
         pickle.dump(
             track_graph,
             handle,
@@ -253,7 +248,7 @@ def run_trackastra(
         )
 
     np.save(
-        paths.napari_tracks(run_id),
+        paths.napari_tracks,
         napari_tracks,
         allow_pickle=False,
     )
@@ -274,7 +269,7 @@ def run_trackastra(
         in napari_graph.items()
     }
     atomic_json(
-        paths.napari_graph(run_id),
+        paths.napari_graph,
         serializable_graph,
     )
 
@@ -298,7 +293,7 @@ def run_trackastra(
     )
 
     cells = pd.read_csv(
-        paths.cells_csv(run_id)
+        paths.cells_csv
     )
     from src.api import (
         prepare_visualization_data,
@@ -312,7 +307,7 @@ def run_trackastra(
         )
     )
     _atomic_csv(
-        paths.tracks_csv(run_id),
+        paths.tracks_csv,
         visualization.tracks,
     )
 
@@ -345,7 +340,7 @@ def run_trackastra(
         ),
     }
     atomic_json(
-        paths.trackastra_summary(run_id),
+        paths.trackastra_summary,
         summary,
     )
 

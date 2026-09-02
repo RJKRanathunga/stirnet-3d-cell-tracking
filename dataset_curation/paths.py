@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# DATASET_CURATION_CANONICAL_SKIP_V1
+
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,49 +67,72 @@ class BioHubVolumePaths:
 
     @property
     def preprocessed_root(self) -> Path:
+        """The one canonical production inference root for this volume."""
         return self.preprocessed_split_root / self.volume_id
 
-    def inference_run(self, run_id: str = "current") -> Path:
-        return self.preprocessed_root / str(run_id)
+    @property
+    def inference_manifest(self) -> Path:
+        return self.preprocessed_root / "curation_manifest.json"
 
-    def inference_manifest(self, run_id: str = "current") -> Path:
-        return self.inference_run(run_id) / "curation_manifest.json"
+    @property
+    def skip_marker(self) -> Path:
+        return self.preprocessed_root / "_SKIPPED.json"
 
-    def movies(self, run_id: str = "current") -> Path:
-        return self.inference_run(run_id) / "movies"
+    @property
+    def movies(self) -> Path:
+        return self.preprocessed_root / "movies"
 
-    def supervoxels(self, run_id: str = "current") -> Path:
-        return self.movies(run_id) / "supervoxels.npy"
+    @property
+    def supervoxels(self) -> Path:
+        return self.movies / "supervoxels.npy"
 
-    def final_instances(self, run_id: str = "current") -> Path:
-        return self.movies(run_id) / "final_instances.npy"
+    @property
+    def final_instances(self) -> Path:
+        return self.movies / "final_instances.npy"
 
-    def cells_csv(self, run_id: str = "current") -> Path:
-        return self.inference_run(run_id) / "cells_all.csv"
+    @property
+    def cells_dir(self) -> Path:
+        return self.preprocessed_root / "cells"
 
-    def spatial_success(self, run_id: str = "current") -> Path:
-        return self.inference_run(run_id) / "_SPATIAL_SUCCESS.json"
+    @property
+    def cells_csv(self) -> Path:
+        return self.preprocessed_root / "cells_all.csv"
 
-    def spatial_summary(self, run_id: str = "current") -> Path:
-        return self.inference_run(run_id) / "spatial_summary.json"
+    @property
+    def spatial_success(self) -> Path:
+        return self.preprocessed_root / "_SPATIAL_SUCCESS.json"
 
-    def trackastra_root(self, run_id: str = "current") -> Path:
-        return self.inference_run(run_id) / "trackastra"
+    @property
+    def spatial_summary(self) -> Path:
+        return self.preprocessed_root / "spatial_summary.json"
 
-    def track_graph(self, run_id: str = "current") -> Path:
-        return self.trackastra_root(run_id) / "track_graph.pkl"
+    @property
+    def trackastra_root(self) -> Path:
+        return self.preprocessed_root / "trackastra"
 
-    def napari_tracks(self, run_id: str = "current") -> Path:
-        return self.trackastra_root(run_id) / "napari_tracks.npy"
+    @property
+    def track_graph(self) -> Path:
+        return self.trackastra_root / "track_graph.pkl"
 
-    def napari_graph(self, run_id: str = "current") -> Path:
-        return self.trackastra_root(run_id) / "napari_graph.json"
+    @property
+    def napari_tracks(self) -> Path:
+        return self.trackastra_root / "napari_tracks.npy"
 
-    def tracks_csv(self, run_id: str = "current") -> Path:
-        return self.trackastra_root(run_id) / "tracks.csv"
+    @property
+    def napari_graph(self) -> Path:
+        return self.trackastra_root / "napari_graph.json"
 
-    def trackastra_summary(self, run_id: str = "current") -> Path:
-        return self.trackastra_root(run_id) / "summary.json"
+    @property
+    def tracks_csv(self) -> Path:
+        return self.trackastra_root / "tracks.csv"
+
+    @property
+    def trackastra_summary(self) -> Path:
+        return self.trackastra_root / "summary.json"
+
+    @property
+    def suspect_scores(self) -> Path:
+        return self.preprocessed_root / "suspects"
 
     @property
     def annotations_split_root(self) -> Path:
@@ -131,9 +157,6 @@ class BioHubVolumePaths:
     def point_annotations(self, name: str = "main") -> Path:
         return self.annotation_set(name) / "points"
 
-    def suspect_scores(self, run_id: str = "current") -> Path:
-        return self.inference_run(run_id) / "suspects"
-
     def ensure_output_roots(self) -> None:
         self.preprocessed_split_root.mkdir(parents=True, exist_ok=True)
         self.annotations_split_root.mkdir(parents=True, exist_ok=True)
@@ -144,17 +167,41 @@ class BioHubVolumePaths:
             and self.ground_truth_edges.is_file()
         )
 
-    def has_any_preprocessed_data(
-        self,
-        run_id: str = "current",
-    ) -> bool:
-        root = self.inference_run(run_id)
+    def has_any_preprocessed_data(self) -> bool:
+        root = self.preprocessed_root
         if not root.is_dir():
             return False
         try:
             return next(root.iterdir(), None) is not None
         except OSError:
             return True
+
+    def inference_skipped(self) -> bool:
+        return self.skip_marker.is_file()
+
+    def read_skip_record(self) -> dict:
+        if not self.skip_marker.is_file():
+            raise FileNotFoundError(self.skip_marker)
+        payload = json.loads(
+            self.skip_marker.read_text(encoding="utf-8")
+        )
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Expected JSON object in {self.skip_marker}"
+            )
+        return payload
+
+    def inference_id(self) -> str | None:
+        if not self.inference_manifest.is_file():
+            return None
+        try:
+            payload = json.loads(
+                self.inference_manifest.read_text(encoding="utf-8")
+            )
+            value = str(payload.get("inference_id", "")).strip()
+            return value or None
+        except Exception:
+            return None
 
     @staticmethod
     def _label_movie_is_valid(
@@ -184,7 +231,6 @@ class BioHubVolumePaths:
 
     def spatial_complete(
         self,
-        run_id: str = "current",
         *,
         frame_count: int | None = None,
     ) -> bool:
@@ -196,48 +242,43 @@ class BioHubVolumePaths:
         Only uint16 atomic supervoxels + final spatial instances are persisted.
         """
         required = (
-            self.supervoxels(run_id),
-            self.final_instances(run_id),
-            self.cells_csv(run_id),
-            self.spatial_success(run_id),
+            self.supervoxels,
+            self.final_instances,
+            self.cells_csv,
+            self.spatial_success,
         )
         if not all(path.is_file() for path in required):
             return False
 
         return (
             self._label_movie_is_valid(
-                self.final_instances(run_id),
+                self.final_instances,
                 frame_count,
             )
             and self._label_movie_is_valid(
-                self.supervoxels(run_id),
+                self.supervoxels,
                 frame_count,
             )
         )
 
-    def tracking_complete(
-        self,
-        run_id: str = "current",
-    ) -> bool:
+    def tracking_complete(self) -> bool:
         required = (
-            self.track_graph(run_id),
-            self.napari_tracks(run_id),
-            self.napari_graph(run_id),
-            self.tracks_csv(run_id),
-            self.trackastra_summary(run_id),
+            self.track_graph,
+            self.napari_tracks,
+            self.napari_graph,
+            self.tracks_csv,
+            self.trackastra_summary,
         )
         return all(path.is_file() for path in required)
 
     def inference_complete(
         self,
-        run_id: str = "current",
         *,
         frame_count: int | None = None,
     ) -> bool:
         return (
-            self.spatial_complete(
-                run_id,
-                frame_count=frame_count,
-            )
-            and self.tracking_complete(run_id)
+            not self.inference_skipped()
+            and self.spatial_complete(frame_count=frame_count)
+            and self.tracking_complete()
+            and self.inference_id() is not None
         )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_CANONICAL_SKIP_V1
+
 """One-volume unified spatial + tracking curation runner."""
 
 import json
@@ -82,7 +84,6 @@ def _replace_frame_nodes_and_centers(
 def run_annotation(
     record: VolumeRecord,
     *,
-    run_id: str = "current",
     annotation_set: str = "main",
     boundary_margin_um: float = 4.0,
     resume: bool = True,
@@ -98,20 +99,19 @@ def run_annotation(
 
     paths = record.paths
     if not paths.inference_complete(
-        run_id,
         frame_count=record.frame_count,
     ):
         raise ArtifactError(
-            f"Volume {record.volume_id} does not have a complete "
-            f"inference run {run_id!r}."
+            f"Volume {record.volume_id} does not have complete "
+            "canonical inference."
         )
 
     required = (
-        paths.supervoxels(run_id),
-        paths.final_instances(run_id),
-        paths.cells_csv(run_id),
-        paths.tracks_csv(run_id),
-        paths.napari_graph(run_id),
+        paths.supervoxels,
+        paths.final_instances,
+        paths.cells_csv,
+        paths.tracks_csv,
+        paths.napari_graph,
     )
     missing = [
         path
@@ -131,12 +131,12 @@ def run_annotation(
         paths.zarr
     )
     supervoxels = np.load(
-        paths.supervoxels(run_id),
+        paths.supervoxels,
         mmap_mode="r",
         allow_pickle=False,
     )
     base_instances = np.load(
-        paths.final_instances(run_id),
+        paths.final_instances,
         mmap_mode="r",
         allow_pickle=False,
     )
@@ -182,13 +182,11 @@ def run_annotation(
 
     ensure_annotation_binding(
         record,
-        run_id=run_id,
         annotation_set=annotation_set,
     )
     touch_annotation_session(
         record,
         annotation_set=annotation_set,
-        run_id=run_id,
     )
 
     spatial_output = (
@@ -221,18 +219,16 @@ def run_annotation(
 
     cells = normalize_cells(
         pd.read_csv(
-            paths.cells_csv(run_id)
+            paths.cells_csv
         )
     )
     tracks = normalize_tracks(
         pd.read_csv(
-            paths.tracks_csv(run_id)
+            paths.tracks_csv
         )
     )
     lineage = json.loads(
-        paths.napari_graph(
-            run_id
-        ).read_text(
+        paths.napari_graph.read_text(
             encoding="utf-8"
         )
     )
@@ -242,7 +238,7 @@ def run_annotation(
     ):
         raise ArtifactError(
             f"Expected lineage dict in "
-            f"{paths.napari_graph(run_id)}."
+            f"{paths.napari_graph}."
         )
 
     valid_nodes: set[Node] = {
@@ -297,9 +293,7 @@ def run_annotation(
 
     track_session = TrackAnnotationSession(
         sample_id=record.volume_id,
-        source_root=paths.inference_run(
-            run_id
-        ),
+        source_root=paths.preprocessed_root,
         output=track_output,
         valid_nodes=valid_nodes,
         base_edges=base_edges,
@@ -329,7 +323,7 @@ def run_annotation(
     print(f"split          : {record.split}")
     print(f"volume         : {record.volume_id}")
     print(f"source Zarr    : {paths.zarr}")
-    print(f"inference run  : {paths.inference_run(run_id)}")
+    print(f"inference run  : {paths.preprocessed_root}")
     print(f"annotations    : {paths.annotation_set(annotation_set)}")
     print(f"resume state   : {resume_unified_state}")
     print(

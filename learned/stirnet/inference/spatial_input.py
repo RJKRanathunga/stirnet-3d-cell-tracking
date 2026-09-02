@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+# DATASET_CURATION_CANONICAL_SKIP_V1
+
 from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path
 import time
+from typing import Callable
 
 import numpy as np
 
@@ -110,6 +113,7 @@ def prepare_spatial_frame(
     *,
     config: SpatialInferenceConfig,
     segmentation_config,
+    source_mask_validator: Callable[[int, np.ndarray], None] | None = None,
 ) -> PreparedSpatialFrame:
     """CPU-only preparation. This function must never touch CUDA."""
     from src.api import (
@@ -129,6 +133,11 @@ def prepare_spatial_frame(
     source_mask = create_binary_mask(
         preprocessed
     )
+    if source_mask_validator is not None:
+        source_mask_validator(
+            int(frame),
+            np.asarray(source_mask),
+        )
     source_labels = segment_instances(
         source_mask,
         config=segmentation_config,

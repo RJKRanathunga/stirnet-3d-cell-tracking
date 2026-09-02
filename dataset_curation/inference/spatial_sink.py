@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_CANONICAL_SKIP_V1
+
 import os
 from pathlib import Path
 
@@ -108,11 +110,9 @@ class CurationSpatialSink:
         self,
         paths,
         *,
-        run_id: str,
         frame_count: int,
     ) -> None:
         self.paths = paths
-        self.run_id = str(run_id)
         self.frame_count = int(frame_count)
 
         self._supervoxels = None
@@ -121,15 +121,15 @@ class CurationSpatialSink:
         self._cells: list[pd.DataFrame] = []
         self._written_frames: set[int] = set()
 
-        output = self.paths.inference_run(self.run_id)
+        output = self.paths.preprocessed_root
         output.mkdir(parents=True, exist_ok=True)
 
         # A regenerated run is incomplete until finish() writes a fresh marker.
-        self.paths.spatial_success(self.run_id).unlink(missing_ok=True)
-        self.paths.spatial_summary(self.run_id).unlink(missing_ok=True)
-        self.paths.cells_csv(self.run_id).unlink(missing_ok=True)
+        self.paths.spatial_success.unlink(missing_ok=True)
+        self.paths.spatial_summary.unlink(missing_ok=True)
+        self.paths.cells_csv.unlink(missing_ok=True)
 
-        movies = self.paths.movies(self.run_id)
+        movies = self.paths.movies
         movies.mkdir(parents=True, exist_ok=True)
         for name in _OBSOLETE_FULL_VOLUME_MOVIES:
             stale = movies / name
@@ -158,13 +158,13 @@ class CurationSpatialSink:
         )
 
         self._supervoxels = np.lib.format.open_memmap(
-            self.paths.supervoxels(self.run_id),
+            self.paths.supervoxels,
             mode="w+",
             dtype=PERSISTED_LABEL_DTYPE,
             shape=shape,
         )
         self._final = np.lib.format.open_memmap(
-            self.paths.final_instances(self.run_id),
+            self.paths.final_instances,
             mode="w+",
             dtype=PERSISTED_LABEL_DTYPE,
             shape=shape,
@@ -246,7 +246,7 @@ class CurationSpatialSink:
             ignore_index=True,
         )
         _atomic_csv(
-            self.paths.cells_csv(self.run_id),
+            self.paths.cells_csv,
             combined,
         )
 
@@ -306,11 +306,11 @@ class CurationSpatialSink:
         }
 
         atomic_json(
-            self.paths.spatial_summary(self.run_id),
+            self.paths.spatial_summary,
             summary,
         )
         atomic_json(
-            self.paths.spatial_success(self.run_id),
+            self.paths.spatial_success,
             {
                 "status": "success",
                 "sample_id": str(sample_id),

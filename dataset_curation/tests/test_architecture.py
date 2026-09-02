@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_CANONICAL_SKIP_V1
+
 import ast
 from pathlib import Path
 
@@ -171,3 +173,25 @@ def test_cli_exposes_only_unified_annotation_entrypoint():
     assert '"view-source"' in cli
     assert "annotate-instances" not in cli
     assert "annotate-tracks" not in cli
+def test_dataset_curation_has_one_canonical_inference_root():
+    package = ROOT / "dataset_curation"
+    offenders = []
+    for path in package.rglob("*.py"):
+        if "__pycache__" in path.parts or "tests" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "run_id" in text or "base_inference_run" in text:
+            offenders.append(str(path.relative_to(ROOT)))
+    assert not offenders, "legacy inference-run concepts remain:\n" + "\n".join(offenders)
+
+    cli = (package / "cli.py").read_text(encoding="utf-8")
+    assert "--run-id" not in cli
+
+
+def test_quality_gate_is_before_expensive_source_segmentation():
+    text = (
+        ROOT / "learned" / "stirnet" / "inference" / "spatial_input.py"
+    ).read_text(encoding="utf-8")
+    assert text.index("source_mask_validator(") < text.index(
+        "source_labels = segment_instances("
+    )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_CANONICAL_SKIP_V1
+
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import gc
@@ -189,6 +191,7 @@ def run_parallel_spatial_volume(
     ]
     | None = None,
     require_nonempty_cells: bool = True,
+    source_mask_validator: Callable[[int, np.ndarray], None] | None = None,
 ) -> SpatialVolumeResult:
     from src.api import (
         detect_cells,
@@ -249,6 +252,9 @@ def run_parallel_spatial_volume(
                 segmentation_config=(
                     segmentation_config
                 ),
+                source_mask_validator=(
+                    source_mask_validator
+                ),
             )
         )
 
@@ -289,6 +295,9 @@ def run_parallel_spatial_volume(
                         config=config,
                         segmentation_config=(
                             segmentation_config
+                        ),
+                        source_mask_validator=(
+                            source_mask_validator
                         ),
                     )
                 )
