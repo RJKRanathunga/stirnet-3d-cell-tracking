@@ -133,7 +133,15 @@ def test_viewer_has_save_merge_and_robust_escape_reset():
     end = viewer.index("def mark_hallucination() -> None:", start)
     merge_block = viewer[start:end]
     assert "spatial_authority_changed=True" in merge_block
-    assert "refresh_tracks=True" in merge_block
+
+    # Save Merge still refreshes the corrected spatial frame immediately, but
+    # the expensive global track rebuild is now deliberately asynchronous.
+    assert "refresh_tracks=False" in merge_block
+    assert "refresh_tracks=True" not in merge_block
+    assert (
+        'request_background_track_refresh("merge")'
+        in merge_block
+    )
 
     assert '"Escape"' in viewer
     assert "viewer.bind_key(" in viewer
