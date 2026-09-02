@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # DATASET_CURATION_CANONICAL_SKIP_V1
+# DATASET_CURATION_EMPTY_TRACKS_SAFE_V1
 
 import ast
 from pathlib import Path
@@ -195,3 +196,28 @@ def test_quality_gate_is_before_expensive_source_segmentation():
     assert text.index("source_mask_validator(") < text.index(
         "source_labels = segment_instances("
     )
+
+def test_unified_viewer_never_constructs_empty_napari_tracks():
+    viewer = (
+        ROOT
+        / "dataset_curation"
+        / "annotation"
+        / "viewer.py"
+    ).read_text(
+        encoding="utf-8"
+    )
+
+    assert "def _sync_tracks_layer(" in viewer
+    assert "if array.shape[0] == 0:" in viewer
+    assert "viewer.layers.remove(" in viewer
+
+    # Every Tracks-layer creation/update must pass through the empty-safe
+    # lifecycle helper. The only direct add_tracks call is inside that helper.
+    assert viewer.count("viewer.add_tracks(") == 1
+
+    # The two dynamic corrected graph layers must be synchronized rather than
+    # assigned an empty (0, 5) array directly.
+    assert 'name="Corrected Tracks - active"' in viewer
+    assert 'name="Hidden tracks"' in viewer
+    assert "group.track_layer = (" in viewer
+

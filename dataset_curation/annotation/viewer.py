@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_EMPTY_TRACKS_SAFE_V1
+
 """Unified Napari viewer for spatial and track annotation."""
 
 from dataclasses import dataclass
@@ -115,6 +117,63 @@ def _configure_dock(dock, panel) -> None:
         pass
 
 
+def _sync_tracks_layer(
+    viewer,
+    layer,
+    data: np.ndarray,
+    *,
+    name: str,
+    scale_tzyx,
+    tail_length: int,
+    visible: bool,
+):
+    # Napari Tracks cannot safely construct/update from shape (0, 5) in
+    # some versions. Empty track sets are valid curation states, so represent
+    # them by absence of the Tracks layer and recreate the layer when rows
+    # reappear.
+    array = np.asarray(
+        data,
+        dtype=np.float64,
+    )
+    if (
+        array.ndim != 2
+        or array.shape[1] != 5
+    ):
+        raise ValueError(
+            f"{name}: expected tracks array with shape (N,5), "
+            f"got {array.shape}"
+        )
+
+    if array.shape[0] == 0:
+        if layer is not None:
+            try:
+                viewer.layers.remove(
+                    layer
+                )
+            except (
+                ValueError,
+                KeyError,
+            ):
+                pass
+        return None
+
+    if layer is None:
+        layer = viewer.add_tracks(
+            array,
+            name=name,
+            scale=scale_tzyx,
+            tail_length=tail_length,
+        )
+    else:
+        layer.data = array
+        layer.refresh()
+
+    layer.visible = bool(
+        visible
+    )
+    return layer
+
+
 def _track_group_layers(
     viewer,
     frame: pd.DataFrame,
@@ -129,11 +188,14 @@ def _track_group_layers(
     tracks_array, points_array, properties = (
         track_frame_arrays(frame)
     )
-    track_layer = viewer.add_tracks(
+    track_layer = _sync_tracks_layer(
+        viewer,
+        None,
         tracks_array,
         name=track_name,
-        scale=scale_tzyx,
+        scale_tzyx=scale_tzyx,
         tail_length=tail_length,
+        visible=visible,
     )
     point_layer = viewer.add_points(
         points_array,
@@ -143,7 +205,6 @@ def _track_group_layers(
         face_color=point_color,
         properties=properties,
     )
-    track_layer.visible = bool(visible)
     point_layer.visible = bool(visible)
     return track_layer, point_layer
 
@@ -151,7 +212,9 @@ def _track_group_layers(
 @dataclass
 class _DiagnosticLayerGroup:
     frame: pd.DataFrame
-    track_layer: Any
+    track_name: str
+    track_layer: Any | None
+    track_visible: bool
     point_layer: Any
 
 
@@ -350,13 +413,15 @@ def make_viewer(
     all_tracks_array, all_points_array, all_properties = (
         track_frame_arrays(original_tracks)
     )
-    all_tracks_layer = viewer.add_tracks(
+    all_tracks_layer = _sync_tracks_layer(
+        viewer,
+        None,
         all_tracks_array,
         name="Tracks - all",
-        scale=scale_tzyx,
+        scale_tzyx=scale_tzyx,
         tail_length=frame_count,
+        visible=False,
     )
-    all_tracks_layer.visible = False
 
     all_centers_layer = viewer.add_points(
         all_points_array,
@@ -403,7 +468,11 @@ def make_viewer(
         diagnostic_layers[key] = (
             _DiagnosticLayerGroup(
                 frame=frame,
+                track_name=track_name,
                 track_layer=track_layer,
+                track_visible=bool(
+                    visible
+                ),
                 point_layer=point_layer,
             )
         )
@@ -441,27 +510,31 @@ def make_viewer(
         visible=False,
     )
 
-    active_tracks_layer = viewer.add_tracks(
+    active_tracks_layer = _sync_tracks_layer(
+        viewer,
+        None,
         edges_to_tracks_array(
             track_session.visible_edges,
             track_centers,
         ),
         name="Corrected Tracks - active",
-        scale=scale_tzyx,
+        scale_tzyx=scale_tzyx,
         tail_length=frame_count,
+        visible=True,
     )
-    active_tracks_layer.visible = True
 
-    hidden_tracks_layer = viewer.add_tracks(
+    hidden_tracks_layer = _sync_tracks_layer(
+        viewer,
+        None,
         edges_to_tracks_array(
             track_session.hidden_edges,
             track_centers,
         ),
         name="Hidden tracks",
-        scale=scale_tzyx,
+        scale_tzyx=scale_tzyx,
         tail_length=frame_count,
+        visible=False,
     )
-    hidden_tracks_layer.visible = False
 
     hidden_track_centers_layer = viewer.add_points(
         nodes_to_points_array(
@@ -781,8 +854,27 @@ def make_viewer(
             tracks_array, points_array, properties = (
                 track_frame_arrays(filtered)
             )
-            group.track_layer.data = tracks_array
-            group.track_layer.refresh()
+
+            if group.track_layer is not None:
+                try:
+                    group.track_visible = bool(
+                        group.track_layer.visible
+                    )
+                except Exception:
+                    pass
+
+            group.track_layer = (
+                _sync_tracks_layer(
+                    viewer,
+                    group.track_layer,
+                    tracks_array,
+                    name=group.track_name,
+                    scale_tzyx=scale_tzyx,
+                    tail_length=frame_count,
+                    visible=group.track_visible,
+                )
+            )
+
             group.point_layer.data = points_array
             try:
                 group.point_layer.properties = properties
@@ -791,21 +883,55 @@ def make_viewer(
             group.point_layer.refresh()
 
     def refresh_track_graph_layers() -> None:
-        active_tracks_layer.data = (
-            edges_to_tracks_array(
-                track_session.visible_edges,
-                track_centers,
-            )
-        )
-        active_tracks_layer.refresh()
+        nonlocal active_tracks_layer, hidden_tracks_layer
 
-        hidden_tracks_layer.data = (
-            edges_to_tracks_array(
-                track_session.hidden_edges,
-                track_centers,
+        active_visible = True
+        if active_tracks_layer is not None:
+            try:
+                active_visible = bool(
+                    active_tracks_layer.visible
+                )
+            except Exception:
+                pass
+
+        hidden_visible = False
+        if hidden_tracks_layer is not None:
+            try:
+                hidden_visible = bool(
+                    hidden_tracks_layer.visible
+                )
+            except Exception:
+                pass
+
+        active_tracks_layer = (
+            _sync_tracks_layer(
+                viewer,
+                active_tracks_layer,
+                edges_to_tracks_array(
+                    track_session.visible_edges,
+                    track_centers,
+                ),
+                name="Corrected Tracks - active",
+                scale_tzyx=scale_tzyx,
+                tail_length=frame_count,
+                visible=active_visible,
             )
         )
-        hidden_tracks_layer.refresh()
+
+        hidden_tracks_layer = (
+            _sync_tracks_layer(
+                viewer,
+                hidden_tracks_layer,
+                edges_to_tracks_array(
+                    track_session.hidden_edges,
+                    track_centers,
+                ),
+                name="Hidden tracks",
+                scale_tzyx=scale_tzyx,
+                tail_length=frame_count,
+                visible=hidden_visible,
+            )
+        )
 
         hidden_track_centers_layer.data = (
             nodes_to_points_array(
