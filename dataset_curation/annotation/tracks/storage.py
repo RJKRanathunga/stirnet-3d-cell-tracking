@@ -38,6 +38,11 @@ class OutputPaths:
     def birth_events_csv(self) -> Path:
         return self.root / "birth_events.csv"
 
+    @property
+    def current_tracks_csv(self) -> Path:
+        """Canonical annotation-owned corrected track table."""
+        return self.root / "current_tracks.csv"
+
 
 def _atomic_json(
     path: Path,

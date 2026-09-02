@@ -25,11 +25,15 @@ from dataset_curation.annotation.instances.split import AnnotationError
 from dataset_curation.annotation.layers import (
     apply_label_color_dict,
     edges_to_tracks_array,
-    filter_diagnostic_track_rows,
     label_color_dict,
     nodes_to_points_array,
     ray_pick_label_from_raw,
     track_frame_arrays,
+)
+from dataset_curation.annotation.tracks.current import (
+    build_current_track_table,
+    persist_current_track_table,
+    prepare_current_endpoint_groups,
 )
 from dataset_curation.annotation.source_data import (
     BinaryMaskFrameCache,
@@ -385,6 +389,9 @@ def make_viewer(
             )
         )
 
+    for layer in seed_highlight_layers:
+        layer.visible = False
+
     track_selection_a_layer = viewer.add_image(
         np.zeros(
             spatial_shape,
@@ -421,15 +428,37 @@ def make_viewer(
         opacity=0.88,
         blending="additive",
     )
+    track_selection_a_layer.visible = False
+    track_selection_b_layer.visible = False
+    track_selection_c_layer.visible = False
 
     print("[viewer] spatial annotation layers ready", flush=True)
 
     # ------------------------------------------------------------------
     # Notebook-09 Trackastra visualization
     # ------------------------------------------------------------------
-    print("[viewer] adding Trackastra diagnostic layers...", flush=True)
+    print("[viewer] adding corrected track diagnostic layers...", flush=True)
+
+    current_tracks = build_current_track_table(
+        valid_nodes=track_session.valid_nodes,
+        active_edges=track_session.active_edges,
+        centers=track_centers,
+    )
+    persist_current_track_table(
+        track_session.output.current_tracks_csv,
+        current_tracks,
+    )
+    current_diagnostics = prepare_current_endpoint_groups(
+        current_tracks,
+        unresolved_start_nodes=track_session.unresolved_start_nodes,
+        unresolved_end_nodes=track_session.unresolved_end_nodes,
+        boundary_entry_nodes=track_session.boundary_entry_nodes,
+        boundary_exit_nodes=track_session.boundary_exit_nodes,
+        hidden_nodes=track_session.hidden_nodes,
+    )
+
     all_tracks_array, all_points_array, all_properties = (
-        track_frame_arrays(original_tracks)
+        track_frame_arrays(current_tracks)
     )
     all_tracks_layer = _sync_tracks_layer(
         viewer,
@@ -497,7 +526,7 @@ def make_viewer(
 
     add_diagnostic(
         "broken",
-        diagnostics.ended_failure_tracks,
+        current_diagnostics.ended_failure_tracks,
         track_name="Broken Tracks",
         point_name="Broken Track Centers",
         color=CATEGORY_COLORS["broken"],
@@ -505,7 +534,7 @@ def make_viewer(
     )
     add_diagnostic(
         "new",
-        diagnostics.new_failure_tracks,
+        current_diagnostics.new_failure_tracks,
         track_name="New Tracks",
         point_name="New Track Centers",
         color=CATEGORY_COLORS["new"],
@@ -513,7 +542,7 @@ def make_viewer(
     )
     add_diagnostic(
         "boundary_entry",
-        diagnostics.boundary_entry_tracks,
+        current_diagnostics.boundary_entry_tracks,
         track_name="Boundary Entry Tracks",
         point_name="Boundary Entry Centers",
         color=CATEGORY_COLORS["boundary_entry"],
@@ -521,7 +550,7 @@ def make_viewer(
     )
     add_diagnostic(
         "boundary_exit",
-        diagnostics.boundary_exit_tracks,
+        current_diagnostics.boundary_exit_tracks,
         track_name="Boundary Exit Tracks",
         point_name="Boundary Exit Centers",
         color=CATEGORY_COLORS["boundary_exit"],
@@ -573,7 +602,7 @@ def make_viewer(
 
     diagnostic_categories = (
         diagnostic_node_categories(
-            diagnostics
+            current_diagnostics
         )
     )
 
@@ -600,6 +629,23 @@ def make_viewer(
     last_binary_frame = {
         "value": -1,
     }
+
+    # Lightweight metadata caches only. No extra 3-D/4-D movie copies.
+    corrected_color_cache: dict[int, dict] = {}
+    sv_metadata_cache: dict[
+        tuple[int, tuple[int, ...]],
+        tuple[np.ndarray, dict[str, np.ndarray], dict],
+    ] = {}
+
+    centers_by_frame: dict[int, dict[int, np.ndarray]] = {}
+    for (frame_id, instance_id), center in track_centers.items():
+        centers_by_frame.setdefault(
+            int(frame_id),
+            {},
+        )[int(instance_id)] = np.asarray(
+            center,
+            dtype=np.float64,
+        )
 
     mode_label = Label(
         value="Mode: Spatial"
@@ -722,13 +768,9 @@ def make_viewer(
         print(exc)
 
     def clear_seed_highlights() -> None:
-        zero = np.zeros(
-            spatial_shape,
-            dtype=np.uint8,
-        )
+        # Hiding is far cheaper than rewriting four full 3-D zero arrays.
         for layer in seed_highlight_layers:
-            layer.data = zero
-            layer.refresh()
+            layer.visible = False
 
     def clear_spatial_selection(
         *,
@@ -770,6 +812,7 @@ def make_viewer(
             np.uint8,
             copy=False,
         )
+        layer.visible = True
         layer.refresh()
         selected_seed_ids[slot] = int(sv_id)
         last_selected_sv["value"] = int(sv_id)
@@ -782,25 +825,16 @@ def make_viewer(
             track_session.reset_selections()
         else:
             track_session.selections.clear()
-        zero = np.zeros(
-            spatial_shape,
-            dtype=np.uint8,
-        )
-        track_selection_a_layer.data = zero
-        track_selection_b_layer.data = zero
-        track_selection_c_layer.data = zero
-        track_selection_a_layer.refresh()
-        track_selection_b_layer.refresh()
-        track_selection_c_layer.refresh()
+        # Selection overlays are transient. Hide them instead of copying
+        # three full 3-D zero arrays on every frame change/reset.
+        track_selection_a_layer.visible = False
+        track_selection_b_layer.visible = False
+        track_selection_c_layer.visible = False
 
     def refresh_track_selection_layers() -> None:
         frame = current_frame()
         corrected = spatial_session.frame(
             frame
-        )
-        zero = np.zeros(
-            spatial_shape,
-            dtype=np.uint8,
         )
         for slot, layer in enumerate(
             (
@@ -809,25 +843,23 @@ def make_viewer(
                 track_selection_c_layer,
             )
         ):
-            if (
-                slot
-                < len(track_session.selections)
-            ):
-                node = track_session.selections[
-                    slot
-                ]
-                if node[0] == frame:
-                    layer.data = (
-                        corrected
-                        == int(node[1])
-                    ).astype(
-                        np.uint8,
-                        copy=False,
-                    )
-                else:
-                    layer.data = zero
-            else:
-                layer.data = zero
+            if slot >= len(track_session.selections):
+                layer.visible = False
+                continue
+
+            node = track_session.selections[slot]
+            if node[0] != frame:
+                layer.visible = False
+                continue
+
+            layer.data = (
+                corrected
+                == int(node[1])
+            ).astype(
+                np.uint8,
+                copy=False,
+            )
+            layer.visible = True
             layer.refresh()
 
     def refresh_binary_layer() -> None:
@@ -851,41 +883,97 @@ def make_viewer(
         frame: int,
         centers: dict[int, np.ndarray],
     ) -> None:
-        stale = [
-            node
-            for node in track_centers
-            if node[0] == int(frame)
-        ]
-        for node in stale:
-            del track_centers[node]
-        for instance_id, center in centers.items():
-            track_centers[
-                (
-                    int(frame),
-                    int(instance_id),
-                )
-            ] = np.asarray(
+        frame = int(frame)
+        for instance_id in centers_by_frame.get(frame, {}):
+            track_centers.pop(
+                (frame, int(instance_id)),
+                None,
+            )
+
+        normalized = {
+            int(instance_id): np.asarray(
                 center,
                 dtype=np.float64,
             )
+            for instance_id, center in centers.items()
+        }
+        centers_by_frame[frame] = normalized
 
-    def refresh_diagnostic_layers() -> None:
+        for instance_id, center in normalized.items():
+            track_centers[
+                (frame, instance_id)
+            ] = center
+
+    def invalidate_frame_metadata(frame: int) -> None:
+        frame = int(frame)
+        corrected_color_cache.pop(frame, None)
+        for key in [
+            key
+            for key in sv_metadata_cache
+            if key[0] == frame
+        ]:
+            del sv_metadata_cache[key]
+
+    def _diagnostic_frame_for_key(
+        key: str,
+        groups: EndpointTrackGroups,
+    ) -> pd.DataFrame:
+        return {
+            "broken": groups.ended_failure_tracks,
+            "new": groups.new_failure_tracks,
+            "boundary_entry": groups.boundary_entry_tracks,
+            "boundary_exit": groups.boundary_exit_tracks,
+        }[key]
+
+    def _refresh_current_center_colors() -> None:
+        frame = current_frame()
+        ids = np.asarray(
+            cell_centers_layer.properties.get(
+                "instance_id",
+                np.zeros((0,), dtype=np.int64),
+            ),
+            dtype=np.int64,
+        )
+        categories = [
+            diagnostic_categories.get(
+                (frame, int(instance_id)),
+                "default",
+            )
+            for instance_id in ids.tolist()
+        ]
+        colors = np.asarray(
+            [
+                _CATEGORY_RGBA[category]
+                for category in categories
+            ],
+            dtype=np.float32,
+        )
+        if colors.size == 0:
+            colors = np.zeros((0, 4), dtype=np.float32)
+
+        try:
+            cell_centers_layer.properties = {
+                "instance_id": ids,
+                "category": np.asarray(
+                    categories,
+                    dtype=object,
+                ),
+            }
+            cell_centers_layer.face_color = colors
+            cell_centers_layer.refresh()
+        except Exception:
+            pass
+
+    def refresh_diagnostic_layers(
+        groups: EndpointTrackGroups,
+    ) -> None:
         for key, group in diagnostic_layers.items():
-            filtered = (
-                filter_diagnostic_track_rows(
-                    group.frame,
-                    category=key,
-                    hidden_nodes=track_session.hidden_nodes,
-                    unresolved_start_nodes=(
-                        track_session.unresolved_start_nodes
-                    ),
-                    unresolved_end_nodes=(
-                        track_session.unresolved_end_nodes
-                    ),
-                )
+            group.frame = _diagnostic_frame_for_key(
+                key,
+                groups,
             )
             tracks_array, points_array, properties = (
-                track_frame_arrays(filtered)
+                track_frame_arrays(group.frame)
             )
 
             if group.track_layer is not None:
@@ -896,18 +984,15 @@ def make_viewer(
                 except Exception:
                     pass
 
-            group.track_layer = (
-                _sync_tracks_layer(
-                    viewer,
-                    group.track_layer,
-                    tracks_array,
-                    name=group.track_name,
-                    scale_tzyx=scale_tzyx,
-                    tail_length=frame_count,
-                    visible=group.track_visible,
-                )
+            group.track_layer = _sync_tracks_layer(
+                viewer,
+                group.track_layer,
+                tracks_array,
+                name=group.track_name,
+                scale_tzyx=scale_tzyx,
+                tail_length=frame_count,
+                visible=group.track_visible,
             )
-
             group.point_layer.data = points_array
             try:
                 group.point_layer.properties = properties
@@ -917,78 +1002,117 @@ def make_viewer(
 
     def refresh_track_graph_layers() -> None:
         nonlocal active_tracks_layer, hidden_tracks_layer
+        nonlocal all_tracks_layer, current_tracks, current_diagnostics
+        nonlocal diagnostic_categories
+
+        current_tracks = build_current_track_table(
+            valid_nodes=track_session.valid_nodes,
+            active_edges=track_session.active_edges,
+            centers=track_centers,
+        )
+        persist_current_track_table(
+            track_session.output.current_tracks_csv,
+            current_tracks,
+        )
+        current_diagnostics = prepare_current_endpoint_groups(
+            current_tracks,
+            unresolved_start_nodes=track_session.unresolved_start_nodes,
+            unresolved_end_nodes=track_session.unresolved_end_nodes,
+            boundary_entry_nodes=track_session.boundary_entry_nodes,
+            boundary_exit_nodes=track_session.boundary_exit_nodes,
+            hidden_nodes=track_session.hidden_nodes,
+        )
+
+        all_visible = False
+        if all_tracks_layer is not None:
+            try:
+                all_visible = bool(all_tracks_layer.visible)
+            except Exception:
+                pass
+
+        all_tracks_array, all_points_array, all_properties = (
+            track_frame_arrays(current_tracks)
+        )
+        all_tracks_layer = _sync_tracks_layer(
+            viewer,
+            all_tracks_layer,
+            all_tracks_array,
+            name="Tracks - all",
+            scale_tzyx=scale_tzyx,
+            tail_length=frame_count,
+            visible=all_visible,
+        )
+        all_centers_layer.data = all_points_array
+        try:
+            all_centers_layer.properties = all_properties
+        except Exception:
+            pass
+        all_centers_layer.refresh()
 
         active_visible = True
         if active_tracks_layer is not None:
             try:
-                active_visible = bool(
-                    active_tracks_layer.visible
-                )
+                active_visible = bool(active_tracks_layer.visible)
             except Exception:
                 pass
 
         hidden_visible = False
         if hidden_tracks_layer is not None:
             try:
-                hidden_visible = bool(
-                    hidden_tracks_layer.visible
-                )
+                hidden_visible = bool(hidden_tracks_layer.visible)
             except Exception:
                 pass
 
-        active_tracks_layer = (
-            _sync_tracks_layer(
-                viewer,
-                active_tracks_layer,
-                edges_to_tracks_array(
-                    track_session.visible_edges,
-                    track_centers,
-                ),
-                name="Corrected Tracks - active",
-                scale_tzyx=scale_tzyx,
-                tail_length=frame_count,
-                visible=active_visible,
-            )
-        )
-
-        hidden_tracks_layer = (
-            _sync_tracks_layer(
-                viewer,
-                hidden_tracks_layer,
-                edges_to_tracks_array(
-                    track_session.hidden_edges,
-                    track_centers,
-                ),
-                name="Hidden tracks",
-                scale_tzyx=scale_tzyx,
-                tail_length=frame_count,
-                visible=hidden_visible,
-            )
-        )
-
-        hidden_track_centers_layer.data = (
-            nodes_to_points_array(
-                track_session.hidden_nodes,
+        active_tracks_layer = _sync_tracks_layer(
+            viewer,
+            active_tracks_layer,
+            edges_to_tracks_array(
+                track_session.visible_edges,
                 track_centers,
-            )
+            ),
+            name="Corrected Tracks - active",
+            scale_tzyx=scale_tzyx,
+            tail_length=frame_count,
+            visible=active_visible,
+        )
+
+        hidden_tracks_layer = _sync_tracks_layer(
+            viewer,
+            hidden_tracks_layer,
+            edges_to_tracks_array(
+                track_session.hidden_edges,
+                track_centers,
+            ),
+            name="Hidden tracks",
+            scale_tzyx=scale_tzyx,
+            tail_length=frame_count,
+            visible=hidden_visible,
+        )
+
+        hidden_track_centers_layer.data = nodes_to_points_array(
+            track_session.hidden_nodes,
+            track_centers,
         )
         hidden_track_centers_layer.refresh()
 
-        refresh_diagnostic_layers()
+        diagnostic_categories = diagnostic_node_categories(
+            current_diagnostics
+        )
+        refresh_diagnostic_layers(
+            current_diagnostics
+        )
+        _refresh_current_center_colors()
 
     def refresh_current_frame_layers(
         *,
         refresh_tracks: bool = True,
+        spatial_authority_changed: bool = False,
     ) -> None:
         frame = current_frame()
-        corrected = spatial_session.frame(
-            frame
-        )
+        corrected = spatial_session.frame(frame)
 
-        hallucinated = (
-            spatial_session.hallucinated_supervoxels(
-                frame
-            )
+        hallucinated = spatial_session.hallucinated_supervoxels(
+            frame
         )
         sv_frame = np.asarray(
             supervoxels[frame]
@@ -1009,49 +1133,97 @@ def make_viewer(
 
         corrected_layer.data = corrected
         corrected_layer.refresh()
+
+        corrected_mapping = corrected_color_cache.get(frame)
+        if corrected_mapping is None:
+            corrected_mapping = label_color_dict(
+                corrected
+            )
+            corrected_color_cache[frame] = corrected_mapping
         apply_label_color_dict(
             corrected_layer,
-            label_color_dict(corrected),
+            corrected_mapping,
         )
 
         supervoxel_layer.data = sv_display
         supervoxel_layer.refresh()
-        apply_label_color_dict(
-            supervoxel_layer,
-            label_color_dict(sv_display),
-        )
 
-        sv_points, sv_properties = (
-            supervoxel_interior_points(
+        sv_key = (
+            int(frame),
+            tuple(sorted(int(v) for v in hallucinated)),
+        )
+        sv_metadata = sv_metadata_cache.get(sv_key)
+        if sv_metadata is None:
+            sv_points, sv_properties = supervoxel_interior_points(
                 sv_display,
                 hidden_ids=hallucinated,
                 spacing_zyx=spacing_zyx,
             )
+            sv_mapping = label_color_dict(
+                sv_display
+            )
+            sv_metadata = (
+                sv_points,
+                sv_properties,
+                sv_mapping,
+            )
+            sv_metadata_cache[sv_key] = sv_metadata
+        else:
+            (
+                sv_points,
+                sv_properties,
+                sv_mapping,
+            ) = sv_metadata
+
+        apply_label_color_dict(
+            supervoxel_layer,
+            sv_mapping,
         )
         supervoxel_id_layer.data = sv_points
         try:
-            supervoxel_id_layer.properties = (
-                sv_properties
-            )
+            supervoxel_id_layer.properties = sv_properties
         except Exception:
             pass
         supervoxel_id_layer.refresh()
 
-        centers = frame_instance_centers(
-            corrected
-        )
-        _replace_frame_centers(
-            frame,
-            centers,
-        )
-        track_session.set_frame_nodes(
-            frame,
-            centers.keys(),
-        )
+        if spatial_authority_changed:
+            centers = frame_instance_centers(
+                corrected
+            )
+            _replace_frame_centers(
+                frame,
+                centers,
+            )
+            track_session.set_frame_nodes(
+                frame,
+                centers.keys(),
+            )
+            invalidate_frame_metadata(
+                frame
+            )
+            # Rebuild the corrected mapping once after invalidation.
+            corrected_mapping = label_color_dict(
+                corrected
+            )
+            corrected_color_cache[frame] = corrected_mapping
+        else:
+            centers = dict(
+                centers_by_frame.get(
+                    int(frame),
+                    {},
+                )
+            )
+            if not centers:
+                # Defensive fallback for a detection table missing this frame.
+                centers = frame_instance_centers(
+                    corrected
+                )
+                _replace_frame_centers(
+                    frame,
+                    centers,
+                )
 
-        ordered_ids = sorted(
-            centers
-        )
+        ordered_ids = sorted(centers)
         center_points = np.asarray(
             [
                 centers[instance_id]
@@ -1067,19 +1239,14 @@ def make_viewer(
 
         categories = [
             diagnostic_categories.get(
-                (
-                    frame,
-                    int(instance_id),
-                ),
+                (frame, int(instance_id)),
                 "default",
             )
             for instance_id in ordered_ids
         ]
         center_colors = np.asarray(
             [
-                _CATEGORY_RGBA[
-                    category
-                ]
+                _CATEGORY_RGBA[category]
                 for category in categories
             ],
             dtype=np.float32,
@@ -1090,9 +1257,7 @@ def make_viewer(
                 dtype=np.float32,
             )
 
-        cell_centers_layer.data = (
-            center_points
-        )
+        cell_centers_layer.data = center_points
         try:
             cell_centers_layer.properties = {
                 "instance_id": np.asarray(
@@ -1104,18 +1269,9 @@ def make_viewer(
                     dtype=object,
                 ),
             }
+            cell_centers_layer.face_color = center_colors
         except Exception:
-            pass
-        try:
-            cell_centers_layer.face_color = (
-                center_colors
-            )
-        except Exception:
-            # Older Napari fallback. Diagnostic point layers still preserve
-            # the requested red/lime/cyan/orange category colors.
-            cell_centers_layer.face_color = (
-                "white"
-            )
+            cell_centers_layer.face_color = "white"
         cell_centers_layer.refresh()
 
         refresh_track_selection_layers()
@@ -1386,7 +1542,10 @@ def make_viewer(
             return
 
         clear_spatial_selection()
-        refresh_current_frame_layers()
+        refresh_current_frame_layers(
+            refresh_tracks=True,
+            spatial_authority_changed=True,
+        )
         refresh_status()
         status_label.value = (
             f"SPLIT saved at t={result.timepoint}: "
@@ -1419,7 +1578,10 @@ def make_viewer(
             return
 
         clear_spatial_selection()
-        refresh_current_frame_layers()
+        refresh_current_frame_layers(
+            refresh_tracks=True,
+            spatial_authority_changed=True,
+        )
         refresh_status()
         status_label.value = (
             f"HALLUCINATION saved: t={record['timepoint']} "
@@ -1439,7 +1601,10 @@ def make_viewer(
             int(result.timepoint),
         )
         clear_spatial_selection()
-        refresh_current_frame_layers()
+        refresh_current_frame_layers(
+            refresh_tracks=True,
+            spatial_authority_changed=True,
+        )
         refresh_status()
         status_label.value = (
             f"Undid spatial {result.operation_type} at "
@@ -1631,7 +1796,12 @@ def make_viewer(
         # Break and Birth all require selecting detections across frames.
         last_frame["value"] = now
         last_binary_frame["value"] = -1
-        refresh_current_frame_layers()
+        # Time navigation changes only the current 3-D overlays. The global
+        # corrected graph/diagnostic layers are unchanged until an annotation
+        # operation actually edits the graph or spatial detections.
+        refresh_current_frame_layers(
+            refresh_tracks=False
+        )
         refresh_status()
 
         if (
