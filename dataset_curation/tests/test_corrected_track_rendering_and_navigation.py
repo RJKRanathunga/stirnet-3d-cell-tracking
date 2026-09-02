@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import ast
 import numpy as np
 
 from dataset_curation.annotation.instances.centers import (
@@ -108,11 +109,35 @@ def test_supervoxel_text_point_is_inside_supervoxel():
 
 def test_viewer_navigation_does_not_rebuild_global_tracks():
     root = Path(__file__).resolve().parents[2]
-    viewer = (
+    viewer_path = (
         root / "dataset_curation" / "annotation" / "viewer.py"
-    ).read_text(encoding="utf-8")
+    )
+    tree = ast.parse(
+        viewer_path.read_text(encoding="utf-8"),
+        filename=str(viewer_path),
+    )
 
-    marker = "def on_dims_change(_event=None) -> None:"
-    block = viewer[viewer.index(marker):]
-    block = block[: block.index("viewer.dims.events.current_step.connect")]
-    assert "refresh_current_frame_layers(refresh_tracks=False)" in block
+    on_dims_change = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "on_dims_change"
+    )
+
+    calls = [
+        node
+        for node in ast.walk(on_dims_change)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "refresh_current_frame_layers"
+    ]
+    assert len(calls) == 1
+
+    keywords = {
+        keyword.arg: keyword.value
+        for keyword in calls[0].keywords
+        if keyword.arg is not None
+    }
+    assert "refresh_tracks" in keywords
+    assert isinstance(keywords["refresh_tracks"], ast.Constant)
+    assert keywords["refresh_tracks"].value is False

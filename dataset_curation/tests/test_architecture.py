@@ -224,8 +224,8 @@ def test_unified_viewer_never_constructs_empty_napari_tracks():
     # lifecycle helper. The only direct add_tracks call is inside that helper.
     assert viewer.count("viewer.add_tracks(") == 1
 
-    # The two dynamic corrected graph layers must be synchronized rather than
-    # assigned an empty (0, 5) array directly.
+    # Dynamic track layers must be synchronized through the empty-safe helper,
+    # regardless of formatting/parenthesization style.
     assert 'name="Corrected Tracks - active"' in viewer
     assert 'name="Hidden tracks"' in viewer
-    assert "group.track_layer = (" in viewer
+    assert "group.track_layer = _sync_tracks_layer(" in viewer
