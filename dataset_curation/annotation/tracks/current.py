@@ -248,3 +248,58 @@ def prepare_current_endpoint_groups(
         boundary_entry_tracks=selected(boundary_entry_ids),
         boundary_exit_tracks=selected(boundary_exit_ids),
     )
+
+def filter_diagnostic_rows_for_frame(
+    frame: pd.DataFrame,
+    *,
+    category: str,
+    current_frame: int,
+    horizon_frames: int,
+) -> pd.DataFrame:
+    """Return only diagnostic rows relevant to the current annotation frame."""
+    if frame.empty:
+        return frame.copy()
+
+    category = str(category)
+    current_frame = int(current_frame)
+    horizon_frames = max(int(horizon_frames), 0)
+
+    if category not in {"broken", "new"}:
+        lower = current_frame - horizon_frames
+        return frame.loc[
+            (frame["frame"] >= lower)
+            & (frame["frame"] <= current_frame)
+        ].copy()
+
+    endpoint_by_track = (
+        frame.groupby("track_id")["frame"].max()
+        if category == "broken"
+        else frame.groupby("track_id")["frame"].min()
+    )
+
+    if category == "broken":
+        active_ids = endpoint_by_track.index[
+            (endpoint_by_track >= current_frame)
+            & (
+                endpoint_by_track
+                <= current_frame + horizon_frames
+            )
+        ]
+    else:
+        active_ids = endpoint_by_track.index[
+            (endpoint_by_track <= current_frame)
+            & (
+                endpoint_by_track
+                >= current_frame - horizon_frames
+            )
+        ]
+
+    if len(active_ids) == 0:
+        return frame.iloc[0:0].copy()
+
+    lower = current_frame - horizon_frames
+    return frame.loc[
+        frame["track_id"].isin(active_ids)
+        & (frame["frame"] >= lower)
+        & (frame["frame"] <= current_frame)
+    ].copy()

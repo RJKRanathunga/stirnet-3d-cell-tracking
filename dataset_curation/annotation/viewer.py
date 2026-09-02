@@ -32,6 +32,7 @@ from dataset_curation.annotation.layers import (
 )
 from dataset_curation.annotation.tracks.current import (
     build_current_track_table,
+    filter_diagnostic_rows_for_frame,
     persist_current_track_table,
     prepare_current_endpoint_groups,
 )
@@ -68,6 +69,10 @@ except ImportError:
 
 MODE_SPATIAL = "spatial"
 MODE_TRACKING = "tracking"
+
+# Full tracking data remains on disk; these only bound rendering.
+TRACK_HISTORY_FRAMES = 5
+DIAGNOSTIC_HORIZON_FRAMES = 5
 
 _CATEGORY_RGBA = {
     "default": (1.0, 1.0, 1.0, 1.0),
@@ -171,6 +176,7 @@ def _sync_tracks_layer(
         )
     else:
         layer.data = array
+        layer.tail_length = int(tail_length)
         layer.refresh()
 
     layer.visible = bool(
@@ -466,7 +472,7 @@ def make_viewer(
         all_tracks_array,
         name="Tracks - all",
         scale_tzyx=scale_tzyx,
-        tail_length=frame_count,
+        tail_length=TRACK_HISTORY_FRAMES,
         visible=False,
     )
 
@@ -509,7 +515,7 @@ def make_viewer(
                 point_color=color,
                 scale_tzyx=scale_tzyx,
                 visible=visible,
-                tail_length=frame_count,
+                tail_length=TRACK_HISTORY_FRAMES,
             )
         )
         diagnostic_layers[key] = (
@@ -526,7 +532,12 @@ def make_viewer(
 
     add_diagnostic(
         "broken",
-        current_diagnostics.ended_failure_tracks,
+        filter_diagnostic_rows_for_frame(
+            current_diagnostics.ended_failure_tracks,
+            category="broken",
+            current_frame=0,
+            horizon_frames=DIAGNOSTIC_HORIZON_FRAMES,
+        ),
         track_name="Broken Tracks",
         point_name="Broken Track Centers",
         color=CATEGORY_COLORS["broken"],
@@ -534,7 +545,12 @@ def make_viewer(
     )
     add_diagnostic(
         "new",
-        current_diagnostics.new_failure_tracks,
+        filter_diagnostic_rows_for_frame(
+            current_diagnostics.new_failure_tracks,
+            category="new",
+            current_frame=0,
+            horizon_frames=DIAGNOSTIC_HORIZON_FRAMES,
+        ),
         track_name="New Tracks",
         point_name="New Track Centers",
         color=CATEGORY_COLORS["new"],
@@ -569,7 +585,7 @@ def make_viewer(
         ),
         name="Corrected Tracks - active",
         scale_tzyx=scale_tzyx,
-        tail_length=frame_count,
+        tail_length=TRACK_HISTORY_FRAMES,
         visible=True,
     )
 
@@ -582,7 +598,7 @@ def make_viewer(
         ),
         name="Hidden tracks",
         scale_tzyx=scale_tzyx,
-        tail_length=frame_count,
+        tail_length=TRACK_HISTORY_FRAMES,
         visible=False,
     )
 
@@ -922,12 +938,19 @@ def make_viewer(
         key: str,
         groups: EndpointTrackGroups,
     ) -> pd.DataFrame:
-        return {
+        source_frame = {
             "broken": groups.ended_failure_tracks,
             "new": groups.new_failure_tracks,
             "boundary_entry": groups.boundary_entry_tracks,
             "boundary_exit": groups.boundary_exit_tracks,
         }[key]
+
+        return filter_diagnostic_rows_for_frame(
+            source_frame,
+            category=key,
+            current_frame=current_frame(),
+            horizon_frames=DIAGNOSTIC_HORIZON_FRAMES,
+        )
 
     def _refresh_current_center_colors() -> None:
         frame = current_frame()
@@ -971,11 +994,16 @@ def make_viewer(
     def refresh_diagnostic_layers(
         groups: EndpointTrackGroups,
     ) -> None:
+        nonlocal diagnostic_categories
+
+        localized_frames: dict[str, pd.DataFrame] = {}
+
         for key, group in diagnostic_layers.items():
             group.frame = _diagnostic_frame_for_key(
                 key,
                 groups,
             )
+            localized_frames[key] = group.frame
             tracks_array, points_array, properties = (
                 track_frame_arrays(group.frame)
             )
@@ -994,7 +1022,7 @@ def make_viewer(
                 tracks_array,
                 name=group.track_name,
                 scale_tzyx=scale_tzyx,
-                tail_length=frame_count,
+                tail_length=TRACK_HISTORY_FRAMES,
                 visible=group.track_visible,
             )
             group.point_layer.data = points_array
@@ -1003,6 +1031,55 @@ def make_viewer(
             except Exception:
                 pass
             group.point_layer.refresh()
+
+        diagnostic_categories = {}
+
+        def assign_current_category(
+            frame: pd.DataFrame,
+            category: str,
+        ) -> None:
+            now = current_frame()
+            for row in frame.itertuples(index=False):
+                if int(row.frame) != now:
+                    continue
+                diagnostic_categories[
+                    (
+                        int(row.frame),
+                        int(row.cell_id),
+                    )
+                ] = category
+
+        # Same priority as the existing notebook-style categories.
+        assign_current_category(
+            localized_frames.get(
+                "boundary_entry",
+                pd.DataFrame(),
+            ),
+            "boundary_entry",
+        )
+        assign_current_category(
+            localized_frames.get(
+                "boundary_exit",
+                pd.DataFrame(),
+            ),
+            "boundary_exit",
+        )
+        assign_current_category(
+            localized_frames.get(
+                "new",
+                pd.DataFrame(),
+            ),
+            "new",
+        )
+        assign_current_category(
+            localized_frames.get(
+                "broken",
+                pd.DataFrame(),
+            ),
+            "broken",
+        )
+
+        _refresh_current_center_colors()
 
     def refresh_track_graph_layers() -> None:
         nonlocal active_tracks_layer, hidden_tracks_layer
@@ -1043,7 +1120,7 @@ def make_viewer(
             all_tracks_array,
             name="Tracks - all",
             scale_tzyx=scale_tzyx,
-            tail_length=frame_count,
+            tail_length=TRACK_HISTORY_FRAMES,
             visible=all_visible,
         )
         all_centers_layer.data = all_points_array
@@ -1076,7 +1153,7 @@ def make_viewer(
             ),
             name="Corrected Tracks - active",
             scale_tzyx=scale_tzyx,
-            tail_length=frame_count,
+            tail_length=TRACK_HISTORY_FRAMES,
             visible=active_visible,
         )
 
@@ -1089,7 +1166,7 @@ def make_viewer(
             ),
             name="Hidden tracks",
             scale_tzyx=scale_tzyx,
-            tail_length=frame_count,
+            tail_length=TRACK_HISTORY_FRAMES,
             visible=hidden_visible,
         )
 
@@ -1099,13 +1176,9 @@ def make_viewer(
         )
         hidden_track_centers_layer.refresh()
 
-        diagnostic_categories = diagnostic_node_categories(
-            current_diagnostics
-        )
         refresh_diagnostic_layers(
             current_diagnostics
         )
-        _refresh_current_center_colors()
 
     def refresh_current_frame_layers(
         *,
@@ -1888,6 +1961,11 @@ def make_viewer(
         refresh_current_frame_layers(
             refresh_tracks=False
         )
+        # Lightweight only: do not rebuild the graph/current_tracks.csv while
+        # scrubbing. Just update the small local diagnostic windows.
+        refresh_diagnostic_layers(
+            current_diagnostics
+        )
         refresh_status()
 
         if (
@@ -1942,7 +2020,8 @@ def make_viewer(
     print("SV number leaders   : removed")
     print("SV IDs              : interior EDT centers")
     print("cell centers        : dynamic corrected-instance centers")
-    print("track diagnostics   : notebook-09 broken/new/boundary groups")
+    print("track diagnostics   : broken look-ahead/new recent window = 5 frames")
+    print(f"track tail          : {TRACK_HISTORY_FRAMES} time units max history")
     print("spatial controls    : Save Split | Save Merge | Hallucination | Undo Spatial")
     print("track controls      : Continue Track | Break Track | Birth | Undo Track")
     print("track completion    : automatic; complete components move to Hidden tracks")
