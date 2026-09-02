@@ -18,6 +18,8 @@ from dataset_curation.catalog import VolumeRecord
 from dataset_curation.errors import ArtifactError
 from dataset_curation.io.atomic import atomic_json
 from dataset_curation.inference.quality import (
+    SourceMaskMetrics,
+    SourceQualityPolicy,
     SourceQualityRejected,
     validate_source_mask,
 )
@@ -27,6 +29,10 @@ from learned.stirnet.inference import (
     SpatialInferenceConfig,
     load_spatial_runtime,
     run_parallel_spatial_volume,
+)
+from learned.stirnet.inference.spatial_pipeline import (
+    SpatialPreparationTimeout,
+    SpatialPreparationWorkerError,
 )
 
 
@@ -173,6 +179,15 @@ def _parse_extra(values: Sequence[str]):
     parser.add_argument("--tile-overlap-zyx", default="8,32,32")
     parser.add_argument("--tile-halo-zyx", default="4,16,16")
     parser.add_argument("--tile-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--frame-prep-timeout",
+        type=float,
+        default=300.0,
+        help=(
+            "Hard wall-clock timeout in seconds for one CPU frame "
+            "preparation task. Timed-out volumes are skipped."
+        ),
+    )
     parser.add_argument("--trackastra-model", default=DEFAULT_TRACKASTRA_MODEL)
     parser.add_argument("--trackastra-mode", default=DEFAULT_TRACKASTRA_MODE)
     parser.add_argument("--trackastra-device", default=DEFAULT_TRACKASTRA_DEVICE)
@@ -184,6 +199,10 @@ def _parse_extra(values: Sequence[str]):
         raise ValueError(
             "Unsupported dataset-curation inference option(s): "
             + " ".join(unknown)
+        )
+    if not float(parsed.frame_prep_timeout) > 0.0:
+        raise ValueError(
+            "--frame-prep-timeout must be positive"
         )
     return parsed
 
@@ -277,6 +296,97 @@ def _record_quality_skip(
         existing_skip=False,
     )
 
+
+def _quality_rejection_from_worker(
+    error: SpatialPreparationWorkerError,
+) -> SourceQualityRejected | None:
+    if error.error_type != "SourceQualityRejected":
+        return None
+
+    metadata = error.metadata
+    try:
+        return SourceQualityRejected(
+            frame=int(
+                metadata["frame"]
+            ),
+            metrics=SourceMaskMetrics(
+                **dict(
+                    metadata["metrics"]
+                )
+            ),
+            policy=SourceQualityPolicy(
+                **dict(
+                    metadata["policy"]
+                )
+            ),
+            reason_code=str(
+                metadata.get(
+                    "reason_code",
+                    "pathological_connected_foreground",
+                )
+            ),
+        )
+    except Exception:
+        return None
+
+
+def _record_preparation_timeout(
+    record: VolumeRecord,
+    timeout: SpatialPreparationTimeout,
+) -> InferenceOutcome:
+    paths = record.paths
+    _cleanup_inference_artifacts(paths)
+    paths.preprocessed_root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    reason_code = "preparation_timeout"
+    payload = {
+        "schema_version": 1,
+        "kind": "biohub_inference_skip",
+        "status": "skipped",
+        "volume_id": record.volume_id,
+        "split": record.split,
+        "reason_code": reason_code,
+        "trigger_frame": int(
+            timeout.frame
+        ),
+        "timeout_seconds": float(
+            timeout.timeout_seconds
+        ),
+        "elapsed_seconds": float(
+            timeout.elapsed_seconds
+        ),
+        "stage": "prepare_spatial_frame",
+        "source_zarr": str(
+            paths.zarr
+        ),
+        "created_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+    atomic_json(
+        paths.skip_marker,
+        payload,
+    )
+
+    print(
+        f"[SKIPPED] {record.split}/{record.volume_id}: "
+        f"{reason_code} at t={timeout.frame:03d} after "
+        f"{timeout.elapsed_seconds:.1f}s "
+        f"(limit={timeout.timeout_seconds:.1f}s)",
+        flush=True,
+    )
+    return InferenceOutcome(
+        status="skipped",
+        output=paths.preprocessed_root,
+        reason_code=reason_code,
+        trigger_frame=int(
+            timeout.frame
+        ),
+        existing_skip=False,
+    )
 
 class StirNetTrackastraBackend:
     """
@@ -386,9 +496,14 @@ class StirNetTrackastraBackend:
             print(f"source     : {paths.zarr}", flush=True)
             print(f"output     : {output}", flush=True)
             print(f"checkpoint : {checkpoint}", flush=True)
+            print(
+                f"prep timeout: {float(options.frame_prep_timeout):.0f}s",
+                flush=True,
+            )
             print("=" * 104, flush=True)
 
             rejection: SourceQualityRejected | None = None
+            preparation_timeout: SpatialPreparationTimeout | None = None
             try:
                 volume_result = run_parallel_spatial_volume(
                     paths.zarr,
@@ -397,6 +512,9 @@ class StirNetTrackastraBackend:
                     sample_id=record.volume_id,
                     on_frame=sink.write_frame,
                     source_mask_validator=validate_source_mask,
+                    preparation_timeout_seconds=float(
+                        options.frame_prep_timeout
+                    ),
                 )
                 sink.finish(
                     volume_result,
@@ -406,6 +524,14 @@ class StirNetTrackastraBackend:
                 )
             except SourceQualityRejected as exc:
                 rejection = exc
+            except SpatialPreparationTimeout as exc:
+                preparation_timeout = exc
+            except SpatialPreparationWorkerError as exc:
+                rejection = _quality_rejection_from_worker(
+                    exc
+                )
+                if rejection is None:
+                    raise
             finally:
                 sink.close()
 
@@ -414,6 +540,12 @@ class StirNetTrackastraBackend:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            if preparation_timeout is not None:
+                return _record_preparation_timeout(
+                    record,
+                    preparation_timeout,
+                )
 
             if rejection is not None:
                 return _record_quality_skip(record, rejection)
@@ -449,7 +581,11 @@ class StirNetTrackastraBackend:
                     "learned.stirnet.inference.run_parallel_spatial_volume"
                 ),
                 "parallel_preparation_workers": 1,
+                "parallel_preparation_worker_kind": "spawn_process",
                 "parallel_prefetch_depth": 1,
+                "frame_preparation_timeout_seconds": float(
+                    options.frame_prep_timeout
+                ),
                 "source_quality_gate": {
                     "enabled": True,
                     "location": "after_binary_mask_before_source_segmentation",

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 # DATASET_CURATION_CANONICAL_SKIP_V1
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import gc
+import multiprocessing
 from pathlib import Path
+import queue
 import time
+import traceback
 from typing import Any, Callable
 
 import numpy as np
@@ -173,12 +175,424 @@ def _count_labels(
     )
 
 
-# STIRNET_PARALLEL_SPATIAL_PIPELINE_V2
+class SpatialPreparationTimeout(RuntimeError):
+    """Hard wall-clock timeout for one CPU frame-preparation task."""
+
+    def __init__(
+        self,
+        *,
+        frame: int,
+        timeout_seconds: float,
+        elapsed_seconds: float,
+    ) -> None:
+        self.frame = int(frame)
+        self.timeout_seconds = float(timeout_seconds)
+        self.elapsed_seconds = float(elapsed_seconds)
+        super().__init__(
+            f"t={self.frame:03d} preparation exceeded "
+            f"{self.timeout_seconds:.1f}s "
+            f"(elapsed={self.elapsed_seconds:.1f}s)"
+        )
+
+
+class SpatialPreparationWorkerError(RuntimeError):
+    """Error raised in the isolated CPU preparation process."""
+
+    def __init__(
+        self,
+        *,
+        frame: int,
+        error_type: str,
+        message: str,
+        traceback_text: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self.frame = int(frame)
+        self.error_type = str(error_type)
+        self.remote_message = str(message)
+        self.traceback_text = str(traceback_text)
+        self.metadata = dict(metadata or {})
+        super().__init__(
+            f"t={self.frame:03d} preparation worker raised "
+            f"{self.error_type}: {self.remote_message}\n"
+            f"{self.traceback_text}"
+        )
+
+
+def _serialize_preparation_error(
+    frame: int,
+    error: BaseException,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+
+    for name in (
+        "frame",
+        "reason_code",
+    ):
+        if hasattr(error, name):
+            value = getattr(error, name)
+            if isinstance(
+                value,
+                (
+                    str,
+                    int,
+                    float,
+                    bool,
+                    type(None),
+                ),
+            ):
+                metadata[name] = value
+
+    for name in (
+        "metrics",
+        "policy",
+    ):
+        value = getattr(
+            error,
+            name,
+            None,
+        )
+        as_dict = getattr(
+            value,
+            "as_dict",
+            None,
+        )
+        if callable(as_dict):
+            metadata[name] = as_dict()
+
+    return {
+        "frame": int(frame),
+        "error_type": type(error).__name__,
+        "message": str(error),
+        "traceback_text": traceback.format_exc(),
+        "metadata": metadata,
+    }
+
+
+def _spatial_preparation_worker_main(
+    task_queue,
+    result_queue,
+    sample_zarr: str,
+    config: SpatialInferenceConfig,
+    segmentation_config,
+    source_mask_validator,
+) -> None:
+    """Persistent CPU-only worker. It must never initialize or touch CUDA."""
+    while True:
+        frame = task_queue.get()
+        if frame is None:
+            return
+
+        frame = int(frame)
+        try:
+            prepared = prepare_spatial_frame(
+                sample_zarr,
+                frame,
+                config=config,
+                segmentation_config=segmentation_config,
+                source_mask_validator=source_mask_validator,
+            )
+        except BaseException as error:
+            result_queue.put(
+                (
+                    "error",
+                    frame,
+                    _serialize_preparation_error(
+                        frame,
+                        error,
+                    ),
+                )
+            )
+            return
+
+        result_queue.put(
+            (
+                "ok",
+                frame,
+                prepared,
+            )
+        )
+
+
+class _SpatialPreparationProcess:
+    """
+    One persistent spawned process for CPU frame preparation.
+
+    The main process owns CUDA. A single task is in flight, preserving the
+    existing one-frame lookahead while making preparation force-terminable.
+    """
+
+    def __init__(
+        self,
+        *,
+        sample_zarr: Path,
+        config: SpatialInferenceConfig,
+        segmentation_config,
+        source_mask_validator,
+        timeout_seconds: float,
+    ) -> None:
+        timeout_seconds = float(
+            timeout_seconds
+        )
+        if not np.isfinite(
+            timeout_seconds
+        ) or timeout_seconds <= 0:
+            raise ValueError(
+                "preparation_timeout_seconds must be positive"
+            )
+
+        self.timeout_seconds = timeout_seconds
+        self._ctx = multiprocessing.get_context(
+            "spawn"
+        )
+        self._tasks = self._ctx.Queue(
+            maxsize=1
+        )
+        self._results = self._ctx.Queue(
+            maxsize=1
+        )
+        self._process = self._ctx.Process(
+            target=_spatial_preparation_worker_main,
+            args=(
+                self._tasks,
+                self._results,
+                str(sample_zarr),
+                config,
+                segmentation_config,
+                source_mask_validator,
+            ),
+            name="stirnet-spatial-prep",
+            daemon=True,
+        )
+        self._pending_frame: int | None = None
+        self._submitted_at: float | None = None
+        self._closed = False
+        self._process.start()
+
+    def submit(
+        self,
+        frame: int,
+    ) -> None:
+        if self._closed:
+            raise RuntimeError(
+                "Preparation process is closed"
+            )
+        if self._pending_frame is not None:
+            raise RuntimeError(
+                "Only one preparation frame may be in flight"
+            )
+        if not self._process.is_alive():
+            raise SpatialPreparationWorkerError(
+                frame=int(frame),
+                error_type="WorkerExited",
+                message=(
+                    "CPU preparation process exited "
+                    f"with code {self._process.exitcode}"
+                ),
+                traceback_text="",
+            )
+
+        self._tasks.put(
+            int(frame)
+        )
+        self._pending_frame = int(frame)
+        self._submitted_at = (
+            time.perf_counter()
+        )
+
+    def result(
+        self,
+    ) -> PreparedSpatialFrame:
+        if self._pending_frame is None:
+            raise RuntimeError(
+                "No preparation frame is pending"
+            )
+        if self._submitted_at is None:
+            raise RuntimeError(
+                "Pending preparation has no submit timestamp"
+            )
+
+        frame = int(
+            self._pending_frame
+        )
+        deadline = (
+            self._submitted_at
+            + self.timeout_seconds
+        )
+
+        while True:
+            now = time.perf_counter()
+            remaining = deadline - now
+            if remaining <= 0:
+                elapsed = (
+                    now
+                    - self._submitted_at
+                )
+                self.terminate()
+                raise SpatialPreparationTimeout(
+                    frame=frame,
+                    timeout_seconds=(
+                        self.timeout_seconds
+                    ),
+                    elapsed_seconds=elapsed,
+                )
+
+            try:
+                message = self._results.get(
+                    timeout=min(
+                        0.5,
+                        remaining,
+                    )
+                )
+            except queue.Empty:
+                if not self._process.is_alive():
+                    raise SpatialPreparationWorkerError(
+                        frame=frame,
+                        error_type="WorkerExited",
+                        message=(
+                            "CPU preparation process exited "
+                            f"with code {self._process.exitcode}"
+                        ),
+                        traceback_text="",
+                    )
+                continue
+
+            status = str(
+                message[0]
+            )
+            result_frame = int(
+                message[1]
+            )
+            payload = message[2]
+
+            self._pending_frame = None
+            self._submitted_at = None
+
+            if result_frame != frame:
+                raise RuntimeError(
+                    "Preparation ordering failure: "
+                    f"expected t={frame:03d}, "
+                    f"got t={result_frame:03d}"
+                )
+
+            if status == "ok":
+                if not isinstance(
+                    payload,
+                    PreparedSpatialFrame,
+                ):
+                    raise TypeError(
+                        "Preparation worker returned "
+                        f"{type(payload).__name__}, "
+                        "expected PreparedSpatialFrame"
+                    )
+                return payload
+
+            if status == "error":
+                raise SpatialPreparationWorkerError(
+                    frame=int(
+                        payload.get(
+                            "frame",
+                            frame,
+                        )
+                    ),
+                    error_type=str(
+                        payload.get(
+                            "error_type",
+                            "RemoteError",
+                        )
+                    ),
+                    message=str(
+                        payload.get(
+                            "message",
+                            "",
+                        )
+                    ),
+                    traceback_text=str(
+                        payload.get(
+                            "traceback_text",
+                            "",
+                        )
+                    ),
+                    metadata=dict(
+                        payload.get(
+                            "metadata",
+                            {},
+                        )
+                    ),
+                )
+
+            raise RuntimeError(
+                f"Unknown preparation worker status: {status!r}"
+            )
+
+    def terminate(
+        self,
+    ) -> None:
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(
+                timeout=2.0
+            )
+
+        if self._process.is_alive():
+            kill = getattr(
+                self._process,
+                "kill",
+                None,
+            )
+            if callable(kill):
+                kill()
+                self._process.join(
+                    timeout=2.0
+                )
+
+    def close(
+        self,
+        *,
+        graceful: bool,
+    ) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        if (
+            graceful
+            and self._process.is_alive()
+        ):
+            try:
+                self._tasks.put(
+                    None,
+                    timeout=0.5,
+                )
+            except Exception:
+                pass
+            self._process.join(
+                timeout=2.0
+            )
+
+        if self._process.is_alive():
+            self.terminate()
+
+        for channel in (
+            self._tasks,
+            self._results,
+        ):
+            try:
+                channel.cancel_join_thread()
+            except Exception:
+                pass
+            try:
+                channel.close()
+            except Exception:
+                pass
+
+
+# STIRNET_PARALLEL_SPATIAL_PIPELINE_V3
 #
 # Canonical production owner of the one-frame CPU lookahead scheduler.
-# Exactly one worker prepares t+1 while the main thread owns CUDA inference for
-# t. No worker thread is allowed to touch CUDA. Host-memory lookahead is bounded
-# to one prepared frame.
+# Exactly one spawned CPU process prepares t+1 while the main process owns
+# CUDA inference for t. The process can be force-terminated on timeout or
+# KeyboardInterrupt. Host-memory lookahead remains bounded to one frame.
 def run_parallel_spatial_volume(
     sample_zarr: str | Path,
     runtime: SpatialModelRuntime,
@@ -192,6 +606,7 @@ def run_parallel_spatial_volume(
     | None = None,
     require_nonempty_cells: bool = True,
     source_mask_validator: Callable[[int, np.ndarray], None] | None = None,
+    preparation_timeout_seconds: float = 300.0,
 ) -> SpatialVolumeResult:
     from src.api import (
         detect_cells,
@@ -239,23 +654,23 @@ def run_parallel_spatial_volume(
     ] = []
     run_started = time.perf_counter()
 
-    with ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="stirnet-spatial-prep",
-    ) as prep_executor:
-        prepared_future = (
-            prep_executor.submit(
-                prepare_spatial_frame,
-                sample_zarr,
-                0,
-                config=config,
-                segmentation_config=(
-                    segmentation_config
-                ),
-                source_mask_validator=(
-                    source_mask_validator
-                ),
-            )
+    prep_worker = _SpatialPreparationProcess(
+        sample_zarr=sample_zarr,
+        config=config,
+        segmentation_config=segmentation_config,
+        source_mask_validator=source_mask_validator,
+        timeout_seconds=float(
+            preparation_timeout_seconds
+        ),
+    )
+    completed = False
+
+    try:
+        prep_worker.submit(0)
+        print(
+            f"[{name} t=000] prep started "
+            f"(timeout={float(preparation_timeout_seconds):.0f}s)",
+            flush=True,
         )
 
         for frame in range(
@@ -269,7 +684,7 @@ def run_parallel_spatial_volume(
                 time.perf_counter()
             )
             prepared = (
-                prepared_future.result()
+                prep_worker.result()
             )
             preparation_wait_seconds = (
                 time.perf_counter()
@@ -287,19 +702,13 @@ def run_parallel_spatial_volume(
             # submit t+1 BEFORE CUDA starts for t.
             next_frame = frame + 1
             if next_frame < frame_count:
-                prepared_future = (
-                    prep_executor.submit(
-                        prepare_spatial_frame,
-                        sample_zarr,
-                        next_frame,
-                        config=config,
-                        segmentation_config=(
-                            segmentation_config
-                        ),
-                        source_mask_validator=(
-                            source_mask_validator
-                        ),
-                    )
+                prep_worker.submit(
+                    next_frame
+                )
+                print(
+                    f"[{name} t={next_frame:03d}] prep started "
+                    f"(timeout={float(preparation_timeout_seconds):.0f}s)",
+                    flush=True,
                 )
 
             (
@@ -497,6 +906,12 @@ def run_parallel_spatial_volume(
             if runtime.device.type == "cuda":
                 torch.cuda.empty_cache()
             gc.collect()
+
+        completed = True
+    finally:
+        prep_worker.close(
+            graceful=completed
+        )
 
     return SpatialVolumeResult(
         frame_count=frame_count,
