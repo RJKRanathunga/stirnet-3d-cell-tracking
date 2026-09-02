@@ -151,6 +151,7 @@ def test_unified_viewer_has_requested_layer_and_control_contract():
         "Boundary Exit Tracks",
         "Hidden tracks",
         "Hallucination",
+        "Save Merge",
         "Continue Track",
         "Break Track",
         "Birth",

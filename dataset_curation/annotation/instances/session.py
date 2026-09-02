@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Lazy per-frame spatial annotation state for split and hallucination edits."""
+"""Lazy per-frame spatial annotation state for split, merge, and hallucination edits."""
 
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -24,6 +24,14 @@ class SpatialUndoResult:
     operation_type: str
     timepoint: int
     message: str
+
+
+@dataclass(frozen=True)
+class SpatialMergeResult:
+    timepoint: int
+    selected_supervoxel_ids: tuple[int, ...]
+    source_instance_ids: tuple[int, ...]
+    output_instance_id: int
 
 
 def _dominant_parent_instance(
@@ -62,7 +70,7 @@ class AnnotationSession:
     are loaded on demand, cached in a small LRU, and persisted independently.
     """
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(
         self,
@@ -123,6 +131,11 @@ class AnnotationSession:
                         max_logged,
                         int(group.get("output_instance_id", 0)),
                     )
+            elif op.get("type") == "merge":
+                max_logged = max(
+                    max_logged,
+                    int(op.get("output_instance_id", 0)),
+                )
         self.next_label = max(max_base, max_logged) + 1
 
     def _local_index_for_dataset_timepoint(self, dataset_t: int) -> int:
@@ -243,6 +256,15 @@ class AnnotationSession:
 
     def hallucinations_in_frame(self, local_t: int) -> int:
         return len(self.hallucinated_supervoxels(local_t))
+
+    def merge_corrections_in_frame(self, local_t: int) -> int:
+        dataset_t = int(self.timepoints[int(local_t)])
+        return sum(
+            1
+            for op in self.operations
+            if op.get("type") == "merge"
+            and int(op.get("timepoint", -1)) == dataset_t
+        )
 
     def _parent_instance_for_sv(self, local_t: int, sv_id: int) -> int:
         return _dominant_parent_instance(
@@ -395,6 +417,136 @@ class AnnotationSession:
             groups=expanded_groups,
         )
 
+    def apply_merge(
+        self,
+        local_t: int,
+        supervoxel_ids: list[int],
+    ) -> SpatialMergeResult:
+        """Merge the full corrected instances identified by selected SVs."""
+        local_t = int(local_t)
+        selected = tuple(
+            int(value)
+            for value in supervoxel_ids
+            if int(value) > 0
+        )
+        if len(selected) < 2:
+            raise AnnotationError(
+                "Save Merge requires at least two selected supervoxels."
+            )
+        if len(selected) != len(set(selected)):
+            raise AnnotationError(
+                "The same supervoxel cannot be selected twice for Save Merge."
+            )
+
+        sv_frame = np.asarray(self.supervoxels[local_t])
+        frame = self.frame(local_t)
+
+        hallucinated = self.hallucinated_supervoxels(local_t)
+        invalid_hallucinated = sorted(set(selected) & hallucinated)
+        if invalid_hallucinated:
+            raise AnnotationError(
+                "Hallucinated supervoxels cannot be merged: "
+                f"{invalid_hallucinated}"
+            )
+
+        frame_sv_ids = {
+            int(value)
+            for value in np.unique(sv_frame).tolist()
+            if int(value) > 0
+        }
+        missing = sorted(set(selected) - frame_sv_ids)
+        if missing:
+            raise AnnotationError(
+                "These supervoxels are absent from the current frame: "
+                f"{missing}"
+            )
+
+        parent_ids: list[int] = []
+        for sv_id in selected:
+            parent = self._parent_instance_for_sv(
+                local_t,
+                sv_id,
+            )
+            if parent <= 0:
+                raise AnnotationError(
+                    f"Supervoxel {sv_id} is currently background."
+                )
+            parent_ids.append(int(parent))
+
+        source_instance_ids = tuple(
+            sorted(set(parent_ids))
+        )
+        if len(source_instance_ids) < 2:
+            raise AnnotationError(
+                "Save Merge needs supervoxels from at least two different "
+                "current corrected instances. The selected supervoxels "
+                f"all belong to instance {source_instance_ids[0]}."
+            )
+
+        source_groups: list[dict[str, Any]] = []
+        for instance_id in source_instance_ids:
+            source_supervoxels = sorted(
+                self._expected_supervoxels(
+                    local_t,
+                    int(instance_id),
+                )
+            )
+            if not source_supervoxels:
+                raise AnnotationError(
+                    f"Instance {instance_id} has no positive supervoxels."
+                )
+            source_groups.append(
+                {
+                    "instance_id": int(instance_id),
+                    "supervoxels": [
+                        int(value)
+                        for value in source_supervoxels
+                    ],
+                }
+            )
+
+        merge_mask = np.isin(
+            frame,
+            np.asarray(
+                source_instance_ids,
+                dtype=frame.dtype,
+            ),
+        )
+        if not np.any(merge_mask):
+            raise AnnotationError(
+                "Selected source instances are no longer present."
+            )
+
+        output_instance_id = int(self.next_label)
+        self.next_label += 1
+        frame[merge_mask] = output_instance_id
+
+        dataset_t = int(self.timepoints[local_t])
+        self.operations.append(
+            {
+                "type": "merge",
+                "timepoint": dataset_t,
+                "selected_supervoxels": [
+                    int(value)
+                    for value in selected
+                ],
+                "source_instance_ids": [
+                    int(value)
+                    for value in source_instance_ids
+                ],
+                "source_groups": source_groups,
+                "output_instance_id": output_instance_id,
+            }
+        )
+        self._persist_changed_frame(local_t)
+
+        return SpatialMergeResult(
+            timepoint=dataset_t,
+            selected_supervoxel_ids=selected,
+            source_instance_ids=source_instance_ids,
+            output_instance_id=output_instance_id,
+        )
+
     def apply_hallucination(
         self,
         local_t: int,
@@ -481,6 +633,74 @@ class AnnotationSession:
             message = (
                 f"restored instance {original_id}; removed split labels "
                 f"{output_ids}"
+            )
+
+        elif op_type == "merge":
+            output_id = int(op["output_instance_id"])
+            output_mask = frame == output_id
+            if not np.any(output_mask):
+                raise AnnotationError(
+                    "Cannot undo merge: its output instance "
+                    f"{output_id} is no longer present."
+                )
+
+            restored = np.zeros(
+                frame.shape,
+                dtype=bool,
+            )
+            source_groups = list(
+                op.get("source_groups", [])
+            )
+            if len(source_groups) < 2:
+                raise AnnotationError(
+                    "Merge history does not contain enough source groups "
+                    "to restore the original instances."
+                )
+
+            for group in source_groups:
+                source_id = int(group["instance_id"])
+                sv_ids = [
+                    int(value)
+                    for value in group.get(
+                        "supervoxels",
+                        [],
+                    )
+                ]
+                if not sv_ids:
+                    raise AnnotationError(
+                        "Merge history contains an empty source "
+                        f"supervoxel group for instance {source_id}."
+                    )
+
+                group_mask = (
+                    output_mask
+                    & np.isin(
+                        sv_frame,
+                        np.asarray(
+                            sv_ids,
+                            dtype=sv_frame.dtype,
+                        ),
+                    )
+                )
+                frame[group_mask] = source_id
+                restored |= group_mask
+
+            if np.any(output_mask & ~restored):
+                raise AnnotationError(
+                    "Cannot undo merge losslessly: some output voxels "
+                    "cannot be assigned back to their source instances."
+                )
+
+            source_ids = tuple(
+                int(value)
+                for value in op.get(
+                    "source_instance_ids",
+                    [],
+                )
+            )
+            message = (
+                f"restored merged instances {source_ids}; "
+                f"removed merged label {output_id}"
             )
 
         elif op_type == "hallucination":

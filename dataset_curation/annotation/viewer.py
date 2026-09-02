@@ -656,7 +656,7 @@ def make_viewer(
     status_label = Label(
         value=(
             "Spatial mode: click visible supervoxels. "
-            "Use Save Split or Hallucination."
+            "Use Save Split, Save Merge, or Hallucination."
         )
     )
 
@@ -680,6 +680,9 @@ def make_viewer(
 
     save_split_button = PushButton(
         text="Save Split"
+    )
+    save_merge_button = PushButton(
+        text="Save Merge"
     )
     hallucination_button = PushButton(
         text="Hallucination"
@@ -729,6 +732,7 @@ def make_viewer(
             box3,
             box4,
             save_split_button,
+            save_merge_button,
             hallucination_button,
             reset_spatial_button,
             undo_spatial_button,
@@ -1302,6 +1306,7 @@ def make_viewer(
         frame_label.value = (
             f"Frame t={frame}/{frame_count - 1} | "
             f"splits={spatial_session.split_corrections_in_frame(frame)} | "
+            f"merges={spatial_session.merge_corrections_in_frame(frame)} | "
             f"hallucinations={spatial_session.hallucinations_in_frame(frame)}"
         )
         selection_label.value = (
@@ -1354,6 +1359,7 @@ def make_viewer(
                 box3,
                 box4,
                 save_split_button,
+                save_merge_button,
                 hallucination_button,
                 reset_spatial_button,
                 undo_spatial_button,
@@ -1388,8 +1394,9 @@ def make_viewer(
                 "Mode: Spatial"
             )
             status_label.value = (
-                "Spatial mode: click supervoxels. "
-                "Save Split or mark the last selected SV as Hallucination."
+                "Spatial mode: click supervoxels. Save Split separates one "
+                "instance; Save Merge joins the current instances containing "
+                "the selected supervoxels; Hallucination removes one SV."
             )
         else:
             clear_spatial_selection()
@@ -1470,8 +1477,8 @@ def make_viewer(
             slot = next_empty_seed_slot()
             if slot is None:
                 status_label.value = (
-                    "All four split seed slots are filled. "
-                    "Save Split, Hallucination, or Reset Spatial."
+                    "All four spatial selection slots are filled. "
+                    "Save Split, Save Merge, Hallucination, or Reset Spatial."
                 )
                 return
             selected_seed_ids[
@@ -1552,6 +1559,39 @@ def make_viewer(
             f"{result.original_instance_id} -> "
             f"{result.output_instance_ids}. "
             "No track association was invented for the new detections."
+        )
+
+    def save_merge() -> None:
+        try:
+            selected_supervoxels: list[int] = []
+            for box in boxes:
+                selected_supervoxels.extend(
+                    parse_supervoxel_group(
+                        str(box.value)
+                    )
+                )
+
+            result = spatial_session.apply_merge(
+                current_frame(),
+                selected_supervoxels,
+            )
+        except Exception as exc:
+            show_error(exc)
+            return
+
+        clear_spatial_selection()
+        refresh_current_frame_layers(
+            refresh_tracks=True,
+            spatial_authority_changed=True,
+        )
+        refresh_status()
+        status_label.value = (
+            f"MERGE saved at t={result.timepoint}: "
+            f"instances {result.source_instance_ids} -> "
+            f"{result.output_instance_id}, selected by SVs "
+            f"{result.selected_supervoxel_ids}. "
+            "A fresh corrected instance ID was created; track associations "
+            "were not inherited automatically."
         )
 
     def mark_hallucination() -> None:
@@ -1710,6 +1750,9 @@ def make_viewer(
     save_split_button.changed.connect(
         lambda *_: save_split()
     )
+    save_merge_button.changed.connect(
+        lambda *_: save_merge()
+    )
     hallucination_button.changed.connect(
         lambda *_: mark_hallucination()
     )
@@ -1745,24 +1788,67 @@ def make_viewer(
         lambda *_: undo_track()
     )
 
-    @viewer.bind_key("Escape")
-    def reset_current_mode(_viewer):
-        if (
-            mode["value"]
-            == MODE_SPATIAL
-        ):
-            clear_spatial_selection(
-                persist_message=(
-                    "Spatial selections reset."
-                )
-            )
-        else:
-            clear_track_selection()
-            status_label.value = (
-                "Track selections reset."
-            )
+    def reset_all_selections(_source=None) -> None:
+        clear_spatial_selection()
+        clear_track_selection()
+        status_label.value = (
+            "Spatial and tracking selections reset."
+        )
         refresh_status()
 
+
+    def reset_with_escape(_viewer=None) -> None:
+        reset_all_selections(_viewer)
+
+
+    try:
+        viewer.bind_key(
+            "Escape",
+            reset_with_escape,
+            overwrite=True,
+        )
+    except TypeError:
+        viewer.bind_key(
+            "Escape",
+            reset_with_escape,
+        )
+
+
+    def _bind_escape_to_layer(layer) -> None:
+        try:
+            layer.bind_key(
+                "Escape",
+                reset_all_selections,
+                overwrite=True,
+            )
+        except TypeError:
+            try:
+                layer.bind_key(
+                    "Escape",
+                    reset_all_selections,
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+    for _layer in list(viewer.layers):
+        _bind_escape_to_layer(_layer)
+
+
+    def _bind_escape_to_inserted_layer(event) -> None:
+        layer = getattr(event, "value", None)
+        if layer is not None:
+            _bind_escape_to_layer(layer)
+
+
+    try:
+        viewer.layers.events.inserted.connect(
+            _bind_escape_to_inserted_layer
+        )
+    except Exception:
+        pass
     @viewer.bind_key("Control-S")
     def save_spatial_shortcut(_viewer):
         if (
@@ -1857,7 +1943,7 @@ def make_viewer(
     print("SV IDs              : interior EDT centers")
     print("cell centers        : dynamic corrected-instance centers")
     print("track diagnostics   : notebook-09 broken/new/boundary groups")
-    print("spatial controls    : Save Split | Hallucination | Undo Spatial")
+    print("spatial controls    : Save Split | Save Merge | Hallucination | Undo Spatial")
     print("track controls      : Continue Track | Break Track | Birth | Undo Track")
     print("track completion    : automatic; complete components move to Hidden tracks")
     print("ray picking         : always derived from Raw BioHub")
