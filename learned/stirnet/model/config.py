@@ -96,6 +96,15 @@ class PartitionConfig:
     watershed_sdf_weight: float = 0.15
     min_supervoxel_voxels: int = 1
 
+    # STIRNET_TINY_SUPERVOXEL_AGGLOMERATION_V1
+    # Final cleanup after the face-level safety guard and before RAG
+    # construction. Investigation 41 on BioHub 44b6_0113de3b showed a dense
+    # pathological tail far below plausible cell size. 50 voxels is a
+    # deliberately round, conservative V1 threshold; recalibrate across the
+    # full corpus later if needed.
+    tiny_supervoxel_agglomeration_enabled: bool = True
+    tiny_supervoxel_max_voxels: int = 50
+
     # Post-watershed face-level safety guard. Separator remains a soft CNN
     # target, but hard topology is represented on actual 6-neighbor faces.
     # Face scores are physically normalized using
@@ -323,6 +332,10 @@ class ModelConfig:
             raise ValueError("foreground_threshold must be in (0, 1)")
         if self.partition.max_supervoxels < 1:
             raise ValueError("max_supervoxels must be positive")
+        if self.partition.tiny_supervoxel_max_voxels < 1:
+            raise ValueError(
+                "tiny_supervoxel_max_voxels must be positive"
+            )
         if self.partition.watershed_backend not in {"reference", "fast"}:
             raise ValueError("partition.watershed_backend must be 'reference' or 'fast'")
         if self.partition.region_stats_backend not in {"torch", "auto"}:

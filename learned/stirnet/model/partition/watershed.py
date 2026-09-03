@@ -14,6 +14,7 @@ from ..geometry.derived import build_geometry_derived_cache
 from ..types import GeometryDerivedCache, GeometryLike, geometry_field
 from .seeds import build_markers, build_markers_fast
 from .supervoxel_guard import SupervoxelSafetyGuard
+from .tiny_agglomeration import agglomerate_tiny_supervoxels
 
 
 def _profile(profiler, name: str):
@@ -248,6 +249,26 @@ class LearnedGeometryWatershed(nn.Module):
                     spacing_um[b],
                     dref_um[b],
                 )
+
+            # STIRNET_TINY_SUPERVOXEL_AGGLOMERATION_V1_AFTER_GUARD
+            # Final atomic-region invariant before any RAG nodes/features are
+            # constructed. This also cleans tiny shards introduced by the
+            # face-level safety guard itself.
+            if self.cfg.tiny_supervoxel_agglomeration_enabled:
+                with _profile(
+                    stage_profiler,
+                    f"{profile_prefix}_tiny_supervoxel_agglomeration",
+                ):
+                    labels, _tiny_agglomeration_diagnostics = (
+                        agglomerate_tiny_supervoxels(
+                            labels,
+                            spacing_um[b].detach().cpu().numpy(),
+                            max_voxels=(
+                                self.cfg.tiny_supervoxel_max_voxels
+                            ),
+                        )
+                    )
+
             if int(labels.max()) > self.cfg.max_supervoxels:
                 raise RuntimeError(
                     f"Watershed created {int(labels.max())} supervoxels, exceeding "

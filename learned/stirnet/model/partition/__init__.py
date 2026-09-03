@@ -10,6 +10,10 @@ from .local_update import LocalPartitionUpdateResult, LocalPartitionUpdater
 from .partitioner import GraphPartitioner
 from .rag import RAGBuilder, RAGCriterion, RAGTargets
 from .watershed import LearnedGeometryWatershed
+from .tiny_agglomeration import (
+    TinySupervoxelAgglomerationDiagnostics,
+    agglomerate_tiny_supervoxels,
+)
 from .supervoxel_guard import (
     FaceArrays,
     SupervoxelGuardDiagnostics,
@@ -27,6 +31,8 @@ from .statistics import (
 
 __all__ = [
     "LearnedGeometryWatershed",
+    "TinySupervoxelAgglomerationDiagnostics",
+    "agglomerate_tiny_supervoxels",
     "FaceArrays",
     "SupervoxelGuardDiagnostics",
     "SupervoxelSafetyGuard",
