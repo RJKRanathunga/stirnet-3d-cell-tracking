@@ -10,6 +10,8 @@ from __future__ import annotations
 
 # DATASET_CURATION_POINTS_TEXT_SYNC_V1
 
+# DATASET_CURATION_POINTS_TEXT_RECREATE_V2
+
 """Unified Napari viewer for spatial and track annotation."""
 
 from dataclasses import dataclass
@@ -210,6 +212,116 @@ def _sync_points_data_and_features(
         layer.text = dict(text_spec)
 
     layer.refresh()
+
+
+def _sync_feature_text_points_layer(
+    viewer,
+    layer,
+    data: np.ndarray,
+    *,
+    name: str,
+    scale,
+    size: float,
+    face_color,
+    properties: dict[str, np.ndarray],
+    text_spec: dict[str, Any],
+    out_of_slice_display: bool | None = None,
+):
+    """
+    Synchronize a feature-backed text Points layer without exposing Napari's
+    stale `_indices_view` cache to a changed point count.
+
+    If N changes, recreate the layer from one self-consistent constructor
+    payload. This is cheap for curation point overlays (hundreds of points)
+    and avoids depending on private Napari slice-refresh APIs.
+
+    If N is unchanged, retain the lighter V1 in-place synchronization.
+    """
+    array = np.asarray(data)
+    if array.ndim != 2:
+        raise ValueError(
+            f"{name}: Points data must be 2-D, got {array.shape}."
+        )
+
+    row_count = int(array.shape[0])
+    old_count = int(
+        np.asarray(layer.data).shape[0]
+    )
+
+    if old_count != row_count:
+        try:
+            visible = bool(layer.visible)
+        except Exception:
+            visible = True
+
+        try:
+            old_index = int(
+                viewer.layers.index(layer)
+            )
+        except Exception:
+            old_index = None
+
+        try:
+            viewer.layers.remove(
+                layer
+            )
+        except (ValueError, KeyError):
+            pass
+
+        layer = viewer.add_points(
+            array,
+            name=name,
+            scale=scale,
+            size=float(size),
+            face_color=face_color,
+            properties=properties,
+            text=dict(text_spec),
+        )
+        layer.visible = visible
+
+        if out_of_slice_display is not None:
+            try:
+                layer.out_of_slice_display = bool(
+                    out_of_slice_display
+                )
+            except Exception:
+                pass
+
+        # Recreating a layer normally appends it to the top of the layer list.
+        # Restore its previous ordering when the installed Napari LayerList
+        # exposes the stable move() API.
+        if old_index is not None:
+            try:
+                current_index = int(
+                    viewer.layers.index(layer)
+                )
+                if current_index != old_index:
+                    viewer.layers.move(
+                        current_index,
+                        old_index,
+                    )
+            except Exception:
+                pass
+
+        return layer
+
+    _sync_points_data_and_features(
+        layer,
+        array,
+        properties=properties,
+        face_color=face_color,
+        text_spec=text_spec,
+    )
+
+    if out_of_slice_display is not None:
+        try:
+            layer.out_of_slice_display = bool(
+                out_of_slice_display
+            )
+        except Exception:
+            pass
+
+    return layer
 
 
 def _sync_tracks_layer(
@@ -1203,7 +1315,8 @@ def make_viewer(
 
     def refresh_track_graph_layers() -> None:
         nonlocal active_tracks_layer, hidden_tracks_layer
-        nonlocal all_tracks_layer, current_tracks, current_diagnostics
+        nonlocal all_tracks_layer, all_centers_layer
+        nonlocal current_tracks, current_diagnostics
         nonlocal diagnostic_categories
 
         current_tracks = build_current_track_table(
@@ -1245,9 +1358,14 @@ def make_viewer(
             tail_length=TRACK_HISTORY_FRAMES,
             visible=all_visible,
         )
-        _sync_points_data_and_features(
+        all_centers_layer = _sync_feature_text_points_layer(
+            viewer,
             all_centers_layer,
             all_points_array,
+            name="Centroids - all",
+            scale=scale_tzyx,
+            size=4,
+            face_color="red",
             properties=all_properties,
             text_spec={
                 "string": "{cell_id}",
@@ -1350,6 +1468,7 @@ def make_viewer(
         result: TrackRefreshResult,
     ) -> None:
         nonlocal all_tracks_layer
+        nonlocal all_centers_layer
         nonlocal active_tracks_layer
         nonlocal hidden_tracks_layer
         nonlocal current_tracks
@@ -1394,9 +1513,14 @@ def make_viewer(
             visible=all_visible,
         )
 
-        _sync_points_data_and_features(
+        all_centers_layer = _sync_feature_text_points_layer(
+            viewer,
             all_centers_layer,
             result.all_points_array,
+            name="Centroids - all",
+            scale=scale_tzyx,
+            size=4,
+            face_color="red",
             properties=result.all_properties,
             text_spec={
                 "string": "{cell_id}",
@@ -1498,6 +1622,8 @@ def make_viewer(
         refresh_tracks: bool = True,
         spatial_authority_changed: bool = False,
     ) -> None:
+        nonlocal supervoxel_id_layer, cell_centers_layer
+
         frame = current_frame()
         corrected = spatial_session.frame(frame)
 
@@ -1574,9 +1700,14 @@ def make_viewer(
             supervoxel_layer,
             sv_mapping,
         )
-        _sync_points_data_and_features(
+        supervoxel_id_layer = _sync_feature_text_points_layer(
+            viewer,
             supervoxel_id_layer,
             sv_points,
+            name="Supervoxel IDs",
+            scale=spacing_zyx,
+            size=1,
+            face_color="transparent",
             properties=sv_properties,
             text_spec={
                 "string": "{sv_id}",
@@ -1584,6 +1715,7 @@ def make_viewer(
                 "color": "white",
                 "anchor": "center",
             },
+            out_of_slice_display=False,
         )
 
         if spatial_authority_changed:
@@ -1653,9 +1785,14 @@ def make_viewer(
                 dtype=np.float32,
             )
 
-        _sync_points_data_and_features(
+        cell_centers_layer = _sync_feature_text_points_layer(
+            viewer,
             cell_centers_layer,
             center_points,
+            name="Cell instance centers",
+            scale=spacing_zyx,
+            size=4.5,
+            face_color=center_colors,
             properties={
                 "instance_id": np.asarray(
                     ordered_ids,
@@ -1666,7 +1803,6 @@ def make_viewer(
                     dtype=object,
                 ),
             },
-            face_color=center_colors,
             text_spec={
                 "string": "{instance_id}",
                 "size": 7,
