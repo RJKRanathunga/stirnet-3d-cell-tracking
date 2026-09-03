@@ -6,6 +6,8 @@ from __future__ import annotations
 
 # DATASET_CURATION_EMPTY_TRACKS_SAFE_V1
 
+# DATASET_CURATION_EXACT_BOUNDARY_TOUCH_V1
+
 """Unified Napari viewer for spatial and track annotation."""
 
 from dataclasses import dataclass
@@ -52,6 +54,7 @@ from dataset_curation.annotation.source_data import (
 from dataset_curation.annotation.tracks.diagnostics import (
     CATEGORY_COLORS,
     EndpointTrackGroups,
+    boundary_touching_instance_ids,
     diagnostic_node_categories,
 )
 from dataset_curation.annotation.tracks.graph import Node
@@ -1516,6 +1519,10 @@ def make_viewer(
             track_session.set_frame_nodes(
                 frame,
                 centers.keys(),
+            )
+            track_session.set_frame_exact_boundary_touch_nodes(
+                frame,
+                boundary_touching_instance_ids(corrected),
             )
         else:
             centers = dict(

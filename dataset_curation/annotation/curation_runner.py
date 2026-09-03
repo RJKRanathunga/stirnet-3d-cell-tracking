@@ -4,6 +4,8 @@ from __future__ import annotations
 
 # DATASET_CURATION_CANONICAL_SKIP_V1
 
+# DATASET_CURATION_EXACT_BOUNDARY_TOUCH_V1
+
 """One-volume unified spatial + tracking curation runner."""
 
 import json
@@ -24,6 +26,7 @@ from dataset_curation.annotation.source_data import (
     open_source_movie,
 )
 from dataset_curation.annotation.tracks.diagnostics import (
+    boundary_touching_instance_ids,
     normalize_cells,
     normalize_tracks,
     prepare_endpoint_track_groups,
@@ -273,18 +276,31 @@ def run_annotation(
     }
 
     # Resume-time spatial edits are authoritative over Trackastra's original
-    # cell table. Only changed frames need to be rescanned.
-    for local_t in (
+    # cell table. Only changed frames need a full corrected-frame rescan.
+    changed_local_indices = set(
         spatial_session.changed_local_indices()
-    ):
+    )
+    for local_t in sorted(changed_local_indices):
         _replace_frame_nodes_and_centers(
             valid_nodes,
             centers,
             frame=int(local_t),
-            labels_zyx=spatial_session.frame(
-                local_t
-            ),
+            labels_zyx=spatial_session.frame(local_t),
         )
+
+    # Additive exact-mask boundary rule. Ordinary frames inspect only the six
+    # faces of the base uint16 memmap; edited frames use current corrected labels.
+    exact_boundary_touch_nodes: set[Node] = set()
+    for local_t in range(frame_count):
+        labels_zyx = (
+            spatial_session.frame(local_t)
+            if local_t in changed_local_indices
+            else base_instances[local_t]
+        )
+        for instance_id in boundary_touching_instance_ids(labels_zyx):
+            node = (int(local_t), int(instance_id))
+            if node in valid_nodes:
+                exact_boundary_touch_nodes.add(node)
 
     base_edges = (
         build_trackastra_detection_edges(
@@ -340,6 +356,7 @@ def run_annotation(
         boundary_entry_nodes=boundary_entry_nodes,
         boundary_exit_nodes=boundary_exit_nodes,
         resume=resume_unified_state,
+        exact_boundary_touch_nodes=exact_boundary_touch_nodes,
     )
 
     binary_cache = BinaryMaskFrameCache(
@@ -357,7 +374,11 @@ def run_annotation(
     print(f"annotations    : {paths.annotation_set(annotation_set)}")
     print(f"resume state   : {resume_unified_state}")
     print(
-        "diagnostics    : notebook-09 broken/new/boundary endpoint groups"
+        "diagnostics    : notebook-09 boundary heuristic + exact mask-face contact"
+    )
+    print(
+        f"exact boundary : {len(exact_boundary_touch_nodes)} "
+        "current instance nodes"
     )
     print("=" * 96)
 

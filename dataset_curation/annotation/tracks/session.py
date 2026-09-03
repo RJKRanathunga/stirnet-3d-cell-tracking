@@ -2,6 +2,8 @@ from __future__ import annotations
 
 # DATASET_CURATION_LOCAL_TRACK_REPAIR_V2
 
+# DATASET_CURATION_EXACT_BOUNDARY_TOUCH_V1
+
 """Persistent corrected tracking graph with automatic completion detection."""
 
 from collections import defaultdict, deque
@@ -55,6 +57,7 @@ class TrackAnnotationSession:
         boundary_entry_nodes: set[Node],
         boundary_exit_nodes: set[Node],
         resume: bool,
+        exact_boundary_touch_nodes: set[Node] | None = None,
     ) -> None:
         self.sample_id = str(sample_id)
         self.source_root = Path(source_root)
@@ -71,14 +74,21 @@ class TrackAnnotationSession:
         if self.frame_count < 1:
             raise ValueError("frame_count must be >= 1")
 
-        self.boundary_entry_nodes = {
+        # Existing near-boundary heuristic stays as an independent
+        # source of truth. Exact raster contact is additive.
+        self._heuristic_boundary_entry_nodes = {
             (int(node[0]), int(node[1]))
             for node in boundary_entry_nodes
         }
-        self.boundary_exit_nodes = {
+        self._heuristic_boundary_exit_nodes = {
             (int(node[0]), int(node[1]))
             for node in boundary_exit_nodes
         }
+        self.exact_boundary_touch_nodes = {
+            (int(node[0]), int(node[1]))
+            for node in (exact_boundary_touch_nodes or set())
+        }
+        self._refresh_boundary_node_unions()
 
         self.forced_edges: set[Edge] = set()
         self.broken_edges: set[Edge] = set()
@@ -99,6 +109,53 @@ class TrackAnnotationSession:
             self._load()
         else:
             self.persist()
+
+    def _refresh_boundary_node_unions(self) -> None:
+        self.boundary_entry_nodes = (
+            set(self._heuristic_boundary_entry_nodes)
+            | set(self.exact_boundary_touch_nodes)
+        )
+        self.boundary_exit_nodes = (
+            set(self._heuristic_boundary_exit_nodes)
+            | set(self.exact_boundary_touch_nodes)
+        )
+
+    def set_frame_exact_boundary_touch_nodes(
+        self,
+        frame: int,
+        instance_ids: Iterable[int],
+    ) -> tuple[set[Node], set[Node]]:
+        """Replace exact raster-contact boundary nodes for one frame."""
+        frame = int(frame)
+        if not (0 <= frame < self.frame_count):
+            raise AnnotationError(
+                f"Boundary frame {frame} is outside 0..{self.frame_count - 1}."
+            )
+
+        new_nodes = {
+            (frame, int(instance_id))
+            for instance_id in instance_ids
+            if int(instance_id) > 0
+        }
+        old_nodes = {
+            node
+            for node in self.exact_boundary_touch_nodes
+            if int(node[0]) == frame
+        }
+        if new_nodes == old_nodes:
+            return set(), set()
+
+        removed = old_nodes - new_nodes
+        added = new_nodes - old_nodes
+        self.exact_boundary_touch_nodes.difference_update(old_nodes)
+        self.exact_boundary_touch_nodes.update(new_nodes)
+        self._refresh_boundary_node_unions()
+        self._invalidate_analysis()
+
+        # Derived from current spatial labels; rebuilt on resume. Persist here
+        # only to preserve the existing canonical/derived update rhythm.
+        self.persist()
+        return removed, added
 
     def _validate_node(self, node: Node) -> None:
         node = (int(node[0]), int(node[1]))

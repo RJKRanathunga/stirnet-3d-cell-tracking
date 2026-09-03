@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_EXACT_BOUNDARY_TOUCH_V1
+
 """Notebook-09-equivalent Trackastra endpoint diagnostics for curation."""
 
 from dataclasses import dataclass
@@ -31,6 +33,36 @@ class EndpointTrackGroups:
     ended_failure_tracks: pd.DataFrame
     boundary_entry_tracks: pd.DataFrame
     boundary_exit_tracks: pd.DataFrame
+
+
+def boundary_touching_instance_ids(
+    labels_zyx: np.ndarray,
+) -> set[int]:
+    """Return positive instance IDs occupying any of the six volume faces."""
+    labels = np.asarray(labels_zyx)
+    if labels.ndim != 3:
+        raise ValueError(
+            "Boundary-touch classification expects one (Z,Y,X) label frame; "
+            f"got shape {labels.shape}."
+        )
+    if 0 in labels.shape:
+        return set()
+
+    result: set[int] = set()
+    faces = (
+        labels[0, :, :],
+        labels[-1, :, :],
+        labels[:, 0, :],
+        labels[:, -1, :],
+        labels[:, :, 0],
+        labels[:, :, -1],
+    )
+    for face in faces:
+        for value in np.unique(face).tolist():
+            instance_id = int(value)
+            if instance_id > 0:
+                result.add(instance_id)
+    return result
 
 
 def normalize_cells(cells: pd.DataFrame) -> pd.DataFrame:
