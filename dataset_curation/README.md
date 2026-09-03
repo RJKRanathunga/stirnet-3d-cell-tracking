@@ -13,6 +13,8 @@ python -m dataset_curation infer --split train --id <volume-id>
 python -m dataset_curation annotate --next
 python -m dataset_curation annotate --resume
 python -m dataset_curation annotate --id <volume-id>
+python -m dataset_curation progress --split train --id <volume-id>
+python -m dataset_curation progress --split train
 python -m dataset_curation view-source --id <volume-id>
 ```
 
@@ -107,6 +109,45 @@ A spatial edit is authoritative. If a split or hallucination removes a previous
 Trackastra detection ID, graph edges incident to that detection become inactive.
 New split detections are selectable for manual `Continue Track`, but the tool
 does not invent track associations automatically.
+
+<!-- DATASET_CURATION_ANNOTATION_PROGRESS_V1 -->
+
+## Annotation progress
+
+Saved annotation activity can be inspected without opening Napari:
+
+```powershell
+python -m dataset_curation progress --split train --id 44b6_0113de3b
+```
+
+If `--id` is omitted, `progress` reports the most recently touched started
+annotation session in the selected split:
+
+```powershell
+python -m dataset_curation progress --split train
+```
+
+The command is read-only. It derives progress directly from the canonical
+annotation state and reports:
+
+- frames containing saved spatial corrections
+- total saved split, merge, and hallucination operations
+- persisted manual corrected-frame count
+- frames participating in manual track actions
+- manual `Continue Track` and `Break Track` counts
+- `Birth` event count
+- ignored/deferred event count
+- the union of unique frames with any saved annotation activity
+- compact frame ranges for spatial, tracking, and overall activity
+
+`Birth` creates two forced track edges internally; those edges are excluded
+from the ordinary manual-Continue count so the event is not double-counted.
+
+The reported frame coverage is **saved annotation activity**, not complete
+human-review coverage. The current annotator does not persist a separate
+"reviewed and accepted with no correction" marker. Therefore, a frame that was
+visually inspected but required no saved edit cannot currently be recovered
+from persisted annotation state.
 
 ## Hallucinations
 

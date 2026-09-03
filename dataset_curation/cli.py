@@ -276,6 +276,63 @@ def cmd_annotate(args) -> None:
     )
 
 
+# DATASET_CURATION_ANNOTATION_PROGRESS_V1
+def cmd_progress(args) -> None:
+    from dataset_curation.annotation.progress import (
+        compute_annotation_progress,
+        format_annotation_progress,
+    )
+    from dataset_curation.annotation.selection import annotation_mtime
+
+    catalog = _catalog(args, ensure_outputs=False)
+
+    if args.id:
+        record = catalog.get(args.id, split=args.split)
+    else:
+        started = [
+            candidate
+            for candidate in catalog.discover(args.split)
+            if annotation_started(
+                candidate,
+                annotation_set=args.annotation_set,
+            )
+        ]
+        if not started:
+            raise RuntimeError(
+                f"No started annotation session exists in split {args.split!r} "
+                f"for annotation set {args.annotation_set!r}."
+            )
+        record = max(
+            started,
+            key=lambda candidate: annotation_mtime(
+                candidate,
+                annotation_set=args.annotation_set,
+            ),
+        )
+
+    if record.frame_count is None:
+        raise RuntimeError(
+            f"Could not determine frame count for {record.split}/{record.volume_id}."
+        )
+
+    annotation_root = record.paths.annotation_set(args.annotation_set)
+    if not annotation_root.is_dir():
+        raise FileNotFoundError(f"Annotation set does not exist: {annotation_root}")
+
+    progress = compute_annotation_progress(
+        annotation_root,
+        frame_count=int(record.frame_count),
+    )
+    print(
+        format_annotation_progress(
+            progress,
+            split=record.split,
+            volume_id=record.volume_id,
+            annotation_set=args.annotation_set,
+        )
+    )
+
+
 def _find_source_record(
     catalog: BioHubCatalog,
     *,
@@ -448,6 +505,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ignore persisted unified spatial/track state for this volume.",
     )
     annotate.set_defaults(func=cmd_annotate)
+
+    progress = sub.add_parser(
+        "progress",
+        help=(
+            "Report saved spatial/track annotation activity. If --id is "
+            "omitted, use the most recently touched started session."
+        ),
+    )
+    _add_data_root(progress)
+    progress.add_argument(
+        "--split",
+        choices=("train", "test"),
+        default="train",
+    )
+    progress.add_argument(
+        "--id",
+        default=None,
+        help=(
+            "Volume ID. If omitted, use the most recently touched started "
+            "annotation session in the selected split."
+        ),
+    )
+    progress.add_argument("--annotation-set", default="main")
+    progress.set_defaults(func=cmd_progress)
 
     source = sub.add_parser(
         "view-source",
