@@ -558,55 +558,144 @@ class AnnotationSession:
             output_instance_id=output_instance_id,
         )
 
+    # DATASET_CURATION_MULTI_HALLUCINATION_V1
+    def apply_hallucinations(
+        self,
+        local_t: int,
+        sv_ids: list[int] | tuple[int, ...],
+    ) -> tuple[dict[str, Any], ...]:
+        """Mark all selected supervoxels as hallucinations atomically."""
+        local_t = int(local_t)
+        selected = tuple(
+            int(value)
+            for value in sv_ids
+            if int(value) > 0
+        )
+        if not selected:
+            raise AnnotationError(
+                "Select at least one positive supervoxel first."
+            )
+        if len(selected) != len(set(selected)):
+            raise AnnotationError(
+                "The same supervoxel cannot be selected twice for Hallucination."
+            )
+
+        already_hallucinated = self.hallucinated_supervoxels(local_t)
+        repeated = sorted(
+            set(selected) & already_hallucinated
+        )
+        if repeated:
+            raise AnnotationError(
+                "These supervoxels are already marked as hallucinations: "
+                f"{repeated}"
+            )
+
+        sv_frame = np.asarray(
+            self.supervoxels[local_t]
+        )
+        frame = self.frame(local_t)
+        dataset_t = int(
+            self.timepoints[local_t]
+        )
+
+        pending: list[
+            tuple[int, np.ndarray, int, int]
+        ] = []
+
+        # Validate the whole selection before mutating the corrected frame.
+        for sv_id in selected:
+            mask = sv_frame == int(sv_id)
+            voxel_count = int(
+                np.count_nonzero(mask)
+            )
+            if voxel_count == 0:
+                raise AnnotationError(
+                    f"Supervoxel {sv_id} does not exist in this frame."
+                )
+
+            parent_ids = np.unique(
+                frame[mask]
+            )
+            parent_ids = parent_ids[
+                parent_ids > 0
+            ]
+            if len(parent_ids) == 0:
+                raise AnnotationError(
+                    f"Supervoxel {sv_id} is already background in the "
+                    "corrected labels."
+                )
+            if len(parent_ids) != 1:
+                raise AnnotationError(
+                    f"Supervoxel {sv_id} overlaps multiple corrected "
+                    f"instances: {parent_ids.tolist()}."
+                )
+
+            pending.append(
+                (
+                    int(sv_id),
+                    mask,
+                    int(parent_ids[0]),
+                    int(voxel_count),
+                )
+            )
+
+        batch_id: str | None = None
+        if len(pending) > 1:
+            batch_id = (
+                f"hallucination-{dataset_t}-"
+                f"{len(self.operations)}"
+            )
+
+        records: list[
+            dict[str, Any]
+        ] = []
+
+        for (
+            sv_id,
+            mask,
+            previous_instance_id,
+            voxel_count,
+        ) in pending:
+            frame[mask] = 0
+
+            record: dict[str, Any] = {
+                "type": "hallucination",
+                "timepoint": dataset_t,
+                "supervoxel_id": int(sv_id),
+                "previous_instance_id": int(
+                    previous_instance_id
+                ),
+                "voxel_count": int(
+                    voxel_count
+                ),
+            }
+            if batch_id is not None:
+                record[
+                    "batch_id"
+                ] = batch_id
+
+            records.append(
+                record
+            )
+
+        self.operations.extend(
+            records
+        )
+        self._persist_changed_frame(
+            local_t
+        )
+        return tuple(records)
+
     def apply_hallucination(
         self,
         local_t: int,
         sv_id: int,
     ) -> dict[str, Any]:
-        local_t = int(local_t)
-        sv_id = int(sv_id)
-        if sv_id <= 0:
-            raise AnnotationError("Select one positive supervoxel first.")
-        if sv_id in self.hallucinated_supervoxels(local_t):
-            raise AnnotationError(
-                f"Supervoxel {sv_id} is already marked as a hallucination."
-            )
-
-        sv_frame = np.asarray(self.supervoxels[local_t])
-        mask = sv_frame == sv_id
-        voxel_count = int(np.count_nonzero(mask))
-        if voxel_count == 0:
-            raise AnnotationError(
-                f"Supervoxel {sv_id} does not exist in this frame."
-            )
-
-        frame = self.frame(local_t)
-        parent_ids = np.unique(frame[mask])
-        parent_ids = parent_ids[parent_ids > 0]
-        if len(parent_ids) == 0:
-            raise AnnotationError(
-                f"Supervoxel {sv_id} is already background in the corrected labels."
-            )
-        if len(parent_ids) != 1:
-            raise AnnotationError(
-                f"Supervoxel {sv_id} overlaps multiple corrected instances: "
-                f"{parent_ids.tolist()}."
-            )
-
-        previous_instance_id = int(parent_ids[0])
-        frame[mask] = 0
-        dataset_t = int(self.timepoints[local_t])
-
-        record = {
-            "type": "hallucination",
-            "timepoint": dataset_t,
-            "supervoxel_id": sv_id,
-            "previous_instance_id": previous_instance_id,
-            "voxel_count": voxel_count,
-        }
-        self.operations.append(record)
-        self._persist_changed_frame(local_t)
-        return record
+        """Backward-compatible single-supervoxel Hallucination API."""
+        return self.apply_hallucinations(
+            int(local_t),
+            [int(sv_id)],
+        )[0]
 
     def can_undo(self) -> bool:
         return bool(self.operations)
@@ -618,6 +707,7 @@ class AnnotationSession:
         op = self.operations[-1]
         op_type = str(op.get("type"))
         dataset_t = int(op["timepoint"])
+        undo_count = 1
         local_t = self._local_index_for_dataset_timepoint(dataset_t)
         frame = self.frame(local_t)
         sv_frame = np.asarray(self.supervoxels[local_t])
@@ -715,23 +805,122 @@ class AnnotationSession:
             )
 
         elif op_type == "hallucination":
-            sv_id = int(op["supervoxel_id"])
-            mask = sv_frame == sv_id
-            if not np.any(mask):
-                raise AnnotationError(
-                    f"Cannot undo hallucination: SV {sv_id} no longer exists."
-                )
-            previous_id = int(op["previous_instance_id"])
-            frame[mask] = previous_id
-            message = (
-                f"restored hallucinated SV {sv_id} to instance {previous_id}"
+            batch_id = op.get(
+                "batch_id"
             )
+
+            if batch_id is None:
+                hallucination_ops = [
+                    op
+                ]
+            else:
+                hallucination_ops: list[
+                    dict[str, Any]
+                ] = []
+                index = len(
+                    self.operations
+                ) - 1
+                while index >= 0:
+                    candidate = (
+                        self.operations[
+                            index
+                        ]
+                    )
+                    if (
+                        candidate.get(
+                            "type"
+                        )
+                        != "hallucination"
+                        or candidate.get(
+                            "batch_id"
+                        )
+                        != batch_id
+                    ):
+                        break
+                    hallucination_ops.append(
+                        candidate
+                    )
+                    index -= 1
+
+                hallucination_ops.reverse()
+
+            # Validate the complete undo before changing the frame.
+            restore_items: list[
+                tuple[
+                    int,
+                    np.ndarray,
+                    int,
+                ]
+            ] = []
+            for hallucination_op in hallucination_ops:
+                sv_id = int(
+                    hallucination_op[
+                        "supervoxel_id"
+                    ]
+                )
+                mask = (
+                    sv_frame
+                    == sv_id
+                )
+                if not np.any(
+                    mask
+                ):
+                    raise AnnotationError(
+                        "Cannot undo hallucination: "
+                        f"SV {sv_id} no longer exists."
+                    )
+                previous_id = int(
+                    hallucination_op[
+                        "previous_instance_id"
+                    ]
+                )
+                restore_items.append(
+                    (
+                        sv_id,
+                        mask,
+                        previous_id,
+                    )
+                )
+
+            for (
+                sv_id,
+                mask,
+                previous_id,
+            ) in restore_items:
+                frame[
+                    mask
+                ] = previous_id
+
+            undo_count = len(
+                hallucination_ops
+            )
+            if undo_count == 1:
+                sv_id, _, previous_id = (
+                    restore_items[
+                        0
+                    ]
+                )
+                message = (
+                    f"restored hallucinated SV {sv_id} "
+                    f"to instance {previous_id}"
+                )
+            else:
+                restored_ids = tuple(
+                    int(item[0])
+                    for item in restore_items
+                )
+                message = (
+                    "restored hallucination batch "
+                    f"{restored_ids}"
+                )
         else:
             raise AnnotationError(
                 f"Unknown spatial operation type: {op_type!r}"
             )
 
-        self.operations.pop()
+        del self.operations[
+            -int(undo_count):
+        ]
         self._persist_changed_frame(local_t)
         return SpatialUndoResult(
             operation_type=op_type,

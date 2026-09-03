@@ -1717,7 +1717,7 @@ def make_viewer(
             status_label.value = (
                 "Spatial mode: click supervoxels. Save Split separates one "
                 "instance; Save Merge joins the current instances containing "
-                "the selected supervoxels; Hallucination removes one SV; Ignore defers an edge case for later analysis."
+                "the selected supervoxels; Hallucination removes all selected SVs; Ignore defers an edge case for later analysis."
             )
         else:
             clear_spatial_selection()
@@ -2034,23 +2034,30 @@ def make_viewer(
             "were not inherited automatically."
         )
 
+    # DATASET_CURATION_MULTI_HALLUCINATION_V1
     def mark_hallucination() -> None:
-        sv_id = last_selected_sv[
-            "value"
-        ]
-        if sv_id is None:
-            show_error(
-                AnnotationError(
-                    "Select one visible supervoxel first."
-                )
-            )
-            return
-
         try:
-            record = (
-                spatial_session.apply_hallucination(
+            selected_supervoxels: list[
+                int
+            ] = []
+            for box in boxes:
+                selected_supervoxels.extend(
+                    parse_supervoxel_group(
+                        str(
+                            box.value
+                        )
+                    )
+                )
+
+            if not selected_supervoxels:
+                raise AnnotationError(
+                    "Select one or more visible supervoxels first."
+                )
+
+            records = (
+                spatial_session.apply_hallucinations(
                     current_frame(),
-                    int(sv_id),
+                    selected_supervoxels,
                 )
             )
         except Exception as exc:
@@ -2062,12 +2069,23 @@ def make_viewer(
             refresh_tracks=False,
             spatial_authority_changed=True,
         )
-        request_background_track_refresh("hallucination")
+        request_background_track_refresh(
+            "hallucination"
+        )
         refresh_status()
+
+        saved_ids = tuple(
+            int(
+                record[
+                    "supervoxel_id"
+                ]
+            )
+            for record in records
+        )
         status_label.value = (
-            f"HALLUCINATION saved: t={record['timepoint']} "
-            f"SV={record['supervoxel_id']} removed from corrected "
-            "instances and supervoxel visualization."
+            f"HALLUCINATION saved: t={records[0]['timepoint']} "
+            f"SVs={saved_ids} removed from corrected instances "
+            "and supervoxel visualization."
         )
 
     def undo_spatial() -> None:
