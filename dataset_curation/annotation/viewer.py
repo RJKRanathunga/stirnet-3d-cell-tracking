@@ -8,6 +8,8 @@ from __future__ import annotations
 
 # DATASET_CURATION_EXACT_BOUNDARY_TOUCH_V1
 
+# DATASET_CURATION_POINTS_TEXT_SYNC_V1
+
 """Unified Napari viewer for spatial and track annotation."""
 
 from dataclasses import dataclass
@@ -142,6 +144,72 @@ def _configure_dock(dock, panel) -> None:
         dock.setMaximumWidth(16_777_215)
     except Exception:
         pass
+
+
+def _sync_points_data_and_features(
+    layer,
+    data: np.ndarray,
+    *,
+    properties: dict[str, np.ndarray] | None = None,
+    face_color=None,
+    text_spec: dict[str, Any] | None = None,
+) -> None:
+    """
+    Replace a dynamic Napari Points payload without exposing mismatched
+    point/feature lengths to feature-backed text rendering.
+
+    Napari/Vispy may render text synchronously from the `data` event. Therefore
+    assigning data first and properties second is unsafe whenever N changes
+    between frames. Clearing text before either mutation prevents the renderer
+    from indexing stale FormatStringEncoding values.
+
+    `features` is used for the replacement because it is the canonical table
+    backing Points properties/text in current Napari.
+    """
+    array = np.asarray(data)
+    if array.ndim != 2:
+        raise ValueError(
+            f"Points data must be 2-D, got shape {array.shape}."
+        )
+
+    row_count = int(array.shape[0])
+    normalized: dict[str, np.ndarray] = {}
+
+    if properties is not None:
+        for key, values in properties.items():
+            values_array = np.asarray(values)
+            if values_array.ndim == 0:
+                values_array = np.repeat(
+                    values_array.reshape(1),
+                    row_count,
+                )
+            if int(values_array.shape[0]) != row_count:
+                raise ValueError(
+                    f"Points property {key!r} has "
+                    f"{values_array.shape[0]} rows for {row_count} points."
+                )
+            normalized[str(key)] = values_array
+
+    # A feature-backed TextManager can receive a Vispy callback immediately
+    # from layer.data. Remove it first; restore it only after the new feature
+    # table has the same row count as the new coordinates.
+    if text_spec is not None:
+        layer.text = None
+
+    layer.data = array
+
+    if properties is not None:
+        layer.features = pd.DataFrame(
+            normalized
+        )
+
+    if face_color is not None:
+        layer.face_color = face_color
+
+    if text_spec is not None:
+        layer.text = dict(text_spec)
+
+    layer.refresh()
 
 
 def _sync_tracks_layer(
@@ -1078,12 +1146,11 @@ def make_viewer(
                 tail_length=TRACK_HISTORY_FRAMES,
                 visible=group.track_visible,
             )
-            group.point_layer.data = points_array
-            try:
-                group.point_layer.properties = properties
-            except Exception:
-                pass
-            group.point_layer.refresh()
+            _sync_points_data_and_features(
+                group.point_layer,
+                points_array,
+                properties=properties,
+            )
 
         diagnostic_categories = {}
 
@@ -1178,12 +1245,17 @@ def make_viewer(
             tail_length=TRACK_HISTORY_FRAMES,
             visible=all_visible,
         )
-        all_centers_layer.data = all_points_array
-        try:
-            all_centers_layer.properties = all_properties
-        except Exception:
-            pass
-        all_centers_layer.refresh()
+        _sync_points_data_and_features(
+            all_centers_layer,
+            all_points_array,
+            properties=all_properties,
+            text_spec={
+                "string": "{cell_id}",
+                "size": 8,
+                "color": "white",
+                "anchor": "center",
+            },
+        )
 
         active_visible = True
         if active_tracks_layer is not None:
@@ -1322,16 +1394,17 @@ def make_viewer(
             visible=all_visible,
         )
 
-        all_centers_layer.data = (
-            result.all_points_array
+        _sync_points_data_and_features(
+            all_centers_layer,
+            result.all_points_array,
+            properties=result.all_properties,
+            text_spec={
+                "string": "{cell_id}",
+                "size": 8,
+                "color": "white",
+                "anchor": "center",
+            },
         )
-        try:
-            all_centers_layer.properties = (
-                result.all_properties
-            )
-        except Exception:
-            pass
-        all_centers_layer.refresh()
 
         active_visible = True
         if active_tracks_layer is not None:
@@ -1501,12 +1574,17 @@ def make_viewer(
             supervoxel_layer,
             sv_mapping,
         )
-        supervoxel_id_layer.data = sv_points
-        try:
-            supervoxel_id_layer.properties = sv_properties
-        except Exception:
-            pass
-        supervoxel_id_layer.refresh()
+        _sync_points_data_and_features(
+            supervoxel_id_layer,
+            sv_points,
+            properties=sv_properties,
+            text_spec={
+                "string": "{sv_id}",
+                "size": 11,
+                "color": "white",
+                "anchor": "center",
+            },
+        )
 
         if spatial_authority_changed:
             centers = frame_instance_centers(
@@ -1575,9 +1653,10 @@ def make_viewer(
                 dtype=np.float32,
             )
 
-        cell_centers_layer.data = center_points
-        try:
-            cell_centers_layer.properties = {
+        _sync_points_data_and_features(
+            cell_centers_layer,
+            center_points,
+            properties={
                 "instance_id": np.asarray(
                     ordered_ids,
                     dtype=np.int64,
@@ -1586,11 +1665,15 @@ def make_viewer(
                     categories,
                     dtype=object,
                 ),
-            }
-            cell_centers_layer.face_color = center_colors
-        except Exception:
-            cell_centers_layer.face_color = "white"
-        cell_centers_layer.refresh()
+            },
+            face_color=center_colors,
+            text_spec={
+                "string": "{instance_id}",
+                "size": 7,
+                "color": "white",
+                "anchor": "center",
+            },
+        )
 
         refresh_track_selection_layers()
         refresh_binary_layer()
