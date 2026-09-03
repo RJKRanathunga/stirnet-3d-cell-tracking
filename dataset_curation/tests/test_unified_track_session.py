@@ -28,6 +28,9 @@ def test_spatial_node_sync_invalidates_old_edge_without_deleting_history(
                 old_b,
             )
         },
+        frame_count=3,
+        boundary_entry_nodes=set(),
+        boundary_exit_nodes=set(),
         resume=False,
     )
 
@@ -57,7 +60,7 @@ def test_spatial_node_sync_invalidates_old_edge_without_deleting_history(
     assert edge in session.visible_edges
 
 
-def test_complete_moves_component_to_hidden_edges(
+def test_complete_component_is_hidden_automatically(
     tmp_path: Path,
 ):
     a = (0, 1)
@@ -79,14 +82,15 @@ def test_complete_moves_component_to_hidden_edges(
                 b,
             )
         },
+        frame_count=2,
+        boundary_entry_nodes=set(),
+        boundary_exit_nodes=set(),
         resume=False,
     )
-    session.add_selection(a)
-    completed = (
-        session.complete_selected_components()
-    )
 
-    assert completed == {
+    # Manual Complete Track no longer exists. A component is hidden as soon as
+    # its start/end are legitimate: frame 0 -> final frame here.
+    assert session.hidden_nodes == {
         a,
         b,
     }

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_LOCAL_TRACK_REPAIR_V2
+
 """Background derivation/export for interactive dataset curation."""
 
 from collections import defaultdict, deque
@@ -42,6 +44,7 @@ class TrackRefreshSnapshot:
     valid_nodes: frozenset[Node]
     base_edges: frozenset[Edge]
     forced_edges: frozenset[Edge]
+    auto_repair_edges: frozenset[Edge]
     broken_edges: frozenset[Edge]
     boundary_entry_nodes: frozenset[Node]
     boundary_exit_nodes: frozenset[Node]
@@ -122,6 +125,10 @@ def capture_track_refresh_snapshot(
         forced_edges=frozenset(
             _canonical_edge(edge[0], edge[1])
             for edge in track_session.forced_edges
+        ),
+        auto_repair_edges=frozenset(
+            _canonical_edge(edge[0], edge[1])
+            for edge in track_session.auto_repair_edges
         ),
         broken_edges=frozenset(
             _canonical_edge(edge[0], edge[1])
@@ -313,6 +320,8 @@ def export_track_snapshot(
     ):
         if edge in birth_edges:
             origin = "birth"
+        elif edge in snapshot.auto_repair_edges:
+            origin = "auto_repair"
         elif edge in snapshot.forced_edges:
             origin = "manual_continue"
         else:

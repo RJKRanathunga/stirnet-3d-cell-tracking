@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_LOCAL_TRACK_REPAIR_V2
+
 # DATASET_CURATION_RAW_RAY_BIRTH_AUTOHIDE_V1
 
 # DATASET_CURATION_EMPTY_TRACKS_SAFE_V1
@@ -53,6 +55,9 @@ from dataset_curation.annotation.tracks.diagnostics import (
     diagnostic_node_categories,
 )
 from dataset_curation.annotation.tracks.graph import Node
+from dataset_curation.annotation.tracks.local_repair import (
+    repair_split_tracks,
+)
 from dataset_curation.annotation.tracks.session import TrackAnnotationSession
 
 try:
@@ -1940,6 +1945,8 @@ def make_viewer(
             )
 
     def save_split() -> None:
+        frame = current_frame()
+
         try:
             groups = [
                 parse_supervoxel_group(
@@ -1949,7 +1956,7 @@ def make_viewer(
             ]
             result = (
                 spatial_session.apply_split(
-                    current_frame(),
+                    frame,
                     groups,
                 )
             )
@@ -1962,13 +1969,35 @@ def make_viewer(
             refresh_tracks=False,
             spatial_authority_changed=True,
         )
+
+        try:
+            repair_result = repair_split_tracks(
+                frame=frame,
+                new_instance_ids=result.output_instance_ids,
+                track_session=track_session,
+                track_centers=track_centers,
+                labels_for_frame=spatial_session.frame,
+                spacing_zyx_um=spacing_zyx,
+            )
+            repair_text = repair_result.summary_text()
+        except Exception as exc:
+            # The spatial edit is already canonical. Automatic tracking is a
+            # convenience layer and must never roll back a valid split.
+            repair_text = (
+                "automatic track repair failed; "
+                f"manual tracking remains available ({exc})"
+            )
+            print()
+            print("[local track repair error]")
+            print(exc)
+
         request_background_track_refresh("split")
         refresh_status()
         status_label.value = (
             f"SPLIT saved at t={result.timepoint}: "
             f"{result.original_instance_id} -> "
             f"{result.output_instance_ids}. "
-            "No track association was invented for the new detections."
+            f"Track repair: {repair_text}."
         )
 
     def save_merge() -> None:

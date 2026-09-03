@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# DATASET_CURATION_LOCAL_TRACK_REPAIR_V2
+
 """Persistent corrected tracking graph with automatic completion detection."""
 
 from collections import defaultdict, deque
@@ -487,6 +489,100 @@ class TrackAnnotationSession:
         self.persist()
         return edge
 
+    @property
+    def auto_repair_edges(self) -> set[Edge]:
+        # Derive current automatic provenance from canonical LIFO history.
+        # Manual Continue/Break/Birth after an automatic edge takes ownership.
+        automatic: set[Edge] = set()
+
+        for operation in self.history:
+            op_type = str(operation.get("type"))
+
+            if op_type == "auto_repair":
+                for state in operation.get("edge_states", []):
+                    automatic.add(
+                        _parse_edge(state["edge"])
+                    )
+                continue
+
+            if op_type in {"connect", "break"}:
+                raw_edge = operation.get("edge")
+                if raw_edge is not None:
+                    automatic.discard(
+                        _parse_edge(raw_edge)
+                    )
+                continue
+
+            if op_type == "birth":
+                for state in operation.get("edge_states", []):
+                    raw_edge = state.get("edge")
+                    if raw_edge is not None:
+                        automatic.discard(
+                            _parse_edge(raw_edge)
+                        )
+
+        return automatic & self.forced_edges
+
+    def apply_auto_repair(
+        self,
+        edges: Iterable[Edge],
+        *,
+        focus_frame: int,
+        details: dict[str, Any] | None = None,
+    ) -> tuple[Edge, ...]:
+        # One whole repair is one undoable canonical operation and one persist.
+        normalized = sorted(
+            {
+                _canonical_edge(edge[0], edge[1])
+                for edge in edges
+            }
+        )
+        if not normalized:
+            return ()
+
+        birth_edges = self.birth_edges
+        edge_states: list[dict[str, Any]] = []
+        applied: list[Edge] = []
+
+        for edge in normalized:
+            self._validate_edge(edge)
+
+            if edge in birth_edges:
+                continue
+
+            previous_forced = edge in self.forced_edges
+            previous_broken = edge in self.broken_edges
+
+            if self._edge_is_active(edge) and not previous_broken:
+                continue
+
+            edge_states.append(
+                {
+                    "edge": _edge_json(edge),
+                    "previous_forced": bool(previous_forced),
+                    "previous_broken": bool(previous_broken),
+                }
+            )
+            self.forced_edges.add(edge)
+            self.broken_edges.discard(edge)
+            applied.append(edge)
+
+        if not applied:
+            return ()
+
+        self._invalidate_analysis()
+        self.history.append(
+            {
+                "type": "auto_repair",
+                "edge_states": edge_states,
+                "focus_frame": int(focus_frame),
+                "details": dict(details or {}),
+            }
+        )
+        self.selections.clear()
+        self.persist()
+        return tuple(applied)
+
     def break_selected(self) -> Edge:
         edge = self._selected_edge()
         previous_forced = edge in self.forced_edges
@@ -683,6 +779,35 @@ class TrackAnnotationSession:
             else:
                 self.broken_edges.discard(edge)
 
+        elif op_type == "auto_repair":
+            for state in op.get(
+                "edge_states",
+                [],
+            ):
+                edge = _parse_edge(
+                    state["edge"]
+                )
+
+                if bool(
+                    state.get(
+                        "previous_forced",
+                        False,
+                    )
+                ):
+                    self.forced_edges.add(edge)
+                else:
+                    self.forced_edges.discard(edge)
+
+                if bool(
+                    state.get(
+                        "previous_broken",
+                        False,
+                    )
+                ):
+                    self.broken_edges.add(edge)
+                else:
+                    self.broken_edges.discard(edge)
+
         elif op_type == "birth":
             event = dict(
                 op.get(
@@ -821,11 +946,15 @@ class TrackAnnotationSession:
         birth_edges = self.birth_edges
 
         active_rows: list[dict[str, Any]] = []
+        auto_repair_edges = self.auto_repair_edges
+
         for edge in sorted(
             self.active_edges
         ):
             if edge in birth_edges:
                 origin = "birth"
+            elif edge in auto_repair_edges:
+                origin = "auto_repair"
             elif edge in self.forced_edges:
                 origin = "manual_continue"
             else:
