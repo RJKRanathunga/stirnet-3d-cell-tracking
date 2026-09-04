@@ -8,7 +8,8 @@ import torch
 from scipy import ndimage as ndi
 
 
-TEMPORAL_CACHE_CONTRACT_VERSION = 4
+# STIRNET_TEMPORAL_GLOBAL_MOTION_V1: v5 invalidates raw-motion temporal caches.
+TEMPORAL_CACHE_CONTRACT_VERSION = 5
 # Compatibility name for callers that imported the earlier history-only label.
 HISTORY_CACHE_CONTRACT_VERSION = TEMPORAL_CACHE_CONTRACT_VERSION
 

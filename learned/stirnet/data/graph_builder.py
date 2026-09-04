@@ -16,8 +16,10 @@ from .historical_instances import (
     projected_support_overlap,
     select_nearest_history_support,
 )
+from .temporal_motion import compensate_detection_records
 
 
+# STIRNET_TEMPORAL_GLOBAL_MOTION_V1
 DETECTION_EDGE_DIM = 15
 DETECTION_EDGE_ACCEPTED_COLUMN = 14
 HYPOTHESIS_EDGE_DIM = 22
@@ -200,8 +202,15 @@ def build_temporal_graph(
     candidate_graph_enabled: bool = True,
     max_candidate_edges: int | None = None,
     candidate_edge_chunk_size: int = 65_536,
+    global_motion_by_offset_um: dict[int, tuple[float,float,float]] | None = None,
 ) -> dict:
     records=list(records); associations=list(associations)
+    if global_motion_by_offset_um is not None:
+        records = compensate_detection_records(
+            records,
+            associations,
+            global_motion_by_offset_um,
+        )
     availability_was_explicit = available_time_offsets is not None
     available_time_offsets = _resolve_available_time_offsets(
         temporal_radius,

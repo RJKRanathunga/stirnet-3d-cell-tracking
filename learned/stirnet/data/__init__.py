@@ -5,5 +5,10 @@ from .targets import build_gt_targets, build_source_gt_compatibility, extract_in
 from .bucket_sampler import ShapeBucketBatchSampler
 from .sample_builder import build_cached_sample, renormalize_cached_dref, resolve_model_dref, robust_normalize
 from .historical_instances import build_historical_instance_grid, build_node_instance_grids
+from .temporal_motion import (
+    STIRNET_TEMPORAL_GLOBAL_MOTION_CONTRACT,
+    compensate_detection_records,
+    target_relative_global_motion_um,
+)
 
-__all__=["CachedStirNetDataset","stirnet_collate","DetectionRecord","AssociationRecord","build_temporal_graph","build_gt_targets","build_source_gt_compatibility","extract_instance_metadata","estimate_dref_um","estimate_model_dref_um","stable_log_shape_ratio","ShapeBucketBatchSampler","build_cached_sample","renormalize_cached_dref","resolve_model_dref","robust_normalize","build_historical_instance_grid","build_node_instance_grids"]
+__all__=["CachedStirNetDataset","stirnet_collate","DetectionRecord","AssociationRecord","build_temporal_graph","build_gt_targets","build_source_gt_compatibility","extract_instance_metadata","estimate_dref_um","estimate_model_dref_um","stable_log_shape_ratio","ShapeBucketBatchSampler","build_cached_sample","renormalize_cached_dref","resolve_model_dref","robust_normalize","build_historical_instance_grid","build_node_instance_grids","STIRNET_TEMPORAL_GLOBAL_MOTION_CONTRACT","compensate_detection_records","target_relative_global_motion_um"]

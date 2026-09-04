@@ -41,6 +41,29 @@ and export receive the final graph in the original source coordinate system.
 Global motion is estimated only from first-pass Trackastra predictions.
 Production tracking never imports annotations, investigations, or ground truth.
 
+## Target-frame-anchored temporal coordinates
+
+Any STIR-Net temporal reasoning that consumes Trackastra evidence must use the
+float cumulative global-motion estimate produced by primary tracking. Temporal
+detections are expressed relative to the current target frame as
+
+```text
+p_temporal(t | t0) = p_source_relative(t) - (G(t) - G(t0))
+```
+
+This keeps the target frame and current spatial RAG unchanged while removing
+common stage/embryo translation from historical and future detections. Temporal
+velocities are recomputed from accepted Trackastra continuations after this
+coordinate transform.
+
+The temporal path must not materialize another padded movie. The Trackastra
+graph, visualization, stitching and export continue to use original BioHub
+source coordinates. `src.pipeline.stages.temporal_evidence` owns the bridge
+from `TrackastraResult.global_motion` to STIR-Net's temporal graph builder.
+
+The shared STIR-Net temporal cache contract is versioned so raw-motion temporal
+caches cannot be silently reused after this change.
+
 ## Dependency rules
 
 1. Active production code must not import `legacy.classical_pipeline`.
