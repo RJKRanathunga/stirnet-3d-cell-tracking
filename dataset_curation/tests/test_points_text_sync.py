@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # DATASET_CURATION_POINTS_TEXT_SYNC_V1
+# DATASET_CURATION_POINTS_TEXT_RECREATE_V2_TEST_UPDATE
 
 from pathlib import Path
 
@@ -31,6 +32,17 @@ def test_supervoxel_and_cell_text_are_restored_after_sync():
     assert '"string": "{instance_id}"' in text
     assert '"string": "{cell_id}"' in text
 
-    # There must be dynamic sync calls for both feature-backed point layers.
-    assert "_sync_points_data_and_features(\n            supervoxel_id_layer," in text
-    assert "_sync_points_data_and_features(\n            cell_centers_layer," in text
+    # V2 keeps the V1 in-place synchronizer for equal point counts, but
+    # feature-backed dynamic text layers now use the stronger recreate-aware
+    # wrapper so stale Napari `_indices_view` entries cannot outlive a point
+    # count change.
+    assert "def _sync_points_data_and_features(" in text
+    assert "def _sync_feature_text_points_layer(" in text
+    assert (
+        "supervoxel_id_layer = _sync_feature_text_points_layer("
+        in text
+    )
+    assert (
+        "cell_centers_layer = _sync_feature_text_points_layer("
+        in text
+    )
