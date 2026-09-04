@@ -64,7 +64,11 @@ def test_parallel_scheduler_has_single_production_owner():
         / "run_submission.py"
     ).read_text(encoding="utf-8")
 
-    assert "ThreadPoolExecutor" in production
-    assert "STIRNET_PARALLEL_SPATIAL_PIPELINE_V2" in production
+    # Production moved from the temporary thread-pool scheduler to one
+    # persistent spawned CPU preparation process. The main process remains the
+    # sole CUDA owner, and Kaggle consumes the shared production implementation.
+    assert "multiprocessing.get_context" in production
+    assert "STIRNET_PARALLEL_SPATIAL_PIPELINE_V3" in production
+    assert "ThreadPoolExecutor" not in production
     assert "ThreadPoolExecutor" not in kaggle
     assert "investigations/stirnet/data" not in kaggle

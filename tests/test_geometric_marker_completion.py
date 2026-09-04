@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from importlib import import_module
 from unittest.mock import patch
 
@@ -61,7 +62,12 @@ class GeometricCompletionProductionTests(unittest.TestCase):
         mask = self.fixture.thin_recovery()
 
         result = pipeline_module.segment_instances_detailed(
-            mask, retain_debug_artifacts=True
+            mask,
+            config=replace(
+                DEFAULT_CONFIG,
+                enable_geometric_completion=True,
+            ),
+            retain_debug_artifacts=True,
         )
         diagnostic = result.component_diagnostics[0]
         artifact = result.component_debug_artifacts[0]
@@ -90,7 +96,13 @@ class GeometricCompletionProductionTests(unittest.TestCase):
         mask = self.fixture.ellipsoid(
             self.fixture.center, (5.0, 2.3, 2.3), rotation
         )
-        diagnostic = pipeline_module.segment_instances_detailed(mask).component_diagnostics[0]
+        diagnostic = pipeline_module.segment_instances_detailed(
+            mask,
+            config=replace(
+                DEFAULT_CONFIG,
+                enable_geometric_completion=True,
+            ),
+        ).component_diagnostics[0]
         self.assertEqual(diagnostic.effective_peak_count, 1)
         self.assertEqual(diagnostic.supplemental_marker_count, 0)
         self.assertEqual(diagnostic.instance_count, 1)

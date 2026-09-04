@@ -338,7 +338,13 @@ class PipelineCandidateGateTests(unittest.TestCase):
             "safely_complete_geometric_markers",
             return_value=completion,
         ) as geometry:
-            pipeline_module.segment_instances_detailed(self.mask())
+            pipeline_module.segment_instances_detailed(
+                self.mask(),
+                config=replace(
+                    DEFAULT_CONFIG,
+                    enable_geometric_completion=True,
+                ),
+            )
         geometry.assert_called_once()
 
         no_candidate = models_module.GeometricCandidateResult.no_candidate()
@@ -370,7 +376,13 @@ class PipelineCandidateGateTests(unittest.TestCase):
         ), patch.object(
             pipeline_module, "safely_complete_geometric_markers"
         ) as geometry:
-            result = pipeline_module.segment_instances_detailed(self.mask())
+            result = pipeline_module.segment_instances_detailed(
+                self.mask(),
+                config=replace(
+                    DEFAULT_CONFIG,
+                    enable_geometric_completion=True,
+                ),
+            )
         diagnostic = result.component_diagnostics[0]
         geometry.assert_not_called()
         self.assertEqual(diagnostic.processing_status, "processed")
