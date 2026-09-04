@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 
-BIOHUB_DATA_ROOT = Path(r"E:\data\biohub")
+# DATASET_CURATION_FULL_BIOHUB_ROOT_V2
+BIOHUB_DATA_ROOT = Path(r"E:\Data\cell-tracking\Datasets\full_biohub_80\biohub-cell-tracking-during-development")
 DEFAULT_SPACING_ZYX_UM = (1.625, 0.40625, 0.40625)
 
 

@@ -212,3 +212,36 @@ annotations/<split>/<volume>/<annotation-set>/
 The repository intentionally has no compatibility layer for the removed
 run-directory hierarchy or the removed separate annotation viewers. Git history
 is the recovery mechanism.
+
+<!-- DATASET_CURATION_FULL_BIOHUB_ROOT_V2 -->
+
+## Full BioHub dataset root
+
+The canonical dataset-curation root is:
+
+```text
+E:\Data\cell-tracking\Datasets\full_biohub_80\biohub-cell-tracking-during-development
+```
+
+Raw source volumes use the existing dataset-curation contract:
+
+```text
+source/<split>/<volume-id>/<volume-id>.zarr
+```
+
+Training GEFF data is preserved beside the Zarr source and exported to:
+
+```text
+source/train/<volume-id>/ground_truth/ground_truth_nodes.csv
+source/train/<volume-id>/ground_truth/ground_truth_edges.csv
+```
+
+Generated inference and human annotations live under the same root:
+
+```text
+preprocessed/
+annotations/
+```
+
+The original BioHub Zarr payload is reorganized by same-volume directory rename;
+it is not copied or re-encoded.
