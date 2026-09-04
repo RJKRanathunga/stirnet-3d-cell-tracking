@@ -43,7 +43,15 @@ DEFAULT_TILE_BATCH_SIZE = 1
 
 DEFAULT_TRACKASTRA_MODEL = "ctc"
 DEFAULT_TRACKASTRA_MODE = "greedy"
-DEFAULT_TRACKASTRA_DEVICE = "cuda"
+
+# Conservative curation default validated with the current pinned Trackastra
+# environment. Explicitly opt into CUDA on environments where Trackastra's
+# transformer kernels are known to work.
+DEFAULT_TRACKASTRA_DEVICE = "cpu"
+DEFAULT_TRACKASTRA_BATCH_SIZE = 1
+DEFAULT_GLOBAL_MOTION_MIN_PAIRS = 10
+DEFAULT_GLOBAL_MOTION_MAD_SCALE = 4.0
+DEFAULT_GLOBAL_MOTION_MIN_RESIDUAL_GATE_UM = 2.0
 
 
 @dataclass(frozen=True)
@@ -191,6 +199,34 @@ def _parse_extra(values: Sequence[str]):
     parser.add_argument("--trackastra-model", default=DEFAULT_TRACKASTRA_MODEL)
     parser.add_argument("--trackastra-mode", default=DEFAULT_TRACKASTRA_MODE)
     parser.add_argument("--trackastra-device", default=DEFAULT_TRACKASTRA_DEVICE)
+    parser.add_argument(
+        "--trackastra-batch-size",
+        type=int,
+        default=DEFAULT_TRACKASTRA_BATCH_SIZE,
+    )
+    parser.add_argument(
+        "--disable-trackastra-global-motion",
+        action="store_true",
+        help=(
+            "Run a single Trackastra pass instead of bootstrap global-motion "
+            "compensation."
+        ),
+    )
+    parser.add_argument(
+        "--global-motion-min-pairs",
+        type=int,
+        default=DEFAULT_GLOBAL_MOTION_MIN_PAIRS,
+    )
+    parser.add_argument(
+        "--global-motion-mad-scale",
+        type=float,
+        default=DEFAULT_GLOBAL_MOTION_MAD_SCALE,
+    )
+    parser.add_argument(
+        "--global-motion-min-residual-gate-um",
+        type=float,
+        default=DEFAULT_GLOBAL_MOTION_MIN_RESIDUAL_GATE_UM,
+    )
     parser.add_argument("--rebuild-trackastra", action="store_true")
     parser.add_argument("--overwrite-spatial", action="store_true")
 
@@ -203,6 +239,16 @@ def _parse_extra(values: Sequence[str]):
     if not float(parsed.frame_prep_timeout) > 0.0:
         raise ValueError(
             "--frame-prep-timeout must be positive"
+        )
+    if int(parsed.trackastra_batch_size) < 1:
+        raise ValueError("--trackastra-batch-size must be >= 1")
+    if int(parsed.global_motion_min_pairs) < 1:
+        raise ValueError("--global-motion-min-pairs must be >= 1")
+    if float(parsed.global_motion_mad_scale) < 0.0:
+        raise ValueError("--global-motion-mad-scale must be >= 0")
+    if float(parsed.global_motion_min_residual_gate_um) < 0.0:
+        raise ValueError(
+            "--global-motion-min-residual-gate-um must be >= 0"
         )
     return parsed
 
@@ -560,6 +606,15 @@ class StirNetTrackastraBackend:
             model_name=options.trackastra_model,
             mode=options.trackastra_mode,
             device=options.trackastra_device,
+            batch_size=int(options.trackastra_batch_size),
+            global_motion=not bool(
+                options.disable_trackastra_global_motion
+            ),
+            minimum_pairs=int(options.global_motion_min_pairs),
+            mad_scale=float(options.global_motion_mad_scale),
+            minimum_residual_gate_um=float(
+                options.global_motion_min_residual_gate_um
+            ),
             rebuild=rebuild_trackastra,
         )
 
@@ -567,7 +622,7 @@ class StirNetTrackastraBackend:
         atomic_json(
             paths.inference_manifest,
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "kind": "biohub_curation_inference",
                 "inference_id": inference_id,
                 "backend": self.name,
@@ -595,6 +650,38 @@ class StirNetTrackastraBackend:
                     "model": str(options.trackastra_model),
                     "mode": str(options.trackastra_mode),
                     "device": str(options.trackastra_device),
+                    "batch_size": int(options.trackastra_batch_size),
+                    "strategy": (
+                        "single_pass"
+                        if bool(options.disable_trackastra_global_motion)
+                        else "bootstrap_global_motion_v1"
+                    ),
+                    "passes": (
+                        1
+                        if bool(options.disable_trackastra_global_motion)
+                        else 2
+                    ),
+                    "global_motion": {
+                        "enabled": not bool(
+                            options.disable_trackastra_global_motion
+                        ),
+                        "minimum_pairs": int(
+                            options.global_motion_min_pairs
+                        ),
+                        "mad_scale": float(
+                            options.global_motion_mad_scale
+                        ),
+                        "minimum_residual_gate_um": float(
+                            options.global_motion_min_residual_gate_um
+                        ),
+                        "voxel_size_zyx_um": [
+                            1.625,
+                            0.40625,
+                            0.40625,
+                        ],
+                        "integer_translation": True,
+                        "wraparound": False,
+                    },
                 },
             },
         )

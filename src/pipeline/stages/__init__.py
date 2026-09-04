@@ -6,13 +6,21 @@ from .spatial_refinement import (
     load_spatial_runtime,
     run_parallel_spatial_volume,
 )
-from .primary_tracking import TrackastraConfig, TrackastraResult, run_trackastra
+from .primary_tracking import (
+    GlobalMotionConfig,
+    GlobalMotionEstimate,
+    TrackastraConfig,
+    TrackastraResult,
+    run_trackastra,
+)
 from .track_stitching import (
     LearnedTrackStitchingNotFinalized,
     require_track_stitcher,
 )
 
 __all__ = [
+    "GlobalMotionConfig",
+    "GlobalMotionEstimate",
     "LearnedTrackStitchingNotFinalized",
     "SourceFrameResult",
     "SpatialInferenceConfig",

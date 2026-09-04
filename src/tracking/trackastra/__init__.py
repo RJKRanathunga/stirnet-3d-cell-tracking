@@ -1,17 +1,13 @@
-"""Primary-tracking infrastructure used by the current pipeline."""
+"""Production Trackastra tracking with bootstrap global-motion compensation."""
 
-from .observations import assign_nearest_instance_ids
-from .trackastra import (
-    BOOTSTRAP_STRATEGY,
+from .config import (
     GlobalMotionConfig,
     GlobalMotionEstimate,
-    GlobalMotionEstimationError,
-    TRACKING_SCHEMA_VERSION,
     TrackastraConfig,
     TrackastraResult,
-    estimate_global_motion,
-    run_trackastra,
 )
+from .global_motion import GlobalMotionEstimationError, estimate_global_motion
+from .runner import BOOTSTRAP_STRATEGY, TRACKING_SCHEMA_VERSION, run_trackastra
 
 __all__ = [
     "BOOTSTRAP_STRATEGY",
@@ -21,7 +17,6 @@ __all__ = [
     "TRACKING_SCHEMA_VERSION",
     "TrackastraConfig",
     "TrackastraResult",
-    "assign_nearest_instance_ids",
     "estimate_global_motion",
     "run_trackastra",
 ]

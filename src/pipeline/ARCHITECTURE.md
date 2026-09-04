@@ -13,7 +13,13 @@ src/source_instances/
 learned/stirnet/
       |
       v
-src/tracking/trackastra.py
+src/tracking/trackastra/
+      |
+      |-- Trackastra pass 1 in source coordinates
+      |-- robust global-motion estimate from pass-1 continuations
+      |-- lazy padded stabilization of raw + instance movies
+      |-- Trackastra pass 2 in stabilized coordinates
+      `-- restore final graph coordinates to source coordinates
       |
       v
 learned/track_reconciler/
@@ -25,6 +31,15 @@ final exporter
 The learned track stitcher is still being finalized. The pipeline has an
 explicit Stage-4 boundary but never falls back silently to the historical
 heuristic stitcher.
+
+## Primary-tracking contract
+
+`src.tracking` owns Trackastra execution. Bootstrap global-motion compensation
+is internal to the primary-tracking stage. Downstream stitching, visualization
+and export receive the final graph in the original source coordinate system.
+
+Global motion is estimated only from first-pass Trackastra predictions.
+Production tracking never imports annotations, investigations, or ground truth.
 
 ## Dependency rules
 

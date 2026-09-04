@@ -14,10 +14,14 @@ import torch
 
 from dataset_curation.io.atomic import atomic_json
 from src.tracking import (
+    GlobalMotionConfig,
     TrackastraConfig,
     assign_nearest_instance_ids,
     run_trackastra as run_trackastra_core,
 )
+
+
+BIOHUB_SPACING_ZYX_UM = (1.625, 0.40625, 0.40625)
 
 
 def _atomic_csv(path: Path, frame: pd.DataFrame) -> None:
@@ -56,7 +60,12 @@ def _dask_from_label_memmap(path: Path):
     if labels.dtype != np.dtype(np.uint16):
         raise TypeError(f"Expected compact uint16 final instances, got {labels.dtype}")
     chunks = (1, *tuple(int(v) for v in labels.shape[1:]))
-    lazy = da.from_array(labels, chunks=chunks, asarray=False, fancy=False)
+    lazy = da.from_array(
+        labels,
+        chunks=chunks,
+        asarray=False,
+        fancy=False,
+    )
     return labels, lazy
 
 
@@ -65,10 +74,19 @@ def run_trackastra(
     *,
     model_name: str = "ctc",
     mode: str = "greedy",
-    device: str = "cuda",
+    device: str = "cpu",
+    batch_size: int = 1,
+    global_motion: bool = True,
+    minimum_pairs: int = 10,
+    mad_scale: float = 4.0,
+    minimum_residual_gate_um: float = 2.0,
     rebuild: bool = False,
 ) -> None:
-    """Run primary tracking and persist curation-owned artifacts."""
+    """Run primary tracking and persist curation-owned artifacts.
+
+    Existing complete caches remain reusable unless ``rebuild`` is requested.
+    This protects annotation sets tied to an existing inference_id.
+    """
     output = paths.trackastra_root
     output.mkdir(parents=True, exist_ok=True)
 
@@ -94,14 +112,16 @@ def run_trackastra(
 
     print("", flush=True)
     print("=" * 96, flush=True)
-    print("DATASET CURATION — TRACKASTRA", flush=True)
+    print("DATASET CURATION — TWO-PASS TRACKASTRA", flush=True)
     print("=" * 96, flush=True)
-    print(f"model     : {model_name}", flush=True)
-    print(f"mode      : {mode}", flush=True)
-    print(f"device    : {device}", flush=True)
-    print(f"raw       : {paths.zarr} (lazy Dask/Zarr)", flush=True)
+    print(f"model         : {model_name}", flush=True)
+    print(f"mode          : {mode}", flush=True)
+    print(f"device        : {device}", flush=True)
+    print(f"batch size    : {batch_size}", flush=True)
+    print(f"global motion : {bool(global_motion)}", flush=True)
+    print(f"raw           : {paths.zarr} (lazy Dask/Zarr)", flush=True)
     print(
-        f"instances : {paths.final_instances} (uint16 memmap/Dask)",
+        f"instances     : {paths.final_instances} (uint16 memmap/Dask)",
         flush=True,
     )
     print("=" * 96, flush=True)
@@ -113,11 +133,22 @@ def run_trackastra(
             model_name=str(model_name),
             mode=str(mode),
             device=str(device),
+            batch_size=int(batch_size),
+            global_motion=GlobalMotionConfig(
+                enabled=bool(global_motion),
+                voxel_size_zyx=BIOHUB_SPACING_ZYX_UM,
+                minimum_pairs=int(minimum_pairs),
+                mad_scale=float(mad_scale),
+                minimum_residual_gate_physical=float(
+                    minimum_residual_gate_um
+                ),
+            ),
         ),
     )
 
     with paths.track_graph.open("wb") as handle:
         pickle.dump(result.graph, handle)
+
     np.save(paths.napari_tracks, result.napari_tracks, allow_pickle=False)
     atomic_json(
         paths.napari_graph,
@@ -130,6 +161,7 @@ def run_trackastra(
     )
     tracks_df["track_id"] = tracks_df["track_id"].astype(np.int64)
     tracks_df["frame"] = tracks_df["frame"].astype(np.int64)
+
     cells = pd.read_csv(paths.cells_csv)
     tracks_with_instances = assign_nearest_instance_ids(
         tracks_df,
@@ -138,14 +170,34 @@ def run_trackastra(
     )
     _atomic_csv(paths.tracks_csv, tracks_with_instances)
 
+    bootstrap_motion_csv = output / "bootstrap_motion.csv"
+    if result.global_motion is not None:
+        _atomic_csv(
+            bootstrap_motion_csv,
+            pd.DataFrame(result.global_motion.records()),
+        )
+    else:
+        bootstrap_motion_csv.unlink(missing_ok=True)
+
     summary = dict(result.summary)
     summary.update(
         {
             "raw_input": "source_zarr_dask",
             "instance_input": "uint16_memmap_dask",
             "tracked_masks_persisted": False,
+            "bootstrap_motion_persisted": bool(
+                result.global_motion is not None
+            ),
+            "bootstrap_motion_csv": (
+                str(bootstrap_motion_csv)
+                if result.global_motion is not None
+                else None
+            ),
         }
     )
+
+    # Summary is written last so a failed rebuild does not advertise a complete
+    # new tracking result.
     atomic_json(paths.trackastra_summary, summary)
 
     del result, raw_movie, final_movie, source_handle, final_handle
@@ -155,6 +207,8 @@ def run_trackastra(
 
     print(
         "[trackastra] "
+        f"strategy={summary['strategy']} "
+        f"passes={summary['passes']} "
         f"nodes={summary['graph_nodes']} "
         f"edges={summary['graph_edges']} "
         f"tracklets={summary['napari_tracklets']} "
