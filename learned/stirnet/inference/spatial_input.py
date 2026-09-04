@@ -99,7 +99,7 @@ def canonical_source_segmentation_config():
     parallel pipeline.
     """
     module = import_module(
-        "src.03_segmentation.config"
+        "src.source_instances.segmentation.config"
     )
     return replace(
         module.DEFAULT_SEGMENTATION_CONFIG,
@@ -116,7 +116,7 @@ def prepare_spatial_frame(
     source_mask_validator: Callable[[int, np.ndarray], None] | None = None,
 ) -> PreparedSpatialFrame:
     """CPU-only preparation. This function must never touch CUDA."""
-    from src.api import (
+    from src.source_instances import (
         create_binary_mask,
         preprocess_volume,
         segment_instances,

@@ -1,71 +1,48 @@
-"""Narrow public facade for stable stage-level pipeline entry points."""
+"""Deprecated compatibility facade.
+
+New code should import src.source_instances, src.tracking, or src.pipeline.
+"""
 
 from __future__ import annotations
-
 from importlib import import_module
 
+from src.source_instances import (
+    create_binary_mask,
+    detect_cells,
+    extract_cell_features,
+    preprocess_volume,
+    segment_instances,
+)
 
-preprocess_volume = import_module(
-    "src.01_preprocessing.pipeline"
-).preprocess_volume
-create_binary_mask = import_module(
-    "src.02_masking.pipeline"
-).create_binary_mask
-segment_instances = import_module(
-    "src.03_segmentation.pipeline"
-).segment_instances
-detect_cells = import_module(
-    "src.04_detection.pipeline"
-).detect_cells
-extract_cell_features = import_module(
-    "src.05_feature_extraction.pipeline"
-).extract_cell_features
+_LEGACY_EXPORTS = {
+    "run_cell_tracking": ("legacy.classical_pipeline.tracking", "run_cell_tracking"),
+    "FourDGraphConfig": ("legacy.classical_pipeline.tracking", "FourDGraphConfig"),
+    "GraphTrackingConfig": ("legacy.classical_pipeline.tracking", "GraphTrackingConfig"),
+    "run_track_stitching": (
+        "legacy.classical_pipeline.stitching.step01_pipeline", "run_track_stitching"
+    ),
+    "prepare_visualization_data": (
+        "legacy.classical_pipeline.visualization.step03_pipeline",
+        "prepare_visualization_data",
+    ),
+    "run_cell_lineage": (
+        "legacy.classical_pipeline.lineage.step06_pipeline", "run_cell_lineage"
+    ),
+    "run_track_reconciliation": (
+        "legacy.classical_pipeline.reconciliation.step11_pipeline",
+        "run_track_reconciliation",
+    ),
+}
 
 
-def _not_available(name: str):
-    def missing(*args, **kwargs):
-        raise RuntimeError(f"Stage entry point {name} has not been installed")
-    return missing
-
-
-try:
-    tracking_module = import_module("src.07_cell_tracking")
-
-    run_cell_tracking = tracking_module.run_cell_tracking
-    FourDGraphConfig = tracking_module.FourDGraphConfig
-    GraphTrackingConfig = tracking_module.GraphTrackingConfig
-except ModuleNotFoundError:
-    run_cell_tracking = _not_available("run_cell_tracking")
-    FourDGraphConfig = _not_available("FourDGraphConfig")
-    GraphTrackingConfig = _not_available("GraphTrackingConfig")
-
-try:
-    run_track_stitching = import_module(
-        "src.08_track_stitching.step01_pipeline"
-    ).run_track_stitching
-except ModuleNotFoundError:
-    run_track_stitching = _not_available("run_track_stitching")
-
-try:
-    prepare_visualization_data = import_module(
-        "src.09_visualization.step03_pipeline"
-    ).prepare_visualization_data
-except ModuleNotFoundError:
-    prepare_visualization_data = _not_available("prepare_visualization_data")
-
-try:
-    run_cell_lineage = import_module(
-        "src.10_cell_lineage.step06_pipeline"
-    ).run_cell_lineage
-except ModuleNotFoundError:
-    run_cell_lineage = _not_available("run_cell_lineage")
-
-try:
-    run_track_reconciliation = import_module(
-        "src.11_track_reconciliation.step11_pipeline"
-    ).run_track_reconciliation
-except ModuleNotFoundError:
-    run_track_reconciliation = _not_available("run_track_reconciliation")
+def __getattr__(name: str):
+    target = _LEGACY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(name)
+    module_name, attribute = target
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
 
 
 __all__ = [
@@ -76,8 +53,8 @@ __all__ = [
     "extract_cell_features",
     "prepare_visualization_data",
     "preprocess_volume",
-    "run_cell_tracking",
     "run_cell_lineage",
+    "run_cell_tracking",
     "run_track_reconciliation",
     "run_track_stitching",
     "segment_instances",

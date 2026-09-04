@@ -122,7 +122,7 @@ def component_debug_result(artifact, diagnostic, padding: int) -> ComponentDebug
         ]
     )
     candidate_detection_module = import_module(
-        "src.03_segmentation.candidate_detection"
+        "src.source_instances.segmentation.candidate_detection"
     )
     candidate_result = artifact.candidate_result
     shape_peaks = candidate_detection_module.shape_peaks_dataframe(
@@ -141,7 +141,7 @@ def component_debug_result(artifact, diagnostic, padding: int) -> ComponentDebug
         for axis in "zyx":
             if axis in table:
                 table[axis] = table[axis] - float(padding)
-    marker_completion_module = import_module("src.03_segmentation.marker_completion")
+    marker_completion_module = import_module("src.source_instances.segmentation.marker_completion")
     completion = artifact.geometric_completion
     surface_caps = marker_completion_module.surface_caps_dataframe(
         completion, artifact.component_id

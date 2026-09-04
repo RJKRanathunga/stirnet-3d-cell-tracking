@@ -27,7 +27,7 @@ class RemappingResult:
 
 
 def _empty_stage10(column_name: str) -> pd.DataFrame:
-    schemas = import_module("src.10_cell_lineage.step01_config")
+    schemas = import_module("legacy.classical_pipeline.lineage.step01_config")
     return pd.DataFrame(columns=getattr(schemas, column_name))
 
 
@@ -116,7 +116,7 @@ def _rebuild_track_lineage(
     lineage_edges: pd.DataFrame,
     sequence_first_frame: int | None,
 ) -> pd.DataFrame:
-    schemas = import_module("src.10_cell_lineage.step01_config")
+    schemas = import_module("legacy.classical_pipeline.lineage.step01_config")
     columns = schemas.TRACK_LINEAGE_COLUMNS
     if tracks.empty:
         return pd.DataFrame(columns=columns)

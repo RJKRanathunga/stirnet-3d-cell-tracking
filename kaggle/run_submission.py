@@ -336,7 +336,7 @@ def _run_tracking_stack(
     )
     print(f"[{sample.dataset}] Stage 11 reconciliation ...", flush=True)
     reconciliation_cls = import_module(
-        "src.11_track_reconciliation.step01_config"
+        "legacy.classical_pipeline.reconciliation.step01_config"
     ).TrackReconciliationConfig
     spatial_shape = tuple(
         int(v)

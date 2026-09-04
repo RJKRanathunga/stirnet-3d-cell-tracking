@@ -10,11 +10,11 @@ import pandas as pd
 from .models import CanonicalMismatchError, Stage3ComponentRun
 
 
-peaks_module = import_module("src.03_segmentation.peaks")
-watershed_module = import_module("src.03_segmentation.watershed")
-pipeline_module = import_module("src.03_segmentation.pipeline")
-marker_completion_module = import_module("src.03_segmentation.marker_completion")
-candidate_detection_module = import_module("src.03_segmentation.candidate_detection")
+peaks_module = import_module("src.source_instances.segmentation.peaks")
+watershed_module = import_module("src.source_instances.segmentation.watershed")
+pipeline_module = import_module("src.source_instances.segmentation.pipeline")
+marker_completion_module = import_module("src.source_instances.segmentation.marker_completion")
+candidate_detection_module = import_module("src.source_instances.segmentation.candidate_detection")
 
 
 def run_stage3_component(resolution, component_id: int, config) -> Stage3ComponentRun:
@@ -70,7 +70,7 @@ def run_stage3_component(resolution, component_id: int, config) -> Stage3Compone
         )
     else:
         geometric_completion = import_module(
-            "src.03_segmentation.models"
+            "src.source_instances.segmentation.models"
         ).GeometricCompletionResult.not_candidate(candidate_result)
     final_markers = marker_completion_module.combine_markers(
         effective_markers, geometric_completion.supplemental_markers

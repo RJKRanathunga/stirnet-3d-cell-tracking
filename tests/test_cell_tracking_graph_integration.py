@@ -14,7 +14,7 @@ from src.io import PipelinePaths, load_stage7_outputs, save_tracking_result
 
 
 GraphTrackingConfig = import_module(
-    "src.07_cell_tracking.graph_tracking"
+    "legacy.classical_pipeline.tracking.graph_tracking"
 ).GraphTrackingConfig
 
 

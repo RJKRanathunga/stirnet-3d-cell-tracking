@@ -275,7 +275,7 @@ def load_stage10_outputs(*, paths: PipelinePaths | None = None) -> Stage10Output
 
     resolved = paths or PipelinePaths.discover()
     root = resolved.stage10_lineage
-    schemas = import_module("src.10_cell_lineage.step01_config")
+    schemas = import_module("legacy.classical_pipeline.lineage.step01_config")
     return Stage10Outputs(
         division_candidates=load_csv(
             root / "division_candidates.csv",
@@ -329,8 +329,8 @@ def load_stage11_outputs(*, paths: PipelinePaths | None = None) -> Stage11Output
 
     resolved = paths or PipelinePaths.discover()
     root = resolved.stage11_reconciliation
-    schemas = import_module("src.11_track_reconciliation.step01_config")
-    lineage_schemas = import_module("src.10_cell_lineage.step01_config")
+    schemas = import_module("legacy.classical_pipeline.reconciliation.step01_config")
+    lineage_schemas = import_module("legacy.classical_pipeline.lineage.step01_config")
     return Stage11Outputs(
         tracks=load_csv(root / "tracks.csv", required_columns=TRACK_COLUMNS),
         segmentation_events=load_optional_csv(root / "segmentation_events.csv"),

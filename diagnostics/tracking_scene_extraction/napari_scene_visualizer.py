@@ -9,7 +9,7 @@ import numpy as np
 
 from src.io.scene_io import load_tracking_scene as load_scene_data
 scene_layer_transform = import_module(
-    "src.09_visualization.transforms"
+    "legacy.classical_pipeline.visualization.transforms"
 ).scene_layer_transform
 
 try:

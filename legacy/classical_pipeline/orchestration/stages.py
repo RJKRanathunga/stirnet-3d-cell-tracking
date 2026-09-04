@@ -18,7 +18,7 @@ from src.api import (
     run_track_reconciliation,
     run_track_stitching,
 )
-from src.dataset_processing import process_dataset
+from src.source_instances.volume_pipeline import process_dataset
 from src.io import (
     load_csv,
     load_json,
@@ -38,7 +38,7 @@ from .paths import SampleOutputPaths
 
 
 TrackReconciliationConfig = import_module(
-    "src.11_track_reconciliation.step01_config"
+    "legacy.classical_pipeline.reconciliation.step01_config"
 ).TrackReconciliationConfig
 
 

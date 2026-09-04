@@ -7,7 +7,7 @@ from src.api import GraphTrackingConfig, run_cell_tracking
 
 
 FourDGraphConfig = import_module(
-    "src.07_cell_tracking.graph_tracking.four_d"
+    "legacy.classical_pipeline.tracking.graph_tracking.four_d"
 ).FourDGraphConfig
 
 

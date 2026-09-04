@@ -235,19 +235,19 @@ def prepare_spatial_data():
     )
 
     preprocess_volume = import_module(
-        "src.01_preprocessing.pipeline"
+        "src.source_instances.preprocessing.pipeline"
     ).preprocess_volume
 
     PreprocessingConfig = import_module(
-        "src.01_preprocessing.config"
+        "src.source_instances.preprocessing.config"
     ).PreprocessingConfig
 
     create_binary_mask = import_module(
-        "src.02_masking.pipeline"
+        "src.source_instances.foreground.pipeline"
     ).create_binary_mask
 
     MaskingConfig = import_module(
-        "src.02_masking.config"
+        "src.source_instances.foreground.config"
     ).MaskingConfig
 
     if not source_dir.exists():

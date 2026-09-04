@@ -1,4 +1,4 @@
-"""Mapping from current `src/11_track_reconciliation` candidates to model evidence.
+"""Mapping from historical `legacy/classical_pipeline/reconciliation` candidates to model evidence.
 
 The default manifest intentionally uses primitive measurements, availability,
 counts/ranks and reliability—not the current hand-weighted continuation score.
@@ -47,7 +47,7 @@ STAGE11_PAIR_FEATURES: tuple[str, ...] = (
     "intensity_iqr_error",
     "intensity_cv_error",
     "target_real_observation_count",
-    # legacy Stage-7 / Trackastra-like association evidence
+    # historical classical-tracker / Trackastra-like association evidence
     "stage7_candidate_available",
     "stage7_candidate_distance_um",
     "stage7_candidate_pair_cost",

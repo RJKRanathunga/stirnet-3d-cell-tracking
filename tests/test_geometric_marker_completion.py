@@ -9,11 +9,11 @@ from unittest.mock import patch
 import numpy as np
 
 
-config_module = import_module("src.03_segmentation.config")
-body_module = import_module("src.03_segmentation.geometric_bodies")
-completion_module = import_module("src.03_segmentation.marker_completion")
-models_module = import_module("src.03_segmentation.models")
-pipeline_module = import_module("src.03_segmentation.pipeline")
+config_module = import_module("src.source_instances.segmentation.config")
+body_module = import_module("src.source_instances.segmentation.geometric_bodies")
+completion_module = import_module("src.source_instances.segmentation.marker_completion")
+models_module = import_module("src.source_instances.segmentation.models")
+pipeline_module = import_module("src.source_instances.segmentation.pipeline")
 DEFAULT_CONFIG = config_module.DEFAULT_SEGMENTATION_CONFIG
 
 

@@ -12,11 +12,11 @@ import numpy as np
 from scipy import ndimage
 
 
-candidate_module = import_module("src.03_segmentation.candidate_detection")
-config_module = import_module("src.03_segmentation.config")
-models_module = import_module("src.03_segmentation.models")
-peaks_module = import_module("src.03_segmentation.peaks")
-pipeline_module = import_module("src.03_segmentation.pipeline")
+candidate_module = import_module("src.source_instances.segmentation.candidate_detection")
+config_module = import_module("src.source_instances.segmentation.config")
+models_module = import_module("src.source_instances.segmentation.models")
+peaks_module = import_module("src.source_instances.segmentation.peaks")
+pipeline_module = import_module("src.source_instances.segmentation.pipeline")
 DEFAULT_CONFIG = config_module.DEFAULT_SEGMENTATION_CONFIG
 DEFAULT_CANDIDATE = DEFAULT_CONFIG.geometric_completion.candidate_detection
 

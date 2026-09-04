@@ -1,15 +1,6 @@
-"""Full-dataset orchestration for the cell-tracking research pipeline."""
+"""Canonical orchestration package for the current cell-tracking pipeline."""
 
-from .batch_runner import FullPipelineSummary, run_full_pipeline
-from .config import FullPipelineConfig
-from .dataset import FullDatasetSample, discover_samples
-from .sample_runner import SampleRunResult
+from .contracts import PipelineRequest, PipelineStages, PipelineState
+from .runner import run_pipeline
 
-__all__ = [
-    "FullDatasetSample",
-    "FullPipelineConfig",
-    "FullPipelineSummary",
-    "SampleRunResult",
-    "discover_samples",
-    "run_full_pipeline",
-]
+__all__ = ["PipelineRequest", "PipelineStages", "PipelineState", "run_pipeline"]

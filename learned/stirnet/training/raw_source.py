@@ -113,10 +113,10 @@ def prepare_raw_training_batch(
     if not 0 <= raw_channel_low_percentile < raw_channel_high_percentile <= 100:
         raise ValueError("raw-channel percentiles are invalid")
 
-    prep_module = import_module("src.01_preprocessing.pipeline")
-    prep_config_module = import_module("src.01_preprocessing.config")
-    mask_module = import_module("src.02_masking.pipeline")
-    mask_config_module = import_module("src.02_masking.config")
+    prep_module = import_module("src.source_instances.preprocessing.pipeline")
+    prep_config_module = import_module("src.source_instances.preprocessing.config")
+    mask_module = import_module("src.source_instances.foreground.pipeline")
+    mask_config_module = import_module("src.source_instances.foreground.config")
     if preprocessing_config is None:
         preprocessing_config = prep_config_module.PreprocessingConfig(voxel_size_zyx_um=spacing)
     else:

@@ -14,7 +14,7 @@ import pandas as pd
 
 from src.api import prepare_visualization_data
 
-overlay_module = import_module("src.09_visualization.step04_scene_overlay")
+overlay_module = import_module("legacy.classical_pipeline.visualization.step04_scene_overlay")
 prepare_stage8_scene_overlay = overlay_module.prepare_stage8_scene_overlay
 
 

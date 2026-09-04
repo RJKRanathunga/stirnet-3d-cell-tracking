@@ -31,7 +31,7 @@ def test_exact_milp_is_sparse_deterministic_and_integral() -> None:
 def test_solver_failure_falls_back_only_to_provisional_component(monkeypatch) -> None:
     module = __import__(
         "importlib"
-    ).import_module("src.07_cell_tracking.graph_tracking.four_d.milp_model")
+    ).import_module("legacy.classical_pipeline.tracking.graph_tracking.four_d.milp_model")
 
     def fail(*args, **kwargs):
         raise RuntimeError("synthetic HiGHS failure")
@@ -52,7 +52,7 @@ def test_solver_failure_falls_back_only_to_provisional_component(monkeypatch) ->
 def test_all_solver_paths_receive_a_finite_time_limit(monkeypatch) -> None:
     module = __import__(
         "importlib"
-    ).import_module("src.07_cell_tracking.graph_tracking.four_d.milp_model")
+    ).import_module("legacy.classical_pipeline.tracking.graph_tracking.four_d.milp_model")
     observed: list[tuple[str, float]] = []
     original_milp = module.milp
     original_linprog = module.linprog
@@ -99,7 +99,7 @@ def test_all_solver_paths_receive_a_finite_time_limit(monkeypatch) -> None:
 def test_iterative_solver_failure_restores_provisional_tracks(monkeypatch) -> None:
     module = __import__(
         "importlib"
-    ).import_module("src.07_cell_tracking.graph_tracking.four_d.milp_model")
+    ).import_module("legacy.classical_pipeline.tracking.graph_tracking.four_d.milp_model")
 
     def fail(*args, **kwargs):
         raise RuntimeError("synthetic fallback HiGHS failure")

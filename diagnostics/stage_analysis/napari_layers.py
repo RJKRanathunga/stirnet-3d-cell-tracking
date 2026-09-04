@@ -12,7 +12,7 @@ from .source import build_display_scope
 
 
 OWNER = "stage3-analysis"
-peaks_module = import_module("src.03_segmentation.peaks")
+peaks_module = import_module("src.source_instances.segmentation.peaks")
 
 ANALYSIS_LAYER_NAMES = {
     "EDT | Raw",

@@ -9,12 +9,12 @@ from importlib import import_module
 import numpy as np
 
 
-config_module = import_module("src.03_segmentation.config")
-models_module = import_module("src.03_segmentation.models")
-surface_module = import_module("src.03_segmentation.surface_geometry")
-watershed_module = import_module("src.03_segmentation.watershed")
-completion_module = import_module("src.03_segmentation.marker_completion")
-peaks_module = import_module("src.03_segmentation.peaks")
+config_module = import_module("src.source_instances.segmentation.config")
+models_module = import_module("src.source_instances.segmentation.models")
+surface_module = import_module("src.source_instances.segmentation.surface_geometry")
+watershed_module = import_module("src.source_instances.segmentation.watershed")
+completion_module = import_module("src.source_instances.segmentation.marker_completion")
+peaks_module = import_module("src.source_instances.segmentation.peaks")
 DEFAULT_CONFIG = config_module.DEFAULT_SEGMENTATION_CONFIG
 InstanceMarker = models_module.InstanceMarker
 

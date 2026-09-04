@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.pipeline import FullPipelineConfig, run_full_pipeline  # noqa: E402
+from legacy.classical_pipeline.orchestration import FullPipelineConfig, run_full_pipeline  # noqa: E402
 
 
 # Edit these two defaults if the local full-dataset/output locations change.

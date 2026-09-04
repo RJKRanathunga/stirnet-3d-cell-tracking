@@ -608,7 +608,7 @@ def run_parallel_spatial_volume(
     source_mask_validator: Callable[[int, np.ndarray], None] | None = None,
     preparation_timeout_seconds: float = 300.0,
 ) -> SpatialVolumeResult:
-    from src.api import (
+    from src.source_instances import (
         detect_cells,
         extract_cell_features,
     )

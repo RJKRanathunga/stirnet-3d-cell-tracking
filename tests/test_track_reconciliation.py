@@ -18,8 +18,8 @@ from src.io import (
 )
 
 
-config_module = import_module("src.11_track_reconciliation.step01_config")
-lineage_schemas = import_module("src.10_cell_lineage.step01_config")
+config_module = import_module("legacy.classical_pipeline.reconciliation.step01_config")
+lineage_schemas = import_module("legacy.classical_pipeline.lineage.step01_config")
 TrackReconciliationConfig = config_module.TrackReconciliationConfig
 
 

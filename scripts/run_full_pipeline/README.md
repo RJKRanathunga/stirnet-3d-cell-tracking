@@ -26,7 +26,7 @@ The `ground_truth` directory is recorded when present, but it is not required by
 The batch order is:
 
 ```text
-Stages 1-6  -> existing src.dataset_processing.process_dataset
+Stages 1-6  -> existing src.source_instances.volume_pipeline.process_dataset
 Stage 7     -> current apply-mode windowed 4D graph tracking
 Stage 8     -> track stitching / merge repair
 Stage 9     -> skipped (visualization only)

@@ -4,13 +4,13 @@ import numpy as np
 from importlib import import_module
 
 build_observations = import_module(
-    "src.07_cell_tracking.graph_tracking.four_d.observations"
+    "legacy.classical_pipeline.tracking.graph_tracking.four_d.observations"
 ).build_observations
 build_relation_histories = import_module(
-    "src.07_cell_tracking.graph_tracking.four_d.relation_history"
+    "legacy.classical_pipeline.tracking.graph_tracking.four_d.relation_history"
 ).build_relation_histories
 build_spatial_relations = import_module(
-    "src.07_cell_tracking.graph_tracking.four_d.spatial_relations"
+    "legacy.classical_pipeline.tracking.graph_tracking.four_d.spatial_relations"
 ).build_spatial_relations
 
 from .helpers import FourDGraphConfig, moving_frames, run_cell_tracking

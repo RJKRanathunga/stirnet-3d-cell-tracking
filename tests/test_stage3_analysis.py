@@ -26,8 +26,8 @@ from diagnostics.stage_analysis.source import (
 )
 
 
-config_module = import_module("src.03_segmentation.config")
-peaks_module = import_module("src.03_segmentation.peaks")
+config_module = import_module("src.source_instances.segmentation.config")
+peaks_module = import_module("src.source_instances.segmentation.peaks")
 DEFAULT_CONFIG = config_module.DEFAULT_SEGMENTATION_CONFIG
 
 

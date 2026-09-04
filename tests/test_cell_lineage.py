@@ -14,8 +14,8 @@ from src.api import run_cell_lineage
 from src.io import PipelinePaths, load_stage10_outputs, save_lineage_result
 
 
-lineage_module = import_module("src.10_cell_lineage.step06_pipeline")
-config_module = import_module("src.10_cell_lineage.step01_config")
+lineage_module = import_module("legacy.classical_pipeline.lineage.step06_pipeline")
+config_module = import_module("legacy.classical_pipeline.lineage.step01_config")
 CellLineageConfig = config_module.CellLineageConfig
 
 

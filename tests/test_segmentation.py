@@ -13,8 +13,8 @@ import numpy as np
 from src.api import detect_cells, segment_instances
 
 
-segmentation_config_module = import_module("src.03_segmentation.config")
-pipeline_module = import_module("src.03_segmentation.pipeline")
+segmentation_config_module = import_module("src.source_instances.segmentation.config")
+pipeline_module = import_module("src.source_instances.segmentation.pipeline")
 DEFAULT_SEGMENTATION_CONFIG = segmentation_config_module.DEFAULT_SEGMENTATION_CONFIG
 segment_instances_detailed = pipeline_module.segment_instances_detailed
 
@@ -194,7 +194,7 @@ class AllEffectivePeakSegmentationTests(unittest.TestCase):
         self.assertNotIn("max_cells", config_fields)
         self.assertNotIn("max_candidate_peaks", config_fields)
         self.assertNotIn("max_combinations_per_k", config_fields)
-        self.assertNotIn("src.03_segmentation.hypotheses", sys.modules)
+        self.assertNotIn("src.source_instances.segmentation.hypotheses", sys.modules)
 
     def test_full_entry_point_preserves_downstream_output_contract(self) -> None:
         mask = self.synthetic.ball(self.synthetic.center, 2.8)

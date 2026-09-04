@@ -15,9 +15,9 @@ import pandas as pd
 from src.io import PipelinePaths
 
 
-comparison_module = import_module("src.09_visualization.step05_comparison")
-endpoint_module = import_module("src.09_visualization.step02_endpoints")
-napari_module = import_module("src.09_visualization.napari_layers")
+comparison_module = import_module("legacy.classical_pipeline.visualization.step05_comparison")
+endpoint_module = import_module("legacy.classical_pipeline.visualization.step02_endpoints")
+napari_module = import_module("legacy.classical_pipeline.visualization.napari_layers")
 
 Stage9Snapshot = comparison_module.Stage9Snapshot
 compare_stage9_snapshots = comparison_module.compare_stage9_snapshots
@@ -427,7 +427,7 @@ class Stage9ComparisonTests(unittest.TestCase):
             and node.name == "add_track_group"
         ]
         self.assertFalse(local_helpers)
-        self.assertIn("src.09_visualization.napari_layers", source)
+        self.assertIn("legacy.classical_pipeline.visualization.napari_layers", source)
         spatial_calls = [
             node
             for node in ast.walk(tree)

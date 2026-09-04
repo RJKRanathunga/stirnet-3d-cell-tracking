@@ -8,13 +8,13 @@ from .helpers import FourDGraphConfig, moving_frames, run_cell_tracking
 
 
 build_observations = import_module(
-    "src.07_cell_tracking.graph_tracking.four_d.observations"
+    "legacy.classical_pipeline.tracking.graph_tracking.four_d.observations"
 ).build_observations
 build_spatial_relations = import_module(
-    "src.07_cell_tracking.graph_tracking.four_d.spatial_relations"
+    "legacy.classical_pipeline.tracking.graph_tracking.four_d.spatial_relations"
 ).build_spatial_relations
 expanded_pairs = import_module(
-    "src.07_cell_tracking.graph_tracking.four_d.temporal_candidates"
+    "legacy.classical_pipeline.tracking.graph_tracking.four_d.temporal_candidates"
 )._expanded_pairs
 
 

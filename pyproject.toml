@@ -9,4 +9,10 @@ requires-python = ">=3.11"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src", "src.*", "diagnostics", "diagnostics.*"]
+include = [
+    "src", "src.*",
+    "learned", "learned.*",
+    "dataset_curation", "dataset_curation.*",
+    "diagnostics", "diagnostics.*",
+    "legacy", "legacy.*",
+]

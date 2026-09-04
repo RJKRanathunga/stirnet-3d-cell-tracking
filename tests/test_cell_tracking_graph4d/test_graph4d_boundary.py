@@ -9,13 +9,13 @@ from .helpers import FourDGraphConfig, GraphTrackingConfig, detection, run_cell_
 
 
 build_observations = import_module(
-    "src.07_cell_tracking.graph_tracking.four_d.observations"
+    "legacy.classical_pipeline.tracking.graph_tracking.four_d.observations"
 ).build_observations
 start_event_options = import_module(
-    "src.07_cell_tracking.graph_tracking.four_d.boundary_events"
+    "legacy.classical_pipeline.tracking.graph_tracking.four_d.boundary_events"
 ).start_event_options
 end_event_options = import_module(
-    "src.07_cell_tracking.graph_tracking.four_d.boundary_events"
+    "legacy.classical_pipeline.tracking.graph_tracking.four_d.boundary_events"
 ).end_event_options
 
 

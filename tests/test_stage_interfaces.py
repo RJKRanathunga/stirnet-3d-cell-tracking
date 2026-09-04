@@ -58,8 +58,8 @@ class StageInterfaceTests(unittest.TestCase):
         )
 
     def test_stage10_empty_headers_and_required_column_validation(self) -> None:
-        module = import_module("src.10_cell_lineage.step06_pipeline")
-        schemas = import_module("src.10_cell_lineage.step01_config")
+        module = import_module("legacy.classical_pipeline.lineage.step06_pipeline")
+        schemas = import_module("legacy.classical_pipeline.lineage.step01_config")
         with tempfile.TemporaryDirectory() as directory:
             paths = PipelinePaths(Path(directory))
             result = module.CellLineageResult(

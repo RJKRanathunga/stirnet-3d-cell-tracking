@@ -32,10 +32,10 @@ from diagnostics.pipeline_replay.napari_layers import (
 from src.api import create_binary_mask, preprocess_volume
 from src.io import PipelinePaths, save_csv, save_json, save_npy
 
-preprocessing_config = import_module("src.01_preprocessing.config")
-masking_config = import_module("src.02_masking.config")
+preprocessing_config = import_module("src.source_instances.preprocessing.config")
+masking_config = import_module("src.source_instances.foreground.config")
 replay_runner_module = import_module("diagnostics.pipeline_replay.runner")
-segmentation_config = import_module("src.03_segmentation.config")
+segmentation_config = import_module("src.source_instances.segmentation.config")
 
 
 class _SyntheticSource:

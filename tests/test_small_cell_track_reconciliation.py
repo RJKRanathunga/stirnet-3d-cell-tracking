@@ -19,8 +19,8 @@ from tests.test_track_reconciliation import (
 )
 
 
-config_module = import_module("src.11_track_reconciliation.step01_config")
-reliability = import_module("src.11_track_reconciliation.small_cell_reliability")
+config_module = import_module("legacy.classical_pipeline.reconciliation.step01_config")
+reliability = import_module("legacy.classical_pipeline.reconciliation.small_cell_reliability")
 TrackReconciliationConfig = config_module.TrackReconciliationConfig
 
 

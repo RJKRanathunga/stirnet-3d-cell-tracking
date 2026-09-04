@@ -8,7 +8,7 @@ from importlib import import_module
 import pandas as pd
 
 
-stage12 = import_module("src.12_final_visualization")
+stage12 = import_module("legacy.classical_pipeline.final_visualization")
 FinalVisualizationConfig = stage12.FinalVisualizationConfig
 prepare_final_visualization_data = stage12.prepare_final_visualization_data
 

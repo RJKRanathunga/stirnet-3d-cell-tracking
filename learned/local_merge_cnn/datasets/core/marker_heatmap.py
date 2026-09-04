@@ -45,8 +45,8 @@ def detect_effective_markers_stage3(
     if not np.allclose(spacing, spacing[0]):
         raise ValueError("canonical marker detection requires cubic voxels")
 
-    pipeline = import_module("src.03_segmentation.pipeline")
-    config_module = import_module("src.03_segmentation.config")
+    pipeline = import_module("src.source_instances.segmentation.pipeline")
+    config_module = import_module("src.source_instances.segmentation.config")
     config = replace(
         config_module.DEFAULT_SEGMENTATION_CONFIG,
         voxel_size_zyx_um=tuple(float(v) for v in spacing),

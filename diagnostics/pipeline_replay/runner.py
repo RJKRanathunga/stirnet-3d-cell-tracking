@@ -14,10 +14,10 @@ from .component_debug import component_debug_result
 from .models import PipelineReplayState, ReplayMode, ReplayResult
 from .source import PipelineReplaySource
 
-preprocessing_config_module = import_module("src.01_preprocessing.config")
-masking_config_module = import_module("src.02_masking.config")
-segmentation_module = import_module("src.03_segmentation.pipeline")
-segmentation_config_module = import_module("src.03_segmentation.config")
+preprocessing_config_module = import_module("src.source_instances.preprocessing.config")
+masking_config_module = import_module("src.source_instances.foreground.config")
+segmentation_module = import_module("src.source_instances.segmentation.pipeline")
+segmentation_config_module = import_module("src.source_instances.segmentation.config")
 
 DEFAULT_PREPROCESSING_CONFIG = preprocessing_config_module.DEFAULT_PREPROCESSING_CONFIG
 DEFAULT_MASKING_CONFIG = masking_config_module.DEFAULT_MASKING_CONFIG

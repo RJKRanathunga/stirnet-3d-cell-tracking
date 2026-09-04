@@ -52,7 +52,7 @@ from .source import Stage3AnalysisSource, discover_categories, discover_scenes
 
 
 DEFAULT_SEGMENTATION_CONFIG = import_module(
-    "src.03_segmentation.config"
+    "src.source_instances.segmentation.config"
 ).DEFAULT_SEGMENTATION_CONFIG
 
 PARAMETER_SPECS = (
