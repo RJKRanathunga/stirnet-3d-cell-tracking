@@ -62,7 +62,7 @@ INV46 = load_module(
     ROOT
     / "investigations"
     / "stirnet"
-    / "46_biohub_hard_cutter_temporal_training_v4.py",
+    / "46_biohub_hard_cutter_temporal_training.py",
     "_inv47_inv46_v4",
 )
 INV42 = INV46.INV42

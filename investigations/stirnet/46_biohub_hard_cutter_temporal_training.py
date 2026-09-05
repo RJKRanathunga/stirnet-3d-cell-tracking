@@ -84,43 +84,71 @@ This is experiment-local. Production graph semantics are not modified.
 
 Training
 --------
-Investigation 46 V3 freezes the enriched temporal candidate. The V2 smoke run
-showed that this candidate was already strong before fine-tuning and that even
-small candidate updates reduced CUT/exact recovery.
+Investigation 46 V4 keeps the successful hard cutter, stabilized coordinates,
+explicit physical temporal features, and the strong frozen temporal candidate.
 
-V3 therefore trains only a small DISCRETE WRITE SELECTOR. For editable RAG
-edges, frozen spatial and candidate predictions define:
+V3 showed that an edge-level HELP/SUPPRESS classifier can recover precision,
+but even a perfect edge-level oracle produced worse exact component recovery
+than the raw candidate. That means candidate edits sometimes need to be applied
+as a coordinated partition rather than as independent edge decisions.
 
-    HELP:
-        spatial wrong, candidate correct -> WRITE target = 1
+V4 therefore changes the decision unit from RAG EDGE to CURRENT SPATIAL
+COMPONENT.
 
-    SUPPRESS:
-        spatial correct, candidate wrong -> WRITE target = 0
+For each trusted current spatial component C there are only two alternatives:
+
+    KEEP_SPATIAL:
+        keep the complete frozen spatial partition inside C
+
+    USE_CANDIDATE:
+        use the complete frozen temporal-candidate partition inside C
+
+The component selector is trained only on strong, stationary labels:
+
+    HELP / USE_CANDIDATE:
+        candidate partition is exact for C
+        and spatial partition is not exact
+
+    SUPPRESS / KEEP_SPATIAL:
+        spatial partition is exact for C
+        and candidate partition is not exact
 
     NEUTRAL:
-        both correct or both wrong -> excluded from selector training
+        both exact or both wrong
+        -> excluded from component-selector training
 
-The selector is trained on balanced HELP/SUPPRESS minibatches. Its features are
-the frozen RAG edge embedding, Investigation-42/V11 candidate scalars, and the
-explicit physical evidence introduced by Investigation 46.
+The selector is a balanced binary classifier. It receives:
+    * pooled frozen RAG edge embedding for the component,
+    * the 7 explicit physical/cutter features introduced in Investigation 46,
+    * component-level candidate proposal statistics:
+        node/edge counts
+        candidate/spatial CUT fractions
+        candidate KEEP probability statistics
+        candidate-vs-spatial logit displacement
+        candidate cut strength
+        split-head probability
+        number of candidate-proposed subcomponents
 
-Final inference is discrete, not interpolated:
+At inference, selection is discrete and coordinated:
 
-    SUPPRESS -> use spatial logit exactly
-    WRITE    -> use candidate logit exactly
+    KEEP_SPATIAL  -> all editable edges in C use spatial logits
+    USE_CANDIDATE -> all editable edges in C use candidate logits
 
-The write threshold is calibrated only on training-frame HELP/SUPPRESS examples,
-maximizing HELP recall under a configurable harmful-write constraint. Validation
-never participates in threshold calibration.
+The selection threshold is calibrated ONLY on training components. Among
+thresholds satisfying a configurable maximum SUPPRESS-use rate, V4 chooses the
+threshold with maximum HELP recall.
 
 Typical command:
 
-    python .\investigations\stirnet\46_biohub_hard_cutter_temporal_training_v3.py `
-        --selector-steps 400 `
-        --selector-lr 3e-4 `
-        --selector-eval-every 50 `
-        --selector-max-suppress-write-rate 0.10 `
+    python .\investigations\stirnet\46_biohub_hard_cutter_temporal_training_v4.py `
+        --component-selector-steps 400 `
+        --component-selector-lr 3e-4 `
+        --component-selector-eval-every 50 `
+        --component-selector-max-suppress-use-rate 0.10 `
         --print-every 25
+
+The 30-39 validation range is still a DEVELOPMENT split used by earlier
+investigations. A fresh untouched holdout is required before production claims.
 
 Default initializer
 -------------------
@@ -220,8 +248,8 @@ INV45 = load_module(
 )
 INV35 = INV42.INV35
 
-SCRIPT_NAME = "46_biohub_hard_cutter_temporal_training_v3"
-OBJECTIVE_VERSION = 3
+SCRIPT_NAME = "46_biohub_hard_cutter_temporal_training_v4"
+OBJECTIVE_VERSION = 4
 
 DEFAULT_CUTTER_TARGET_CLEAN_BREAK = 0.08
 DEFAULT_CUTTER_MIN_THRESHOLD = 2.0
@@ -1649,15 +1677,17 @@ def write_manifest_46(
 
 
 # =============================================================================
-# Investigation 46 V3 — frozen candidate + discrete HELP/SUPPRESS selector
+# Investigation 46 V4 — frozen candidate + COMPONENT-LEVEL partition selector
 # =============================================================================
 
 
-class Inv46DiscreteWriteSelector(torch.nn.Module):
-    """Small classifier deciding whether to use candidate or spatial exactly."""
+COMPONENT_PHYSICAL_DIM = PHYSICAL_GATE_DIM
+COMPONENT_PROPOSAL_DIM = 11
+COMPONENT_SCALAR_DIM = COMPONENT_PHYSICAL_DIM + COMPONENT_PROPOSAL_DIM
 
-    ORIGINAL_SCALAR_DIM = 9
-    SCALAR_DIM = ORIGINAL_SCALAR_DIM + PHYSICAL_GATE_DIM
+
+class Inv46ComponentSelector(torch.nn.Module):
+    """Choose KEEP_SPATIAL vs USE_CANDIDATE for a whole current component."""
 
     def __init__(self, edge_embedding_dim: int) -> None:
         super().__init__()
@@ -1665,49 +1695,66 @@ class Inv46DiscreteWriteSelector(torch.nn.Module):
         if edge_embedding_dim <= 0:
             raise ValueError("edge_embedding_dim must be positive")
         self.edge_embedding_dim = edge_embedding_dim
+
         self.edge_norm = torch.nn.LayerNorm(edge_embedding_dim)
-        self.scalar_norm = torch.nn.LayerNorm(self.SCALAR_DIM)
+        self.scalar_norm = torch.nn.LayerNorm(COMPONENT_SCALAR_DIM)
         self.net = torch.nn.Sequential(
-            torch.nn.Linear(edge_embedding_dim + self.SCALAR_DIM, 64),
+            torch.nn.Linear(edge_embedding_dim + COMPONENT_SCALAR_DIM, 64),
             torch.nn.SiLU(),
             torch.nn.Linear(64, 32),
             torch.nn.SiLU(),
             torch.nn.Linear(32, 1),
         )
 
-    def forward(self, *, edge_embedding: Tensor, scalar_features: Tensor) -> Tensor:
-        if edge_embedding.ndim != 2 or scalar_features.ndim != 2:
-            raise ValueError("selector inputs must be [E,D] and [E,F]")
-        if edge_embedding.shape[0] != scalar_features.shape[0]:
-            raise ValueError("selector row mismatch")
-        if int(edge_embedding.shape[1]) != self.edge_embedding_dim:
-            raise ValueError("selector edge embedding dimension mismatch")
-        if int(scalar_features.shape[1]) != self.SCALAR_DIM:
+    def forward(
+        self,
+        *,
+        pooled_edge_embedding: Tensor,
+        scalar_features: Tensor,
+    ) -> Tensor:
+        if pooled_edge_embedding.ndim != 2 or scalar_features.ndim != 2:
+            raise ValueError("component-selector inputs must be 2-D")
+        if pooled_edge_embedding.shape[0] != scalar_features.shape[0]:
+            raise ValueError("component-selector row mismatch")
+        if int(pooled_edge_embedding.shape[1]) != self.edge_embedding_dim:
             raise ValueError(
-                f"selector scalar dim={scalar_features.shape[1]} expected={self.SCALAR_DIM}"
+                "component-selector edge embedding dimension mismatch"
             )
-        edge = self.edge_norm(edge_embedding.float())
+        if int(scalar_features.shape[1]) != COMPONENT_SCALAR_DIM:
+            raise ValueError(
+                f"component-selector scalar dim={scalar_features.shape[1]} "
+                f"expected={COMPONENT_SCALAR_DIM}"
+            )
+
+        edge = self.edge_norm(pooled_edge_embedding.float())
         scalar = self.scalar_norm(scalar_features.float())
         return self.net(torch.cat([edge, scalar], dim=-1)).squeeze(-1)
 
 
 @dataclass
-class SelectorDatasetV3:
-    edge_embedding: Tensor
+class ComponentSelectorDatasetV4:
+    pooled_edge_embedding: Tensor
     scalar_features: Tensor
-    target_write: Tensor
+    target_use_candidate: Tensor
     metadata: pd.DataFrame
 
     @property
     def help_count(self) -> int:
-        return int((self.target_write > 0.5).sum().item())
+        return int((self.target_use_candidate > 0.5).sum().item())
 
     @property
     def suppress_count(self) -> int:
-        return int((self.target_write <= 0.5).sum().item())
+        return int((self.target_use_candidate <= 0.5).sum().item())
 
 
-def frozen_candidate_bundle_v3(model, *, runtime, case, encoded, temporal=None):
+def frozen_candidate_bundle_v4(
+    model,
+    *,
+    runtime,
+    case,
+    encoded,
+    temporal=None,
+):
     state = encoded.temporal if temporal is None else temporal
     base_reasoning = model.instance_temporal(
         encoded.instances,
@@ -1715,75 +1762,367 @@ def frozen_candidate_bundle_v3(model, *, runtime, case, encoded, temporal=None):
         state,
         encoded.dref_t,
     )
-    candidate_logits = case.rag.spatial_edge_logits + base_reasoning.edge_temporal_delta
-    scalar_features = selective_gate_scalar_features_46(
-        model,
-        runtime=runtime,
-        case=case,
-        base_reasoning=base_reasoning,
-        candidate_logits=candidate_logits,
+    candidate_logits = (
+        case.rag.spatial_edge_logits
+        + base_reasoning.edge_temporal_delta
     )
-    return base_reasoning, candidate_logits, scalar_features
+    return base_reasoning, candidate_logits
 
 
-def help_suppress_masks_v3(model, case, candidate_logits):
-    threshold = float(model.cfg.partition.final_merge_threshold)
-    target_keep = case.target_keep.bool()
-    spatial_pred = torch.sigmoid(case.rag.spatial_edge_logits) >= threshold
-    candidate_pred = torch.sigmoid(candidate_logits) >= threshold
-    spatial_correct = spatial_pred == target_keep
-    candidate_correct = candidate_pred == target_keep
-    help_mask = case.editable & candidate_correct & ~spatial_correct
-    suppress_mask = case.editable & ~candidate_correct & spatial_correct
-    return help_mask, suppress_mask
+def partition_from_logits_v4(model, case, logits):
+    predicted = model.partitioner(
+        case.rag,
+        logits,
+        model.cfg.partition.final_merge_threshold,
+        stage="final",
+    )
+    return INV42.enforce_split_only(case, predicted)
 
 
-def reason_case_v3(
+def component_exact_v4(
+    runtime,
+    case,
+    node_component: Tensor,
+    component: int,
+) -> bool:
+    """Exact target partition for one current spatial component.
+
+    This mirrors Investigation-42 exact-component logic, but evaluates one
+    component at a time so the selector can receive component-level labels.
+    """
+    component = int(component)
+    rows = torch.nonzero(
+        case.node_current_component == component,
+        as_tuple=False,
+    ).flatten()
+    if rows.numel() == 0:
+        return False
+    if not bool(runtime.node_valid[rows].all()):
+        return False
+
+    target_ids = torch.unique(runtime.node_target[rows])
+    target_ids = target_ids[target_ids > 0]
+    if target_ids.numel() == 0:
+        return False
+
+    seen: set[int] = set()
+    for target_id in target_ids.tolist():
+        target_rows = rows[
+            runtime.node_target[rows] == int(target_id)
+        ]
+        predicted_components = torch.unique(
+            node_component[target_rows]
+        )
+        if predicted_components.numel() != 1:
+            return False
+
+        final_component = int(predicted_components.item())
+        if final_component in seen:
+            return False
+        seen.add(final_component)
+
+        members = torch.nonzero(
+            node_component == final_component,
+            as_tuple=False,
+        ).flatten()
+        trusted_members = members[runtime.node_valid[members]]
+        member_targets = runtime.node_target[trusted_members]
+        if bool((member_targets != int(target_id)).any()):
+            return False
+
+    return True
+
+
+def component_exact_flags_v4(
+    runtime,
+    case,
+    candidate_partition,
+) -> tuple[Tensor, Tensor]:
+    component_count = int(case.split_target.numel())
+    spatial_exact = torch.zeros(
+        component_count,
+        dtype=torch.bool,
+        device=case.node_current_component.device,
+    )
+    candidate_exact = torch.zeros_like(spatial_exact)
+
+    for component in range(component_count):
+        if not bool(
+            case.split_valid[component]
+            & case.metric_component_valid[component]
+        ):
+            continue
+        spatial_exact[component] = component_exact_v4(
+            runtime,
+            case,
+            case.node_current_component,
+            component,
+        )
+        candidate_exact[component] = component_exact_v4(
+            runtime,
+            case,
+            candidate_partition.node_component_global,
+            component,
+        )
+    return spatial_exact, candidate_exact
+
+
+def component_internal_edge_rows_v4(case, component: int) -> Tensor:
+    src, dst = case.rag.edge_index
+    current = case.node_current_component
+    return torch.nonzero(
+        (current[src] == int(component))
+        & (current[dst] == int(component))
+        & case.editable,
+        as_tuple=False,
+    ).flatten()
+
+
+def component_feature_tables_v4(
     model,
-    selector: Inv46DiscreteWriteSelector,
+    *,
+    runtime,
+    case,
+    base_reasoning,
+    candidate_logits,
+    candidate_partition,
+) -> tuple[Tensor, Tensor]:
+    """Return pooled edge embeddings and scalar features for every component."""
+
+    component_count = int(case.split_target.numel())
+    edge_dim = int(case.rag.edge_embeddings.shape[1])
+    device = case.rag.spatial_edge_logits.device
+
+    pooled = torch.zeros(
+        (component_count, edge_dim),
+        device=device,
+        dtype=torch.float32,
+    )
+    scalar = torch.zeros(
+        (component_count, COMPONENT_SCALAR_DIM),
+        device=device,
+        dtype=torch.float32,
+    )
+
+    physical = component_physical_features_46(runtime, case).float()
+    scalar[:, :COMPONENT_PHYSICAL_DIM] = physical
+
+    threshold = float(model.cfg.partition.final_merge_threshold)
+    spatial_prob = torch.sigmoid(
+        case.rag.spatial_edge_logits.float()
+    )
+    candidate_prob = torch.sigmoid(candidate_logits.float())
+    delta = (
+        candidate_logits.float()
+        - case.rag.spatial_edge_logits.float()
+    )
+
+    for component in range(component_count):
+        node_rows = torch.nonzero(
+            case.node_current_component == component,
+            as_tuple=False,
+        ).flatten()
+        edge_rows = component_internal_edge_rows_v4(
+            case,
+            component,
+        )
+
+        if edge_rows.numel():
+            pooled[component] = (
+                case.rag.edge_embeddings[edge_rows]
+                .detach()
+                .float()
+                .mean(dim=0)
+            )
+
+            cp = candidate_prob[edge_rows]
+            sp = spatial_prob[edge_rows]
+            de = delta[edge_rows]
+
+            candidate_cut = cp < threshold
+            spatial_cut = sp < threshold
+
+            mean_candidate_keep = cp.mean()
+            min_candidate_keep = cp.min()
+            mean_abs_delta = de.abs().mean()
+            max_abs_delta = de.abs().max()
+            mean_cut_strength = (1.0 - cp).mean()
+        else:
+            candidate_cut = torch.zeros(
+                0,
+                device=device,
+                dtype=torch.bool,
+            )
+            spatial_cut = torch.zeros_like(candidate_cut)
+            mean_candidate_keep = torch.tensor(
+                1.0,
+                device=device,
+            )
+            min_candidate_keep = torch.tensor(
+                1.0,
+                device=device,
+            )
+            mean_abs_delta = torch.tensor(
+                0.0,
+                device=device,
+            )
+            max_abs_delta = torch.tensor(
+                0.0,
+                device=device,
+            )
+            mean_cut_strength = torch.tensor(
+                0.0,
+                device=device,
+            )
+
+        candidate_parts = torch.unique(
+            candidate_partition.node_component_global[node_rows]
+        ).numel() if node_rows.numel() else 0
+
+        split_probability = (
+            torch.sigmoid(
+                base_reasoning.split_logits[component].float()
+            )
+            if component < int(base_reasoning.split_logits.numel())
+            else torch.tensor(0.0, device=device)
+        )
+
+        proposal = torch.stack(
+            [
+                torch.tensor(
+                    min(
+                        math.log1p(int(node_rows.numel())) / 5.0,
+                        1.0,
+                    ),
+                    device=device,
+                ),
+                torch.tensor(
+                    min(
+                        math.log1p(int(edge_rows.numel())) / 5.0,
+                        1.0,
+                    ),
+                    device=device,
+                ),
+                (
+                    candidate_cut.float().mean()
+                    if candidate_cut.numel()
+                    else torch.tensor(0.0, device=device)
+                ),
+                (
+                    spatial_cut.float().mean()
+                    if spatial_cut.numel()
+                    else torch.tensor(0.0, device=device)
+                ),
+                mean_candidate_keep,
+                min_candidate_keep,
+                torch.tanh(mean_abs_delta / 4.0),
+                torch.tanh(max_abs_delta / 4.0),
+                mean_cut_strength,
+                split_probability,
+                torch.tensor(
+                    min(
+                        max(int(candidate_parts) - 1, 0) / 3.0,
+                        1.0,
+                    ),
+                    device=device,
+                ),
+            ],
+            dim=0,
+        ).float()
+
+        scalar[
+            component,
+            COMPONENT_PHYSICAL_DIM:
+        ] = proposal
+
+    return pooled, scalar
+
+
+def reason_case_v4(
+    model,
+    selector: Inv46ComponentSelector,
     *,
     runtime,
     case,
     encoded,
-    write_threshold: float,
+    use_threshold: float,
     temporal=None,
 ):
-    base_reasoning, candidate_logits, scalar_features = frozen_candidate_bundle_v3(
+    base_reasoning, candidate_logits = frozen_candidate_bundle_v4(
         model,
         runtime=runtime,
         case=case,
         encoded=encoded,
         temporal=temporal,
     )
-    selector_logits = selector(
-        edge_embedding=case.rag.edge_embeddings.detach(),
-        scalar_features=scalar_features.detach(),
+    candidate_partition = partition_from_logits_v4(
+        model,
+        case,
+        candidate_logits,
     )
-    write_probability = torch.sigmoid(selector_logits)
-    write_mask = case.editable & (write_probability >= float(write_threshold))
+    pooled, scalar = component_feature_tables_v4(
+        model,
+        runtime=runtime,
+        case=case,
+        base_reasoning=base_reasoning,
+        candidate_logits=candidate_logits,
+        candidate_partition=candidate_partition,
+    )
 
-    # Central V3 change: exact discrete source selection, no interpolation.
+    selector_logits = selector(
+        pooled_edge_embedding=pooled.detach(),
+        scalar_features=scalar.detach(),
+    )
+    use_probability = torch.sigmoid(selector_logits)
+    use_component = (
+        use_probability >= float(use_threshold)
+    )
+
+    src, dst = case.rag.edge_index
+    current = case.node_current_component
+    editable_component = current[src]
+
+    if bool(
+        (
+            case.editable
+            & (current[src] != current[dst])
+        ).any()
+    ):
+        raise RuntimeError(
+            "Editable edge crosses current spatial components."
+        )
+
+    use_edge = (
+        case.editable
+        & use_component[editable_component]
+    )
+
+    # Central V4 change: a selected component receives ALL of its candidate
+    # editable-edge logits together. There are no independent edge decisions.
     final_logits = torch.where(
-        write_mask,
+        use_edge,
         candidate_logits,
         case.rag.spatial_edge_logits,
     )
+
     reasoning = dataclasses.replace(
         base_reasoning,
-        edge_temporal_gate=write_probability.to(base_reasoning.edge_temporal_gate.dtype),
         final_edge_logits=final_logits,
     )
-    return INV42.ReasonedCase(
-        reasoning=reasoning,
-        final_logits=final_logits,
-        candidate_logits=candidate_logits,
-        gate_logits=selector_logits,
-        base_gate=base_reasoning.edge_temporal_gate.detach(),
-    )
+    return {
+        "reasoning": reasoning,
+        "candidate_logits": candidate_logits,
+        "candidate_partition": candidate_partition,
+        "final_logits": final_logits,
+        "selector_logits": selector_logits,
+        "use_probability": use_probability,
+        "pooled_edge_embedding": pooled,
+        "scalar_features": scalar,
+    }
 
 
 @torch.no_grad()
-def extract_selector_dataset_v3(
+def extract_component_selector_dataset_v4(
     model,
     *,
     frames: Sequence[int],
@@ -1793,13 +2132,18 @@ def extract_selector_dataset_v3(
     temporal_radius: int,
     spacing: Sequence[float],
     device: torch.device,
-) -> SelectorDatasetV3:
+) -> ComponentSelectorDatasetV4:
     model.eval()
-    edge_chunks=[]; scalar_chunks=[]; target_chunks=[]; meta=[]
+
+    pooled_chunks: list[Tensor] = []
+    scalar_chunks: list[Tensor] = []
+    target_chunks: list[Tensor] = []
+    metadata: list[dict[str, Any]] = []
+
     for t in frames:
-        runtime=loader.load(int(t))
-        case=INV42.build_real_case(runtime)
-        temporal_input=make_temporal_input_46(
+        runtime = loader.load(int(t))
+        case = INV42.build_real_case(runtime)
+        temporal_input = make_temporal_input_46(
             graph,
             runtime=runtime,
             paths=paths,
@@ -1807,7 +2151,7 @@ def extract_selector_dataset_v3(
             spacing=spacing,
             device=device,
         )
-        encoded=INV42.encode_case(
+        encoded = INV42.encode_case(
             model,
             runtime=runtime,
             case=case,
@@ -1815,341 +2159,1844 @@ def extract_selector_dataset_v3(
             spacing=spacing,
             device=device,
         )
-        _, candidate_logits, scalar_features=frozen_candidate_bundle_v3(
+        base_reasoning, candidate_logits = frozen_candidate_bundle_v4(
             model,
             runtime=runtime,
             case=case,
             encoded=encoded,
         )
-        help_mask,suppress_mask=help_suppress_masks_v3(model,case,candidate_logits)
-        chosen=torch.nonzero(help_mask|suppress_mask,as_tuple=False).flatten()
-        if chosen.numel()==0:
+        candidate_partition = partition_from_logits_v4(
+            model,
+            case,
+            candidate_logits,
+        )
+        spatial_exact, candidate_exact = component_exact_flags_v4(
+            runtime,
+            case,
+            candidate_partition,
+        )
+        pooled, scalar = component_feature_tables_v4(
+            model,
+            runtime=runtime,
+            case=case,
+            base_reasoning=base_reasoning,
+            candidate_logits=candidate_logits,
+            candidate_partition=candidate_partition,
+        )
+
+        help_mask = (
+            case.split_valid
+            & case.metric_component_valid
+            & candidate_exact
+            & ~spatial_exact
+        )
+        suppress_mask = (
+            case.split_valid
+            & case.metric_component_valid
+            & spatial_exact
+            & ~candidate_exact
+        )
+        chosen = torch.nonzero(
+            help_mask | suppress_mask,
+            as_tuple=False,
+        ).flatten()
+        if chosen.numel() == 0:
             continue
-        labels=help_mask[chosen].float()
-        edge_chunks.append(case.rag.edge_embeddings[chosen].detach().float().cpu())
-        scalar_chunks.append(scalar_features[chosen].detach().float().cpu())
-        target_chunks.append(labels.detach().float().cpu())
-        phys=physical_gate_edge_features_46(runtime,case)[chosen].detach().float().cpu()
-        spatial=case.rag.spatial_edge_logits[chosen].detach().float().cpu()
-        candidate=candidate_logits[chosen].detach().float().cpu()
-        for k,edge_row in enumerate(chosen.tolist()):
-            meta.append({
-                'frame':int(t),
-                'edge_row':int(edge_row),
-                'class':'HELP' if labels[k].item()>0.5 else 'SUPPRESS',
-                'target_write':int(labels[k].item()>0.5),
-                'spatial_logit':float(spatial[k].item()),
-                'candidate_logit':float(candidate[k].item()),
-                'local_volume_feature':float(phys[k,0].item()),
-                'parent_growth_feature':float(phys[k,1].item()),
-                'hard_cut_feature':float(phys[k,2].item()),
-                'prediction_error_feature':float(phys[k,3].item()),
-                'nearby_broken_feature':float(phys[k,4].item()),
-                'cutter_score_feature':float(phys[k,5].item()),
-                'rejected_predecessor_feature':float(phys[k,6].item()),
-            })
-    if not target_chunks:
-        raise RuntimeError('No HELP/SUPPRESS selector examples found in training frames')
-    ds=SelectorDatasetV3(
-        edge_embedding=torch.cat(edge_chunks,dim=0),
-        scalar_features=torch.cat(scalar_chunks,dim=0),
-        target_write=torch.cat(target_chunks,dim=0),
-        metadata=pd.DataFrame(meta),
-    )
-    if ds.help_count<=0 or ds.suppress_count<=0:
-        raise RuntimeError(
-            f'Selector needs both classes: HELP={ds.help_count} SUPPRESS={ds.suppress_count}'
+
+        labels = help_mask[chosen].float()
+        pooled_chunks.append(
+            pooled[chosen].detach().float().cpu()
         )
-    return ds
-
-
-def selector_auc_v3(probability: np.ndarray, target: np.ndarray) -> float:
-    probability=np.asarray(probability,dtype=np.float64)
-    target=np.asarray(target,dtype=np.int64)
-    pos=probability[target==1]; neg=probability[target==0]
-    if pos.size==0 or neg.size==0:
-        return 0.5
-    greater=float((pos[:,None]>neg[None,:]).sum())
-    equal=float((pos[:,None]==neg[None,:]).sum())
-    return (greater+0.5*equal)/float(pos.size*neg.size)
-
-
-def selector_threshold_metrics_v3(probability,target,threshold:float)->dict[str,Any]:
-    p=np.asarray(probability,dtype=np.float64)
-    y=np.asarray(target,dtype=np.int64)
-    write=p>=float(threshold)
-    help_mask=y==1; suppress_mask=y==0
-    help_recall=float(write[help_mask].mean()) if help_mask.any() else 0.0
-    suppress_write=float(write[suppress_mask].mean()) if suppress_mask.any() else 0.0
-    return {
-        'threshold':float(threshold),
-        'help_recall':help_recall,
-        'suppress_write_rate':suppress_write,
-        'balanced_accuracy':0.5*(help_recall+1.0-suppress_write),
-        'auc':selector_auc_v3(p,y),
-        'help_count':int(help_mask.sum()),
-        'suppress_count':int(suppress_mask.sum()),
-    }
-
-
-def choose_selector_threshold_v3(probability,target,*,max_suppress_write_rate:float,override):
-    p=np.asarray(probability,dtype=np.float64)
-    y=np.asarray(target,dtype=np.int64)
-    if override is not None:
-        th=float(override)
-        return th,selector_threshold_metrics_v3(p,y,th)
-    candidates=[1.0+1e-7]+sorted(set(float(v) for v in p.tolist()),reverse=True)+[0.0]
-    feasible=[]
-    for th in candidates:
-        m=selector_threshold_metrics_v3(p,y,th)
-        if m['suppress_write_rate']<=float(max_suppress_write_rate)+1e-12:
-            feasible.append((m['help_recall'],-m['suppress_write_rate'],float(th),m))
-    if not feasible:
-        th=1.0+1e-7
-        return th,selector_threshold_metrics_v3(p,y,th)
-    feasible.sort(key=lambda row:(row[0],row[1],row[2]),reverse=True)
-    return float(feasible[0][2]),dict(feasible[0][3])
-
-
-@torch.no_grad()
-def selector_probabilities_v3(selector,dataset,device):
-    selector.eval()
-    logits=selector(
-        edge_embedding=dataset.edge_embedding.to(device),
-        scalar_features=dataset.scalar_features.to(device),
-    )
-    return torch.sigmoid(logits).detach().float().cpu().numpy().astype(np.float64,copy=False)
-
-
-@torch.no_grad()
-def evaluate_v3(
-    model,selector,*,frames,loader,graph,paths,temporal_radius,spacing,device,write_threshold
-):
-    model.eval(); selector.eval()
-    real_acc=INV42.metric_accumulator(); candidate_acc=INV42.metric_accumulator()
-    oracle_acc=INV42.metric_accumulator(); contentless_acc=INV42.metric_accumulator(); shuffled_acc=INV42.metric_accumulator()
-    hp=sp=0.0; hc=sc=hw=sw=0
-    for t in frames:
-        runtime=loader.load(int(t)); case=INV42.build_real_case(runtime)
-        temporal_input=make_temporal_input_46(
-            graph,runtime=runtime,paths=paths,temporal_radius=int(temporal_radius),spacing=spacing,device=device
+        scalar_chunks.append(
+            scalar[chosen].detach().float().cpu()
         )
-        encoded=INV42.encode_case(
-            model,runtime=runtime,case=case,temporal_input=temporal_input,spacing=spacing,device=device
+        target_chunks.append(
+            labels.detach().float().cpu()
         )
-        full=reason_case_v3(
-            model,selector,runtime=runtime,case=case,encoded=encoded,write_threshold=float(write_threshold)
-        )
-        INV42.update_metric_accumulator(real_acc,model=model,runtime=runtime,case=case,logits=full.final_logits)
-        INV42.update_metric_accumulator(candidate_acc,model=model,runtime=runtime,case=case,logits=full.candidate_logits)
-        help_mask,suppress_mask=help_suppress_masks_v3(model,case,full.candidate_logits)
-        oracle_logits=torch.where(help_mask,full.candidate_logits,case.rag.spatial_edge_logits)
-        INV42.update_metric_accumulator(oracle_acc,model=model,runtime=runtime,case=case,logits=oracle_logits)
-        prob=full.reasoning.edge_temporal_gate.float(); write=case.editable&(prob>=float(write_threshold))
-        if bool(help_mask.any()):
-            hp+=float(prob[help_mask].sum().detach().cpu()); hc+=int(help_mask.sum().item()); hw+=int(write[help_mask].sum().item())
-        if bool(suppress_mask.any()):
-            sp+=float(prob[suppress_mask].sum().detach().cpu()); sc+=int(suppress_mask.sum().item()); sw+=int(write[suppress_mask].sum().item())
-        for corruption,acc,seed in (
-            ('contentless',contentless_acc,46_300_001+int(t)),('shuffled',shuffled_acc,46_400_001+int(t))
-        ):
-            state=INV42.corrupt_temporal_state(encoded.temporal,corruption=corruption,seed=seed)
-            corrupted=reason_case_v3(
-                model,selector,runtime=runtime,case=case,encoded=encoded,temporal=state,write_threshold=float(write_threshold)
+
+        for k, component in enumerate(chosen.tolist()):
+            component = int(component)
+            internal_edges = component_internal_edge_rows_v4(
+                case,
+                component,
             )
-            INV42.update_metric_accumulator(acc,model=model,runtime=runtime,case=case,logits=corrupted.final_logits)
-    real=INV42.finalize_metrics(real_acc); candidate=INV42.finalize_metrics(candidate_acc); oracle=INV42.finalize_metrics(oracle_acc)
-    contentless=INV42.finalize_metrics(contentless_acc); shuffled=INV42.finalize_metrics(shuffled_acc)
-    control_exact=0.5*(contentless['exact_bad_component_recovery']+shuffled['exact_bad_component_recovery'])
-    control_cut=0.5*(contentless['cut_accuracy']+shuffled['cut_accuracy'])
-    score=(3.0*real['cut_accuracy']+2.0*real['exact_bad_component_recovery']+1.5*real['keep_accuracy']
-           -4.0*real['clean_false_split_rate']-0.75*control_exact-0.25*control_cut)
-    safe=bool(real['cut_accuracy']>0 and real['keep_accuracy']>=0.98 and real['clean_false_split_rate']<=0.005 and real['split_only_violations']==0)
-    strict=bool(real['cut_accuracy']>=0.80 and real['keep_accuracy']>=0.98 and real['exact_bad_component_recovery']>=0.60 and real['clean_false_split_rate']<=0.02 and real['split_only_violations']==0)
+            metadata.append(
+                {
+                    "frame": int(t),
+                    "component": component,
+                    "class": (
+                        "HELP"
+                        if labels[k].item() > 0.5
+                        else "SUPPRESS"
+                    ),
+                    "target_use_candidate": int(
+                        labels[k].item() > 0.5
+                    ),
+                    "spatial_exact": bool(
+                        spatial_exact[component].item()
+                    ),
+                    "candidate_exact": bool(
+                        candidate_exact[component].item()
+                    ),
+                    "bad_component": bool(
+                        case.split_target[component].item() > 0.5
+                    ),
+                    "node_count": int(
+                        (
+                            case.node_current_component
+                            == component
+                        ).sum().item()
+                    ),
+                    "editable_edge_count": int(
+                        internal_edges.numel()
+                    ),
+                    "local_volume_feature": float(
+                        scalar[
+                            component,
+                            0,
+                        ].item()
+                    ),
+                    "parent_growth_feature": float(
+                        scalar[
+                            component,
+                            1,
+                        ].item()
+                    ),
+                    "hard_cut_feature": float(
+                        scalar[
+                            component,
+                            2,
+                        ].item()
+                    ),
+                    "prediction_error_feature": float(
+                        scalar[
+                            component,
+                            3,
+                        ].item()
+                    ),
+                    "nearby_broken_feature": float(
+                        scalar[
+                            component,
+                            4,
+                        ].item()
+                    ),
+                    "cutter_score_feature": float(
+                        scalar[
+                            component,
+                            5,
+                        ].item()
+                    ),
+                    "rejected_predecessor_feature": float(
+                        scalar[
+                            component,
+                            6,
+                        ].item()
+                    ),
+                    "candidate_cut_fraction": float(
+                        scalar[
+                            component,
+                            COMPONENT_PHYSICAL_DIM + 2,
+                        ].item()
+                    ),
+                    "candidate_split_head_probability": float(
+                        scalar[
+                            component,
+                            COMPONENT_PHYSICAL_DIM + 9,
+                        ].item()
+                    ),
+                    "candidate_subcomponent_signal": float(
+                        scalar[
+                            component,
+                            COMPONENT_PHYSICAL_DIM + 10,
+                        ].item()
+                    ),
+                }
+            )
+
+    if not target_chunks:
+        raise RuntimeError(
+            "No component HELP/SUPPRESS examples found in training frames."
+        )
+
+    dataset = ComponentSelectorDatasetV4(
+        pooled_edge_embedding=torch.cat(
+            pooled_chunks,
+            dim=0,
+        ),
+        scalar_features=torch.cat(
+            scalar_chunks,
+            dim=0,
+        ),
+        target_use_candidate=torch.cat(
+            target_chunks,
+            dim=0,
+        ),
+        metadata=pd.DataFrame(metadata),
+    )
+
+    if dataset.help_count <= 0 or dataset.suppress_count <= 0:
+        raise RuntimeError(
+            "Component selector needs both classes: "
+            f"HELP={dataset.help_count} "
+            f"SUPPRESS={dataset.suppress_count}"
+        )
+    return dataset
+
+
+def selector_auc_v4(
+    probability: np.ndarray,
+    target: np.ndarray,
+) -> float:
+    probability = np.asarray(
+        probability,
+        dtype=np.float64,
+    )
+    target = np.asarray(
+        target,
+        dtype=np.int64,
+    )
+    pos = probability[target == 1]
+    neg = probability[target == 0]
+    if pos.size == 0 or neg.size == 0:
+        return 0.5
+
+    greater = float(
+        (pos[:, None] > neg[None, :]).sum()
+    )
+    equal = float(
+        (pos[:, None] == neg[None, :]).sum()
+    )
+    return (
+        greater + 0.5 * equal
+    ) / float(pos.size * neg.size)
+
+
+def selector_threshold_metrics_v4(
+    probability,
+    target,
+    threshold: float,
+) -> dict[str, Any]:
+    p = np.asarray(
+        probability,
+        dtype=np.float64,
+    )
+    y = np.asarray(
+        target,
+        dtype=np.int64,
+    )
+    use = p >= float(threshold)
+    help_mask = y == 1
+    suppress_mask = y == 0
+
+    help_recall = (
+        float(use[help_mask].mean())
+        if help_mask.any()
+        else 0.0
+    )
+    suppress_use = (
+        float(use[suppress_mask].mean())
+        if suppress_mask.any()
+        else 0.0
+    )
+
     return {
-        'real':real,'candidate':candidate,'oracle_selector':oracle,
-        'selector':{
-            'write_threshold':float(write_threshold),
-            'helpful_edges':int(hc),'harmful_edges':int(sc),
-            'helpful_probability_mean':float(hp/max(hc,1)),
-            'harmful_probability_mean':float(sp/max(sc,1)),
-            'probability_separation':float(hp/max(hc,1)-sp/max(sc,1)),
-            'help_write_rate':float(hw/max(hc,1)),'suppress_write_rate':float(sw/max(sc,1)),
+        "threshold": float(threshold),
+        "help_recall": float(help_recall),
+        "suppress_use_rate": float(suppress_use),
+        "balanced_accuracy": float(
+            0.5 * (
+                help_recall
+                + 1.0
+                - suppress_use
+            )
+        ),
+        "auc": float(
+            selector_auc_v4(p, y)
+        ),
+        "help_count": int(help_mask.sum()),
+        "suppress_count": int(
+            suppress_mask.sum()
+        ),
+    }
+
+
+def choose_selector_threshold_v4(
+    probability,
+    target,
+    *,
+    max_suppress_use_rate: float,
+    override,
+):
+    p = np.asarray(
+        probability,
+        dtype=np.float64,
+    )
+    y = np.asarray(
+        target,
+        dtype=np.int64,
+    )
+
+    if override is not None:
+        threshold = float(override)
+        return (
+            threshold,
+            selector_threshold_metrics_v4(
+                p,
+                y,
+                threshold,
+            ),
+        )
+
+    candidates = (
+        [1.0 + 1.0e-7]
+        + sorted(
+            set(float(v) for v in p.tolist()),
+            reverse=True,
+        )
+        + [0.0]
+    )
+    feasible = []
+    for threshold in candidates:
+        metrics = selector_threshold_metrics_v4(
+            p,
+            y,
+            threshold,
+        )
+        if (
+            metrics["suppress_use_rate"]
+            <= float(max_suppress_use_rate)
+            + 1.0e-12
+        ):
+            feasible.append(
+                (
+                    metrics["help_recall"],
+                    -metrics["suppress_use_rate"],
+                    float(threshold),
+                    metrics,
+                )
+            )
+
+    if not feasible:
+        threshold = 1.0 + 1.0e-7
+        return (
+            threshold,
+            selector_threshold_metrics_v4(
+                p,
+                y,
+                threshold,
+            ),
+        )
+
+    feasible.sort(
+        key=lambda row: (
+            row[0],
+            row[1],
+            row[2],
+        ),
+        reverse=True,
+    )
+    return (
+        float(feasible[0][2]),
+        dict(feasible[0][3]),
+    )
+
+
+@torch.no_grad()
+def component_selector_probabilities_v4(
+    selector,
+    dataset,
+    device,
+):
+    selector.eval()
+    logits = selector(
+        pooled_edge_embedding=(
+            dataset.pooled_edge_embedding.to(
+                device
+            )
+        ),
+        scalar_features=(
+            dataset.scalar_features.to(
+                device
+            )
+        ),
+    )
+    return (
+        torch.sigmoid(logits)
+        .detach()
+        .float()
+        .cpu()
+        .numpy()
+        .astype(
+            np.float64,
+            copy=False,
+        )
+    )
+
+
+def _metrics_score_v4(
+    real,
+    contentless,
+    shuffled,
+) -> float:
+    control_exact = 0.5 * (
+        contentless[
+            "exact_bad_component_recovery"
+        ]
+        + shuffled[
+            "exact_bad_component_recovery"
+        ]
+    )
+    control_cut = 0.5 * (
+        contentless["cut_accuracy"]
+        + shuffled["cut_accuracy"]
+    )
+    return float(
+        3.0 * real["cut_accuracy"]
+        + 2.0
+        * real[
+            "exact_bad_component_recovery"
+        ]
+        + 1.5 * real["keep_accuracy"]
+        - 4.0
+        * real[
+            "clean_false_split_rate"
+        ]
+        - 0.75 * control_exact
+        - 0.25 * control_cut
+    )
+
+
+def _component_oracle_final_logits_v4(
+    case,
+    candidate_logits,
+    spatial_exact,
+    candidate_exact,
+) -> tuple[Tensor, Tensor]:
+    use_candidate = (
+        case.split_valid
+        & case.metric_component_valid
+        & candidate_exact
+        & ~spatial_exact
+    )
+
+    src, _dst = case.rag.edge_index
+    edge_component = (
+        case.node_current_component[src]
+    )
+    use_edge = (
+        case.editable
+        & use_candidate[edge_component]
+    )
+    final = torch.where(
+        use_edge,
+        candidate_logits,
+        case.rag.spatial_edge_logits,
+    )
+    return final, use_candidate
+
+
+@torch.no_grad()
+def evaluate_v4(
+    model,
+    selector,
+    *,
+    frames,
+    loader,
+    graph,
+    paths,
+    temporal_radius,
+    spacing,
+    device,
+    use_threshold,
+):
+    model.eval()
+    selector.eval()
+
+    real_acc = INV42.metric_accumulator()
+    candidate_acc = INV42.metric_accumulator()
+    oracle_acc = INV42.metric_accumulator()
+    contentless_acc = INV42.metric_accumulator()
+    shuffled_acc = INV42.metric_accumulator()
+
+    help_prob_sum = 0.0
+    suppress_prob_sum = 0.0
+    help_count = suppress_count = 0
+    help_use = suppress_use = 0
+
+    for t in frames:
+        runtime = loader.load(int(t))
+        case = INV42.build_real_case(runtime)
+        temporal_input = make_temporal_input_46(
+            graph,
+            runtime=runtime,
+            paths=paths,
+            temporal_radius=int(
+                temporal_radius
+            ),
+            spacing=spacing,
+            device=device,
+        )
+        encoded = INV42.encode_case(
+            model,
+            runtime=runtime,
+            case=case,
+            temporal_input=temporal_input,
+            spacing=spacing,
+            device=device,
+        )
+
+        full = reason_case_v4(
+            model,
+            selector,
+            runtime=runtime,
+            case=case,
+            encoded=encoded,
+            use_threshold=float(
+                use_threshold
+            ),
+        )
+        INV42.update_metric_accumulator(
+            real_acc,
+            model=model,
+            runtime=runtime,
+            case=case,
+            logits=full[
+                "final_logits"
+            ],
+        )
+        INV42.update_metric_accumulator(
+            candidate_acc,
+            model=model,
+            runtime=runtime,
+            case=case,
+            logits=full[
+                "candidate_logits"
+            ],
+        )
+
+        spatial_exact, candidate_exact = (
+            component_exact_flags_v4(
+                runtime,
+                case,
+                full[
+                    "candidate_partition"
+                ],
+            )
+        )
+        oracle_logits, _ = (
+            _component_oracle_final_logits_v4(
+                case,
+                full[
+                    "candidate_logits"
+                ],
+                spatial_exact,
+                candidate_exact,
+            )
+        )
+        INV42.update_metric_accumulator(
+            oracle_acc,
+            model=model,
+            runtime=runtime,
+            case=case,
+            logits=oracle_logits,
+        )
+
+        help_mask = (
+            case.split_valid
+            & case.metric_component_valid
+            & candidate_exact
+            & ~spatial_exact
+        )
+        suppress_mask = (
+            case.split_valid
+            & case.metric_component_valid
+            & spatial_exact
+            & ~candidate_exact
+        )
+
+        probability = torch.sigmoid(
+            full["selector_logits"]
+        )
+        use = (
+            probability
+            >= float(use_threshold)
+        )
+
+        if bool(help_mask.any()):
+            help_prob_sum += float(
+                probability[
+                    help_mask
+                ].sum().detach().cpu()
+            )
+            help_count += int(
+                help_mask.sum().item()
+            )
+            help_use += int(
+                use[
+                    help_mask
+                ].sum().item()
+            )
+
+        if bool(suppress_mask.any()):
+            suppress_prob_sum += float(
+                probability[
+                    suppress_mask
+                ].sum().detach().cpu()
+            )
+            suppress_count += int(
+                suppress_mask.sum().item()
+            )
+            suppress_use += int(
+                use[
+                    suppress_mask
+                ].sum().item()
+            )
+
+        for corruption, acc, seed in (
+            (
+                "contentless",
+                contentless_acc,
+                46_500_001 + int(t),
+            ),
+            (
+                "shuffled",
+                shuffled_acc,
+                46_600_001 + int(t),
+            ),
+        ):
+            corrupted_state = (
+                INV42.corrupt_temporal_state(
+                    encoded.temporal,
+                    corruption=corruption,
+                    seed=seed,
+                )
+            )
+            corrupted = reason_case_v4(
+                model,
+                selector,
+                runtime=runtime,
+                case=case,
+                encoded=encoded,
+                temporal=corrupted_state,
+                use_threshold=float(
+                    use_threshold
+                ),
+            )
+            INV42.update_metric_accumulator(
+                acc,
+                model=model,
+                runtime=runtime,
+                case=case,
+                logits=corrupted[
+                    "final_logits"
+                ],
+            )
+
+    real = INV42.finalize_metrics(
+        real_acc
+    )
+    candidate = INV42.finalize_metrics(
+        candidate_acc
+    )
+    oracle = INV42.finalize_metrics(
+        oracle_acc
+    )
+    contentless = INV42.finalize_metrics(
+        contentless_acc
+    )
+    shuffled = INV42.finalize_metrics(
+        shuffled_acc
+    )
+
+    score = _metrics_score_v4(
+        real,
+        contentless,
+        shuffled,
+    )
+    safe = bool(
+        real["cut_accuracy"] > 0.0
+        and real["keep_accuracy"] >= 0.98
+        and real[
+            "clean_false_split_rate"
+        ]
+        <= 0.005
+        and real[
+            "split_only_violations"
+        ]
+        == 0
+    )
+    strict = bool(
+        real["cut_accuracy"] >= 0.80
+        and real["keep_accuracy"] >= 0.98
+        and real[
+            "exact_bad_component_recovery"
+        ]
+        >= 0.60
+        and real[
+            "clean_false_split_rate"
+        ]
+        <= 0.02
+        and real[
+            "split_only_violations"
+        ]
+        == 0
+    )
+
+    help_mean = (
+        help_prob_sum
+        / max(help_count, 1)
+    )
+    suppress_mean = (
+        suppress_prob_sum
+        / max(suppress_count, 1)
+    )
+
+    return {
+        "real": real,
+        "candidate": candidate,
+        "component_oracle": oracle,
+        "component_selector": {
+            "use_threshold": float(
+                use_threshold
+            ),
+            "helpful_components": int(
+                help_count
+            ),
+            "harmful_components": int(
+                suppress_count
+            ),
+            "helpful_probability_mean": float(
+                help_mean
+            ),
+            "harmful_probability_mean": float(
+                suppress_mean
+            ),
+            "probability_separation": float(
+                help_mean
+                - suppress_mean
+            ),
+            "help_use_rate": float(
+                help_use
+                / max(help_count, 1)
+            ),
+            "suppress_use_rate": float(
+                suppress_use
+                / max(suppress_count, 1)
+            ),
         },
-        'contentless':contentless,'shuffled':shuffled,
-        'checkpoint_score':float(score),'safe_pass':safe,'strict_pass':strict,
+        "contentless": contentless,
+        "shuffled": shuffled,
+        "checkpoint_score": float(
+            score
+        ),
+        "safe_pass": bool(safe),
+        "strict_pass": bool(strict),
     }
 
 
-def print_metrics_v3(title,step,metrics,train_selector=None):
-    r=metrics['real']; c=metrics['candidate']; o=metrics['oracle_selector']; s=metrics['selector']
-    print('\n'+'='*112,flush=True); print(f'{title} @ STEP {step}',flush=True); print('='*112,flush=True)
-    print(f"final CUT/KEEP            : {r['cut_accuracy']:.4f} / {r['keep_accuracy']:.4f}",flush=True)
-    print(f"final exact/false split   : {r['exact_bad_component_recovery']:.4f} / {r['clean_false_split_rate']:.4f}",flush=True)
-    print(f"candidate CUT/KEEP        : {c['cut_accuracy']:.4f} / {c['keep_accuracy']:.4f}",flush=True)
-    print(f"candidate exact           : {c['exact_bad_component_recovery']:.4f}",flush=True)
-    print(f"oracle CUT/KEEP           : {o['cut_accuracy']:.4f} / {o['keep_accuracy']:.4f}",flush=True)
-    print(f"oracle exact              : {o['exact_bad_component_recovery']:.4f}",flush=True)
-    print(f"selector threshold        : {s['write_threshold']:.6f}",flush=True)
-    print(f"HELP prob/write           : {s['helpful_probability_mean']:.4f} / {s['help_write_rate']:.4f} (n={s['helpful_edges']})",flush=True)
-    print(f"SUPPRESS prob/write       : {s['harmful_probability_mean']:.4f} / {s['suppress_write_rate']:.4f} (n={s['harmful_edges']})",flush=True)
-    print(f"selector separation       : {s['probability_separation']:.4f}",flush=True)
+def print_metrics_v4(
+    title,
+    step,
+    metrics,
+    *,
+    train_selector=None,
+):
+    real = metrics["real"]
+    candidate = metrics["candidate"]
+    oracle = metrics[
+        "component_oracle"
+    ]
+    selector = metrics[
+        "component_selector"
+    ]
+
+    print(
+        "\n" + "=" * 112,
+        flush=True,
+    )
+    print(
+        f"{title} @ STEP {step}",
+        flush=True,
+    )
+    print("=" * 112, flush=True)
+
+    print(
+        f"final CUT/KEEP              : "
+        f"{real['cut_accuracy']:.4f} / "
+        f"{real['keep_accuracy']:.4f}",
+        flush=True,
+    )
+    print(
+        f"final exact/false split     : "
+        f"{real['exact_bad_component_recovery']:.4f} / "
+        f"{real['clean_false_split_rate']:.4f}",
+        flush=True,
+    )
+    print(
+        f"candidate CUT/KEEP          : "
+        f"{candidate['cut_accuracy']:.4f} / "
+        f"{candidate['keep_accuracy']:.4f}",
+        flush=True,
+    )
+    print(
+        f"candidate exact             : "
+        f"{candidate['exact_bad_component_recovery']:.4f}",
+        flush=True,
+    )
+    print(
+        f"COMPONENT ORACLE CUT/KEEP   : "
+        f"{oracle['cut_accuracy']:.4f} / "
+        f"{oracle['keep_accuracy']:.4f}",
+        flush=True,
+    )
+    print(
+        f"COMPONENT ORACLE exact      : "
+        f"{oracle['exact_bad_component_recovery']:.4f}",
+        flush=True,
+    )
+    print(
+        f"component threshold         : "
+        f"{selector['use_threshold']:.6f}",
+        flush=True,
+    )
+    print(
+        f"HELP comp prob/use          : "
+        f"{selector['helpful_probability_mean']:.4f} / "
+        f"{selector['help_use_rate']:.4f} "
+        f"(n={selector['helpful_components']})",
+        flush=True,
+    )
+    print(
+        f"SUPPRESS comp prob/use      : "
+        f"{selector['harmful_probability_mean']:.4f} / "
+        f"{selector['suppress_use_rate']:.4f} "
+        f"(n={selector['harmful_components']})",
+        flush=True,
+    )
+    print(
+        f"component probability sep   : "
+        f"{selector['probability_separation']:.4f}",
+        flush=True,
+    )
+
     if train_selector is not None:
-        print(f"TRAIN HELP recall         : {train_selector['help_recall']:.4f}",flush=True)
-        print(f"TRAIN suppress write rate : {train_selector['suppress_write_rate']:.4f}",flush=True)
-        print(f"TRAIN selector AUC        : {train_selector['auc']:.4f}",flush=True)
-    print(f"contentless CUT/exact     : {metrics['contentless']['cut_accuracy']:.4f} / {metrics['contentless']['exact_bad_component_recovery']:.4f}",flush=True)
-    print(f"shuffled CUT/exact        : {metrics['shuffled']['cut_accuracy']:.4f} / {metrics['shuffled']['exact_bad_component_recovery']:.4f}",flush=True)
-    print(f"SAFE / STRICT             : {metrics['safe_pass']} / {metrics['strict_pass']}",flush=True)
-    print(f"checkpoint score          : {metrics['checkpoint_score']:.5f}",flush=True); print('='*112,flush=True)
+        print(
+            f"TRAIN HELP recall           : "
+            f"{train_selector['help_recall']:.4f}",
+            flush=True,
+        )
+        print(
+            f"TRAIN SUPPRESS use rate     : "
+            f"{train_selector['suppress_use_rate']:.4f}",
+            flush=True,
+        )
+        print(
+            f"TRAIN component AUC         : "
+            f"{train_selector['auc']:.4f}",
+            flush=True,
+        )
+
+    print(
+        f"contentless CUT/exact       : "
+        f"{metrics['contentless']['cut_accuracy']:.4f} / "
+        f"{metrics['contentless']['exact_bad_component_recovery']:.4f}",
+        flush=True,
+    )
+    print(
+        f"shuffled CUT/exact          : "
+        f"{metrics['shuffled']['cut_accuracy']:.4f} / "
+        f"{metrics['shuffled']['exact_bad_component_recovery']:.4f}",
+        flush=True,
+    )
+    print(
+        f"SAFE / STRICT               : "
+        f"{metrics['safe_pass']} / "
+        f"{metrics['strict_pass']}",
+        flush=True,
+    )
+    print(
+        f"checkpoint score            : "
+        f"{metrics['checkpoint_score']:.5f}",
+        flush=True,
+    )
+    print("=" * 112, flush=True)
 
 
-def rank_v3(metrics):
-    return (int(bool(metrics.get('strict_pass',False))),int(bool(metrics.get('safe_pass',False))),float(metrics['checkpoint_score']))
+def rank_v4(metrics):
+    return (
+        int(bool(
+            metrics.get(
+                "strict_pass",
+                False,
+            )
+        )),
+        int(bool(
+            metrics.get(
+                "safe_pass",
+                False,
+            )
+        )),
+        float(
+            metrics[
+                "checkpoint_score"
+            ]
+        ),
+    )
 
 
-def cp_v3(paths):
+def cp_v4(paths):
     return {
-        'best':paths.output/'best_selector_v3.pt',
-        'best_metrics':paths.output/'best_selector_metrics_v3.json',
-        'final':paths.output/'final_selector_v3.pt',
-        'history':paths.output/'selector_history_v3.json',
-        'train_examples':paths.output/'selector_train_examples_v3.csv',
-        'initial':paths.output/'initial_selector_metrics_v3.json',
+        "best": (
+            paths.output
+            / "best_component_selector_v4.pt"
+        ),
+        "best_metrics": (
+            paths.output
+            / "best_component_selector_metrics_v4.json"
+        ),
+        "final": (
+            paths.output
+            / "final_component_selector_v4.pt"
+        ),
+        "history": (
+            paths.output
+            / "component_selector_history_v4.json"
+        ),
+        "train_examples": (
+            paths.output
+            / "component_selector_train_examples_v4.csv"
+        ),
+        "initial_metrics": (
+            paths.output
+            / "component_selector_initial_metrics_v4.json"
+        ),
     }
 
 
-def save_v3(path,*,model,selector,threshold,calibration,metrics,args,step):
-    if STATE is None: raise RuntimeError('Inv46 state missing')
-    payload={
-        'format':'inv46_discrete_write_selector_v3','investigation':SCRIPT_NAME,'objective_version':OBJECTIVE_VERSION,
-        'selector_step':int(step),'write_threshold':float(threshold),'selector_calibration':calibration,
-        'temporal_encoder_state_dict':model.temporal_encoder.state_dict(),
-        'instance_temporal_state_dict':model.instance_temporal.state_dict(),
-        'selector_state_dict':selector.state_dict(),'validation_metrics':metrics,'cutter':STATE.cutter_metrics,'motion':STATE.motion_metrics,'args':vars(args),
-        'notes':{'temporal_candidate_frozen':True,'balanced_help_suppress':True,'threshold_train_only':True,'hard_candidate_or_spatial':True,'continuous_interpolation_removed':True},
+def save_v4(
+    path,
+    *,
+    model,
+    selector,
+    threshold,
+    calibration,
+    metrics,
+    args,
+    step,
+):
+    if STATE is None:
+        raise RuntimeError(
+            "Inv46 state unavailable"
+        )
+
+    payload = {
+        "format": (
+            "inv46_component_selector_v4"
+        ),
+        "investigation": SCRIPT_NAME,
+        "objective_version": (
+            OBJECTIVE_VERSION
+        ),
+        "selector_step": int(step),
+        "initializer": str(
+            resolve(args.resume)
+            if args.resume is not None
+            else STATE.paths.checkpoint
+        ),
+        "temporal_encoder_state_dict": (
+            model.temporal_encoder.state_dict()
+        ),
+        "instance_temporal_state_dict": (
+            model.instance_temporal.state_dict()
+        ),
+        "component_selector_state_dict": (
+            selector.state_dict()
+        ),
+        "component_scalar_dim": int(
+            COMPONENT_SCALAR_DIM
+        ),
+        "physical_component_dim": int(
+            COMPONENT_PHYSICAL_DIM
+        ),
+        "proposal_component_dim": int(
+            COMPONENT_PROPOSAL_DIM
+        ),
+        "use_threshold": float(
+            threshold
+        ),
+        "selector_calibration": (
+            calibration
+        ),
+        "validation_metrics": (
+            metrics
+        ),
+        "cutter": STATE.cutter_metrics,
+        "motion": STATE.motion_metrics,
+        "args": vars(args),
+        "notes": {
+            "spatial_frozen": True,
+            "temporal_candidate_frozen": True,
+            "old_edge_gate_not_used_for_final_selection": True,
+            "component_selector_training": True,
+            "component_threshold_train_only": True,
+            "final_selection_is_whole_component_partition": True,
+            "independent_edge_selection_removed": True,
+        },
     }
-    path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.tmp"
+    )
     try:
-        torch.save(payload,tmp); os.replace(tmp,path)
+        torch.save(
+            payload,
+            tmp,
+        )
+        os.replace(
+            tmp,
+            path,
+        )
     finally:
-        tmp.unlink(missing_ok=True)
+        tmp.unlink(
+            missing_ok=True
+        )
 
 
-def restore_v3(path,*,model,selector):
-    payload=torch_load(path,map_location='cpu')
-    if not isinstance(payload,dict) or payload.get('format')!='inv46_discrete_write_selector_v3':
-        raise RuntimeError(f'Invalid V3 checkpoint {path}')
-    model.temporal_encoder.load_state_dict(payload['temporal_encoder_state_dict'],strict=True)
-    model.instance_temporal.load_state_dict(payload['instance_temporal_state_dict'],strict=True)
-    selector.load_state_dict(payload['selector_state_dict'],strict=True)
+def restore_v4(
+    path,
+    *,
+    model,
+    selector,
+):
+    payload = torch_load(
+        path,
+        map_location="cpu",
+    )
+    if not isinstance(
+        payload,
+        dict,
+    ):
+        raise TypeError(
+            f"Expected checkpoint dict in {path}"
+        )
+    if (
+        payload.get("format")
+        != "inv46_component_selector_v4"
+    ):
+        raise RuntimeError(
+            "Unexpected V4 checkpoint format: "
+            f"{payload.get('format')!r}"
+        )
+
+    model.temporal_encoder.load_state_dict(
+        payload[
+            "temporal_encoder_state_dict"
+        ],
+        strict=True,
+    )
+    model.instance_temporal.load_state_dict(
+        payload[
+            "instance_temporal_state_dict"
+        ],
+        strict=True,
+    )
+    selector.load_state_dict(
+        payload[
+            "component_selector_state_dict"
+        ],
+        strict=True,
+    )
     return payload
 
 
-def train_discrete_selector_v3(*,paths,train_frames,val_frames,loader,graph,spacing,device,args):
-    cp=cp_v3(paths)
-    initializer=resolve(args.resume) if args.resume is not None else paths.checkpoint
-    payload,model=INV42.load_model(initializer,device)
-    initializer_step=int(payload.get('global_step',0)) if isinstance(payload,dict) else 0
-    for p in model.parameters(): p.requires_grad_(False)
+def train_component_selector_v4(
+    *,
+    paths,
+    train_frames,
+    val_frames,
+    loader,
+    graph,
+    spacing,
+    device,
+    args,
+):
+    cp = cp_v4(paths)
+
+    initializer = (
+        resolve(args.resume)
+        if args.resume is not None
+        else paths.checkpoint
+    )
+    checkpoint_payload, model = (
+        INV42.load_model(
+            initializer,
+            device,
+        )
+    )
+    initializer_step = int(
+        checkpoint_payload.get(
+            "global_step",
+            0,
+        )
+        if isinstance(
+            checkpoint_payload,
+            dict,
+        )
+        else 0
+    )
+
+    for parameter in model.parameters():
+        parameter.requires_grad_(
+            False
+        )
     model.eval()
-    selector=Inv46DiscreteWriteSelector(int(model.cfg.partition.rag_hidden_dim)).to(device)
-    ds=extract_selector_dataset_v3(model,frames=train_frames,loader=loader,graph=graph,paths=paths,temporal_radius=int(args.temporal_radius),spacing=spacing,device=device)
-    atomic_csv(cp['train_examples'],ds.metadata)
-    print('\n'+'='*112,flush=True); print('INVESTIGATION 46 V3 — BALANCED DISCRETE WRITE SELECTOR',flush=True); print('='*112,flush=True)
-    print(f'initializer             : {initializer}',flush=True); print(f'initializer global step : {initializer_step}',flush=True)
-    print('temporal candidate      : FROZEN',flush=True); print('final write             : HARD candidate-or-spatial',flush=True)
-    print(f'train examples          : {len(ds.target_write):,} (HELP={ds.help_count}, SUPPRESS={ds.suppress_count})',flush=True)
-    print(f'selector parameters     : {sum(p.numel() for p in selector.parameters()):,}',flush=True)
-    print(f'selector steps/lr       : {int(args.selector_steps)} / {float(args.selector_lr):.3g}',flush=True)
-    print(f'max TRAIN suppress write: {float(args.selector_max_suppress_write_rate):.3f}',flush=True); print('='*112,flush=True)
-    initial=evaluate_v3(model,selector,frames=val_frames,loader=loader,graph=graph,paths=paths,temporal_radius=int(args.temporal_radius),spacing=spacing,device=device,write_threshold=1.0+1e-6)
-    candidate_reference=dict(initial['candidate']); atomic_json(cp['initial'],initial); print_metrics_v3('INV46 V3 FROZEN CANDIDATE BASELINE',0,initial)
-    help_idx=torch.nonzero(ds.target_write>0.5,as_tuple=False).flatten(); suppress_idx=torch.nonzero(ds.target_write<=0.5,as_tuple=False).flatten()
-    opt=torch.optim.AdamW(selector.parameters(),lr=float(args.selector_lr),weight_decay=float(args.selector_weight_decay))
-    gen=torch.Generator(device='cpu'); gen.manual_seed(int(args.seed)+46503)
-    history=[]; best_rank=None; best_step=-1; stale=0
-    for step in range(1,int(args.selector_steps)+1):
-        selector.train(True); opt.zero_grad(set_to_none=True); n=int(args.selector_batch_per_class)
-        hi=help_idx[torch.randint(0,int(help_idx.numel()),(n,),generator=gen)]; si=suppress_idx[torch.randint(0,int(suppress_idx.numel()),(n,),generator=gen)]
-        batch=torch.cat([hi,si]); batch=batch[torch.randperm(int(batch.numel()),generator=gen)]
-        logits=selector(edge_embedding=ds.edge_embedding[batch].to(device),scalar_features=ds.scalar_features[batch].to(device)); target=ds.target_write[batch].to(device)
-        loss=torch.nn.functional.binary_cross_entropy_with_logits(logits,target)
-        if not bool(torch.isfinite(loss.detach())): raise FloatingPointError(f'non-finite selector loss at {step}')
-        loss.backward(); grad=torch.nn.utils.clip_grad_norm_(selector.parameters(),float(args.grad_clip)); grad_norm=float(torch.as_tensor(grad).detach().cpu())
-        if not math.isfinite(grad_norm): raise FloatingPointError(f'non-finite selector grad at {step}')
-        opt.step(); history.append({'step':int(step),'loss':float(loss.detach().cpu()),'grad_norm':grad_norm})
-        if step==1 or step%int(args.print_every)==0:
-            print(f'[selector {step:04d}/{int(args.selector_steps)}] loss={float(loss.detach().cpu()):.5f} grad={grad_norm:.3f}',flush=True)
-        if step%int(args.selector_eval_every)==0 or step==int(args.selector_steps):
-            probs=selector_probabilities_v3(selector,ds,device); target_np=ds.target_write.numpy().astype(np.int64,copy=False)
-            threshold,cal=choose_selector_threshold_v3(probs,target_np,max_suppress_write_rate=float(args.selector_max_suppress_write_rate),override=args.selector_threshold)
-            metrics=evaluate_v3(model,selector,frames=val_frames,loader=loader,graph=graph,paths=paths,temporal_radius=int(args.temporal_radius),spacing=spacing,device=device,write_threshold=threshold)
-            INV42.assert_candidate_invariant(candidate_reference,metrics['candidate']); print_metrics_v3('INV46 V3 VALIDATION',step,metrics,train_selector=cal)
-            rank=rank_v3(metrics)
-            if best_rank is None or rank>best_rank:
-                best_rank=rank; best_step=step; stale=0; save_v3(cp['best'],model=model,selector=selector,threshold=threshold,calibration=cal,metrics=metrics,args=args,step=step); atomic_json(cp['best_metrics'],metrics)
-                print(f'[best selector] step={step} rank={rank} threshold={threshold:.6f}',flush=True)
+
+    selector = Inv46ComponentSelector(
+        int(
+            model.cfg.partition.rag_hidden_dim
+        )
+    ).to(device)
+
+    dataset = (
+        extract_component_selector_dataset_v4(
+            model,
+            frames=train_frames,
+            loader=loader,
+            graph=graph,
+            paths=paths,
+            temporal_radius=int(
+                args.temporal_radius
+            ),
+            spacing=spacing,
+            device=device,
+        )
+    )
+    atomic_csv(
+        cp["train_examples"],
+        dataset.metadata,
+    )
+
+    print(
+        "\n" + "=" * 112,
+        flush=True,
+    )
+    print(
+        "INVESTIGATION 46 V4 — COMPONENT PARTITION SELECTOR",
+        flush=True,
+    )
+    print("=" * 112, flush=True)
+    print(
+        f"initializer               : {initializer}",
+        flush=True,
+    )
+    print(
+        f"initializer global step   : {initializer_step}",
+        flush=True,
+    )
+    print(
+        "temporal candidate        : FROZEN",
+        flush=True,
+    )
+    print(
+        "selection unit            : WHOLE CURRENT COMPONENT",
+        flush=True,
+    )
+    print(
+        "final alternatives        : KEEP_SPATIAL vs USE_CANDIDATE",
+        flush=True,
+    )
+    print(
+        f"train examples            : "
+        f"{len(dataset.target_use_candidate):,} "
+        f"(HELP={dataset.help_count}, "
+        f"SUPPRESS={dataset.suppress_count})",
+        flush=True,
+    )
+    print(
+        f"selector parameters       : "
+        f"{sum(p.numel() for p in selector.parameters()):,}",
+        flush=True,
+    )
+    print(
+        f"selector steps/lr         : "
+        f"{int(args.component_selector_steps)} / "
+        f"{float(args.component_selector_lr):.3g}",
+        flush=True,
+    )
+    print(
+        f"max TRAIN SUPPRESS use    : "
+        f"{float(args.component_selector_max_suppress_use_rate):.3f}",
+        flush=True,
+    )
+    print("=" * 112, flush=True)
+
+    initial = evaluate_v4(
+        model,
+        selector,
+        frames=val_frames,
+        loader=loader,
+        graph=graph,
+        paths=paths,
+        temporal_radius=int(
+            args.temporal_radius
+        ),
+        spacing=spacing,
+        device=device,
+        use_threshold=1.0 + 1.0e-6,
+    )
+    candidate_reference = dict(
+        initial["candidate"]
+    )
+    atomic_json(
+        cp["initial_metrics"],
+        initial,
+    )
+    print_metrics_v4(
+        "INV46 V4 FROZEN CANDIDATE BASELINE",
+        0,
+        initial,
+    )
+
+    help_idx = torch.nonzero(
+        dataset.target_use_candidate > 0.5,
+        as_tuple=False,
+    ).flatten()
+    suppress_idx = torch.nonzero(
+        dataset.target_use_candidate <= 0.5,
+        as_tuple=False,
+    ).flatten()
+
+    optimizer = torch.optim.AdamW(
+        selector.parameters(),
+        lr=float(
+            args.component_selector_lr
+        ),
+        weight_decay=float(
+            args.component_selector_weight_decay
+        ),
+    )
+
+    generator = torch.Generator(
+        device="cpu"
+    )
+    generator.manual_seed(
+        int(args.seed) + 46_704
+    )
+
+    history = []
+    best_rank = None
+    best_step = -1
+    stale = 0
+
+    for step in range(
+        1,
+        int(
+            args.component_selector_steps
+        )
+        + 1,
+    ):
+        selector.train(True)
+        optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        n = int(
+            args.component_selector_batch_per_class
+        )
+        help_batch = help_idx[
+            torch.randint(
+                0,
+                int(help_idx.numel()),
+                (n,),
+                generator=generator,
+            )
+        ]
+        suppress_batch = suppress_idx[
+            torch.randint(
+                0,
+                int(suppress_idx.numel()),
+                (n,),
+                generator=generator,
+            )
+        ]
+        batch = torch.cat(
+            [
+                help_batch,
+                suppress_batch,
+            ]
+        )
+        batch = batch[
+            torch.randperm(
+                int(batch.numel()),
+                generator=generator,
+            )
+        ]
+
+        logits = selector(
+            pooled_edge_embedding=(
+                dataset.pooled_edge_embedding[
+                    batch
+                ].to(device)
+            ),
+            scalar_features=(
+                dataset.scalar_features[
+                    batch
+                ].to(device)
+            ),
+        )
+        target = (
+            dataset.target_use_candidate[
+                batch
+            ].to(device)
+        )
+
+        loss = (
+            torch.nn.functional
+            .binary_cross_entropy_with_logits(
+                logits,
+                target,
+            )
+        )
+        if not bool(
+            torch.isfinite(
+                loss.detach()
+            )
+        ):
+            raise FloatingPointError(
+                f"non-finite component-selector loss at {step}"
+            )
+
+        loss.backward()
+        grad = (
+            torch.nn.utils
+            .clip_grad_norm_(
+                selector.parameters(),
+                float(args.grad_clip),
+            )
+        )
+        grad_norm = float(
+            torch.as_tensor(
+                grad
+            ).detach().cpu()
+        )
+        if not math.isfinite(
+            grad_norm
+        ):
+            raise FloatingPointError(
+                f"non-finite component-selector grad at {step}"
+            )
+
+        optimizer.step()
+
+        history.append(
+            {
+                "step": int(step),
+                "loss": float(
+                    loss.detach().cpu()
+                ),
+                "grad_norm": float(
+                    grad_norm
+                ),
+            }
+        )
+
+        if (
+            step == 1
+            or step
+            % int(
+                args.print_every
+            )
+            == 0
+        ):
+            print(
+                f"[component-selector "
+                f"{step:04d}/"
+                f"{int(args.component_selector_steps)}] "
+                f"loss={float(loss.detach().cpu()):.5f} "
+                f"grad={grad_norm:.3f}",
+                flush=True,
+            )
+
+        if (
+            step
+            % int(
+                args.component_selector_eval_every
+            )
+            == 0
+            or step
+            == int(
+                args.component_selector_steps
+            )
+        ):
+            probabilities = (
+                component_selector_probabilities_v4(
+                    selector,
+                    dataset,
+                    device,
+                )
+            )
+            target_np = (
+                dataset.target_use_candidate
+                .numpy()
+                .astype(
+                    np.int64,
+                    copy=False,
+                )
+            )
+            threshold, calibration = (
+                choose_selector_threshold_v4(
+                    probabilities,
+                    target_np,
+                    max_suppress_use_rate=float(
+                        args.component_selector_max_suppress_use_rate
+                    ),
+                    override=(
+                        args.component_selector_threshold
+                    ),
+                )
+            )
+
+            metrics = evaluate_v4(
+                model,
+                selector,
+                frames=val_frames,
+                loader=loader,
+                graph=graph,
+                paths=paths,
+                temporal_radius=int(
+                    args.temporal_radius
+                ),
+                spacing=spacing,
+                device=device,
+                use_threshold=threshold,
+            )
+            INV42.assert_candidate_invariant(
+                candidate_reference,
+                metrics["candidate"],
+            )
+            print_metrics_v4(
+                "INV46 V4 VALIDATION",
+                step,
+                metrics,
+                train_selector=calibration,
+            )
+
+            rank = rank_v4(
+                metrics
+            )
+            if (
+                best_rank is None
+                or rank > best_rank
+            ):
+                best_rank = rank
+                best_step = int(step)
+                stale = 0
+                save_v4(
+                    cp["best"],
+                    model=model,
+                    selector=selector,
+                    threshold=threshold,
+                    calibration=calibration,
+                    metrics=metrics,
+                    args=args,
+                    step=step,
+                )
+                atomic_json(
+                    cp["best_metrics"],
+                    metrics,
+                )
+                print(
+                    f"[best component selector] "
+                    f"step={step} rank={rank} "
+                    f"threshold={threshold:.6f}",
+                    flush=True,
+                )
             else:
-                stale+=1; print(f'[selector selection] rank={rank} best={best_rank} stale={stale}',flush=True)
-            atomic_json(cp['history'],history)
-            if int(args.selector_patience)>0 and stale>=int(args.selector_patience):
-                print('[selector early-stop] no validation improvement.',flush=True); break
-    if not cp['best'].is_file(): raise RuntimeError('No best V3 selector checkpoint produced')
-    probs=selector_probabilities_v3(selector,ds,device); target_np=ds.target_write.numpy().astype(np.int64,copy=False)
-    threshold,cal=choose_selector_threshold_v3(probs,target_np,max_suppress_write_rate=float(args.selector_max_suppress_write_rate),override=args.selector_threshold)
-    metrics=evaluate_v3(model,selector,frames=val_frames,loader=loader,graph=graph,paths=paths,temporal_radius=int(args.temporal_radius),spacing=spacing,device=device,write_threshold=threshold)
-    save_v3(cp['final'],model=model,selector=selector,threshold=threshold,calibration=cal,metrics=metrics,args=args,step=len(history)); atomic_json(cp['history'],history)
-    selected=restore_v3(cp['best'],model=model,selector=selector); threshold=float(selected['write_threshold'])
-    metrics=evaluate_v3(model,selector,frames=val_frames,loader=loader,graph=graph,paths=paths,temporal_radius=int(args.temporal_radius),spacing=spacing,device=device,write_threshold=threshold)
-    INV42.assert_candidate_invariant(candidate_reference,metrics['candidate']); print_metrics_v3('INV46 V3 SELECTED FINAL',best_step,metrics,train_selector=selected['selector_calibration'])
-    print('\n'+'='*112,flush=True); print('INVESTIGATION 46 V3 TRAINING COMPLETE',flush=True); print('='*112,flush=True)
-    print(f"best selector : {cp['best']}",flush=True); print(f"last selector : {cp['final']}",flush=True); print(f'selected threshold: {threshold:.6f}',flush=True); print('='*112,flush=True)
+                stale += 1
+                print(
+                    f"[component-selector selection] "
+                    f"rank={rank} "
+                    f"best={best_rank} "
+                    f"stale={stale}",
+                    flush=True,
+                )
+
+            atomic_json(
+                cp["history"],
+                history,
+            )
+
+            if (
+                int(
+                    args.component_selector_patience
+                )
+                > 0
+                and stale
+                >= int(
+                    args.component_selector_patience
+                )
+            ):
+                print(
+                    "[component-selector early-stop] "
+                    "no validation improvement.",
+                    flush=True,
+                )
+                break
+
+    if not cp["best"].is_file():
+        raise RuntimeError(
+            "No best V4 component-selector checkpoint produced"
+        )
+
+    probabilities = (
+        component_selector_probabilities_v4(
+            selector,
+            dataset,
+            device,
+        )
+    )
+    target_np = (
+        dataset.target_use_candidate
+        .numpy()
+        .astype(
+            np.int64,
+            copy=False,
+        )
+    )
+    threshold, calibration = (
+        choose_selector_threshold_v4(
+            probabilities,
+            target_np,
+            max_suppress_use_rate=float(
+                args.component_selector_max_suppress_use_rate
+            ),
+            override=(
+                args.component_selector_threshold
+            ),
+        )
+    )
+    metrics = evaluate_v4(
+        model,
+        selector,
+        frames=val_frames,
+        loader=loader,
+        graph=graph,
+        paths=paths,
+        temporal_radius=int(
+            args.temporal_radius
+        ),
+        spacing=spacing,
+        device=device,
+        use_threshold=threshold,
+    )
+    INV42.assert_candidate_invariant(
+        candidate_reference,
+        metrics["candidate"],
+    )
+    save_v4(
+        cp["final"],
+        model=model,
+        selector=selector,
+        threshold=threshold,
+        calibration=calibration,
+        metrics=metrics,
+        args=args,
+        step=len(history),
+    )
+    atomic_json(
+        cp["history"],
+        history,
+    )
+
+    selected = restore_v4(
+        cp["best"],
+        model=model,
+        selector=selector,
+    )
+    threshold = float(
+        selected["use_threshold"]
+    )
+    metrics = evaluate_v4(
+        model,
+        selector,
+        frames=val_frames,
+        loader=loader,
+        graph=graph,
+        paths=paths,
+        temporal_radius=int(
+            args.temporal_radius
+        ),
+        spacing=spacing,
+        device=device,
+        use_threshold=threshold,
+    )
+    INV42.assert_candidate_invariant(
+        candidate_reference,
+        metrics["candidate"],
+    )
+    print_metrics_v4(
+        "INV46 V4 SELECTED FINAL",
+        best_step,
+        metrics,
+        train_selector=(
+            selected[
+                "selector_calibration"
+            ]
+        ),
+    )
+
+    print(
+        "\n" + "=" * 112,
+        flush=True,
+    )
+    print(
+        "INVESTIGATION 46 V4 TRAINING COMPLETE",
+        flush=True,
+    )
+    print("=" * 112, flush=True)
+    print(
+        f"best selector : {cp['best']}",
+        flush=True,
+    )
+    print(
+        f"last selector : {cp['final']}",
+        flush=True,
+    )
+    print(
+        f"selected threshold: "
+        f"{threshold:.6f}",
+        flush=True,
+    )
+    print("=" * 112, flush=True)
 
 
-# Extend the cutter/data parser with V3 selector controls.
+# Extend the cutter/data parser with V4 component-selector controls.
 _BUILD_PARSER_BASE = build_parser
 _VALIDATE_ARGS_BASE = validate_inv46_args
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser=_BUILD_PARSER_BASE()
-    parser.description='Investigation 46 V3: frozen enriched temporal candidate + balanced discrete write selector.'
-    parser.add_argument('--selector-steps',type=int,default=400)
-    parser.add_argument('--selector-lr',type=float,default=3.0e-4)
-    parser.add_argument('--selector-weight-decay',type=float,default=1.0e-4)
-    parser.add_argument('--selector-batch-per-class',type=int,default=32)
-    parser.add_argument('--selector-eval-every',type=int,default=50)
-    parser.add_argument('--selector-patience',type=int,default=6)
-    parser.add_argument('--selector-max-suppress-write-rate',type=float,default=0.10)
-    parser.add_argument('--selector-threshold',type=float,default=None)
-    parser.set_defaults(print_every=25)
+    parser = _BUILD_PARSER_BASE()
+    parser.description = (
+        "Investigation 46 V4: frozen enriched temporal candidate + "
+        "component-level KEEP_SPATIAL vs USE_CANDIDATE selector."
+    )
+    parser.add_argument(
+        "--component-selector-steps",
+        type=int,
+        default=400,
+    )
+    parser.add_argument(
+        "--component-selector-lr",
+        type=float,
+        default=3.0e-4,
+    )
+    parser.add_argument(
+        "--component-selector-weight-decay",
+        type=float,
+        default=1.0e-4,
+    )
+    parser.add_argument(
+        "--component-selector-batch-per-class",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--component-selector-eval-every",
+        type=int,
+        default=50,
+    )
+    parser.add_argument(
+        "--component-selector-patience",
+        type=int,
+        default=6,
+    )
+    parser.add_argument(
+        "--component-selector-max-suppress-use-rate",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
+        "--component-selector-threshold",
+        type=float,
+        default=None,
+    )
+    parser.set_defaults(
+        print_every=25
+    )
     return parser
 
 
-def validate_inv46_args(args: argparse.Namespace) -> None:
+def validate_inv46_args(
+    args: argparse.Namespace,
+) -> None:
     _VALIDATE_ARGS_BASE(args)
-    if int(args.selector_steps)<1: raise ValueError('--selector-steps must be >=1')
-    if float(args.selector_lr)<=0: raise ValueError('--selector-lr must be >0')
-    if float(args.selector_weight_decay)<0: raise ValueError('--selector-weight-decay must be >=0')
-    if int(args.selector_batch_per_class)<1: raise ValueError('--selector-batch-per-class must be >=1')
-    if int(args.selector_eval_every)<1: raise ValueError('--selector-eval-every must be >=1')
-    if int(args.selector_patience)<0: raise ValueError('--selector-patience must be >=0')
-    if not 0.0<=float(args.selector_max_suppress_write_rate)<=1.0: raise ValueError('--selector-max-suppress-write-rate must be in [0,1]')
-    if args.selector_threshold is not None and not 0.0<=float(args.selector_threshold)<=1.0: raise ValueError('--selector-threshold must be in [0,1]')
+
+    if int(
+        args.component_selector_steps
+    ) < 1:
+        raise ValueError(
+            "--component-selector-steps must be >=1"
+        )
+    if float(
+        args.component_selector_lr
+    ) <= 0:
+        raise ValueError(
+            "--component-selector-lr must be >0"
+        )
+    if float(
+        args.component_selector_weight_decay
+    ) < 0:
+        raise ValueError(
+            "--component-selector-weight-decay must be >=0"
+        )
+    if int(
+        args.component_selector_batch_per_class
+    ) < 1:
+        raise ValueError(
+            "--component-selector-batch-per-class must be >=1"
+        )
+    if int(
+        args.component_selector_eval_every
+    ) < 1:
+        raise ValueError(
+            "--component-selector-eval-every must be >=1"
+        )
+    if int(
+        args.component_selector_patience
+    ) < 0:
+        raise ValueError(
+            "--component-selector-patience must be >=0"
+        )
+    if not (
+        0.0
+        <= float(
+            args.component_selector_max_suppress_use_rate
+        )
+        <= 1.0
+    ):
+        raise ValueError(
+            "--component-selector-max-suppress-use-rate must be in [0,1]"
+        )
+    if (
+        args.component_selector_threshold
+        is not None
+        and not (
+            0.0
+            <= float(
+                args.component_selector_threshold
+            )
+            <= 1.0
+        )
+    ):
+        raise ValueError(
+            "--component-selector-threshold must be in [0,1]"
+        )
 
 
-def write_manifest_46(paths,*,args,reviewed,train_frames,val_frames,spacing)->None:
-    payload={
-        'version':OBJECTIVE_VERSION,'investigation':SCRIPT_NAME,'sample_id':paths.sample,'split':paths.split,'annotation_set':paths.annotation_set,
-        'reviewed_frames':list(map(int,reviewed)),'train_frames':list(map(int,train_frames)),'val_frames':list(map(int,val_frames)),
-        'temporal_radius':int(args.temporal_radius),'spacing_zyx_um':list(map(float,spacing)),
-        'initializer':str(args.resume) if args.resume is not None else str(paths.checkpoint),'spatial_cache':str(paths.spatial_cache),'track_graph':str(paths.track_graph),
-        'cutter_contract':{'synchronous':True,'recursive_cascade':False,'one_to_one_tracklet_edges_only':True,'target_clean_break_rate':float(args.cutter_target_clean_break_rate),'boundary_volume_scale':float(args.cutter_boundary_volume_scale),'near_radius_dref':float(args.cutter_near_radius_dref)},
-        'temporal_contract':{'global_motion_compensated':True,'volume_features':True,'hard_cut_flags':True,'candidate_frozen':True,'split_only':True},
-        'selector_contract':{'balanced_help_suppress':True,'neutral_excluded':True,'physical_feature_dim':int(PHYSICAL_GATE_DIM),'steps':int(args.selector_steps),'lr':float(args.selector_lr),'threshold_train_only':True,'max_suppress_write_rate':float(args.selector_max_suppress_write_rate),'hard_candidate_or_spatial':True,'continuous_interpolation':False},
+def write_manifest_46(
+    paths,
+    *,
+    args,
+    reviewed,
+    train_frames,
+    val_frames,
+    spacing,
+) -> None:
+    payload = {
+        "version": OBJECTIVE_VERSION,
+        "investigation": SCRIPT_NAME,
+        "sample_id": paths.sample,
+        "split": paths.split,
+        "annotation_set": (
+            paths.annotation_set
+        ),
+        "reviewed_frames": list(
+            map(int, reviewed)
+        ),
+        "train_frames": list(
+            map(int, train_frames)
+        ),
+        "val_frames": list(
+            map(int, val_frames)
+        ),
+        "temporal_radius": int(
+            args.temporal_radius
+        ),
+        "spacing_zyx_um": list(
+            map(float, spacing)
+        ),
+        "initializer": (
+            str(args.resume)
+            if args.resume is not None
+            else str(paths.checkpoint)
+        ),
+        "spatial_cache": str(
+            paths.spatial_cache
+        ),
+        "track_graph": str(
+            paths.track_graph
+        ),
+        "cutter_contract": {
+            "synchronous": True,
+            "recursive_cascade": False,
+            "one_to_one_tracklet_edges_only": True,
+            "target_clean_break_rate": float(
+                args.cutter_target_clean_break_rate
+            ),
+            "boundary_volume_scale": float(
+                args.cutter_boundary_volume_scale
+            ),
+            "near_radius_dref": float(
+                args.cutter_near_radius_dref
+            ),
+        },
+        "temporal_contract": {
+            "global_motion_compensated": True,
+            "volume_features": True,
+            "hard_cut_flags": True,
+            "candidate_frozen": True,
+            "split_only": True,
+        },
+        "component_selector_contract": {
+            "decision_unit": (
+                "current_spatial_component"
+            ),
+            "alternatives": [
+                "KEEP_SPATIAL",
+                "USE_CANDIDATE",
+            ],
+            "balanced_help_suppress": True,
+            "neutral_excluded": True,
+            "physical_feature_dim": int(
+                COMPONENT_PHYSICAL_DIM
+            ),
+            "proposal_feature_dim": int(
+                COMPONENT_PROPOSAL_DIM
+            ),
+            "steps": int(
+                args.component_selector_steps
+            ),
+            "lr": float(
+                args.component_selector_lr
+            ),
+            "threshold_train_only": True,
+            "max_suppress_use_rate": float(
+                args.component_selector_max_suppress_use_rate
+            ),
+            "whole_component_candidate_partition": True,
+            "independent_edge_selection": False,
+        },
     }
-    atomic_json(paths.output/'dataset_manifest_v3.json',payload)
+    atomic_json(
+        paths.output
+        / "dataset_manifest_v4.json",
+        payload,
+    )
 
 
 def main() -> int:
@@ -2428,27 +4275,33 @@ def main() -> int:
         return 0
 
     print("\n" + "=" * 112, flush=True)
-    print("INVESTIGATION 46 V3 — DISCRETE WRITE SELECTOR", flush=True)
+    print("INVESTIGATION 46 V4 — COMPONENT PARTITION SELECTOR", flush=True)
     print("=" * 112, flush=True)
     print("temporal coordinates : target-relative global-motion compensated", flush=True)
     print("hard cutter          : ACTIVE, synchronous, non-recursive", flush=True)
     print("temporal candidate   : FROZEN", flush=True)
-    print("final write          : HARD candidate-or-spatial", flush=True)
-    print("selector training    : balanced HELP/SUPPRESS", flush=True)
+    print("selection unit       : WHOLE CURRENT COMPONENT", flush=True)
+    print("final alternatives   : KEEP_SPATIAL / USE_CANDIDATE", flush=True)
     print("=" * 112, flush=True)
 
-    train_discrete_selector_v3(
-        paths=paths, train_frames=train_frames, val_frames=val_frames, loader=loader,
-        graph=graph_sanitized, spacing=spacing, device=device, args=args,
+    train_component_selector_v4(
+        paths=paths,
+        train_frames=train_frames,
+        val_frames=val_frames,
+        loader=loader,
+        graph=graph_sanitized,
+        spacing=spacing,
+        device=device,
+        args=args,
     )
 
     print("\n" + "=" * 112, flush=True)
-    print("INVESTIGATION 46 V3 COMPLETE", flush=True)
+    print("INVESTIGATION 46 V4 COMPLETE", flush=True)
     print("=" * 112, flush=True)
     print(f"output             : {paths.output}", flush=True)
     print(f"hard cutter edges  : {paths.output / 'hard_cutter_edges.csv'}", flush=True)
     print(f"cutter metrics     : {paths.output / 'hard_cutter_metrics.json'}", flush=True)
-    cp = cp_v3(paths)
+    cp = cp_v4(paths)
     print(f"best selector      : {cp['best']}", flush=True)
     print(f"last selector      : {cp['final']}", flush=True)
     print(f"train examples     : {cp['train_examples']}", flush=True)
