@@ -84,19 +84,43 @@ This is experiment-local. Production graph semantics are not modified.
 
 Training
 --------
-The mature spatial network and InstanceTokenizer remain frozen.
+Investigation 46 V3 freezes the enriched temporal candidate. The V2 smoke run
+showed that this candidate was already strong before fine-tuning and that even
+small candidate updates reduced CUT/exact recovery.
 
-Trainable:
-    temporal_encoder
-    instance_temporal reasoner except its original 4-scalar edge_gate
-    Investigation-42 selective-write gate calibrator
+V3 therefore trains only a small DISCRETE WRITE SELECTOR. For editable RAG
+edges, frozen spatial and candidate predictions define:
 
-The loss is Investigation 42 V11's curated split-only objective plus:
-    candidate_weight * ungated temporal candidate CUT/KEEP loss
-    split_weight * component split-head loss
+    HELP:
+        spatial wrong, candidate correct -> WRITE target = 1
 
-The original candidate-invariance assertion is intentionally disabled because
-the purpose of Investigation 46 is to raise the temporal candidate ceiling.
+    SUPPRESS:
+        spatial correct, candidate wrong -> WRITE target = 0
+
+    NEUTRAL:
+        both correct or both wrong -> excluded from selector training
+
+The selector is trained on balanced HELP/SUPPRESS minibatches. Its features are
+the frozen RAG edge embedding, Investigation-42/V11 candidate scalars, and the
+explicit physical evidence introduced by Investigation 46.
+
+Final inference is discrete, not interpolated:
+
+    SUPPRESS -> use spatial logit exactly
+    WRITE    -> use candidate logit exactly
+
+The write threshold is calibrated only on training-frame HELP/SUPPRESS examples,
+maximizing HELP recall under a configurable harmful-write constraint. Validation
+never participates in threshold calibration.
+
+Typical command:
+
+    python .\investigations\stirnet\46_biohub_hard_cutter_temporal_training_v3.py `
+        --selector-steps 400 `
+        --selector-lr 3e-4 `
+        --selector-eval-every 50 `
+        --selector-max-suppress-write-rate 0.10 `
+        --print-every 25
 
 Default initializer
 -------------------
@@ -113,19 +137,17 @@ Default spatial cache
 If available, the exact persisted-label Investigation-42 spatial cache is
 reused automatically.
 
-Typical commands
-----------------
+Additional commands
+-------------------
 Audit cutter only:
 
-    python .\investigations\stirnet\46_biohub_hard_cutter_temporal_training.py --audit-only
+    python .\investigations\stirnet\46_biohub_hard_cutter_temporal_training_v3.py --audit-only
 
-First training run:
+Short selector smoke run:
 
-    python .\investigations\stirnet\46_biohub_hard_cutter_temporal_training.py `
-        --steps 600 `
-        --lr 5e-5 `
-        --candidate-weight 0.5 `
-        --eval-every 50 `
+    python .\investigations\stirnet\46_biohub_hard_cutter_temporal_training_v3.py `
+        --selector-steps 80 `
+        --selector-eval-every 20 `
         --print-every 10
 
 The 30-39 validation range is a DEVELOPMENT split already used repeatedly in
@@ -198,8 +220,8 @@ INV45 = load_module(
 )
 INV35 = INV42.INV35
 
-SCRIPT_NAME = "46_biohub_hard_cutter_temporal_training"
-OBJECTIVE_VERSION = 1
+SCRIPT_NAME = "46_biohub_hard_cutter_temporal_training_v3"
+OBJECTIVE_VERSION = 3
 
 DEFAULT_CUTTER_TARGET_CLEAN_BREAK = 0.08
 DEFAULT_CUTTER_MIN_THRESHOLD = 2.0
@@ -1256,199 +1278,185 @@ def make_temporal_input_46(
 
 
 # =============================================================================
-# Temporal training overrides for Investigation 42's mature training loop
+# Investigation 46 shared physical-selector feature helpers
 # =============================================================================
 
 
-ORIGINAL_TRAINING_LOSS = INV42.training_loss
 ORIGINAL_PRINT_METRICS = INV42.print_temporal_metrics
+ORIGINAL_GATE_SCALARS = INV42.selective_gate_scalar_features
+
+PHYSICAL_GATE_DIM = 7
+
+# Lazily populated CPU-side current-component evidence.
+COMPONENT_PHYSICAL_CACHE: dict[int, np.ndarray] = {}
+BASE_INSTANCE_MOVIE = None
+CELL_EVIDENCE_BY_KEY: dict[tuple[int, int], NodeEvidence] | None = None
 
 
-def configure_temporal_training_46(model, gate_calibrator):
-    global ACTIVE_MODEL
-    ACTIVE_MODEL = model
-
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
-
-    trainable: list[Tensor] = []
-
-    for parameter in model.temporal_encoder.parameters():
-        parameter.requires_grad_(True)
-        trainable.append(parameter)
-
-    # Train the temporal candidate/reasoner but keep the old under-specified
-    # 4-scalar production edge_gate frozen. The experiment-local V11 calibrator
-    # remains responsible for selective writing.
-    for name, parameter in model.instance_temporal.named_parameters():
-        if name.startswith("edge_gate."):
-            parameter.requires_grad_(False)
-            continue
-        parameter.requires_grad_(True)
-        trainable.append(parameter)
-
-    for parameter in gate_calibrator.parameters():
-        parameter.requires_grad_(True)
-        trainable.append(parameter)
-
-    model.eval()
-    gate_calibrator.train(True)
-    return trainable
+def _cell_evidence_index() -> dict[tuple[int, int], NodeEvidence]:
+    global CELL_EVIDENCE_BY_KEY
+    if CELL_EVIDENCE_BY_KEY is not None:
+        return CELL_EVIDENCE_BY_KEY
+    if STATE is None:
+        raise RuntimeError("Inv46 state is not initialized")
+    result: dict[tuple[int, int], NodeEvidence] = {}
+    for evidence in STATE.node_evidence.values():
+        result[(int(evidence.frame), int(evidence.cell_id))] = evidence
+    CELL_EVIDENCE_BY_KEY = result
+    return result
 
 
-def parameter_audit_46(model, gate_calibrator):
-    temporal_encoder = int(
-        sum(
-            p.numel()
-            for p in model.temporal_encoder.parameters()
-            if p.requires_grad
+def _base_instance_movie():
+    global BASE_INSTANCE_MOVIE
+    if BASE_INSTANCE_MOVIE is None:
+        if STATE is None:
+            raise RuntimeError("Inv46 state is not initialized")
+        BASE_INSTANCE_MOVIE = np.load(
+            STATE.paths.base_instances,
+            mmap_mode="r",
+            allow_pickle=False,
         )
-    )
-    temporal_reasoner = int(
-        sum(
-            p.numel()
-            for p in model.instance_temporal.parameters()
-            if p.requires_grad
+    return BASE_INSTANCE_MOVIE
+
+
+def component_physical_features_46(runtime, case) -> Tensor:
+    """Return [current_component, 7] normalized physical evidence."""
+
+    t = int(runtime.t)
+    cached = COMPONENT_PHYSICAL_CACHE.get(t)
+    if cached is None:
+        base_movie = _base_instance_movie()
+        base_labels = np.asarray(base_movie[t])
+
+        supervoxels = (
+            runtime.rag.supervoxel_labels[0]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.int64, copy=False)
         )
-    )
-    frozen_edge_gate = int(
-        sum(
-            p.numel()
-            for p in model.instance_temporal.edge_gate.parameters()
-            if not p.requires_grad
+        node_sv = (
+            runtime.rag.node_supervoxel_id
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.int64, copy=False)
         )
-    )
-    calibrator = int(
-        sum(
-            p.numel()
-            for p in gate_calibrator.parameters()
-            if p.requires_grad
+        lookup = INV35.sv_label_lookup(
+            supervoxels,
+            base_labels,
+            name=f"inv46 gate current identity t={t}",
         )
+        node_cell = lookup[node_sv]
+
+        current = (
+            case.node_current_component
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.int64, copy=False)
+        )
+        component_count = int(case.split_target.numel())
+        rows = np.zeros((component_count, PHYSICAL_GATE_DIM), dtype=np.float32)
+        evidence_index = _cell_evidence_index()
+
+        for component in range(component_count):
+            node_rows = np.flatnonzero(current == component)
+            if node_rows.size == 0:
+                continue
+
+            ids = node_cell[node_rows]
+            ids = ids[ids > 0]
+            if ids.size == 0:
+                continue
+
+            unique, counts = np.unique(ids, return_counts=True)
+            cell_id = int(unique[int(np.argmax(counts))])
+            evidence = evidence_index.get((t, cell_id))
+            if evidence is None:
+                continue
+
+            dref = max(float(runtime.dref_um), 1.0e-6)
+            threshold = (
+                max(float(STATE.cutter_threshold), 1.0e-6)
+                if STATE is not None
+                else 1.0
+            )
+            local_units = (
+                float(evidence.local_log_ratio) / LEGACY_VOLUME_LOG_SCALE
+            )
+
+            rows[component] = np.asarray(
+                [
+                    np.clip(local_units / 5.0, -1.0, 1.0),
+                    np.clip(
+                        float(evidence.positive_parent_growth_units) / 5.0,
+                        0.0,
+                        1.0,
+                    ),
+                    float(evidence.hard_cut_incoming),
+                    np.clip(
+                        float(evidence.prediction_error_um) / (5.0 * dref),
+                        0.0,
+                        1.0,
+                    ),
+                    min(int(evidence.nearby_broken_count), 3) / 3.0,
+                    math.tanh(float(evidence.cutter_score) / threshold),
+                    min(int(evidence.rejected_plausible_count), 3) / 3.0,
+                ],
+                dtype=np.float32,
+            )
+
+        COMPONENT_PHYSICAL_CACHE[t] = rows
+        cached = rows
+
+    return torch.from_numpy(cached).to(
+        device=case.rag.spatial_edge_logits.device,
+        dtype=torch.float32,
     )
-    total = temporal_encoder + temporal_reasoner + calibrator
-
-    if total <= 0:
-        raise RuntimeError("Investigation 46 has zero trainable parameters.")
-
-    return {
-        "temporal_encoder": temporal_encoder,
-        "temporal_reasoner_excluding_old_gate": temporal_reasoner,
-        "frozen_old_edge_gate": frozen_edge_gate,
-        "selective_gate_calibrator": calibrator,
-        "total": total,
-    }
 
 
-def training_loss_46(
+def physical_gate_edge_features_46(runtime, case) -> Tensor:
+    if case.rag.edge_index.shape[1] == 0:
+        return case.rag.spatial_edge_logits.new_zeros(
+            (0, PHYSICAL_GATE_DIM),
+            dtype=torch.float32,
+        )
+
+    component = case.node_current_component.long()
+    component_features = component_physical_features_46(runtime, case)
+    if component.numel() and int(component.max().item()) >= int(component_features.shape[0]):
+        raise RuntimeError(
+            "Inv46 current-component index exceeds physical-feature table: "
+            f"max={int(component.max().item())} rows={int(component_features.shape[0])}"
+        )
+    src, dst = case.rag.edge_index
+    left = component_features[component[src]]
+    right = component_features[component[dst]]
+    return 0.5 * (left + right)
+
+
+def selective_gate_scalar_features_46(
     model,
-    gate_calibrator,
     *,
+    runtime,
     case,
-    encoded,
-    full,
-    args,
-    rng,
-    corruption,
-):
-    base = ORIGINAL_TRAINING_LOSS(
+    base_reasoning,
+    candidate_logits,
+) -> Tensor:
+    original = ORIGINAL_GATE_SCALARS(
         model,
-        gate_calibrator,
         case=case,
-        encoded=encoded,
-        full=full,
-        args=args,
-        rng=rng,
-        corruption=corruption,
+        base_reasoning=base_reasoning,
+        candidate_logits=candidate_logits,
     )
-    total = (
-        base.total
-        + float(args.candidate_weight) * base.candidate_total
-        + float(args.split_weight) * base.split
-    )
-    return dataclass_replace_loss(base, total=total)
-
-
-def no_candidate_invariant(reference, current) -> None:
-    # Candidate change is the objective of Investigation 46.
-    return None
-
-
-def print_temporal_metrics_46(title: str, step: int, metrics: dict[str, Any]) -> None:
-    ORIGINAL_PRINT_METRICS(
-        title.replace("INVESTIGATION 42", "INVESTIGATION 46"),
-        step,
-        metrics,
-    )
-
-
-def save_training_state_46(
-    path: Path,
-    *,
-    gate_calibrator,
-    optimizer,
-    scaler,
-    step: int,
-    config,
-    paths,
-    args,
-    audit,
-    validation,
-    base_checkpoint: Path,
-) -> None:
-    global ACTIVE_MODEL, STATE
-    if ACTIVE_MODEL is None:
-        raise RuntimeError("Inv46 active model is unavailable during checkpoint save.")
-
-    payload = {
-        "format": "inv46_hard_cutter_temporal_v1",
-        "investigation": SCRIPT_NAME,
-        "objective_version": OBJECTIVE_VERSION,
-        "global_step": int(step),
-        "initializer_checkpoint": str(base_checkpoint),
-        "initializer_checkpoint_sha256": INV42.sha256(base_checkpoint),
-        "temporal_encoder_state_dict": ACTIVE_MODEL.temporal_encoder.state_dict(),
-        "instance_temporal_state_dict": ACTIVE_MODEL.instance_temporal.state_dict(),
-        "selective_gate_state_dict": gate_calibrator.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
-        "training_config": config,
-        "args": vars(args),
-        "parameter_audit": audit,
-        "validation_metrics": validation or {},
-        "cutter": (
-            STATE.cutter_metrics if STATE is not None else {}
-        ),
-        "notes": {
-            "spatial_model_frozen": True,
-            "instance_tokenizer_frozen": True,
-            "temporal_encoder_trained": True,
-            "temporal_candidate_trained": True,
-            "old_four_scalar_edge_gate_frozen": True,
-            "selective_gate_trained": True,
-            "hard_tracklet_cutter": True,
-            "global_motion_compensated_temporal_coordinates": True,
-            "manual_tracking_overrides_used": False,
-            "temporal_action": "split_only",
-        },
-    }
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        torch.save(payload, tmp)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-def install_training_overrides() -> None:
-    INV42.configure_temporal_training = configure_temporal_training_46
-    INV42.parameter_audit = parameter_audit_46
-    INV42.training_loss = training_loss_46
-    INV42.assert_candidate_invariant = no_candidate_invariant
-    INV42.make_temporal_input = make_temporal_input_46
-    INV42.save_training_state = save_training_state_46
-    INV42.print_temporal_metrics = print_temporal_metrics_46
+    physical = physical_gate_edge_features_46(runtime, case)
+    if original.shape[0] != physical.shape[0]:
+        raise RuntimeError(
+            "Inv46 gate scalar/physical edge row mismatch: "
+            f"{original.shape[0]} != {physical.shape[0]}"
+        )
+    return torch.cat([original.float(), physical.float()], dim=-1)
 
 
 # =============================================================================
@@ -1459,19 +1467,9 @@ def install_training_overrides() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = INV42.build_parser()
     parser.description = (
-        "Investigation 46: calibrate an aggressive physical hard tracklet cutter "
-        "and fine-tune STIR-Net temporal reasoning on the resulting enriched graph."
+        "Investigation 46 V3: hard tracklet cutter and frozen enriched temporal candidate."
     )
-
-    parser.add_argument(
-        "--cutter-threshold",
-        type=float,
-        default=None,
-        help=(
-            "Explicit hard-cutter threshold. Default: calibrate on training "
-            "frames only under --cutter-target-clean-break-rate."
-        ),
-    )
+    parser.add_argument("--cutter-threshold", type=float, default=None)
     parser.add_argument(
         "--cutter-target-clean-break-rate",
         type=float,
@@ -1497,30 +1495,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_CUTTER_PLAUSIBLE_SCORE,
     )
-    parser.add_argument(
-        "--hypothesis-cache",
-        type=Path,
-        default=None,
-        help=(
-            "Optional Investigation-45 hypothesis edges.csv. If omitted, the "
-            "standard Inv45 run path is used when present."
-        ),
-    )
-
-    # Investigation-46 defaults: starting from the step-300 temporal checkpoint
-    # usually means --steps 600 performs ~300 additional optimizer steps.
-    parser.set_defaults(
-        steps=600,
-        lr=5.0e-5,
-        weight_decay=1.0e-4,
-        candidate_weight=0.5,
-        candidate_preservation_weight=1.0,
-        split_weight=0.05,
-        preservation_weight=2.0,
-        cut_frame_probability=0.80,
-        eval_every=50,
-        print_every=10,
-    )
+    parser.add_argument("--hypothesis-cache", type=Path, default=None)
+    # Keep inherited Investigation-42 validator-compatible values. V3 does not
+    # optimize the candidate/gate through those legacy flags.
+    parser.set_defaults(steps=1, lr=1e-5, candidate_weight=0.0, split_weight=0.0)
     return parser
 
 
@@ -1538,11 +1516,7 @@ def validate_inv46_args(args: argparse.Namespace) -> None:
     if not 0.0 <= float(args.cutter_plausible_score) <= 1.0:
         raise ValueError("--cutter-plausible-score must be in [0,1]")
     if args.gate_resume is not None:
-        raise ValueError(
-            "Investigation 46 does not support --gate-resume because the temporal "
-            "parameter topology is intentionally different. Start from --resume "
-            "(the step-300 full temporal checkpoint) instead."
-        )
+        raise ValueError("--gate-resume is not used by Investigation 46 V3")
 
 
 def auto_defaults(args: argparse.Namespace) -> None:
@@ -1643,17 +1617,539 @@ def write_manifest_46(
             "manual_tracking_overrides": False,
         },
         "training_contract": {
+            "two_stage": True,
+            "phase_a": {
+                "candidate_only": True,
+                "temporal_encoder_trainable": True,
+                "temporal_reasoner_trainable_except_old_gate": True,
+                "selective_gate_frozen": True,
+                "steps": int(args.candidate_steps),
+                "lr": float(args.candidate_lr),
+                "candidate_keep_weight": float(args.candidate_preservation_weight),
+                "split_weight": float(args.split_weight),
+                "baseline_is_selectable": True,
+            },
+            "phase_b": {
+                "candidate_frozen": True,
+                "old_four_scalar_gate_frozen": True,
+                "enriched_selective_gate_trainable": True,
+                "physical_gate_feature_dim": int(PHYSICAL_GATE_DIM),
+                "steps": int(args.gate_steps),
+                "lr": float(args.gate_lr),
+                "final_loss_weight": float(args.gate_final_weight),
+                "anchor_weight": float(args.gate_anchor_weight),
+                "candidate_invariant": True,
+            },
             "spatial_frozen": True,
             "instance_tokenizer_frozen": True,
-            "temporal_encoder_trainable": True,
-            "temporal_reasoner_trainable": True,
-            "old_four_scalar_gate_frozen": True,
-            "selective_gate_trainable": True,
-            "candidate_auxiliary_loss": float(args.candidate_weight),
-            "split_loss": float(args.split_weight),
         },
     }
     atomic_json(paths.output / "dataset_manifest.json", payload)
+
+
+
+# =============================================================================
+# Investigation 46 V3 — frozen candidate + discrete HELP/SUPPRESS selector
+# =============================================================================
+
+
+class Inv46DiscreteWriteSelector(torch.nn.Module):
+    """Small classifier deciding whether to use candidate or spatial exactly."""
+
+    ORIGINAL_SCALAR_DIM = 9
+    SCALAR_DIM = ORIGINAL_SCALAR_DIM + PHYSICAL_GATE_DIM
+
+    def __init__(self, edge_embedding_dim: int) -> None:
+        super().__init__()
+        edge_embedding_dim = int(edge_embedding_dim)
+        if edge_embedding_dim <= 0:
+            raise ValueError("edge_embedding_dim must be positive")
+        self.edge_embedding_dim = edge_embedding_dim
+        self.edge_norm = torch.nn.LayerNorm(edge_embedding_dim)
+        self.scalar_norm = torch.nn.LayerNorm(self.SCALAR_DIM)
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(edge_embedding_dim + self.SCALAR_DIM, 64),
+            torch.nn.SiLU(),
+            torch.nn.Linear(64, 32),
+            torch.nn.SiLU(),
+            torch.nn.Linear(32, 1),
+        )
+
+    def forward(self, *, edge_embedding: Tensor, scalar_features: Tensor) -> Tensor:
+        if edge_embedding.ndim != 2 or scalar_features.ndim != 2:
+            raise ValueError("selector inputs must be [E,D] and [E,F]")
+        if edge_embedding.shape[0] != scalar_features.shape[0]:
+            raise ValueError("selector row mismatch")
+        if int(edge_embedding.shape[1]) != self.edge_embedding_dim:
+            raise ValueError("selector edge embedding dimension mismatch")
+        if int(scalar_features.shape[1]) != self.SCALAR_DIM:
+            raise ValueError(
+                f"selector scalar dim={scalar_features.shape[1]} expected={self.SCALAR_DIM}"
+            )
+        edge = self.edge_norm(edge_embedding.float())
+        scalar = self.scalar_norm(scalar_features.float())
+        return self.net(torch.cat([edge, scalar], dim=-1)).squeeze(-1)
+
+
+@dataclass
+class SelectorDatasetV3:
+    edge_embedding: Tensor
+    scalar_features: Tensor
+    target_write: Tensor
+    metadata: pd.DataFrame
+
+    @property
+    def help_count(self) -> int:
+        return int((self.target_write > 0.5).sum().item())
+
+    @property
+    def suppress_count(self) -> int:
+        return int((self.target_write <= 0.5).sum().item())
+
+
+def frozen_candidate_bundle_v3(model, *, runtime, case, encoded, temporal=None):
+    state = encoded.temporal if temporal is None else temporal
+    base_reasoning = model.instance_temporal(
+        encoded.instances,
+        case.rag,
+        state,
+        encoded.dref_t,
+    )
+    candidate_logits = case.rag.spatial_edge_logits + base_reasoning.edge_temporal_delta
+    scalar_features = selective_gate_scalar_features_46(
+        model,
+        runtime=runtime,
+        case=case,
+        base_reasoning=base_reasoning,
+        candidate_logits=candidate_logits,
+    )
+    return base_reasoning, candidate_logits, scalar_features
+
+
+def help_suppress_masks_v3(model, case, candidate_logits):
+    threshold = float(model.cfg.partition.final_merge_threshold)
+    target_keep = case.target_keep.bool()
+    spatial_pred = torch.sigmoid(case.rag.spatial_edge_logits) >= threshold
+    candidate_pred = torch.sigmoid(candidate_logits) >= threshold
+    spatial_correct = spatial_pred == target_keep
+    candidate_correct = candidate_pred == target_keep
+    help_mask = case.editable & candidate_correct & ~spatial_correct
+    suppress_mask = case.editable & ~candidate_correct & spatial_correct
+    return help_mask, suppress_mask
+
+
+def reason_case_v3(
+    model,
+    selector: Inv46DiscreteWriteSelector,
+    *,
+    runtime,
+    case,
+    encoded,
+    write_threshold: float,
+    temporal=None,
+):
+    base_reasoning, candidate_logits, scalar_features = frozen_candidate_bundle_v3(
+        model,
+        runtime=runtime,
+        case=case,
+        encoded=encoded,
+        temporal=temporal,
+    )
+    selector_logits = selector(
+        edge_embedding=case.rag.edge_embeddings.detach(),
+        scalar_features=scalar_features.detach(),
+    )
+    write_probability = torch.sigmoid(selector_logits)
+    write_mask = case.editable & (write_probability >= float(write_threshold))
+
+    # Central V3 change: exact discrete source selection, no interpolation.
+    final_logits = torch.where(
+        write_mask,
+        candidate_logits,
+        case.rag.spatial_edge_logits,
+    )
+    reasoning = dataclasses.replace(
+        base_reasoning,
+        edge_temporal_gate=write_probability.to(base_reasoning.edge_temporal_gate.dtype),
+        final_edge_logits=final_logits,
+    )
+    return INV42.ReasonedCase(
+        reasoning=reasoning,
+        final_logits=final_logits,
+        candidate_logits=candidate_logits,
+        gate_logits=selector_logits,
+        base_gate=base_reasoning.edge_temporal_gate.detach(),
+    )
+
+
+@torch.no_grad()
+def extract_selector_dataset_v3(
+    model,
+    *,
+    frames: Sequence[int],
+    loader,
+    graph,
+    paths,
+    temporal_radius: int,
+    spacing: Sequence[float],
+    device: torch.device,
+) -> SelectorDatasetV3:
+    model.eval()
+    edge_chunks=[]; scalar_chunks=[]; target_chunks=[]; meta=[]
+    for t in frames:
+        runtime=loader.load(int(t))
+        case=INV42.build_real_case(runtime)
+        temporal_input=make_temporal_input_46(
+            graph,
+            runtime=runtime,
+            paths=paths,
+            temporal_radius=int(temporal_radius),
+            spacing=spacing,
+            device=device,
+        )
+        encoded=INV42.encode_case(
+            model,
+            runtime=runtime,
+            case=case,
+            temporal_input=temporal_input,
+            spacing=spacing,
+            device=device,
+        )
+        _, candidate_logits, scalar_features=frozen_candidate_bundle_v3(
+            model,
+            runtime=runtime,
+            case=case,
+            encoded=encoded,
+        )
+        help_mask,suppress_mask=help_suppress_masks_v3(model,case,candidate_logits)
+        chosen=torch.nonzero(help_mask|suppress_mask,as_tuple=False).flatten()
+        if chosen.numel()==0:
+            continue
+        labels=help_mask[chosen].float()
+        edge_chunks.append(case.rag.edge_embeddings[chosen].detach().float().cpu())
+        scalar_chunks.append(scalar_features[chosen].detach().float().cpu())
+        target_chunks.append(labels.detach().float().cpu())
+        phys=physical_gate_edge_features_46(runtime,case)[chosen].detach().float().cpu()
+        spatial=case.rag.spatial_edge_logits[chosen].detach().float().cpu()
+        candidate=candidate_logits[chosen].detach().float().cpu()
+        for k,edge_row in enumerate(chosen.tolist()):
+            meta.append({
+                'frame':int(t),
+                'edge_row':int(edge_row),
+                'class':'HELP' if labels[k].item()>0.5 else 'SUPPRESS',
+                'target_write':int(labels[k].item()>0.5),
+                'spatial_logit':float(spatial[k].item()),
+                'candidate_logit':float(candidate[k].item()),
+                'local_volume_feature':float(phys[k,0].item()),
+                'parent_growth_feature':float(phys[k,1].item()),
+                'hard_cut_feature':float(phys[k,2].item()),
+                'prediction_error_feature':float(phys[k,3].item()),
+                'nearby_broken_feature':float(phys[k,4].item()),
+                'cutter_score_feature':float(phys[k,5].item()),
+                'rejected_predecessor_feature':float(phys[k,6].item()),
+            })
+    if not target_chunks:
+        raise RuntimeError('No HELP/SUPPRESS selector examples found in training frames')
+    ds=SelectorDatasetV3(
+        edge_embedding=torch.cat(edge_chunks,dim=0),
+        scalar_features=torch.cat(scalar_chunks,dim=0),
+        target_write=torch.cat(target_chunks,dim=0),
+        metadata=pd.DataFrame(meta),
+    )
+    if ds.help_count<=0 or ds.suppress_count<=0:
+        raise RuntimeError(
+            f'Selector needs both classes: HELP={ds.help_count} SUPPRESS={ds.suppress_count}'
+        )
+    return ds
+
+
+def selector_auc_v3(probability: np.ndarray, target: np.ndarray) -> float:
+    probability=np.asarray(probability,dtype=np.float64)
+    target=np.asarray(target,dtype=np.int64)
+    pos=probability[target==1]; neg=probability[target==0]
+    if pos.size==0 or neg.size==0:
+        return 0.5
+    greater=float((pos[:,None]>neg[None,:]).sum())
+    equal=float((pos[:,None]==neg[None,:]).sum())
+    return (greater+0.5*equal)/float(pos.size*neg.size)
+
+
+def selector_threshold_metrics_v3(probability,target,threshold:float)->dict[str,Any]:
+    p=np.asarray(probability,dtype=np.float64)
+    y=np.asarray(target,dtype=np.int64)
+    write=p>=float(threshold)
+    help_mask=y==1; suppress_mask=y==0
+    help_recall=float(write[help_mask].mean()) if help_mask.any() else 0.0
+    suppress_write=float(write[suppress_mask].mean()) if suppress_mask.any() else 0.0
+    return {
+        'threshold':float(threshold),
+        'help_recall':help_recall,
+        'suppress_write_rate':suppress_write,
+        'balanced_accuracy':0.5*(help_recall+1.0-suppress_write),
+        'auc':selector_auc_v3(p,y),
+        'help_count':int(help_mask.sum()),
+        'suppress_count':int(suppress_mask.sum()),
+    }
+
+
+def choose_selector_threshold_v3(probability,target,*,max_suppress_write_rate:float,override):
+    p=np.asarray(probability,dtype=np.float64)
+    y=np.asarray(target,dtype=np.int64)
+    if override is not None:
+        th=float(override)
+        return th,selector_threshold_metrics_v3(p,y,th)
+    candidates=[1.0+1e-7]+sorted(set(float(v) for v in p.tolist()),reverse=True)+[0.0]
+    feasible=[]
+    for th in candidates:
+        m=selector_threshold_metrics_v3(p,y,th)
+        if m['suppress_write_rate']<=float(max_suppress_write_rate)+1e-12:
+            feasible.append((m['help_recall'],-m['suppress_write_rate'],float(th),m))
+    if not feasible:
+        th=1.0+1e-7
+        return th,selector_threshold_metrics_v3(p,y,th)
+    feasible.sort(key=lambda row:(row[0],row[1],row[2]),reverse=True)
+    return float(feasible[0][2]),dict(feasible[0][3])
+
+
+@torch.no_grad()
+def selector_probabilities_v3(selector,dataset,device):
+    selector.eval()
+    logits=selector(
+        edge_embedding=dataset.edge_embedding.to(device),
+        scalar_features=dataset.scalar_features.to(device),
+    )
+    return torch.sigmoid(logits).detach().float().cpu().numpy().astype(np.float64,copy=False)
+
+
+@torch.no_grad()
+def evaluate_v3(
+    model,selector,*,frames,loader,graph,paths,temporal_radius,spacing,device,write_threshold
+):
+    model.eval(); selector.eval()
+    real_acc=INV42.metric_accumulator(); candidate_acc=INV42.metric_accumulator()
+    oracle_acc=INV42.metric_accumulator(); contentless_acc=INV42.metric_accumulator(); shuffled_acc=INV42.metric_accumulator()
+    hp=sp=0.0; hc=sc=hw=sw=0
+    for t in frames:
+        runtime=loader.load(int(t)); case=INV42.build_real_case(runtime)
+        temporal_input=make_temporal_input_46(
+            graph,runtime=runtime,paths=paths,temporal_radius=int(temporal_radius),spacing=spacing,device=device
+        )
+        encoded=INV42.encode_case(
+            model,runtime=runtime,case=case,temporal_input=temporal_input,spacing=spacing,device=device
+        )
+        full=reason_case_v3(
+            model,selector,runtime=runtime,case=case,encoded=encoded,write_threshold=float(write_threshold)
+        )
+        INV42.update_metric_accumulator(real_acc,model=model,runtime=runtime,case=case,logits=full.final_logits)
+        INV42.update_metric_accumulator(candidate_acc,model=model,runtime=runtime,case=case,logits=full.candidate_logits)
+        help_mask,suppress_mask=help_suppress_masks_v3(model,case,full.candidate_logits)
+        oracle_logits=torch.where(help_mask,full.candidate_logits,case.rag.spatial_edge_logits)
+        INV42.update_metric_accumulator(oracle_acc,model=model,runtime=runtime,case=case,logits=oracle_logits)
+        prob=full.reasoning.edge_temporal_gate.float(); write=case.editable&(prob>=float(write_threshold))
+        if bool(help_mask.any()):
+            hp+=float(prob[help_mask].sum().detach().cpu()); hc+=int(help_mask.sum().item()); hw+=int(write[help_mask].sum().item())
+        if bool(suppress_mask.any()):
+            sp+=float(prob[suppress_mask].sum().detach().cpu()); sc+=int(suppress_mask.sum().item()); sw+=int(write[suppress_mask].sum().item())
+        for corruption,acc,seed in (
+            ('contentless',contentless_acc,46_300_001+int(t)),('shuffled',shuffled_acc,46_400_001+int(t))
+        ):
+            state=INV42.corrupt_temporal_state(encoded.temporal,corruption=corruption,seed=seed)
+            corrupted=reason_case_v3(
+                model,selector,runtime=runtime,case=case,encoded=encoded,temporal=state,write_threshold=float(write_threshold)
+            )
+            INV42.update_metric_accumulator(acc,model=model,runtime=runtime,case=case,logits=corrupted.final_logits)
+    real=INV42.finalize_metrics(real_acc); candidate=INV42.finalize_metrics(candidate_acc); oracle=INV42.finalize_metrics(oracle_acc)
+    contentless=INV42.finalize_metrics(contentless_acc); shuffled=INV42.finalize_metrics(shuffled_acc)
+    control_exact=0.5*(contentless['exact_bad_component_recovery']+shuffled['exact_bad_component_recovery'])
+    control_cut=0.5*(contentless['cut_accuracy']+shuffled['cut_accuracy'])
+    score=(3.0*real['cut_accuracy']+2.0*real['exact_bad_component_recovery']+1.5*real['keep_accuracy']
+           -4.0*real['clean_false_split_rate']-0.75*control_exact-0.25*control_cut)
+    safe=bool(real['cut_accuracy']>0 and real['keep_accuracy']>=0.98 and real['clean_false_split_rate']<=0.005 and real['split_only_violations']==0)
+    strict=bool(real['cut_accuracy']>=0.80 and real['keep_accuracy']>=0.98 and real['exact_bad_component_recovery']>=0.60 and real['clean_false_split_rate']<=0.02 and real['split_only_violations']==0)
+    return {
+        'real':real,'candidate':candidate,'oracle_selector':oracle,
+        'selector':{
+            'write_threshold':float(write_threshold),
+            'helpful_edges':int(hc),'harmful_edges':int(sc),
+            'helpful_probability_mean':float(hp/max(hc,1)),
+            'harmful_probability_mean':float(sp/max(sc,1)),
+            'probability_separation':float(hp/max(hc,1)-sp/max(sc,1)),
+            'help_write_rate':float(hw/max(hc,1)),'suppress_write_rate':float(sw/max(sc,1)),
+        },
+        'contentless':contentless,'shuffled':shuffled,
+        'checkpoint_score':float(score),'safe_pass':safe,'strict_pass':strict,
+    }
+
+
+def print_metrics_v3(title,step,metrics,train_selector=None):
+    r=metrics['real']; c=metrics['candidate']; o=metrics['oracle_selector']; s=metrics['selector']
+    print('\n'+'='*112,flush=True); print(f'{title} @ STEP {step}',flush=True); print('='*112,flush=True)
+    print(f"final CUT/KEEP            : {r['cut_accuracy']:.4f} / {r['keep_accuracy']:.4f}",flush=True)
+    print(f"final exact/false split   : {r['exact_bad_component_recovery']:.4f} / {r['clean_false_split_rate']:.4f}",flush=True)
+    print(f"candidate CUT/KEEP        : {c['cut_accuracy']:.4f} / {c['keep_accuracy']:.4f}",flush=True)
+    print(f"candidate exact           : {c['exact_bad_component_recovery']:.4f}",flush=True)
+    print(f"oracle CUT/KEEP           : {o['cut_accuracy']:.4f} / {o['keep_accuracy']:.4f}",flush=True)
+    print(f"oracle exact              : {o['exact_bad_component_recovery']:.4f}",flush=True)
+    print(f"selector threshold        : {s['write_threshold']:.6f}",flush=True)
+    print(f"HELP prob/write           : {s['helpful_probability_mean']:.4f} / {s['help_write_rate']:.4f} (n={s['helpful_edges']})",flush=True)
+    print(f"SUPPRESS prob/write       : {s['harmful_probability_mean']:.4f} / {s['suppress_write_rate']:.4f} (n={s['harmful_edges']})",flush=True)
+    print(f"selector separation       : {s['probability_separation']:.4f}",flush=True)
+    if train_selector is not None:
+        print(f"TRAIN HELP recall         : {train_selector['help_recall']:.4f}",flush=True)
+        print(f"TRAIN suppress write rate : {train_selector['suppress_write_rate']:.4f}",flush=True)
+        print(f"TRAIN selector AUC        : {train_selector['auc']:.4f}",flush=True)
+    print(f"contentless CUT/exact     : {metrics['contentless']['cut_accuracy']:.4f} / {metrics['contentless']['exact_bad_component_recovery']:.4f}",flush=True)
+    print(f"shuffled CUT/exact        : {metrics['shuffled']['cut_accuracy']:.4f} / {metrics['shuffled']['exact_bad_component_recovery']:.4f}",flush=True)
+    print(f"SAFE / STRICT             : {metrics['safe_pass']} / {metrics['strict_pass']}",flush=True)
+    print(f"checkpoint score          : {metrics['checkpoint_score']:.5f}",flush=True); print('='*112,flush=True)
+
+
+def rank_v3(metrics):
+    return (int(bool(metrics.get('strict_pass',False))),int(bool(metrics.get('safe_pass',False))),float(metrics['checkpoint_score']))
+
+
+def cp_v3(paths):
+    return {
+        'best':paths.output/'best_selector_v3.pt',
+        'best_metrics':paths.output/'best_selector_metrics_v3.json',
+        'final':paths.output/'final_selector_v3.pt',
+        'history':paths.output/'selector_history_v3.json',
+        'train_examples':paths.output/'selector_train_examples_v3.csv',
+        'initial':paths.output/'initial_selector_metrics_v3.json',
+    }
+
+
+def save_v3(path,*,model,selector,threshold,calibration,metrics,args,step):
+    if STATE is None: raise RuntimeError('Inv46 state missing')
+    payload={
+        'format':'inv46_discrete_write_selector_v3','investigation':SCRIPT_NAME,'objective_version':OBJECTIVE_VERSION,
+        'selector_step':int(step),'write_threshold':float(threshold),'selector_calibration':calibration,
+        'temporal_encoder_state_dict':model.temporal_encoder.state_dict(),
+        'instance_temporal_state_dict':model.instance_temporal.state_dict(),
+        'selector_state_dict':selector.state_dict(),'validation_metrics':metrics,'cutter':STATE.cutter_metrics,'motion':STATE.motion_metrics,'args':vars(args),
+        'notes':{'temporal_candidate_frozen':True,'balanced_help_suppress':True,'threshold_train_only':True,'hard_candidate_or_spatial':True,'continuous_interpolation_removed':True},
+    }
+    path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    try:
+        torch.save(payload,tmp); os.replace(tmp,path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def restore_v3(path,*,model,selector):
+    payload=torch_load(path,map_location='cpu')
+    if not isinstance(payload,dict) or payload.get('format')!='inv46_discrete_write_selector_v3':
+        raise RuntimeError(f'Invalid V3 checkpoint {path}')
+    model.temporal_encoder.load_state_dict(payload['temporal_encoder_state_dict'],strict=True)
+    model.instance_temporal.load_state_dict(payload['instance_temporal_state_dict'],strict=True)
+    selector.load_state_dict(payload['selector_state_dict'],strict=True)
+    return payload
+
+
+def train_discrete_selector_v3(*,paths,train_frames,val_frames,loader,graph,spacing,device,args):
+    cp=cp_v3(paths)
+    initializer=resolve(args.resume) if args.resume is not None else paths.checkpoint
+    payload,model=INV42.load_model(initializer,device)
+    initializer_step=int(payload.get('global_step',0)) if isinstance(payload,dict) else 0
+    for p in model.parameters(): p.requires_grad_(False)
+    model.eval()
+    selector=Inv46DiscreteWriteSelector(int(model.cfg.partition.rag_hidden_dim)).to(device)
+    ds=extract_selector_dataset_v3(model,frames=train_frames,loader=loader,graph=graph,paths=paths,temporal_radius=int(args.temporal_radius),spacing=spacing,device=device)
+    atomic_csv(cp['train_examples'],ds.metadata)
+    print('\n'+'='*112,flush=True); print('INVESTIGATION 46 V3 — BALANCED DISCRETE WRITE SELECTOR',flush=True); print('='*112,flush=True)
+    print(f'initializer             : {initializer}',flush=True); print(f'initializer global step : {initializer_step}',flush=True)
+    print('temporal candidate      : FROZEN',flush=True); print('final write             : HARD candidate-or-spatial',flush=True)
+    print(f'train examples          : {len(ds.target_write):,} (HELP={ds.help_count}, SUPPRESS={ds.suppress_count})',flush=True)
+    print(f'selector parameters     : {sum(p.numel() for p in selector.parameters()):,}',flush=True)
+    print(f'selector steps/lr       : {int(args.selector_steps)} / {float(args.selector_lr):.3g}',flush=True)
+    print(f'max TRAIN suppress write: {float(args.selector_max_suppress_write_rate):.3f}',flush=True); print('='*112,flush=True)
+    initial=evaluate_v3(model,selector,frames=val_frames,loader=loader,graph=graph,paths=paths,temporal_radius=int(args.temporal_radius),spacing=spacing,device=device,write_threshold=1.0+1e-6)
+    candidate_reference=dict(initial['candidate']); atomic_json(cp['initial'],initial); print_metrics_v3('INV46 V3 FROZEN CANDIDATE BASELINE',0,initial)
+    help_idx=torch.nonzero(ds.target_write>0.5,as_tuple=False).flatten(); suppress_idx=torch.nonzero(ds.target_write<=0.5,as_tuple=False).flatten()
+    opt=torch.optim.AdamW(selector.parameters(),lr=float(args.selector_lr),weight_decay=float(args.selector_weight_decay))
+    gen=torch.Generator(device='cpu'); gen.manual_seed(int(args.seed)+46503)
+    history=[]; best_rank=None; best_step=-1; stale=0
+    for step in range(1,int(args.selector_steps)+1):
+        selector.train(True); opt.zero_grad(set_to_none=True); n=int(args.selector_batch_per_class)
+        hi=help_idx[torch.randint(0,int(help_idx.numel()),(n,),generator=gen)]; si=suppress_idx[torch.randint(0,int(suppress_idx.numel()),(n,),generator=gen)]
+        batch=torch.cat([hi,si]); batch=batch[torch.randperm(int(batch.numel()),generator=gen)]
+        logits=selector(edge_embedding=ds.edge_embedding[batch].to(device),scalar_features=ds.scalar_features[batch].to(device)); target=ds.target_write[batch].to(device)
+        loss=torch.nn.functional.binary_cross_entropy_with_logits(logits,target)
+        if not bool(torch.isfinite(loss.detach())): raise FloatingPointError(f'non-finite selector loss at {step}')
+        loss.backward(); grad=torch.nn.utils.clip_grad_norm_(selector.parameters(),float(args.grad_clip)); grad_norm=float(torch.as_tensor(grad).detach().cpu())
+        if not math.isfinite(grad_norm): raise FloatingPointError(f'non-finite selector grad at {step}')
+        opt.step(); history.append({'step':int(step),'loss':float(loss.detach().cpu()),'grad_norm':grad_norm})
+        if step==1 or step%int(args.print_every)==0:
+            print(f'[selector {step:04d}/{int(args.selector_steps)}] loss={float(loss.detach().cpu()):.5f} grad={grad_norm:.3f}',flush=True)
+        if step%int(args.selector_eval_every)==0 or step==int(args.selector_steps):
+            probs=selector_probabilities_v3(selector,ds,device); target_np=ds.target_write.numpy().astype(np.int64,copy=False)
+            threshold,cal=choose_selector_threshold_v3(probs,target_np,max_suppress_write_rate=float(args.selector_max_suppress_write_rate),override=args.selector_threshold)
+            metrics=evaluate_v3(model,selector,frames=val_frames,loader=loader,graph=graph,paths=paths,temporal_radius=int(args.temporal_radius),spacing=spacing,device=device,write_threshold=threshold)
+            INV42.assert_candidate_invariant(candidate_reference,metrics['candidate']); print_metrics_v3('INV46 V3 VALIDATION',step,metrics,train_selector=cal)
+            rank=rank_v3(metrics)
+            if best_rank is None or rank>best_rank:
+                best_rank=rank; best_step=step; stale=0; save_v3(cp['best'],model=model,selector=selector,threshold=threshold,calibration=cal,metrics=metrics,args=args,step=step); atomic_json(cp['best_metrics'],metrics)
+                print(f'[best selector] step={step} rank={rank} threshold={threshold:.6f}',flush=True)
+            else:
+                stale+=1; print(f'[selector selection] rank={rank} best={best_rank} stale={stale}',flush=True)
+            atomic_json(cp['history'],history)
+            if int(args.selector_patience)>0 and stale>=int(args.selector_patience):
+                print('[selector early-stop] no validation improvement.',flush=True); break
+    if not cp['best'].is_file(): raise RuntimeError('No best V3 selector checkpoint produced')
+    probs=selector_probabilities_v3(selector,ds,device); target_np=ds.target_write.numpy().astype(np.int64,copy=False)
+    threshold,cal=choose_selector_threshold_v3(probs,target_np,max_suppress_write_rate=float(args.selector_max_suppress_write_rate),override=args.selector_threshold)
+    metrics=evaluate_v3(model,selector,frames=val_frames,loader=loader,graph=graph,paths=paths,temporal_radius=int(args.temporal_radius),spacing=spacing,device=device,write_threshold=threshold)
+    save_v3(cp['final'],model=model,selector=selector,threshold=threshold,calibration=cal,metrics=metrics,args=args,step=len(history)); atomic_json(cp['history'],history)
+    selected=restore_v3(cp['best'],model=model,selector=selector); threshold=float(selected['write_threshold'])
+    metrics=evaluate_v3(model,selector,frames=val_frames,loader=loader,graph=graph,paths=paths,temporal_radius=int(args.temporal_radius),spacing=spacing,device=device,write_threshold=threshold)
+    INV42.assert_candidate_invariant(candidate_reference,metrics['candidate']); print_metrics_v3('INV46 V3 SELECTED FINAL',best_step,metrics,train_selector=selected['selector_calibration'])
+    print('\n'+'='*112,flush=True); print('INVESTIGATION 46 V3 TRAINING COMPLETE',flush=True); print('='*112,flush=True)
+    print(f"best selector : {cp['best']}",flush=True); print(f"last selector : {cp['final']}",flush=True); print(f'selected threshold: {threshold:.6f}',flush=True); print('='*112,flush=True)
+
+
+# Extend the cutter/data parser with V3 selector controls.
+_BUILD_PARSER_BASE = build_parser
+_VALIDATE_ARGS_BASE = validate_inv46_args
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser=_BUILD_PARSER_BASE()
+    parser.description='Investigation 46 V3: frozen enriched temporal candidate + balanced discrete write selector.'
+    parser.add_argument('--selector-steps',type=int,default=400)
+    parser.add_argument('--selector-lr',type=float,default=3.0e-4)
+    parser.add_argument('--selector-weight-decay',type=float,default=1.0e-4)
+    parser.add_argument('--selector-batch-per-class',type=int,default=32)
+    parser.add_argument('--selector-eval-every',type=int,default=50)
+    parser.add_argument('--selector-patience',type=int,default=6)
+    parser.add_argument('--selector-max-suppress-write-rate',type=float,default=0.10)
+    parser.add_argument('--selector-threshold',type=float,default=None)
+    parser.set_defaults(print_every=25)
+    return parser
+
+
+def validate_inv46_args(args: argparse.Namespace) -> None:
+    _VALIDATE_ARGS_BASE(args)
+    if int(args.selector_steps)<1: raise ValueError('--selector-steps must be >=1')
+    if float(args.selector_lr)<=0: raise ValueError('--selector-lr must be >0')
+    if float(args.selector_weight_decay)<0: raise ValueError('--selector-weight-decay must be >=0')
+    if int(args.selector_batch_per_class)<1: raise ValueError('--selector-batch-per-class must be >=1')
+    if int(args.selector_eval_every)<1: raise ValueError('--selector-eval-every must be >=1')
+    if int(args.selector_patience)<0: raise ValueError('--selector-patience must be >=0')
+    if not 0.0<=float(args.selector_max_suppress_write_rate)<=1.0: raise ValueError('--selector-max-suppress-write-rate must be in [0,1]')
+    if args.selector_threshold is not None and not 0.0<=float(args.selector_threshold)<=1.0: raise ValueError('--selector-threshold must be in [0,1]')
+
+
+def write_manifest_46(paths,*,args,reviewed,train_frames,val_frames,spacing)->None:
+    payload={
+        'version':OBJECTIVE_VERSION,'investigation':SCRIPT_NAME,'sample_id':paths.sample,'split':paths.split,'annotation_set':paths.annotation_set,
+        'reviewed_frames':list(map(int,reviewed)),'train_frames':list(map(int,train_frames)),'val_frames':list(map(int,val_frames)),
+        'temporal_radius':int(args.temporal_radius),'spacing_zyx_um':list(map(float,spacing)),
+        'initializer':str(args.resume) if args.resume is not None else str(paths.checkpoint),'spatial_cache':str(paths.spatial_cache),'track_graph':str(paths.track_graph),
+        'cutter_contract':{'synchronous':True,'recursive_cascade':False,'one_to_one_tracklet_edges_only':True,'target_clean_break_rate':float(args.cutter_target_clean_break_rate),'boundary_volume_scale':float(args.cutter_boundary_volume_scale),'near_radius_dref':float(args.cutter_near_radius_dref)},
+        'temporal_contract':{'global_motion_compensated':True,'volume_features':True,'hard_cut_flags':True,'candidate_frozen':True,'split_only':True},
+        'selector_contract':{'balanced_help_suppress':True,'neutral_excluded':True,'physical_feature_dim':int(PHYSICAL_GATE_DIM),'steps':int(args.selector_steps),'lr':float(args.selector_lr),'threshold_train_only':True,'max_suppress_write_rate':float(args.selector_max_suppress_write_rate),'hard_candidate_or_spatial':True,'continuous_interpolation':False},
+    }
+    atomic_json(paths.output/'dataset_manifest_v3.json',payload)
 
 
 def main() -> int:
@@ -1931,66 +2427,31 @@ def main() -> int:
         )
         return 0
 
-    install_training_overrides()
-
-    initializer_path = (
-        resolve(args.resume)
-        if args.resume is not None
-        else paths.checkpoint
-    )
-    initializer_payload = torch_load(initializer_path, map_location="cpu")
-    initializer_step = (
-        int(initializer_payload.get("global_step", 0))
-        if isinstance(initializer_payload, dict)
-        else 0
-    )
-    if int(args.steps) <= initializer_step:
-        raise ValueError(
-            f"--steps={int(args.steps)} must be greater than initializer "
-            f"global_step={initializer_step}. For example, use "
-            f"--steps {initializer_step + 300}."
-        )
-    del initializer_payload
-
     print("\n" + "=" * 112, flush=True)
-    print("INVESTIGATION 46 — TEMPORAL FINE-TUNING", flush=True)
+    print("INVESTIGATION 46 V3 — DISCRETE WRITE SELECTOR", flush=True)
     print("=" * 112, flush=True)
     print("temporal coordinates : target-relative global-motion compensated", flush=True)
     print("hard cutter          : ACTIVE, synchronous, non-recursive", flush=True)
-    print("volume features      : ACTIVE", flush=True)
-    print(
-        f"candidate aux weight : {float(args.candidate_weight):g}",
-        flush=True,
-    )
-    print(
-        f"split-head weight    : {float(args.split_weight):g}",
-        flush=True,
-    )
-    print("old 4-scalar gate    : FROZEN", flush=True)
-    print("V11 selective gate   : TRAINABLE", flush=True)
-    print("temporal encoder     : TRAINABLE", flush=True)
-    print("temporal candidate   : TRAINABLE", flush=True)
+    print("temporal candidate   : FROZEN", flush=True)
+    print("final write          : HARD candidate-or-spatial", flush=True)
+    print("selector training    : balanced HELP/SUPPRESS", flush=True)
     print("=" * 112, flush=True)
 
-    INV42.train(
-        paths=paths,
-        train_frames=train_frames,
-        val_frames=val_frames,
-        loader=loader,
-        graph=graph_sanitized,
-        spacing=spacing,
-        device=device,
-        args=args,
+    train_discrete_selector_v3(
+        paths=paths, train_frames=train_frames, val_frames=val_frames, loader=loader,
+        graph=graph_sanitized, spacing=spacing, device=device, args=args,
     )
 
     print("\n" + "=" * 112, flush=True)
-    print("INVESTIGATION 46 COMPLETE", flush=True)
+    print("INVESTIGATION 46 V3 COMPLETE", flush=True)
     print("=" * 112, flush=True)
     print(f"output             : {paths.output}", flush=True)
     print(f"hard cutter edges  : {paths.output / 'hard_cutter_edges.csv'}", flush=True)
     print(f"cutter metrics     : {paths.output / 'hard_cutter_metrics.json'}", flush=True)
-    print(f"best checkpoint    : {paths.best}", flush=True)
-    print(f"best safe          : {paths.best_safe}", flush=True)
+    cp = cp_v3(paths)
+    print(f"best selector      : {cp['best']}", flush=True)
+    print(f"last selector      : {cp['final']}", flush=True)
+    print(f"train examples     : {cp['train_examples']}", flush=True)
     print("=" * 112, flush=True)
     return 0
 

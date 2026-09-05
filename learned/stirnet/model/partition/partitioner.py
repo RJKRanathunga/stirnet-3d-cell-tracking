@@ -337,6 +337,7 @@ class GraphPartitioner(nn.Module):
         threshold: float,
         *,
         stage: Literal["spatial", "final"] = "spatial",
+        node_parent_component: Tensor | None = None,
     ) -> PartitionState:
         if edge_logits.shape != (rag.edge_index.shape[1],):
             raise ValueError(
@@ -344,6 +345,19 @@ class GraphPartitioner(nn.Module):
             )
         if stage not in {"spatial", "final"}:
             raise ValueError("stage must be 'spatial' or 'final'")
+        if node_parent_component is not None:
+            if node_parent_component.shape != (rag.node_features.shape[0],):
+                raise ValueError(
+                    "node_parent_component must align one-to-one with RAG nodes"
+                )
+            if node_parent_component.dtype not in {
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+                torch.uint8,
+            }:
+                raise TypeError("node_parent_component must have integer dtype")
         if not 0.0 < float(threshold) < 1.0:
             raise ValueError("partition threshold must lie in (0, 1)")
 
@@ -368,6 +382,11 @@ class GraphPartitioner(nn.Module):
         )
         edge_index_cpu = rag.edge_index.detach().long().cpu().numpy()
         edge_batch_cpu = rag.edge_batch.detach().long().cpu().numpy()
+        parent_component_cpu = (
+            None
+            if node_parent_component is None
+            else node_parent_component.detach().long().cpu().numpy()
+        )
 
         for batch_index, supervoxels in enumerate(rag.supervoxel_labels):
             start = int(rag.node_offsets[batch_index].item())
@@ -380,6 +399,11 @@ class GraphPartitioner(nn.Module):
                 continue
 
             edge_rows = np.flatnonzero(edge_batch_cpu == batch_index)
+            if edge_rows.size and parent_component_cpu is not None:
+                edge_rows = edge_rows[
+                    parent_component_cpu[edge_index_cpu[0, edge_rows]]
+                    == parent_component_cpu[edge_index_cpu[1, edge_rows]]
+                ]
             if edge_rows.size:
                 local_edges = (
                     edge_index_cpu[:, edge_rows] - start

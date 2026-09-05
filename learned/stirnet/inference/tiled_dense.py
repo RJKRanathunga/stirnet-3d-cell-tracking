@@ -939,6 +939,7 @@ def tiled_temporal_inference(
         rag,
         reasoning.final_edge_logits,
         model.cfg.partition.final_merge_threshold,
+        stage="final",
     )
     existence_scores = None
     if apply_existence_filter:

@@ -210,6 +210,14 @@ def test_tiled_path_streams_temporal_observations_and_runs_local_refinement():
     config.refinement.recovery_threshold = -1.0
     config.validate()
     model = StirNet(config).eval()
+    recorded_partition_stages: list[str] = []
+    original_partitioner_forward = model.partitioner.forward
+
+    def record_partition_stage(*args, stage="spatial", **kwargs):
+        recorded_partition_stages.append(stage)
+        return original_partitioner_forward(*args, stage=stage, **kwargs)
+
+    model.partitioner.forward = record_partition_stage
     batch = synthetic_batch(temporal=True)
     temporal_input = TemporalInput(
         graph_x=batch["graph_x"],
@@ -236,3 +244,4 @@ def test_tiled_path_streams_temporal_observations_and_runs_local_refinement():
     assert result.refinement.applied_count > 0
     assert result.final_labels[0].shape == batch["spatial_inputs"].shape[-3:]
     assert result.centers_um[0].shape[0] == int(result.final_labels[0].max())
+    assert recorded_partition_stages[-1] == "final"

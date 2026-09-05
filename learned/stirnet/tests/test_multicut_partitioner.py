@@ -138,3 +138,73 @@ def test_final_stage_uses_final_backend() -> None:
         stage="final",
     )
     assert result.component_count_per_batch.tolist() == [2]
+
+
+def test_parent_component_constraint_blocks_external_union_find_bridge() -> None:
+    cfg = PartitionConfig(final_partition_backend="union_find")
+    partitioner = GraphPartitioner(cfg)
+    rag = _rag(3, [(0, 1), (0, 2), (2, 1)])
+    logits = _logits([0.05, 0.99, 0.99])
+
+    unconstrained = partitioner(rag, logits, 0.50, stage="final")
+    constrained = partitioner(
+        rag,
+        logits,
+        0.50,
+        stage="final",
+        node_parent_component=torch.tensor([0, 0, 1]),
+    )
+
+    assert unconstrained.node_component.tolist() == [0, 0, 0]
+    assert constrained.component_count_per_batch.tolist() == [3]
+    assert constrained.node_component[0] != constrained.node_component[1]
+    assert constrained.node_component[0] != constrained.node_component[2]
+    assert constrained.node_component[1] != constrained.node_component[2]
+
+
+def test_parent_component_constraint_applies_to_multicut_backend() -> None:
+    cfg = PartitionConfig(final_partition_backend="multicut")
+    partitioner = GraphPartitioner(cfg)
+    rag = _rag(3, [(0, 1), (0, 2), (2, 1)])
+
+    constrained = partitioner(
+        rag,
+        _logits([0.05, 0.99, 0.99]),
+        0.50,
+        stage="final",
+        node_parent_component=torch.tensor([0, 0, 1]),
+    )
+
+    assert constrained.component_count_per_batch.tolist() == [3]
+
+
+def test_parent_component_constraint_validates_shape_and_dtype() -> None:
+    partitioner = GraphPartitioner(PartitionConfig())
+    rag = _rag(2, [(0, 1)])
+    logits = _logits([0.9])
+
+    try:
+        partitioner(
+            rag,
+            logits,
+            0.50,
+            stage="final",
+            node_parent_component=torch.tensor([0]),
+        )
+    except ValueError as error:
+        assert "align one-to-one" in str(error)
+    else:
+        raise AssertionError("Expected parent-component shape validation")
+
+    try:
+        partitioner(
+            rag,
+            logits,
+            0.50,
+            stage="final",
+            node_parent_component=torch.tensor([0.0, 0.0]),
+        )
+    except TypeError as error:
+        assert "integer dtype" in str(error)
+    else:
+        raise AssertionError("Expected parent-component dtype validation")
