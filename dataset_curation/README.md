@@ -217,10 +217,10 @@ is the recovery mechanism.
 
 ## Full BioHub dataset root
 
-The canonical dataset-curation root is:
+Set the dataset-curation root to the local location of the BioHub dataset:
 
 ```text
-E:\Data\cell-tracking\Datasets\full_biohub_80\biohub-cell-tracking-during-development
+<BIOHUB_DATA_ROOT>
 ```
 
 Raw source volumes use the existing dataset-curation contract:

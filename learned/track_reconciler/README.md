@@ -99,7 +99,7 @@ STIR foreground/separator maps can be appended by increasing `FingerprintConfig.
 
 ## Smoke test
 
-From repository root after copying the folder under `learned/`:
+From the repository root:
 
 ```bash
 python -m learned.track_reconciler.smoke_test
@@ -107,8 +107,3 @@ pytest learned/track_reconciler/tests -q
 ```
 
 No new runtime dependencies are required beyond the repository's existing PyTorch, NumPy, pandas and SciPy stack.
-
-
-### Windows pytest import bootstrap
-
-The test suite includes `tests/conftest.py` so the repository root is inserted into `sys.path` when tests are launched through the Windows `pytest.exe` console entry point. This is necessary because the current repository `pyproject.toml` installs `src` and `diagnostics`, but not `learned`. It does not affect runtime model imports.

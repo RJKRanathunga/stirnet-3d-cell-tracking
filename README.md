@@ -131,7 +131,7 @@ Dense geometric evidence + atomic supervoxels
 Learned spatial RAG + global partitioning
                 |
                 v
-Successful spatial refinement on the main development regime
+Improved spatial refinement on the main development regime
                 |
                 v
 Temporal STIR-Net investigations
@@ -149,7 +149,7 @@ Comparison against mature joint spatial/temporal alternatives
 Competition-oriented custom-model development concluded
 ```
 
-The important research mistake was also useful: after one strong pretrained segmentation approach still exhibited segmentation errors, development moved too quickly toward a custom architecture instead of first benchmarking a broader set of mature segmentation/tracking systems. Later experiments with alternatives such as Cellpose + Ultrack showed that several difficult cases could already be handled effectively by existing spatial-temporal frameworks. That changed the expected value of continuing to expand STIR-Net specifically for the competition.
+The important research mistake was also useful: after one strong pretrained segmentation approach still exhibited segmentation errors, development moved too quickly toward a custom architecture instead of first benchmarking a broader set of mature segmentation/tracking systems. Later experiments with alternatives such as Cellpose + Ultrack suggested that several difficult cases could already be handled effectively by existing spatial-temporal frameworks. That changed the expected value of continuing to expand STIR-Net specifically for the competition.
 
 The repository is therefore best read as both a working pipeline and a record of **iterative ML system development**: hypothesis, implementation, failure analysis, controlled overfit tests, architectural redesign, tooling, and eventual strategy revision.
 
@@ -428,7 +428,7 @@ The implementation lives in [`learned/stirnet/model/geometry/decoder.py`](learne
 </tr>
 <tr>
 <td><b>Separator</b><br><sub>1 channel</sub></td>
-<td align="center"><img src="assets/predicted_prior/3_seperator.png" alt="Predicted separator" width="220"></td>
+<td align="center"><img src="assets/predicted_prior/3_separator.png" alt="Predicted separator" width="220"></td>
 <td>Learned inter-instance separation evidence. High responses indicate locations where adjacent cellular regions are likely to belong to different biological cells, making this field especially important for correcting merged source instances.</td>
 </tr>
 <tr>

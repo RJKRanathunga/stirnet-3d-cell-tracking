@@ -1,6 +1,6 @@
 # STIR-Net spatial-first model package
 
-This directory is a standalone implementation of the redesigned STIR-Net model. It is intended to be merged into the existing `learned/stirnet/model/` tree after review.
+This package contains the current redesigned STIR-Net model implementation.
 
 ## Architectural rule
 
